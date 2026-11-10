@@ -86,7 +86,9 @@ fn fixture(main: &str, dep: &str, broken_directives: &str, include: &str) -> Fix
     fs::write(root.join("DepInc.inc"), include).expect("dependency include");
     fs::write(
         root.join("Broken.pas"),
-        format!("unit Broken;\ninterface\n{broken_directives}const BrokenValue = 1;\nimplementation\nend.\n"),
+        // Broken spells the names the features look up, so it could shadow
+        // them and is parsed (D54, l4d-fpyu): its unproven analysis is noted.
+        format!("unit Broken;\ninterface\n{broken_directives}const BrokenValue = 1; {{ DepValue DepCall }}\nimplementation\nend.\n"),
     )
     .expect("broken dependency");
     fs::write(root.join("BrokenInc.inc"), include).expect("broken include");
@@ -736,18 +738,20 @@ fn chain_completion(levels: usize) -> (Vec<String>, bool, Option<String>) {
     (labels, completion.is_incomplete, note)
 }
 
-/// l4d-4nbs re-review (b): past the round cap, completion lists every
-/// member the loaded prefix of the chain proves, marked incomplete.
+/// l4d-4nbs re-review (b), superseded by D54 (l4d-fpyu): the snapshot's
+/// own import walk loads an ancestor chain longer than the demand rounds'
+/// cap, so completion lists it whole in one snapshot.
 #[test]
-fn past_the_demand_round_cap_completion_lists_the_loaded_prefix() {
+fn a_chain_past_the_demand_round_cap_is_listed_whole() {
+    let count = || super::TEST_ASSISTANCE_SNAPSHOTS.with(std::cell::Cell::get);
+    let before = count();
     let (labels, incomplete, _) = chain_completion(10);
-    for member in ["M0", "M1", "M2", "M3", "M4", "M5"] {
-        assert!(
-            labels.iter().any(|label| label == member),
-            "{member}: {labels:?}"
-        );
+    for level in 0..10 {
+        let member = format!("M{level}");
+        assert!(labels.contains(&member), "{member}: {labels:?}");
     }
-    assert!(incomplete, "the rest of the chain is not loaded");
+    assert!(!incomplete);
+    assert_eq!(count() - before, 1, "one snapshot");
 }
 
 /// l4d-4nbs re-review (a): demand rounds are bounded by the definition
@@ -873,10 +877,12 @@ fn the_demand_byte_bound_counts_a_shared_source_once() {
     );
 }
 
-/// l4d-4nbs final round (2): a demanded unit with no document context is
-/// a coverage gap of the answer, not skipped silently.
+/// l4d-4nbs final round (2), superseded by D54 (l4d-fpyu): the snapshot's
+/// import walk loads a unit with no document context of its own under its
+/// importer's context, as the definition walk does, so the demand rounds
+/// (which noted such a unit as a gap) are not needed for the chain.
 #[test]
-fn a_demanded_unit_without_a_document_context_is_noted() {
+fn a_unit_without_a_document_context_is_walked_under_its_importers() {
     crate::workspace::TEST_NO_DOCUMENT_CONTEXT_OF
         .with(|name| *name.borrow_mut() = Some("/U1.pas".into()));
     let (_temp, input, main, position) = ancestor_chain(4);
@@ -884,14 +890,13 @@ fn a_demanded_unit_without_a_document_context_is_noted() {
         .value
         .expect("completion answers");
     crate::workspace::TEST_NO_DOCUMENT_CONTEXT_OF.with(|name| *name.borrow_mut() = None);
-    assert!(completion.is_incomplete, "{completion:?}");
-    let coverage = super::completion_coverage_for_test();
-    assert!(
-        coverage
-            .iter()
-            .any(|gap| gap.contains("U1.pas") && gap.contains("document context")),
-        "the missing context is noted: {coverage:?}"
-    );
+    assert!(!completion.is_incomplete, "{completion:?}");
+    let labels = completion
+        .items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+    assert!(labels.contains(&"M3"), "{labels:?}");
 }
 
 /// l4d-4nbs final round (3): the units a completion's demand rounds name
@@ -899,6 +904,8 @@ fn a_demanded_unit_without_a_document_context_is_noted() {
 #[test]
 fn the_demanded_unit_list_is_capped() {
     super::TEST_ASSISTANCE_DEMAND_CAP.with(|cap| cap.set(Some(1)));
+    // The walk leaves the chain to the demand rounds (D54).
+    crate::workspace::TEST_NAVIGATION_WALK_BYTES.with(|limit| limit.set(Some(1)));
     let (_temp, input, main, position) = ancestor_chain(4);
     let completion = super::completion_from_input_with_options(
         input,
@@ -913,6 +920,7 @@ fn the_demanded_unit_list_is_capped() {
         &AtomicBool::new(false),
     );
     super::TEST_ASSISTANCE_DEMAND_CAP.with(|cap| cap.set(None));
+    crate::workspace::TEST_NAVIGATION_WALK_BYTES.with(|limit| limit.set(None));
     let result = completion.value.expect("completion answers");
     assert!(result.demanded.len() <= 1, "{:?}", result.demanded);
     assert!(result.list.is_incomplete);

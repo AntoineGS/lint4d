@@ -557,9 +557,67 @@ pub(crate) enum ImportDemand {
 pub(crate) enum ImportNeed {
     /// The unit itself, whatever it declares.
     Unit,
-    /// Only declarations spelled by one of these canonical identifiers: a
-    /// unit whose text cannot spell any of them cannot change the answer.
-    Names(std::collections::BTreeSet<String>),
+    /// Only declarations spelled by one of these canonical identifiers
+    /// (`names`), or by an identifier starting with one of `prefixes`
+    /// (completion, l4d-fpyu): a unit whose text cannot spell any of them
+    /// cannot change the answer.
+    Spelled {
+        names: std::collections::BTreeSet<String>,
+        prefixes: std::collections::BTreeSet<String>,
+    },
+}
+
+impl ImportNeed {
+    /// A lookup that reads which unit the import binds, not what it
+    /// declares.
+    pub(crate) fn binding_only() -> Self {
+        ImportNeed::Spelled {
+            names: std::collections::BTreeSet::new(),
+            prefixes: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// Adds `other`; whether anything was added.
+    fn merge(&mut self, other: &ImportNeed) -> bool {
+        match (&mut *self, other) {
+            (ImportNeed::Unit, _) => false,
+            (_, ImportNeed::Unit) => {
+                *self = ImportNeed::Unit;
+                true
+            }
+            (
+                ImportNeed::Spelled { names, prefixes },
+                ImportNeed::Spelled {
+                    names: other_names,
+                    prefixes: other_prefixes,
+                },
+            ) => {
+                let mut changed = false;
+                for name in other_names {
+                    changed |= names.insert(name.clone());
+                }
+                for prefix in other_prefixes {
+                    changed |= prefixes.insert(prefix.clone());
+                }
+                changed
+            }
+        }
+    }
+
+    /// Whether everything `other` needs is in `self`.
+    fn covers(&self, other: &ImportNeed) -> bool {
+        match (self, other) {
+            (ImportNeed::Unit, _) => true,
+            (_, ImportNeed::Unit) => false,
+            (
+                ImportNeed::Spelled { names, prefixes },
+                ImportNeed::Spelled {
+                    names: other_names,
+                    prefixes: other_prefixes,
+                },
+            ) => other_names.is_subset(names) && other_prefixes.is_subset(prefixes),
+        }
+    }
 }
 
 impl ImportDemand {
@@ -579,41 +637,54 @@ impl ImportDemand {
                             units.insert(unit.clone(), need.clone());
                             changed = true;
                         }
-                        Some(ImportNeed::Unit) => {}
-                        Some(current @ ImportNeed::Names(_)) => match need {
-                            ImportNeed::Unit => {
-                                *current = ImportNeed::Unit;
-                                changed = true;
-                            }
-                            ImportNeed::Names(names) => {
-                                if let ImportNeed::Names(current) = current {
-                                    for name in names {
-                                        changed |= current.insert(name.clone());
-                                    }
-                                }
-                            }
-                        },
+                        Some(current) => changed |= current.merge(need),
                     }
                 }
                 changed
             }
         }
     }
+
+    /// Whether a load that served `self` already handled `need` through the
+    /// import `name`.
+    fn covers(&self, name: &str, need: &ImportNeed) -> bool {
+        match self {
+            ImportDemand::All => true,
+            ImportDemand::Units(units) => units.get(name).is_some_and(|held| held.covers(need)),
+        }
+    }
 }
 
-/// The need of a lookup for `key` through an import: only a plain ASCII
-/// identifier can be proven absent from a unit's bytes (R9-5, A2).
+/// Only a plain ASCII identifier (or identifier prefix) can be proven absent
+/// from a unit's bytes (R9-5, A2).
+fn is_provable_needle(needle: &str) -> bool {
+    !needle.is_empty()
+        && needle
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// The need of a lookup for `key` through an import.
 fn import_need_for(key: Option<&str>) -> ImportNeed {
     match key {
-        Some(key)
-            if !key.is_empty()
-                && key
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') =>
-        {
-            ImportNeed::Names(std::collections::BTreeSet::from([key.to_owned()]))
-        }
+        Some(key) if is_provable_needle(key) => ImportNeed::Spelled {
+            names: std::collections::BTreeSet::from([key.to_ascii_lowercase()]),
+            prefixes: std::collections::BTreeSet::new(),
+        },
         _ => ImportNeed::Unit,
+    }
+}
+
+/// The need of a completion listing the names starting with `prefix`
+/// through an import (l4d-fpyu); an empty prefix needs every name.
+fn import_need_for_prefix(prefix: &str) -> ImportNeed {
+    if is_provable_needle(prefix) {
+        ImportNeed::Spelled {
+            names: std::collections::BTreeSet::new(),
+            prefixes: std::collections::BTreeSet::from([prefix.to_ascii_lowercase()]),
+        }
+    } else {
+        ImportNeed::Unit
     }
 }
 
@@ -2226,19 +2297,19 @@ impl NavigationIndex {
     where
         I: IntoIterator<Item = (String, Url)>,
     {
-        self.bind_imports_with_laziness(uri, bindings, false);
+        self.bind_imports_with_laziness(uri, bindings, None);
     }
 
     /// `bind_imports` for imports some of whose units a lazy load left
     /// unparsed (l4d-ucux): a lookup through one of them demands it again.
-    pub(crate) fn bind_imports_lazily<I>(&mut self, uri: &Url, bindings: I)
+    pub(crate) fn bind_imports_lazily<I>(&mut self, uri: &Url, bindings: I, served: ImportDemand)
     where
         I: IntoIterator<Item = (String, Url)>,
     {
-        self.bind_imports_with_laziness(uri, bindings, true);
+        self.bind_imports_with_laziness(uri, bindings, Some(served));
     }
 
-    fn bind_imports_with_laziness<I>(&mut self, uri: &Url, bindings: I, lazy: bool)
+    fn bind_imports_with_laziness<I>(&mut self, uri: &Url, bindings: I, lazy: Option<ImportDemand>)
     where
         I: IntoIterator<Item = (String, Url)>,
     {
@@ -2258,7 +2329,7 @@ impl NavigationIndex {
             ));
             document.import_bindings = Some(bindings);
             document.unbound = None;
-            document.lazy_imports = lazy.then(|| uri.clone());
+            document.lazy_imports = lazy.map(|served| (uri.clone(), served));
         }
     }
 
@@ -2305,14 +2376,21 @@ impl NavigationIndex {
     /// unit itself). Recorded while the imports are fenced, and while the
     /// import is bound to a unit a lazy load left unparsed.
     fn demand_import(&self, document: &Document, name: &str, key: Option<&str>) {
+        self.demand_import_need(document, name, import_need_for(key));
+    }
+
+    /// `demand_import` for any need. A lazily bound import is demanded only
+    /// when the load that left it unparsed did not already serve `need`.
+    fn demand_import_need(&self, document: &Document, name: &str, need: ImportNeed) {
         let owner = match (&document.unbound, &document.lazy_imports) {
             (Some(uri), _) => uri,
-            (None, Some(uri))
+            (None, Some((uri, served)))
                 if document
                     .import_bindings
                     .as_ref()
                     .and_then(|bindings| bindings.get(name))
-                    .is_some_and(|target| !self.documents.contains_key(target)) =>
+                    .is_some_and(|target| !self.documents.contains_key(target))
+                    && !served.covers(name, &need) =>
             {
                 uri
             }
@@ -2320,7 +2398,7 @@ impl NavigationIndex {
         };
         self.binding_demand.record(
             owner,
-            ImportDemand::Units(HashMap::from([(name.to_owned(), import_need_for(key))])),
+            ImportDemand::Units(HashMap::from([(name.to_owned(), need)])),
         );
     }
 
@@ -8436,10 +8514,20 @@ impl NavigationIndex {
         name: &str,
         key: Option<&str>,
     ) -> Vec<Url> {
+        self.unit_urls_for_import_need(current_document, name, import_need_for(key))
+    }
+
+    /// `unit_urls_for_import` for what `need` reads from the unit.
+    fn unit_urls_for_import_need(
+        &self,
+        current_document: &Document,
+        name: &str,
+        need: ImportNeed,
+    ) -> Vec<Url> {
         if current_document.unknown_imports.contains(name) {
             return Vec::new();
         }
-        self.demand_import(current_document, name, key);
+        self.demand_import_need(current_document, name, need);
         if let Some(bindings) = &current_document.import_bindings {
             return bindings.get(name).cloned().into_iter().collect();
         }
@@ -16795,7 +16883,7 @@ struct Document {
     unbound: Option<Url>,
     /// Set while some bound imports are units a lazy load left unparsed: a
     /// lookup through one of them records a demand for it (l4d-ucux).
-    lazy_imports: Option<Url>,
+    lazy_imports: Option<(Url, ImportDemand)>,
 }
 
 impl Deref for Document {

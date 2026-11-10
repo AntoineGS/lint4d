@@ -5146,6 +5146,11 @@ struct UnverifiedRanking {
     summaries: Option<super::lexical::SummaryMap>,
     proven: Vec<(PathBuf, Arc<super::lexical::LexicalSummary>)>,
     summaries_reused: usize,
+    /// `names` are identifier prefixes (completion, l4d-fpyu): an include
+    /// holds one when one of its identifiers starts with it.
+    prefixes: bool,
+    /// The content hash of every include an include proof read.
+    include_hashes: HashMap<PathBuf, u64>,
 }
 
 #[cfg(test)]
@@ -5437,6 +5442,8 @@ impl UnverifiedRanking {
             summaries: None,
             proven: Vec::new(),
             summaries_reused: 0,
+            prefixes: false,
+            include_hashes: HashMap::new(),
         }
     }
 
@@ -5915,7 +5922,11 @@ impl UnverifiedRanking {
                     stamp.as_ref()?;
                     (pascal_project::content_hash_bytes(&bytes) == content_hash
                         && super::lexical::is_byte_text(&bytes)
-                        && !super::lexical::holds_identifier(&bytes, &self.names))
+                        && !if self.prefixes {
+                            super::lexical::holds_identifier_prefix(&bytes, &self.names)
+                        } else {
+                            super::lexical::holds_identifier(&bytes, &self.names)
+                        })
                     .then_some(())?;
                     let requests = super::lexical::include_requests(&bytes)?;
                     walk.tokens.insert_text(&bytes);
@@ -5923,6 +5934,7 @@ impl UnverifiedRanking {
                 });
                 self.profile.include_reads += read_started.elapsed();
                 let (stamp, requests) = read?;
+                self.include_hashes.insert(child.path.clone(), content_hash);
                 let mut baseline = vec![(child.path.clone(), stamp)];
                 walk.active.push(child_key);
                 let followed = self.follow(
@@ -6088,40 +6100,59 @@ impl UnverifiedRanking {
 /// one navigation walk.
 #[derive(Default)]
 pub(super) struct ImportAbsence {
-    rankings: HashMap<Vec<String>, UnverifiedRanking>,
+    rankings: HashMap<(Vec<String>, bool), UnverifiedRanking>,
 }
 
 impl ImportAbsence {
     /// What proves that the unit at `path`, whose raw bytes the resolver read
-    /// as `text`, spells none of `names` as a whole identifier, in its text
-    /// or its includes resolved in context `key`: the includes it read, each
-    /// with the stamp taken before the read. `None` proves nothing.
+    /// as `text`, spells none of `names` as a whole identifier (or, with
+    /// `prefixes`, no identifier starting with one of them), in its text or
+    /// its includes resolved in context `key`: the includes it read, each
+    /// with the stamp taken before the read and the hash of the bytes read.
+    /// `None` proves nothing.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prove(
         &mut self,
         workspace: &Workspace,
         input: &WorkspaceInput,
         key: &ContextKey,
-        path: &Path,
-        text: &[u8],
+        (path, text): (&Path, &[u8]),
         names: Vec<String>,
+        prefixes: bool,
         cancel: &AtomicBool,
-    ) -> Option<Vec<(PathBuf, Option<PathStamp>)>> {
-        if !super::lexical::proves_absent(text, &names, false) {
+    ) -> Option<Vec<(PathBuf, Option<PathStamp>, u64)>> {
+        let absent = if prefixes {
+            super::lexical::needles_are_provable(&names)
+                && super::lexical::is_byte_text(text)
+                && !super::lexical::holds_identifier_prefix(text, &names)
+        } else {
+            super::lexical::proves_absent(text, &names, false)
+        };
+        if !absent {
             return None;
         }
         let ranking = self
             .rankings
-            .entry(names.clone())
-            .or_insert_with(|| UnverifiedRanking::with(names, Vec::new(), false));
+            .entry((names.clone(), prefixes))
+            .or_insert_with(|| {
+                let mut ranking = UnverifiedRanking::with(names, Vec::new(), false);
+                ranking.prefixes = prefixes;
+                ranking
+            });
         let scope = IncludeScope {
             workspace,
             input,
             key,
         };
-        ranking
-            .includes_absent(&scope, path, text, cancel)
-            .map(|proof| proof.baseline)
+        let proof = ranking.includes_absent(&scope, path, text, cancel)?;
+        proof
+            .baseline
+            .into_iter()
+            .map(|(path, stamp)| {
+                let hash = ranking.include_hashes.get(&path).copied()?;
+                Some((path, stamp, hash))
+            })
+            .collect()
     }
 }
 

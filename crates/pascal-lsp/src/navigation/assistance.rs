@@ -1654,7 +1654,13 @@ impl NavigationIndex {
                     if current_document.unknown_imports.contains(unit.as_str()) {
                         continue;
                     }
-                    for unit_uri in self.unit_urls_for_import(current_document, unit) {
+                    // Only names starting with the prefix are listed
+                    // (l4d-fpyu).
+                    for unit_uri in self.unit_urls_for_import_need(
+                        current_document,
+                        unit,
+                        super::import_need_for_prefix(&accumulator.prefix),
+                    ) {
                         self.add_exported_completion_candidates(
                             &mut accumulator,
                             &unit_uri,
@@ -2092,7 +2098,14 @@ impl NavigationIndex {
         let imported_provider_uris = current_document
             .active_uses(region)
             .into_iter()
-            .flat_map(|unit| self.unit_urls_for_import(current_document, unit))
+            // Only the bound URLs are read, never the units (l4d-fpyu).
+            .flat_map(|unit| {
+                self.unit_urls_for_import_need(
+                    current_document,
+                    unit,
+                    super::ImportNeed::binding_only(),
+                )
+            })
             .collect::<HashSet<_>>();
 
         let mut unit_providers = HashMap::<String, Vec<Url>>::new();

@@ -133,6 +133,8 @@ pub(crate) mod hydration;
 pub(crate) mod indexing;
 #[cfg(all(test, unix))]
 mod isolation;
+#[cfg(test)]
+mod lazy_assistance_tests;
 pub(crate) mod lexical;
 #[cfg(test)]
 mod navigation_walk_tests;
@@ -439,6 +441,12 @@ thread_local! {
     /// Expanding a unit whose file name this is fails.
     static TEST_FAIL_EXPANSION_OF: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
+    /// Every source a workspace indexed as a dependency or document.
+    static TEST_INDEXED_DEPENDENCIES: std::cell::RefCell<Vec<Url>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Snapshots parse every import of their document (l4d-fpyu tests).
+    static TEST_EAGER_SNAPSHOT_IMPORTS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 fn navigation_walk_byte_limit() -> usize {
@@ -3471,14 +3479,39 @@ struct LazyImportLoad {
     skipped: bool,
 }
 
+/// How `Workspace::walk_imports_with_probe` walks.
+#[derive(Clone, Copy)]
+pub(super) struct ImportWalk {
+    /// Parse only the imports that can matter to the demand (D54).
+    pub(super) lazy: bool,
+    /// Without demand, widen level by level.
+    pub(super) widen: bool,
+    /// A dependency whose imports fail to load is skipped with a note.
+    pub(super) skip_failed_dependencies: bool,
+    /// An answer stands only once its lookups demand nothing more: a
+    /// listing (completion) or a rendering (hover) reads more than the
+    /// first declaration it finds.
+    pub(super) settle: bool,
+}
+
+#[derive(Default)]
+pub(super) struct ImportWalkOutcome {
+    pub(super) answered: bool,
+    pub(super) exhausted: bool,
+    pub(super) loaded: Vec<Url>,
+    /// Documents whose imports failed to load and were skipped, with why.
+    pub(super) failed: Vec<(Url, String)>,
+}
+
 /// What a lazy load does with one resolved import (l4d-ucux).
 enum LazyImport {
     Parse,
     /// No query looked through it.
     Unneeded,
     /// It cannot spell what the queries looked up through it: the includes
-    /// that proves it with the stamps taken before reading them.
-    Absent(Vec<(PathBuf, Option<PathStamp>)>),
+    /// that proves it, each with the stamp taken before reading it and the
+    /// hash of the bytes read.
+    Absent(Vec<(PathBuf, Option<PathStamp>, u64)>),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -7603,6 +7636,59 @@ impl Workspace {
                 }
             }
         }
+        let mut found = Vec::new();
+        let walk = self.walk_imports_with_probe(
+            uri,
+            context_key,
+            pinned,
+            cancel,
+            ImportWalk {
+                lazy: self.best_effort_navigation,
+                widen: true,
+                skip_failed_dependencies: self.best_effort_navigation,
+                settle: false,
+            },
+            &mut |workspace| {
+                found = workspace.resolve_virtual_navigation(uri, position, target, cancel)?;
+                Ok(!found.is_empty())
+            },
+        )?;
+        if walk.answered {
+            self.validate_compiled_navigation_locations(&found)?;
+            return Ok(found);
+        }
+        if walk.exhausted {
+            self.warn(format!(
+                "navigation walk limit ({MAX_NAVIGATION_WALK_WORK} units or {} source bytes) reached while resolving {uri}; result is incomplete",
+                navigation_walk_byte_limit()
+            ));
+        }
+
+        check_workspace_cancel(cancel)?;
+        let locations = self.resolve_virtual_navigation(uri, position, target, cancel)?;
+        self.validate_compiled_navigation_locations(&locations)?;
+        Ok(locations)
+    }
+
+    /// The import walk of a query on `uri` (l4d-4nbs D44, l4d-ucux D54):
+    /// `probe` answers the query over what is loaded so far and records the
+    /// binding demand of its lookups; the walk loads what that demand names
+    /// until `probe` answers with nothing demanded that a lazy load left
+    /// unparsed. With `walk.lazy`, a demanded document's imports are parsed
+    /// only where a lookup went through them and they can spell what it
+    /// looked up. Without demand the walk widens level by level when
+    /// `walk.widen`, after loading lazily loaded documents whole; otherwise
+    /// it stops there. Returns whether `probe` answered, whether the walk
+    /// limits stopped it, and the dependencies it loaded.
+    pub(super) fn walk_imports_with_probe(
+        &mut self,
+        uri: &Url,
+        context_key: &ContextKey,
+        pinned: &mut HashSet<Url>,
+        cancel: Option<&AtomicBool>,
+        walk: ImportWalk,
+        probe: &mut dyn FnMut(&Self) -> Result<bool, String>,
+    ) -> Result<ImportWalkOutcome, String> {
         let mut frontier = vec![uri.clone()];
         let mut visited = HashSet::new();
         let mut initialized = HashSet::from([uri.clone()]);
@@ -7618,7 +7704,8 @@ impl Workspace {
         // queries looked up through them (`requested`), and only the imports
         // that can declare it are parsed. `lazy` holds the documents whose
         // last load left a bound import unparsed, with the demand it served.
-        let lazy_walk = self.best_effort_navigation;
+        let lazy_walk = walk.lazy;
+        let mut outcome = ImportWalkOutcome::default();
         let mut requested = HashMap::<Url, crate::navigation::ImportDemand>::new();
         let mut lazy = HashMap::<Url, crate::navigation::ImportDemand>::new();
         let mut lazy_state = LazyImportLoad::default();
@@ -7626,7 +7713,7 @@ impl Workspace {
         loop {
             check_workspace_cancel(cancel)?;
             let _ = self.index.take_import_demand();
-            let locations = self.resolve_virtual_navigation(uri, position, target, cancel)?;
+            let answered = probe(self)?;
             // Load the imports the failed query looked through, not those of
             // every unit loaded so far (l4d-4nbs D44): a name binds only
             // through its document's own imports, so the units along a type's
@@ -7663,12 +7750,22 @@ impl Workspace {
                 })
                 .map(|(document, _)| document.clone())
                 .collect::<Vec<_>>();
-            if !locations.is_empty() && pending.is_empty() {
-                self.validate_compiled_navigation_locations(&locations)?;
-                return Ok(locations);
+            // A settled answer (snapshots) also waits for every other new
+            // demand its lookups made.
+            let unsettled = walk.settle
+                && raw_demand.iter().any(|(document, needed)| {
+                    !lazy.contains_key(document)
+                        && requested.get(document).is_none_or(|wanted| {
+                            let mut wanted = wanted.clone();
+                            wanted.merge(needed)
+                        })
+                });
+            if answered && pending.is_empty() && !unsettled {
+                outcome.answered = true;
+                return Ok(outcome);
             }
             let mut demand = Vec::new();
-            if locations.is_empty() {
+            if !answered || walk.settle {
                 for (document, needed) in raw_demand {
                     if lazy.contains_key(&document) {
                         continue;
@@ -7711,6 +7808,7 @@ impl Workspace {
             if frontier.is_empty()
                 || (walk_exhausted && !frontier.iter().any(|document| lazy.contains_key(document)))
             {
+                outcome.exhausted = walk_exhausted;
                 break;
             }
 
@@ -7776,7 +7874,8 @@ impl Workspace {
                     // D16: a dependency that cannot be loaded only hides what
                     // binds through it; navigation returns what still binds.
                     // Each request rebuilds the walk, so log it once.
-                    Err(error) if self.best_effort_navigation && &current != uri => {
+                    Err(error) if walk.skip_failed_dependencies && &current != uri => {
+                        outcome.failed.push((current.clone(), error.clone()));
                         self.warn_project(format!(
                             "navigation skipped the imports of {current} while resolving {uri}; the result may be incomplete: {error}"
                         ));
@@ -7792,25 +7891,18 @@ impl Workspace {
                             self.index.source_text(&dependency).map_or(0, str::len),
                         );
                     }
+                    if !outcome.loaded.contains(&dependency) {
+                        outcome.loaded.push(dependency.clone());
+                    }
                     next.push(dependency);
                 }
             }
             next.retain(|dependency| !visited.contains(dependency));
             next.sort_by(|left, right| left.as_str().cmp(right.as_str()));
             next.dedup();
-            frontier = next;
+            frontier = if walk.widen { next } else { Vec::new() };
         }
-
-        if walk_exhausted {
-            self.warn(format!(
-                "navigation walk limit ({MAX_NAVIGATION_WALK_WORK} units or {walk_byte_limit} source bytes) reached while resolving {uri}; result is incomplete"
-            ));
-        }
-
-        check_workspace_cancel(cancel)?;
-        let locations = self.resolve_virtual_navigation(uri, position, target, cancel)?;
-        self.validate_compiled_navigation_locations(&locations)?;
-        Ok(locations)
+        Ok(outcome)
     }
 
     /// Dependencies only supply declarations. They cannot make a cursor
@@ -8360,16 +8452,17 @@ impl Workspace {
                             dependency_uri.clone(),
                             false,
                         )?;
-                        for (path, stamp) in includes {
+                        for (path, stamp, content_hash) in includes {
+                            let path_entry = context.path_entry_for(&path);
                             if let Some(record) = rename::path_record_at(
                                 path,
                                 stamp,
-                                None,
+                                Some(content_hash),
                                 None,
                                 None,
                                 Some(context.read_policy().clone()),
-                                None,
-                                false,
+                                path_entry,
+                                true,
                             ) && let Some(records) = self.analysis_records.as_mut()
                             {
                                 resolver::merge_source_record(records, record);
@@ -8557,8 +8650,9 @@ impl Workspace {
                 resolver::merge_source_record(records, record);
             }
         }
-        if lazy.as_ref().is_some_and(|lazy| lazy.skipped) {
-            self.index.bind_imports_lazily(uri, bindings);
+        if let Some(lazy) = lazy.as_ref().filter(|lazy| lazy.skipped) {
+            self.index
+                .bind_imports_lazily(uri, bindings, lazy.demand.clone());
         } else {
             self.index.bind_imports(uri, bindings);
         }
@@ -8582,14 +8676,16 @@ impl Workspace {
             return LazyImport::Parse;
         };
         let mut needles = BTreeSet::new();
+        let mut prefix_needles = BTreeSet::new();
         let mut needed = false;
         for name in names {
             match units.get(name) {
                 None => {}
                 Some(ImportNeed::Unit) => return LazyImport::Parse,
-                Some(ImportNeed::Names(keys)) => {
+                Some(ImportNeed::Spelled { names, prefixes }) => {
                     needed = true;
-                    needles.extend(keys.iter().cloned());
+                    needles.extend(names.iter().cloned());
+                    prefix_needles.extend(prefixes.iter().cloned());
                 }
             }
         }
@@ -8606,18 +8702,25 @@ impl Workspace {
             return LazyImport::Parse;
         }
         let input = lazy.input.get_or_insert_with(|| self.analysis_input());
-        match lazy.absence.prove(
-            self,
-            input,
-            context_key,
-            &dependency.source.path,
-            &dependency.source.bytes,
-            needles.into_iter().collect(),
-            cancel,
-        ) {
-            Some(includes) => LazyImport::Absent(includes),
-            None => LazyImport::Parse,
+        let mut includes = Vec::new();
+        for (needles, prefixes) in [(needles, false), (prefix_needles, true)] {
+            if needles.is_empty() {
+                continue;
+            }
+            match lazy.absence.prove(
+                self,
+                input,
+                context_key,
+                (&dependency.source.path, &dependency.source.bytes),
+                needles.into_iter().collect(),
+                prefixes,
+                cancel,
+            ) {
+                Some(proven) => includes.extend(proven),
+                None => return LazyImport::Parse,
+            }
         }
+        LazyImport::Absent(includes)
     }
 
     fn store_interface_imports(
@@ -9330,6 +9433,8 @@ impl Workspace {
         budget: Option<&ReconciliationBudget>,
     ) -> Result<bool, String> {
         check_workspace_cancel(cancel)?;
+        #[cfg(test)]
+        TEST_INDEXED_DEPENDENCIES.with(|indexed| indexed.borrow_mut().push(uri.clone()));
         let size = disk_size.unwrap_or(source.len());
         if !self.make_room_for_with_control(uri, size, pinned, 0, cancel, budget)? {
             if !self.open_documents.contains_key(uri) {

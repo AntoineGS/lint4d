@@ -696,6 +696,53 @@ pub(crate) struct SnapshotSeed {
     /// fenced (l4d-4nbs review): their imports are loaded, not left to the
     /// cache-only closure walk.
     pub(crate) demanded: Vec<Url>,
+    /// The query the snapshot is for, which loads only the imports its
+    /// lookups need (D54, l4d-fpyu).
+    pub(crate) lazy_probe: Option<LazyProbe>,
+}
+
+/// A read-only query whose snapshot loads its document's imports lazily:
+/// the walk answers it over what is loaded and loads what its lookups
+/// demand (D54, l4d-fpyu).
+#[derive(Debug, Clone)]
+pub(crate) enum LazyProbe {
+    Hover {
+        position: Position,
+        format: lsp_types::MarkupKind,
+    },
+    Completion {
+        position: Position,
+        options: crate::navigation::CompletionOptions,
+    },
+}
+
+impl LazyProbe {
+    /// Whether the query answers over `index`. A failure other than
+    /// cancellation is no answer: the walk then loads the imports whole.
+    fn answers(
+        &self,
+        index: &NavigationIndex,
+        uri: &Url,
+        cancel: &AtomicBool,
+    ) -> Result<bool, String> {
+        let answered = match self {
+            LazyProbe::Hover { position, format } => index
+                .hover_with_cancel(uri, *position, format.clone(), cancel)
+                .map(|hover| hover.is_some()),
+            LazyProbe::Completion { position, options } => index
+                .completion_with_cancel_and_options(uri, *position, options.clone(), cancel)
+                .map(|result| !result.list.items.is_empty()),
+        };
+        match answered {
+            Err(error)
+                if error == CANCELLATION_MESSAGE
+                    || cancel.load(std::sync::atomic::Ordering::Relaxed) =>
+            {
+                Err(error)
+            }
+            answered => Ok(answered.unwrap_or(false)),
+        }
+    }
 }
 
 impl SnapshotSeed {
@@ -706,7 +753,13 @@ impl SnapshotSeed {
             completion_position: None,
             best_effort: false,
             demanded: Vec::new(),
+            lazy_probe: None,
         }
+    }
+
+    pub(crate) fn with_lazy_probe(mut self, probe: Option<LazyProbe>) -> Self {
+        self.lazy_probe = probe;
+        self
     }
 
     pub(crate) fn with_demanded(mut self, demanded: &[Url]) -> Self {
@@ -7524,6 +7577,19 @@ fn build_snapshot_with_policy(
     let mut pins: HashSet<Url> = indexed_uris;
     let mut direct_dependencies = Vec::new();
     let mut declaration_providers = HashSet::new();
+    let lazy_probe = priority_seed
+        .as_ref()
+        .filter(|seed| seed.best_effort && priority.len() == 1)
+        .filter(|_| {
+            matches!(
+                mode,
+                SnapshotMode::LocalWithImports | SnapshotMode::Assistance
+            )
+        })
+        .and_then(|seed| seed.lazy_probe.clone());
+    #[cfg(test)]
+    let lazy_probe =
+        lazy_probe.filter(|_| !super::TEST_EAGER_SNAPSHOT_IMPORTS.with(std::cell::Cell::get));
     crate::trace::trace!("  snapshot indexed {} sources", uris.len());
     if mode != SnapshotMode::WorkspaceSymbols {
         for uri in uris {
@@ -7543,12 +7609,56 @@ fn build_snapshot_with_policy(
                 // bind to one provider do not look incomplete merely because
                 // their dependency URI is shared.
                 let imports = loader.index.imports(&uri);
-                direct_dependencies.extend(loader.load_imports_with_cancel(
-                    &uri,
-                    &context_key,
-                    &mut pins,
-                    Some(cancel),
-                )?);
+                if let Some(probe) = lazy_probe
+                    .as_ref()
+                    .filter(|_| priority.first() == Some(&uri))
+                {
+                    // D54 (l4d-fpyu): parse the imports the feature's lookups
+                    // go through and that can spell what they look up.
+                    loader.index.clear_import_bindings(&uri);
+                    let walk = loader.walk_imports_with_probe(
+                        &uri,
+                        &context_key,
+                        &mut pins,
+                        Some(cancel),
+                        super::ImportWalk {
+                            lazy: true,
+                            widen: false,
+                            skip_failed_dependencies: true,
+                            settle: true,
+                        },
+                        &mut |workspace| probe.answers(&workspace.index, &uri, cancel),
+                    )?;
+                    crate::trace::trace!(
+                        "  snapshot lazy import walk: answered {}, {} dependencies",
+                        walk.answered,
+                        walk.loaded.len()
+                    );
+                    if walk.exhausted {
+                        demand_gaps.push((
+                            None,
+                            format!(
+                                "loading stopped at the walk limit ({} units or {} source bytes) before every unit the answer needs was loaded",
+                                super::MAX_NAVIGATION_WALK_WORK,
+                                super::navigation_walk_byte_limit()
+                            ),
+                        ));
+                    }
+                    for (failed, error) in walk.failed {
+                        demand_gaps.push((
+                            Some(failed.clone()),
+                            format!("the imports of {failed} could not be loaded: {error}"),
+                        ));
+                    }
+                    direct_dependencies.extend(walk.loaded);
+                } else {
+                    direct_dependencies.extend(loader.load_imports_with_cancel(
+                        &uri,
+                        &context_key,
+                        &mut pins,
+                        Some(cancel),
+                    )?);
+                }
                 if imports.iter().any(|import| {
                     loader
                         .index

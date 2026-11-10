@@ -1396,7 +1396,7 @@ never stored.
 **Builds.** Each build of `pascal-lsp` keeps its entries in a namespace of
 its own, named by a fingerprint of the sources it was built from: a rebuild
 after any source change starts with an empty namespace. The store keeps the
-three most recently used namespaces (`persistentCacheMaxNamespaces`), so
+two most recently used namespaces (`persistentCacheMaxNamespaces`), so
 switching between two builds on one machine (an installed server and a
 development build, say) reopens each one's entries. A namespace is used when a
 server opens or closes it, and once a minute while it is open, so a server
@@ -1554,7 +1554,7 @@ are dropped first, then anchors are cut.
 | `persistentCachePageBytes` | 16,777,216 | 786,432 to 16,777,216 | SQLite page cache, summed over the three connections (two readers, one writer) |
 | `persistentCacheScratchBytes` | 16,777,216 | 1,048,576 to 16,777,216 | transient encode and decode buffers |
 | `persistentCacheWaitMs` | 25 | 0 to 25 | longest wait for a lock or connection in one cache operation; 0 tries once and never waits |
-| `persistentCacheMaxNamespaces` | 3 | 1 to 16 | builds whose entries the store keeps, this one included (see Builds above); initialization only. Every server and command opening the store retires by its own value, so the smallest one in use wins; `1` retires every other build's entries. Above 16 it is clamped here, while `--cache-max-namespaces` rejects it |
+| `persistentCacheMaxNamespaces` | 2 | 1 to 16 | builds whose entries the store keeps, this one included (see Builds above); initialization only. Every server and command opening the store retires by its own value, so the smallest one in use wins; `1` retires every other build's entries. Above 16 it is clamped here, while `--cache-max-namespaces` rejects it |
 | `maxWorkspaceUnits` | 100,000 | 1 to 100,000 | most units in one workspace snapshot; same convention as the other limits |
 
 The limits can be lowered, not raised. In `initializationOptions`, a value
@@ -1701,7 +1701,7 @@ pascal-lsp --cache-prune --cache-max-namespaces 1   # keep only this build's ent
 ```
 
 The modes that open the store (all but status) retire namespaces like a
-server, keeping `--cache-max-namespaces N` (1 to 16, default 3) of them. A
+server, keeping `--cache-max-namespaces N` (1 to 16, default 2) of them. A
 value outside that range is a usage error, while the initialization option
 clamps one above 16.
 

@@ -3314,6 +3314,11 @@ pub struct Workspace {
     /// The warm crawl publishes the disk-proven units it analyses
     /// (R8-2/D42). Only the warmer sets it, while the store is enabled.
     crawl_persists: bool,
+    /// Set by the crawl for the next import load only, past the open file's
+    /// own imports: that load takes it (a nested load starts unlimited) and
+    /// loads only the units interface sections import, which snapshots bind
+    /// through (D51 #4).
+    interface_imports_only: bool,
     /// Set when the crawl met a context built from unsaved project input:
     /// it publishes nothing, and the warmer interleaves extraction.
     crawl_private: Arc<AtomicBool>,
@@ -7781,6 +7786,9 @@ impl Workspace {
             &mut bool,
         )>,
     ) -> Result<Vec<Url>, String> {
+        // Only this load is limited to interface imports: a load nested in
+        // it starts unlimited.
+        let interface_imports_only = std::mem::take(&mut self.interface_imports_only);
         check_workspace_cancel(cancel)?;
         #[cfg(test)]
         if TEST_FAIL_IMPORTS_OF.with(|name| {
@@ -8080,6 +8088,21 @@ impl Workspace {
             }
         }
         let mut dependency_units = resolved.dependencies.iter().collect::<Vec<_>>();
+        if interface_imports_only {
+            // A unit only an implementation section imports is not in the
+            // interface closure: the crawl leaves it to the requests that
+            // need it rather than parse the program (D51 #4).
+            let interface_sources = resolved
+                .bindings
+                .iter()
+                .filter(|import| import.site.section != ImportSection::Implementation)
+                .filter_map(|import| match &import.target {
+                    ResolutionTarget::Found(source_id) => Some(source_id),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
+            dependency_units.retain(|unit| interface_sources.contains(&unit.source.id));
+        }
         if self.dependency_hook.is_some() {
             // Warm workspace units before library units: they are small and
             // are where navigation usually lands.
@@ -8503,6 +8526,8 @@ impl Workspace {
             // Each load reports its own dependencies through the hook; keep
             // one progress sequence for the whole crawl.
             let hook = self.dependency_hook.take();
+            // Read and cleared by the load itself.
+            self.interface_imports_only = true;
             let loaded = self.load_imports_with_session_cache(
                 &unit,
                 context_key,
@@ -8510,6 +8535,7 @@ impl Workspace {
                 Some(cancel),
                 session_cache,
             );
+            self.interface_imports_only = false;
             self.dependency_hook = hook;
             let summary = match loaded {
                 Err(error) if error == CANCELLATION_MESSAGE => return Err(error),

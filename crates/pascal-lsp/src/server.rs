@@ -12643,6 +12643,7 @@ fn maintain_warmer(
         warmer.reset(open.clone(), cache);
         *sweep_pending = true;
         swept_fingerprints.clear();
+        cache.begin_fingerprint_sweep();
         if open.is_empty() {
             cache.retain_fingerprints(&HashSet::new());
             *sweep_pending = false;
@@ -12672,10 +12673,7 @@ fn maintain_warmer(
         swept_fingerprints,
         semantic_tokens_refresh,
     )?;
-    if *sweep_pending && (warmer.is_idle() || !cache.has_room()) {
-        cache.retain_fingerprints(swept_fingerprints);
-        *sweep_pending = false;
-    }
+    sweep_stale_fingerprints(cache, warmer.is_idle(), sweep_pending, swept_fingerprints);
     if !cache.has_room() && !*budget_warned {
         eprintln!(
             "pascal-lsp: warning: project cache budget (maxCacheBytes) is full of pinned entries; warming paused"
@@ -12683,6 +12681,26 @@ fn maintain_warmer(
         *budget_warned = true;
     }
     Ok(())
+}
+
+/// After a configuration change, once warming is idle or the budget is full,
+/// drops the entries of fingerprints no longer in use. The fingerprints of
+/// finished crawls and those used since the change are the current
+/// project's and are kept: before any crawl ends the swept set alone is
+/// empty (D51; multidev Task 10b wiped the whole cache mid-query).
+fn sweep_stale_fingerprints(
+    cache: &crate::project_cache::ProjectCache,
+    warmer_idle: bool,
+    sweep_pending: &mut bool,
+    swept_fingerprints: &HashSet<u64>,
+) {
+    // Without a known current fingerprint it waits (D51).
+    if *sweep_pending
+        && (warmer_idle || !cache.has_room())
+        && cache.sweep_fingerprints(swept_fingerprints)
+    {
+        *sweep_pending = false;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -18201,6 +18219,81 @@ mod tests {
             "ready but empty while the warmer runs: select again"
         );
         assert_eq!(super::warm_lane_on_wake(false, false), WarmLane::Drop);
+    }
+
+    /// D51 (multidev Task 10b: `cache retain fingerprints {}` mid-query): a
+    /// sweep before any crawl ended keeps the current project's entries and
+    /// drops only the old project's.
+    #[test]
+    fn a_sweep_before_any_crawl_ended_keeps_the_current_projects_entries() {
+        use crate::project_cache::{Lookup, ProjectCache};
+        let cache = ProjectCache::new(1 << 20);
+        let unit = |name: &str| Url::parse(&format!("file:///ws/{name}")).unwrap();
+        let context = |name: &str| {
+            pascal_project::ProjectContext::from_parts(pascal_project::ProjectContextParts {
+                project_file: Some(std::path::PathBuf::from(name)),
+                ..pascal_project::ProjectContextParts::default()
+            })
+        };
+        let parse = |name: &str| {
+            let mut index = crate::navigation::NavigationIndex::new();
+            let stem = name.trim_end_matches(".pas");
+            index
+                .update(
+                    unit(name),
+                    format!("unit {stem};\ninterface\nimplementation\nend.\n"),
+                )
+                .unwrap();
+            index.parsed_document(&unit(name)).unwrap()
+        };
+        let store = |name: &str, ctx: &pascal_project::ProjectContext| {
+            let cancel = AtomicBool::new(false);
+            let Lookup::Compute(claim) = cache.unit(
+                &unit(name),
+                ctx,
+                1,
+                &std::collections::HashMap::new(),
+                &cancel,
+            ) else {
+                panic!("expected a miss for {name}");
+            };
+            cache.store_unit(
+                claim,
+                crate::project_cache::UnitValue {
+                    parsed: parse(name),
+                    expansion: None,
+                    probes: Vec::new(),
+                    disk: None,
+                },
+                1 << 10,
+                &cancel,
+            );
+        };
+        let old = context("Old.dproj");
+        let current = context("App.dproj");
+        store("Old.pas", &old);
+        // The configuration changed; the current project's units are cached
+        // and used, but no crawl ended.
+        cache.begin_fingerprint_sweep();
+        store("Main.pas", &current);
+        store("Provider.pas", &current);
+        let mut pending = true;
+
+        // Warming went idle (a crawl stopped for room ends nothing).
+        super::sweep_stale_fingerprints(
+            &cache,
+            true,
+            &mut pending,
+            &std::collections::HashSet::new(),
+        );
+
+        assert!(!pending);
+        assert!(
+            !cache.ready_layers(&unit("Main.pas")).is_empty(),
+            "the current project's entries stay"
+        );
+        assert_eq!(cache.stats().units, 2, "only the old project's unit went");
+        assert!(cache.ready_layers(&unit("Old.pas")).is_empty());
     }
 
     #[test]

@@ -45194,6 +45194,9 @@ mod persistent_cache_status;
 #[path = "protocol/best_effort.rs"]
 mod best_effort;
 
+#[path = "protocol/oversized_messages.rs"]
+mod oversized_messages;
+
 fn write_inherited_closure(root: &Path) -> (PathBuf, &'static str) {
     write_file(
         &root.join("Base.pas"),

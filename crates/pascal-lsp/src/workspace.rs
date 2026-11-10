@@ -4632,6 +4632,26 @@ impl Workspace {
     }
 
     pub fn open_document(&mut self, uri: Url, text: String, version: i32) -> Result<(), String> {
+        self.open_document_or_refusal(uri, Ok(text), version)
+    }
+
+    /// Opens `uri` as a rejected document whose text never reached the
+    /// server (its didOpen was over the inbound message limit).
+    pub(crate) fn refuse_open_document(
+        &mut self,
+        uri: Url,
+        version: i32,
+        reason: String,
+    ) -> Result<(), String> {
+        self.open_document_or_refusal(uri, Err(reason), version)
+    }
+
+    fn open_document_or_refusal(
+        &mut self,
+        uri: Url,
+        text: Result<String, String>,
+        version: i32,
+    ) -> Result<(), String> {
         let canonical_uri = canonical_file_uri(&uri);
         for (old_uri, pending) in &mut self.pending_unit_file_renames {
             if pending.new_uri == canonical_uri && self.open_documents.contains_key(old_uri) {
@@ -4689,10 +4709,16 @@ impl Workspace {
             );
             return Ok(());
         }
-        if let Err(reason) = self.validate_open_text(&uri, &text) {
-            self.reject_open_document(uri, version, reason);
-            return Ok(());
-        }
+        let text = match text.and_then(|text| {
+            self.validate_open_text(&uri, &text)?;
+            Ok(text)
+        }) {
+            Ok(text) => text,
+            Err(reason) => {
+                self.reject_open_document(uri, version, reason);
+                return Ok(());
+            }
+        };
         let open_bytes_after = self.open_bytes_after(&uri, text.len());
         let mut pinned = HashSet::new();
         pinned.insert(uri.clone());

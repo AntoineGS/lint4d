@@ -1692,7 +1692,10 @@ impl Warmer {
                     // The pass is done: extraction follows the crawl.
                     self.reuse_done.insert(anchor.clone());
                     self.reuse_retries.remove(anchor);
-                    if !progress.complete {
+                    // Members retrying a previous refusal leave the index
+                    // `complete` but hold the seal back until an extraction
+                    // batch retries them (l4d-8fz9).
+                    if !progress.complete || progress.retrying > 0 {
                         self.request_index(anchor.clone());
                     }
                 }
@@ -5511,6 +5514,39 @@ mod tests {
             }
             assert!(!accept(&mut warmer, &batch(5, 0)), "the pass ends");
             assert!(warmer.reuse_done.contains(&anchor));
+            workspace.persistent_cache().shutdown();
+        }
+
+        /// l4d-8fz9: a reuse pass that ends `complete` with members still
+        /// retrying a previous refusal (pending, without a record) queues an
+        /// extraction batch for them: until they are retried the context
+        /// cannot seal, and nothing else may ask for the anchor again.
+        #[test]
+        fn a_complete_reuse_pass_with_retrying_members_queues_an_extraction_batch() {
+            let gate = Arc::new(InteractiveGate::default());
+            let (_temp, _store, workspace, main) = fixture_persisting(&gate);
+            let mut warmer = Warmer::start(gate);
+            let anchor = IndexAnchor::Document(main);
+            let key = crate::workspace::ContextKey::for_test("/retrying");
+            let mut progress = IndexProgress::new(key, IndexMode::Reuse);
+            progress.reused = 3;
+            progress.pending = 2;
+            progress.retrying = 2;
+            progress.complete = true;
+            let event = WarmEvent::IndexProgress {
+                anchor: anchor.clone(),
+                progress: Box::new(progress),
+                seal: Some(SealOutcome::NotDue),
+                generation: 0,
+            };
+            warmer.busy = true;
+            assert!(warmer.accept_event(&event, workspace.project_cache()));
+            assert!(warmer.reuse_done.contains(&anchor), "the pass is done");
+            assert!(
+                warmer.index_queue.contains(&anchor),
+                "the retries are queued: {:?}",
+                warmer.index_queue
+            );
             workspace.persistent_cache().shutdown();
         }
 

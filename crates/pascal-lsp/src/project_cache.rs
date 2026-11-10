@@ -9098,7 +9098,11 @@ impl IndexStatusEntry {
             anchor_truncated,
             counts,
             membership_complete,
-            complete: membership_complete && eligible_pending == 0,
+            // A member whose record waits for room is not done either:
+            // the batches prove it again and only then seal (l4d-8fz9).
+            complete: membership_complete
+                && eligible_pending == 0
+                && stored.unrecorded_among(&stored.awaiting_room).is_empty(),
             snapshot: match stored.baseline.as_ref() {
                 None => "none",
                 Some(hint) if hint.sealed() => "sealed",

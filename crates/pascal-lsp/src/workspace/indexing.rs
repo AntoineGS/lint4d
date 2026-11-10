@@ -2987,12 +2987,29 @@ impl Workspace {
                                 super::evidence::EvidenceGap::Uncaptured,
                             )) => self.record_unprovable(key, path, unprovable, cancel),
                             // Not even the publication pool had room: the
-                            // member stays memory-only (a retryable miss,
-                            // never a refusal record), counted with a gap.
+                            // member stays memory-only, counted with a gap,
+                            // and is listed artifact-less (no batch of this
+                            // process publishes it again), so the snapshot
+                            // seals and the next start retries it last
+                            // (l4d-8fz9).
                             PersistSkip::Memory => {
                                 self.project_cache.note_index_publication_refused(key);
+                                self.prove_unindexed(key, path, Unindexed::NotRecorded, cancel);
                             }
-                            _ => {}
+                            // No store, or the batch stopped: proven by a
+                            // later persisting batch (memory-only members).
+                            PersistSkip::Unavailable => {}
+                            // Refused for a reason no batch of this process
+                            // retries (low disk space, an internal error):
+                            // an explained gap rather than a member left
+                            // unrecorded, which would withhold the seal for
+                            // good (l4d-8fz9).
+                            skip => self.record_unprovable(
+                                key,
+                                path,
+                                Some(("refused publication", format!("{skip:?}"))),
+                                cancel,
+                            ),
                         }
                         false
                     }
@@ -11538,8 +11555,9 @@ pub(in crate::workspace) mod tests {
 
         /// Fix round 2 (A): `ScratchExhausted` is this store's own scratch
         /// budget, not pressure maintenance clears: a member that exhausts
-        /// it every time is extracted once and stays memory-only, and the
-        /// batches end.
+        /// it every time is extracted once and keeps its facts in memory,
+        /// and the batches end. It is listed by an artifact-less record, an
+        /// unprovable gap, so the context still seals (l4d-8fz9).
         #[test]
         fn a_publication_that_always_exhausts_scratch_is_extracted_once() {
             let temp = tempfile::tempdir().unwrap();
@@ -11564,8 +11582,10 @@ pub(in crate::workspace) mod tests {
                 1,
                 "{last:?}"
             );
-            assert!(!view.project_cache.index_member_has_record(&key, &member));
-            assert_eq!(recorded(&view, &key).len(), 3);
+            assert!(view.project_cache.index_member_has_record(&key, &member));
+            assert_eq!(recorded(&view, &key).len(), 4);
+            let status = view.project_cache.index_status(&|_| false);
+            assert_eq!(status[0].counts.unprovable, 1, "{:?}", status[0]);
             cache.shutdown();
         }
 
@@ -11939,6 +11959,11 @@ pub(in crate::workspace) mod tests {
                         .then_some(pascal_cache::Bypass::WalPressure)
                 }
             })));
+            // No disk space for its artifact-less record either.
+            let unrelated = other.clone();
+            cache.set_record_fault_for_test(Some(Box::new(move |path| {
+                (path == unrelated).then_some(pascal_cache::Bypass::LowDiskSpace)
+            })));
             let loaded = record_loads();
             let last = until_settled(&mut view, &anchor, IndexBound::all(), 10);
             set_after_load_hook(None);
@@ -11969,6 +11994,10 @@ pub(in crate::workspace) mod tests {
             let (mut view, cache) = persisting_view(&workspace, store.path());
             let target = member.clone();
             cache.set_publish_fault_for_test(Some(Box::new(move |path| {
+                (path == target).then_some(pascal_cache::Bypass::LowDiskSpace)
+            })));
+            let target = member.clone();
+            cache.set_record_fault_for_test(Some(Box::new(move |path| {
                 (path == target).then_some(pascal_cache::Bypass::LowDiskSpace)
             })));
             let first = advance(&mut view, &anchor, IndexBound::all());
@@ -12010,6 +12039,11 @@ pub(in crate::workspace) mod tests {
             let (mut view, cache) = persisting_view(&workspace, store.path());
             let pair = [a.clone(), b.clone()];
             cache.set_publish_fault_for_test(Some(Box::new(move |path| {
+                pair.contains(&path.to_path_buf())
+                    .then_some(pascal_cache::Bypass::LowDiskSpace)
+            })));
+            let pair = [a.clone(), b.clone()];
+            cache.set_record_fault_for_test(Some(Box::new(move |path| {
                 pair.contains(&path.to_path_buf())
                     .then_some(pascal_cache::Bypass::LowDiskSpace)
             })));
@@ -12191,7 +12225,12 @@ pub(in crate::workspace) mod tests {
             assert!(progress.complete, "{progress:?}");
             assert_eq!((progress.indexed, progress.persisted), (2, 1));
             assert_eq!(state(&view, &key, &member), Some(MemberState::Fresh));
-            assert_eq!(recorded(&view, &key), vec![temp.path().join("App.dpr")]);
+            // Listed by an artifact-less record, so the context seals with
+            // it as a gap (l4d-8fz9).
+            assert_eq!(
+                recorded(&view, &key),
+                vec![temp.path().join("App.dpr"), member.clone()]
+            );
             // 13b-3 fix round 1 (M3): counted and explained, not re-queued.
             let status = view.project_cache.index_status(&|_| false);
             assert_eq!(status[0].publications_refused, 1, "{status:?}");
@@ -13900,14 +13939,16 @@ pub(in crate::workspace) mod tests {
             let (key, anchor) = first_session(temp.path(), store.path(), 6);
             assert_eq!(retire_everything(temp.path(), store.path(), false), 12);
             // Retired but not deleted yet: never reused, and a publication
-            // is refused (`Retiring`), so the member stays memory-only.
+            // is refused (`Retiring`), so the member keeps its facts in
+            // memory, listed by an artifact-less record (l4d-8fz9).
             let (mut second, cache) = restarted_view(temp.path(), store.path());
             let progress = advance(&mut second, &anchor, IndexBound::all());
             assert!(progress.complete, "{progress:?}");
             assert_eq!((progress.reused, progress.indexed), (0, 6));
             assert_eq!(progress.persisted, 0);
             cache.shutdown();
-            assert_eq!(retire_everything(temp.path(), store.path(), true), 0);
+            // No snapshot lists those artifact-less records: retired too.
+            assert_eq!(retire_everything(temp.path(), store.path(), true), 6);
             // Deleted: extracted and published again.
             let (mut third, cache) = restarted_view(temp.path(), store.path());
             let progress = advance(&mut third, &anchor, IndexBound::all());

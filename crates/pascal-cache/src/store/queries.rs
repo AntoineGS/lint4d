@@ -9,7 +9,7 @@
 use super::Store;
 use super::health::Access;
 use super::limits::{MAX_INDEX_KEY_BYTES, MAX_INDEX_PAGE};
-use super::namespaces::{LIVE, ensure_live, epoch};
+use super::namespaces::{LIVE, ensure_live, epoch, scope_ref};
 use super::outcome::{Bypass, Lookup, Malformed, Miss};
 use super::records::{MemberRecordHeader, UNBOUNDED_TARGET_KEY, member_record_header};
 use super::snapshots::{SnapshotHeader, SnapshotMember, snapshot_ineligible};
@@ -50,6 +50,48 @@ pub const IMPORTERS_QUERY: &str = "SELECT t.dependency, length(t.record_id), t.r
      AND r.namespace_id = ?1 AND r.reset_epoch = ?2 AND r.record_id = t.record_id \
      AND r.lifecycle = ?8 \
      ORDER BY t.record_id, t.ordinal LIMIT ?7";
+
+/// The source keys of one snapshot's live members whose live artifact has a
+/// row of kind `?5` matching the key filter `{filter}` (`?6` the needle),
+/// at most `?8` (l4d-c8l2). `CROSS JOIN` pins the order: the scope's rows of
+/// the kind drive through `artifact_rows_by_index_key`, then the artifact,
+/// its records (`member_records_by_artifact`) and their membership
+/// (`snapshot_members_by_record`); the partial artifact index is named, as
+/// the planner otherwise walks every live record per row. `pub` only so
+/// `test-support` can re-export it.
+pub fn members_with_rows_query(filter: &str) -> String {
+    format!(
+        "SELECT DISTINCT length(m.source_key), m.source_key \
+         FROM artifact_rows r CROSS JOIN artifacts a \
+         CROSS JOIN member_records mr INDEXED BY member_records_by_artifact \
+         CROSS JOIN snapshot_members m \
+         WHERE r.scope_ref = ?4 AND r.row_kind = ?5 AND r.index_key IS NOT NULL AND {filter} \
+         AND a.artifact_ref = r.artifact_ref AND a.namespace_id = ?1 AND a.reset_epoch = ?2 \
+         AND a.lifecycle = ?7 \
+         AND mr.namespace_id = ?1 AND mr.reset_epoch = ?2 AND mr.artifact_id = a.artifact_id \
+         AND mr.artifact_id IS NOT NULL AND mr.lifecycle = ?7 \
+         AND m.namespace_id = ?1 AND m.reset_epoch = ?2 AND m.record_id = mr.record_id \
+         AND m.snapshot_id = ?3 \
+         LIMIT ?8"
+    )
+}
+
+/// A key holding the needle bytes, or any key that is not ASCII: the
+/// needle is matched bytewise, so a caller matching case-insensitively
+/// passes it ASCII-lowercased against ASCII-lowercased keys and keeps every
+/// key it could not compare that way.
+pub const CONTAINING_FILTER: &str = "(instr(r.index_key, ?6) > 0 \
+     OR length(CAST(r.index_key AS TEXT)) <> length(r.index_key))";
+pub const EQUAL_FILTER: &str = "r.index_key = ?6";
+
+/// Which index keys `find_members_with_rows` keeps.
+#[derive(Debug, Clone, Copy)]
+pub enum IndexKeyMatch<'a> {
+    /// Keys containing these bytes, and every key that is not ASCII.
+    Containing(&'a [u8]),
+    /// Keys equal to one of these.
+    Equal(&'a [&'a [u8]]),
+}
 
 /// How a member depends on the queried target (D47). Only `Precise` names
 /// the target as the resolver's single outcome; `Ambiguous` lists it among
@@ -319,6 +361,95 @@ impl Store {
                 None
             };
             Ok(Lookup::Hit(ImporterPage { hits, next }))
+        })
+    }
+
+    /// The canonical source keys (`path_key`) of the live members of
+    /// `snapshot` whose live artifact holds a row of `row_kind` whose index
+    /// key `matching` keeps, in no particular order; `None` when more than
+    /// `limit` members match (l4d-c8l2). A hit selects a candidate to
+    /// re-validate: the artifact and record are unverified until read (spec
+    /// §6.1, §7), and a member absent from the answer is proven nothing.
+    /// Each kept key is charged to the scratch as it is read.
+    pub fn find_members_with_rows(
+        &self,
+        snapshot: &SnapshotHeader,
+        row_kind: u8,
+        matching: IndexKeyMatch<'_>,
+        limit: usize,
+    ) -> Result<Lookup<Option<Vec<Vec<u8>>>>, Bypass> {
+        self.guarded(Access::Read, || {
+            if snapshot.scope != self.scope {
+                return Err(Bypass::Fenced);
+            }
+            let mut reader = self.reader()?;
+            let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
+            ensure_live(&transaction, self.scope)?;
+            if let Some(miss) = snapshot_ineligible(&transaction, self.scope, snapshot.id)? {
+                return Ok(Lookup::Miss(miss));
+            }
+            let Some(scope_ref) = scope_ref(&transaction, self.scope)? else {
+                return Ok(Lookup::Hit(Some(Vec::new())));
+            };
+            let read = |error: rusqlite::Error| classify_read(&error).map(Lookup::Miss);
+            let (filter, needles): (&str, Vec<&[u8]>) = match matching {
+                IndexKeyMatch::Containing(needle) => (CONTAINING_FILTER, vec![needle]),
+                IndexKeyMatch::Equal(keys) => (EQUAL_FILTER, keys.to_vec()),
+            };
+            let query = members_with_rows_query(filter);
+            let mut found = std::collections::HashSet::<Vec<u8>>::new();
+            let mut leases = Vec::new();
+            for needle in needles {
+                if needle.len() > MAX_INDEX_KEY_BYTES {
+                    continue;
+                }
+                let mut statement = match transaction.prepare_cached(&query) {
+                    Ok(statement) => statement,
+                    Err(error) => return read(error),
+                };
+                let rows = statement.query_map(
+                    params![
+                        self.scope.namespace.as_bytes().as_slice(),
+                        epoch(self.scope),
+                        snapshot.id.as_bytes().as_slice(),
+                        scope_ref,
+                        i64::from(row_kind),
+                        needle,
+                        LIVE,
+                        i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX)
+                    ],
+                    |row| {
+                        let length = row.get::<_, i64>(0)?;
+                        usize::try_from(length)
+                            .is_ok_and(|length| length <= MAX_INDEX_KEY_BYTES)
+                            .then(|| row.get::<_, Vec<u8>>(1))
+                            .transpose()
+                    },
+                );
+                let rows = match rows {
+                    Ok(rows) => rows,
+                    Err(error) => return read(error),
+                };
+                for row in rows {
+                    let source = match row {
+                        Ok(Some(source)) => source,
+                        Ok(None) => return Ok(Lookup::Miss(Miss::Malformed(Malformed::Snapshot))),
+                        Err(error) => return read(error),
+                    };
+                    if found.contains(&source) {
+                        continue;
+                    }
+                    if found.len() >= limit {
+                        return Ok(Lookup::Hit(None));
+                    }
+                    let Some(lease) = self.scratch.reserve(source.len() as u64) else {
+                        return Err(Bypass::ScratchExhausted);
+                    };
+                    leases.push(lease);
+                    found.insert(source);
+                }
+            }
+            Ok(Lookup::Hit(Some(found.into_iter().collect())))
         })
     }
 }

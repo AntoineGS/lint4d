@@ -145,6 +145,18 @@ fn descriptor_attempts() -> usize {
 
 #[cfg(test)]
 thread_local! {
+    static ON_DEMAND_REUSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Members a request indexed from the store ahead of the reuse pass since
+/// the last call (l4d-c8l2).
+#[cfg(test)]
+pub(crate) fn take_on_demand_reused() -> usize {
+    ON_DEMAND_REUSED.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+thread_local! {
     static MEMBERSHIP_COMPUTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -3443,6 +3455,48 @@ impl Workspace {
         }
     }
 
+    /// Validate and index `paths` from the store now, ahead of the reuse
+    /// pass, as its serial loop would (l4d-c8l2): a request that waits on
+    /// them proves only its own candidates. Every member is validated in
+    /// full (stamp before the bytes, A7; evidence, spec §7); a miss is
+    /// marked tried, so the pass and the request read it directly. Returns
+    /// how many were indexed.
+    pub(super) fn reuse_members_now(
+        &self,
+        key: &ContextKey,
+        paths: &[PathBuf],
+        cancel: &AtomicBool,
+    ) -> Result<usize, String> {
+        let mut context_key = super::persist::ContextKeyMemo::default();
+        let mut reused = 0;
+        for path in paths {
+            check_workspace_cancel(Some(cancel))?;
+            let Some(own_stamp) = path_stamp(path) else {
+                self.project_cache.invalidate_path(path);
+                continue;
+            };
+            match self.reuse_index_member(key, path, &own_stamp, &mut context_key, cancel) {
+                ReuseOutcome::Reused => reused += 1,
+                ReuseOutcome::Missed { .. } => self.project_cache.mark_index_reuse_tried(key, path),
+                ReuseOutcome::Retrying => {
+                    self.project_cache.mark_index_reuse_tried(key, path);
+                    self.project_cache
+                        .defer_index_member(key, path, RETRYING_REFUSAL);
+                }
+                ReuseOutcome::Memory => break,
+                ReuseOutcome::Cancelled => return Err(CANCELLATION_MESSAGE.to_owned()),
+                ReuseOutcome::Retry | ReuseOutcome::NoStore => {}
+            }
+        }
+        #[cfg(test)]
+        ON_DEMAND_REUSED.with(|count| count.set(count.get() + reused));
+        crate::trace::trace!(
+            "  on-demand reuse: {reused} of {} members indexed from the store",
+            paths.len()
+        );
+        Ok(reused)
+    }
+
     /// The store half of `reuse_index_member`: find the member's facts and
     /// prove them against current inputs. It changes no member's index
     /// state, so workers run it ahead of the batch (R8-1); the caller takes
@@ -4527,6 +4581,11 @@ impl Workspace {
             if let Some(state) = self.contexts.get(key) {
                 result.contexts.insert(key.clone(), state.clone());
             }
+            let persisted = if searched {
+                self.persisted_selection(input, key, anchor, selection, &open, cancel)?
+            } else {
+                None
+            };
             // The directories baseline the membership only while its
             // catalogues are the ones it was computed from; otherwise the
             // membership is computed once more.
@@ -4716,6 +4775,16 @@ impl Workspace {
                     .map(|symbol| (key.clone(), symbol)),
             );
             unverified.sort_by_cached_key(|path| path_key(path));
+            if let Some(persisted) = &persisted {
+                let before = unverified.len();
+                unverified.retain(|path| !persisted.unselected.contains(&path_key(path)));
+                let left = before - unverified.len();
+                if left > 0 {
+                    result.gaps.push(format!(
+                        "{left} units of {display} are not re-validated since the start yet; their stored index selected none of them, so they were not searched"
+                    ));
+                }
+            }
             let mut selected = selected;
             let outside =
                 drop_outside(self, key, &mut selected) + drop_outside(self, key, &mut unverified);
@@ -4927,6 +4996,177 @@ impl RootFiles {
         self.complete
             && self.sources.len() <= small_workspace_sources()
             && self.descriptors.len() <= small_workspace_projects()
+    }
+}
+
+/// Members a request may validate on demand from its context's sealed
+/// snapshot: at most this many; more fall back to the bounded direct reads.
+const MAX_ON_DEMAND_REUSE: usize = 1024;
+
+/// What a request took from the stored index of one target ahead of the
+/// reuse pass (l4d-c8l2).
+struct PersistedSelection {
+    /// `path_key`s of the members awaiting their first reuse that the
+    /// snapshot lists but whose stored facts the request does not select:
+    /// left out, best-effort, with a note.
+    unselected: HashSet<String>,
+}
+
+/// The stored rows that select a member for `selection`: declarations whose
+/// name contains the symbol query, or postings of a candidate name. `None`
+/// when the stored keys cannot be a superset of what the index would
+/// select (a non-ASCII or non-identifier query, a name without a posting
+/// key).
+fn stored_selection(selection: Selection<'_>) -> Option<(u8, Vec<Vec<u8>>, bool)> {
+    match selection {
+        Selection::Symbols {
+            query,
+            direct: true,
+        } => {
+            // A declaration's key is `canonical_name` of its display (`&`
+            // trimmed, ASCII-lowercased), so an identifier query the
+            // display contains is in the key, ASCII-lowercased.
+            (!query.is_empty()
+                && query
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+            .then(|| {
+                (
+                    pascal_cache::DECLARATION_ROW,
+                    vec![query.to_ascii_lowercase().into_bytes()],
+                    true,
+                )
+            })
+        }
+        Selection::Candidates(Some(query)) => {
+            let keys = query
+                .names
+                .iter()
+                .map(|name| crate::workspace_index::posting_key(name))
+                .collect::<Option<Vec<_>>>()?;
+            (!keys.is_empty()).then(|| {
+                (
+                    pascal_cache::POSTING_ROW,
+                    keys.into_iter().map(String::into_bytes).collect(),
+                    false,
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+impl Workspace {
+    /// Before the reuse pass has validated `key`'s members, select the
+    /// candidates of `selection` from the stored index of its held sealed
+    /// snapshot and validate those now (l4d-c8l2, D48/D49). A stored row is
+    /// a hint only: a selected member answers once its stored facts are
+    /// proven current like the reuse pass proves them, and a selected member
+    /// that fails stays unverified (read directly, as before). `None` when
+    /// nothing awaits a first reuse, without a store or snapshot, or when the
+    /// stored rows cannot select (`stored_selection`).
+    fn persisted_selection(
+        &mut self,
+        input: &WorkspaceInput,
+        key: &ContextKey,
+        anchor: &IndexAnchor,
+        selection: Selection<'_>,
+        open: &HashSet<String>,
+        cancel: &AtomicBool,
+    ) -> Result<Option<PersistedSelection>, String> {
+        if !self.persistent_cache().is_enabled() {
+            return Ok(None);
+        }
+        let Some((row_kind, keys, containing)) = stored_selection(selection) else {
+            return Ok(None);
+        };
+        let waiting = self
+            .project_cache
+            .read_index(key, |index, _| index.awaiting_first_reuse())
+            .unwrap_or_default();
+        if waiting.is_empty() {
+            return Ok(None);
+        }
+        let started = Instant::now();
+        // Stored facts are validated against saved files only (D37).
+        let mut view = Workspace::from_analysis_input(&input.disk_baseline());
+        match view.index_context_for(anchor, cancel) {
+            Ok(resolved) if resolved == *key => {}
+            Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+            _ => return Ok(None),
+        }
+        view.adopt_baseline_hint_once(key, cancel);
+        let Some(hint) = self.project_cache.baseline_hint(key) else {
+            return Ok(None);
+        };
+        let Some(job) = self.persistent_cache().job() else {
+            return Ok(None);
+        };
+        let store = job.store();
+        let key_refs = keys.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let matching = if containing {
+            pascal_cache::IndexKeyMatch::Containing(&keys[0])
+        } else {
+            pascal_cache::IndexKeyMatch::Equal(&key_refs)
+        };
+        let named = match store.find_members_with_rows(
+            hint.header(),
+            row_kind,
+            matching,
+            MAX_ON_DEMAND_REUSE,
+        ) {
+            Ok(pascal_cache::Lookup::Hit(Some(named))) => named.into_iter().collect::<HashSet<_>>(),
+            Ok(_) => return Ok(None),
+            Err(bypass) => {
+                job.observe(&bypass);
+                return Ok(None);
+            }
+        };
+        let mut listed = HashSet::new();
+        let mut reader = store.read_snapshot(hint.header());
+        loop {
+            check_workspace_cancel(Some(cancel))?;
+            match reader.next_batch() {
+                Ok(pascal_cache::Lookup::Hit(Some(batch))) => listed.extend(
+                    batch
+                        .members()
+                        .iter()
+                        .map(|member| member.source_key.clone()),
+                ),
+                Ok(pascal_cache::Lookup::Hit(None)) => break,
+                Ok(pascal_cache::Lookup::Miss(_)) => return Ok(None),
+                Err(bypass) => {
+                    job.observe(&bypass);
+                    return Ok(None);
+                }
+            }
+        }
+        drop(reader);
+        drop(job);
+        let mut validate = Vec::new();
+        let mut unselected = HashSet::new();
+        for path in waiting {
+            let local = path_key(&path);
+            if open.contains(&local) {
+                continue;
+            }
+            let stored = pascal_cache::path_key(&path);
+            if named.contains(&stored) {
+                validate.push(path);
+            } else if listed.contains(&stored) {
+                unselected.insert(local);
+            }
+        }
+        let reused = view.reuse_members_now(key, &validate, cancel)?;
+        crate::trace::trace!(
+            "  persisted selection {}: {} named, {reused} validated, {} left to the reuse pass, {} listed, {:.1} ms",
+            anchor_display(anchor),
+            validate.len(),
+            unselected.len(),
+            listed.len(),
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        Ok(Some(PersistedSelection { unselected }))
     }
 }
 
@@ -10714,6 +10954,216 @@ pub(in crate::workspace) mod tests {
                 sink.borrow_mut().push(path.to_path_buf());
             })));
             loaded
+        }
+
+        /// l4d-c8l2: requests on a reopened store before the reuse pass has
+        /// validated the members (`UNITS` units `lib/U<n>.pas` declaring
+        /// `P<n>`, `lib/CallerA.pas` and `lib/CallerB.pas` calling `P3`, one
+        /// sealed snapshot of the configured project).
+        mod reopened {
+            use super::*;
+
+            pub(super) const UNITS: usize = 30;
+
+            pub(super) fn configured(root: &Path) -> WorkspaceOptions {
+                WorkspaceOptions {
+                    project_file: Some(root.join("App.dproj")),
+                    ..WorkspaceOptions::default()
+                }
+            }
+
+            fn caller(root: &Path, name: &str) {
+                write(
+                    &root.join(format!("lib/{name}.pas")),
+                    &format!(
+                        "unit {name};\ninterface\nimplementation\nuses U3;\nprocedure Q;\nbegin\n  P3;\nend;\nend.\n"
+                    ),
+                );
+            }
+
+            /// The first process: every member indexed, published and sealed.
+            pub(super) fn sealed_store(root: &Path, store: &Path) -> (ContextKey, IndexAnchor) {
+                caller(root, "CallerA");
+                caller(root, "CallerB");
+                let (workspace, key, anchor) = indexed_project(root, UNITS + 1, configured(root));
+                let (mut first, cache) = persisting_view(&workspace, store);
+                let progress = advance(&mut first, &anchor, IndexBound::all());
+                assert_eq!(progress.persisted, UNITS + 3, "{progress:?}");
+                assert_eq!(
+                    first.seal_baseline_if_due(&key, &mut || Ok(())),
+                    crate::workspace::baseline::SealOutcome::Sealed
+                );
+                cache.shutdown();
+                (key, anchor)
+            }
+
+            /// A new process over the same files and store, nothing reused.
+            pub(super) fn reopened(root: &Path, store: &Path) -> (Workspace, PersistentCache) {
+                persisting_view(&workspace(root, configured(root)), store)
+            }
+
+            pub(super) fn symbols(
+                view: &Workspace,
+                query: &str,
+            ) -> crate::coverage::Partial<Vec<lsp_types::SymbolInformation>> {
+                crate::workspace::queries::workspace_symbols_from_input(
+                    view.analysis_input(),
+                    query,
+                    &AtomicBool::new(false),
+                )
+                .value
+                .expect("workspace symbols")
+            }
+
+            pub(super) fn names(found: &[lsp_types::SymbolInformation]) -> Vec<String> {
+                let mut names = found
+                    .iter()
+                    .map(|symbol| symbol.name.clone())
+                    .collect::<Vec<_>>();
+                names.sort();
+                names.dedup();
+                names
+            }
+
+            pub(super) fn reuse_all(view: &mut Workspace, anchor: &IndexAnchor) -> IndexProgress {
+                advance(view, anchor, IndexBound::all().with_mode(IndexMode::Reuse))
+            }
+
+            pub(super) fn awaiting(view: &Workspace, key: &ContextKey) -> usize {
+                view.project_cache
+                    .read_index(key, |index, _| index.awaiting_first_reuse().len())
+                    .unwrap_or_default()
+            }
+
+            #[test]
+            fn workspace_symbols_answer_from_the_stored_index_before_the_reuse_pass() {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path();
+                let store = private_dir();
+                let (key, anchor) = sealed_store(root, store.path());
+                let (mut view, cache) = reopened(root, store.path());
+                // No unverified member is read directly: only the stored
+                // index can answer.
+                let _caps = override_caps(|caps| caps.unverified_symbols = Some(0));
+                take_on_demand_reused();
+                crate::navigation::test_reset_document_parse_count();
+                let early = symbols(&view, "P1");
+                // P1, P10..P19: eleven units validated, nothing parsed.
+                assert_eq!(take_on_demand_reused(), 11, "{:?}", early.coverage);
+                assert_eq!(crate::navigation::test_document_parse_count(), 0);
+                assert_eq!(
+                    awaiting(&view, &key),
+                    UNITS + 3 - 11,
+                    "the rest is left to the reuse pass"
+                );
+                let progress = reuse_all(&mut view, &anchor);
+                assert!(progress.complete, "{progress:?}");
+                let warm = symbols(&view, "P1");
+                assert!(warm.coverage.is_complete(), "{:?}", warm.coverage);
+                assert_eq!(take_on_demand_reused(), 0, "warm: nothing on demand");
+                assert_eq!(names(&early.value), names(&warm.value));
+                assert_eq!(names(&warm.value).len(), 11, "{:?}", warm.value);
+                assert_eq!(
+                    early
+                        .value
+                        .iter()
+                        .map(|symbol| symbol.location.clone())
+                        .collect::<HashSet<_>>(),
+                    warm.value
+                        .iter()
+                        .map(|symbol| symbol.location.clone())
+                        .collect::<HashSet<_>>()
+                );
+                cache.shutdown();
+            }
+
+            /// A member whose stored facts select it but whose file changed
+            /// fails its validation and is read directly: its old
+            /// declaration is never offered. One the watcher reported
+            /// changed is never left out on its stored facts' word.
+            #[test]
+            fn changed_members_are_never_answered_from_their_stored_facts() {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path();
+                let store = private_dir();
+                let (key, anchor) = sealed_store(root, store.path());
+                named_unit(&root.join("lib/U15.pas"), "P15Renamed");
+                let (mut view, cache) = reopened(root, store.path());
+                // The membership exists before the watcher reports U25.
+                advance(
+                    &mut view,
+                    &anchor,
+                    IndexBound::units(0).with_mode(IndexMode::Reuse),
+                );
+                named_unit(&root.join("lib/U25.pas"), "P1Gained");
+                view.project_cache
+                    .invalidate_path(&root.join("lib/U25.pas"));
+                take_on_demand_reused();
+                let early = symbols(&view, "P1");
+                let found = names(&early.value);
+                assert!(!found.contains(&"P15".to_owned()), "{found:?}");
+                assert!(found.contains(&"P15Renamed".to_owned()), "{found:?}");
+                assert!(found.contains(&"P1Gained".to_owned()), "{found:?}");
+                assert_eq!(take_on_demand_reused(), 10, "U15 failed validation");
+                assert_eq!(
+                    crate::workspace_index::MemberState::Unindexed,
+                    state(&view, &key, &root.join("lib/U15.pas")).unwrap()
+                );
+                cache.shutdown();
+            }
+
+            fn reference_locations(view: &Workspace, root: &Path) -> (Vec<(String, u32)>, bool) {
+                let found = crate::workspace::queries::references_from_input(
+                    view.analysis_input(),
+                    &Url::from_file_path(root.join("lib/U3.pas")).unwrap(),
+                    lsp_types::Position::new(2, 10),
+                    true,
+                    &AtomicBool::new(false),
+                )
+                .value
+                .expect("references");
+                let mut located = found
+                    .value
+                    .iter()
+                    .map(|location| {
+                        (
+                            location.uri.path().rsplit('/').next().unwrap().to_owned(),
+                            location.range.start.line,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                located.sort();
+                (located, found.coverage.is_complete())
+            }
+
+            #[test]
+            fn references_validate_only_their_stored_candidates_before_the_reuse_pass() {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path();
+                let store = private_dir();
+                let (key, anchor) = sealed_store(root, store.path());
+                let (mut view, cache) = reopened(root, store.path());
+                take_on_demand_reused();
+                let (early, _) = reference_locations(&view, root);
+                // U3, CallerA and CallerB hold postings of P3.
+                assert_eq!(take_on_demand_reused(), 3);
+                assert_eq!(awaiting(&view, &key), UNITS + 3 - 3);
+                assert!(reuse_all(&mut view, &anchor).complete);
+                let (warm, complete) = reference_locations(&view, root);
+                assert!(complete);
+                assert_eq!(take_on_demand_reused(), 0);
+                assert_eq!(early, warm);
+                assert_eq!(
+                    warm,
+                    [
+                        ("CallerA.pas".to_owned(), 6),
+                        ("CallerB.pas".to_owned(), 6),
+                        ("U3.pas".to_owned(), 2),
+                        ("U3.pas".to_owned(), 4),
+                    ]
+                );
+                cache.shutdown();
+            }
         }
 
         #[test]

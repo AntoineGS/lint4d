@@ -467,6 +467,22 @@ fn snapshot_queries_use_their_indexes_without_sorting() {
     let member = plan(directory.path(), pascal_cache::MEMBER_QUERY_FOR_TEST, 5);
     assert!(!member.contains("SCAN"), "{member}");
     assert!(!member.contains("TEMP B-TREE"), "{member}");
+    // l4d-c8l2: one record lookup per matching row, never a walk of every
+    // live record.
+    for filter in [
+        pascal_cache::CONTAINING_FILTER_FOR_TEST,
+        pascal_cache::EQUAL_FILTER_FOR_TEST,
+    ] {
+        let rows = plan(
+            directory.path(),
+            &pascal_cache::members_with_rows_query_for_test(filter),
+            8,
+        );
+        assert!(!rows.contains("SCAN"), "{rows}");
+        assert!(rows.contains("INDEX artifact_rows_by_index_key "), "{rows}");
+        assert!(rows.contains("INDEX member_records_by_artifact "), "{rows}");
+        assert!(rows.contains("INDEX snapshot_members_by_record "), "{rows}");
+    }
 }
 
 /// Spec §10: a query's result vector is charged to the scratch before it is
@@ -781,4 +797,149 @@ fn a_snapshot_retired_at_the_phase_boundary_is_a_miss() {
             .unwrap(),
         Lookup::Miss(Miss::Retired)
     );
+}
+
+/// A member at `path` over a local artifact (unique `text`) with one row
+/// of `row_kind` per key.
+fn member_with_rows(
+    store: &Store,
+    path: &str,
+    text: &str,
+    row_kind: u8,
+    keys: &[&[u8]],
+) -> pascal_cache::Digest {
+    let key = pascal_cache::LocalArtifactKey::new(
+        &pascal_cache::SourceContent::from_bytes(text.as_bytes()),
+        &pascal_project::ConditionalContext::default(),
+        pascal_project::SourceOrigin::ProjectCompiled,
+    );
+    let rows: Vec<pascal_cache::ArtifactRow<'_>> = keys
+        .iter()
+        .map(|index_key| pascal_cache::ArtifactRow {
+            row_kind,
+            index_key: Some(index_key),
+            payload: b"p",
+        })
+        .collect();
+    store
+        .publish_artifact(&pascal_cache::ArtifactWrite {
+            key: pascal_cache::ArtifactKeyRef::local(&key),
+            supplemental: b"",
+            rows: &rows,
+        })
+        .unwrap();
+    let mut record = member(path, &[], pascal_cache::Digest::from_bytes([0; 32]));
+    record.header.artifact = Some(key.digest());
+    store.publish_member_record(&record).unwrap().record_id
+}
+
+fn sources(paths: &[&str]) -> BTreeSet<Vec<u8>> {
+    paths.iter().map(|path| path_key(Path::new(path))).collect()
+}
+
+/// l4d-c8l2: the members of one sealed snapshot whose artifact holds a row
+/// of a kind whose key contains a needle (non-ASCII keys always pass) or
+/// equals one of a list. A selection hint only, before re-validation.
+#[test]
+fn members_with_matching_rows_come_from_one_snapshot() {
+    use pascal_cache::{DECLARATION_ROW, IndexKeyMatch};
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    let a = member_with_rows(
+        &store,
+        "/w/A.pas",
+        "a",
+        DECLARATION_ROW,
+        &[b"tdatabaseinfo", b"x"],
+    );
+    let b = member_with_rows(
+        &store,
+        "/w/B.pas",
+        "b",
+        DECLARATION_ROW,
+        &[b"getdatabaseinfo"],
+    );
+    let c = member_with_rows(&store, "/w/C.pas", "c", DECLARATION_ROW, &[b"other"]);
+    let d = member_with_rows(
+        &store,
+        "/w/D.pas",
+        "d",
+        DECLARATION_ROW,
+        &["café".as_bytes()],
+    );
+    let e = member_with_rows(&store, "/w/E.pas", "e", POSTING_ROW, &[b"tdatabaseinfo"]);
+    let unindexed = records(&store, "U", 1)[0];
+    member_with_rows(
+        &store,
+        "/w/Outside.pas",
+        "f",
+        DECLARATION_ROW,
+        &[b"tdatabaseinfo"],
+    );
+    let header = sealed(&store, &[a, b, c, d, e, unindexed]);
+    let present: [&[u8]; 2] = [b"tdatabaseinfo", b"zz"];
+    let absent: [&[u8]; 1] = [b"databaseinfo"];
+    let found = |row_kind, matching, limit| match store
+        .find_members_with_rows(&header, row_kind, matching, limit)
+        .unwrap()
+    {
+        Lookup::Hit(found) => found.map(|found| found.into_iter().collect::<BTreeSet<_>>()),
+        Lookup::Miss(miss) => panic!("{miss:?}"),
+    };
+    assert_eq!(
+        found(
+            DECLARATION_ROW,
+            IndexKeyMatch::Containing(b"databaseinfo"),
+            10
+        ),
+        Some(sources(&["/w/A.pas", "/w/B.pas", "/w/D.pas"]))
+    );
+    assert_eq!(
+        found(
+            DECLARATION_ROW,
+            IndexKeyMatch::Containing(b"tdatabaseinfo"),
+            10
+        ),
+        Some(sources(&["/w/A.pas", "/w/B.pas", "/w/D.pas"]))
+    );
+    assert_eq!(
+        found(POSTING_ROW, IndexKeyMatch::Equal(&present), 10),
+        Some(sources(&["/w/E.pas"]))
+    );
+    assert_eq!(
+        found(POSTING_ROW, IndexKeyMatch::Equal(&absent), 10),
+        Some(BTreeSet::new())
+    );
+    assert_eq!(
+        found(
+            DECLARATION_ROW,
+            IndexKeyMatch::Containing(b"databaseinfo"),
+            2
+        ),
+        None,
+        "more members than the limit"
+    );
+    assert!(store.retire_member_record(b).unwrap());
+    assert_eq!(
+        found(
+            DECLARATION_ROW,
+            IndexKeyMatch::Containing(b"databaseinfo"),
+            10
+        ),
+        Some(sources(&["/w/A.pas", "/w/D.pas"])),
+        "a retired record is not a member"
+    );
+    assert!(store.retire_snapshot(header.id()).unwrap());
+    assert_eq!(
+        store
+            .find_members_with_rows(
+                &header,
+                DECLARATION_ROW,
+                IndexKeyMatch::Containing(b"x"),
+                10
+            )
+            .unwrap(),
+        Lookup::Miss(Miss::Retired)
+    );
+    assert_eq!(store.scratch_in_use(), 0, "nothing stays reserved");
 }

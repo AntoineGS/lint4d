@@ -56,11 +56,13 @@ pub use location::{DATABASE_FILE, StoreLocation, default_directory};
 pub use maintenance::{Maintenance, Phase, StepBudget, StepReport};
 pub use outcome::SealRefusal;
 pub use outcome::{Bypass, Integrity, LocationIssue, Lookup, Malformed, Miss, Published, TooLarge};
-pub use queries::{Dependency, ImporterHit, ImporterPage};
 #[cfg(feature = "test-support")]
 pub use queries::{
+    CONTAINING_FILTER as CONTAINING_FILTER_FOR_TEST, EQUAL_FILTER as EQUAL_FILTER_FOR_TEST,
     IMPORTERS_QUERY as IMPORTERS_QUERY_FOR_TEST, MEMBER_QUERY as MEMBER_QUERY_FOR_TEST,
+    members_with_rows_query as members_with_rows_query_for_test,
 };
+pub use queries::{Dependency, ImporterHit, ImporterPage, IndexKeyMatch};
 pub use reader::{ArtifactReader, RowBatch, StoredRow};
 pub use records::{BindingBatch, MemberRecordHeader, MemberRecordReader, PublishedRecord};
 pub use snapshots::{

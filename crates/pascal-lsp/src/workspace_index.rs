@@ -206,7 +206,7 @@ fn stamps_bytes(stamps: &[MemberStamp]) -> usize {
 
 /// Last dotted segment after `canonical_name`, or `None` when the name is
 /// not ASCII or the segment is empty: postings prove nothing then (A2).
-fn posting_key(name: &str) -> Option<String> {
+pub(crate) fn posting_key(name: &str) -> Option<String> {
     let name = canonical_name(name);
     let key = name.rsplit('.').next().unwrap_or_default();
     if !name.is_ascii() || key.is_empty() {
@@ -298,6 +298,9 @@ struct Member {
     admission_limit: Option<&'static str>,
     /// The proven record of this member's state, set by this process.
     record: Option<Digest>,
+    /// Invalidated (a watcher or edit event) while it was never indexed in
+    /// this process: its stored facts are known to describe older bytes.
+    invalidated: bool,
 }
 
 /// The deferral reason of a member whose previous refusal is tried again.
@@ -701,6 +704,21 @@ impl ContextIndex {
             .collect()
     }
 
+    /// Members never indexed in this process, not invalidated since it
+    /// started and not asked of the store yet, in path order: what the
+    /// reuse pass has still to validate from the stored facts (l4d-c8l2).
+    pub(crate) fn awaiting_first_reuse(&self) -> Vec<PathBuf> {
+        self.pending_members()
+            .filter(|member| {
+                matches!(member.state(), MemberState::Unindexed)
+                    && !member.reuse_tried
+                    && !member.invalidated
+                    && member.deferred == 0
+            })
+            .map(|member| member.path.clone())
+            .collect()
+    }
+
     /// Whether the store was asked for `path`'s facts since it was last
     /// invalidated; `false` for a path that is no member.
     pub(crate) fn reuse_tried(&self, path: &Path) -> bool {
@@ -1033,6 +1051,7 @@ impl ContextIndex {
         member.state = Some(MemberState::Fresh);
         member.charged = charged;
         member.reuse_tried = false;
+        member.invalidated = false;
         let path = member.path.clone();
         self.member_bytes += charged;
         self.name_bytes += paid.saturating_sub(charged);
@@ -1113,7 +1132,11 @@ impl ContextIndex {
                 member.admission_limit = None;
                 true
             }
-            MemberState::Unindexed | MemberState::Stale => false,
+            MemberState::Unindexed => {
+                member.invalidated = true;
+                false
+            }
+            MemberState::Stale => false,
         }
     }
 

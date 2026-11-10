@@ -3364,6 +3364,9 @@ pub struct Workspace {
     load_refusal: Option<String>,
     cache_epoch: Option<u64>,
     dependency_hook: Option<DependencyHook>,
+    /// Asked before each dependency a closure unit loads, where the hook is
+    /// not: the crawl stops there for requests (l4d-jfpy).
+    dependency_pause: Option<DependencyPause>,
     expansions: HashMap<Url, ExpansionRecord>,
     include_parents: HashMap<Url, HashSet<Url>>,
     /// The content hash each indexed source was cached under.
@@ -3426,6 +3429,8 @@ struct DeferredSource {
 
 pub(crate) type DependencyHook =
     Arc<dyn Fn(&Url, usize, usize) -> Result<(), String> + Send + Sync>;
+
+pub(crate) type DependencyPause = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
 /// Interface-section bindings that resolved to a loaded source unit.
 fn interface_bindings(
@@ -8141,6 +8146,12 @@ impl Workspace {
             if !crate::warmer::yield_to_interactive_work(cancel.unwrap_or(&no_cancel)) {
                 return Err(CANCELLATION_MESSAGE.to_string());
             }
+            // A closure unit's load, where the hook does not run (l4d-jfpy).
+            if self.dependency_hook.is_none()
+                && let Some(pause) = &self.dependency_pause
+            {
+                pause()?;
+            }
             let dependency_uri = Url::from_file_path(&dependency.source.path).map_err(|_| {
                 format!(
                     "resolved unit is not a file URI: {}",
@@ -8399,6 +8410,10 @@ impl Workspace {
 
     pub(crate) fn set_dependency_hook(&mut self, hook: DependencyHook) {
         self.dependency_hook = Some(hook);
+    }
+
+    pub(crate) fn set_dependency_pause(&mut self, pause: DependencyPause) {
+        self.dependency_pause = Some(pause);
     }
 
     /// The warm crawl publishes the disk-proven units it analyses (R8-2/D42).

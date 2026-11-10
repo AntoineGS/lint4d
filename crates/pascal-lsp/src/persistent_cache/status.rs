@@ -30,6 +30,18 @@ pub(crate) struct Reserved {
     pub(crate) query_trees: usize,
 }
 
+/// The open-file crawl's leases and how far requests went past
+/// `maxCacheBytes` beside them (D53).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CrawlBudget {
+    pub(crate) leased: usize,
+    /// The leased bytes the crawl stored itself: how far a request may go
+    /// past the budget while the crawl holds them.
+    pub(crate) allowance: usize,
+    pub(crate) over_budget: usize,
+    pub(crate) max_overshoot: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct UsageView {
     pub(crate) usage: Usage,
@@ -81,6 +93,7 @@ pub(crate) struct CacheStatus {
     pub(crate) limits: StoreLimits,
     pub(crate) reset_epoch: Option<u64>,
     pub(crate) reserved: Reserved,
+    pub(crate) crawl: CrawlBudget,
     pub(crate) usage: Option<UsageView>,
     pub(crate) lock_waits: LockWaits,
     pub(crate) counters: CounterSnapshot,
@@ -186,6 +199,12 @@ impl CacheStatus {
                 "publication": reserved.publication,
                 "queryTrees": reserved.query_trees,
             },
+            "crawlBytes": {
+                "leased": self.crawl.leased,
+                "allowance": self.crawl.allowance,
+                "overBudget": self.crawl.over_budget,
+                "maxOvershoot": self.crawl.max_overshoot,
+            },
             "store": self.usage.as_ref().map(usage_json),
             "lockWaits": {
                 "poolWaits": waits.pool_waits,
@@ -243,6 +262,12 @@ mod tests {
                 publication: usize::MAX,
                 query_trees: usize::MAX,
             },
+            crawl: CrawlBudget {
+                leased: usize::MAX,
+                allowance: usize::MAX,
+                over_budget: usize::MAX,
+                max_overshoot: usize::MAX,
+            },
             usage: Some(UsageView::maximal()),
             lock_waits: LockWaits {
                 pool_waits: u64::MAX,
@@ -288,5 +313,25 @@ mod tests {
         assert_eq!(json["cause"]["location"], "notPrivate");
         assert_eq!(json["cause"]["advice"], "freshDirectory");
         assert_eq!(json["schema"], 1);
+    }
+
+    /// l4d-jfpy review M1 (D53): the crawl's leases and the overshoot beside
+    /// them are reported.
+    #[test]
+    fn status_reports_the_crawl_overshoot() {
+        let status = CacheStatus {
+            crawl: CrawlBudget {
+                leased: 3,
+                allowance: 2,
+                over_budget: 1,
+                max_overshoot: 4,
+            },
+            ..largest()
+        };
+        let json = status.to_json();
+        assert_eq!(json["crawlBytes"]["leased"], 3);
+        assert_eq!(json["crawlBytes"]["allowance"], 2);
+        assert_eq!(json["crawlBytes"]["overBudget"], 1);
+        assert_eq!(json["crawlBytes"]["maxOvershoot"], 4);
     }
 }

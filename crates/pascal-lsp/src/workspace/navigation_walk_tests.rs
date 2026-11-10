@@ -673,3 +673,35 @@ fn an_answer_waiting_on_a_lazy_import_loads_only_that_import() {
         "laziness must not load more of the closure than the full walk"
     );
 }
+
+/// The implicit `Result` of a function shadows every unit-level and
+/// imported name: an imported global `Result` is never its definition
+/// (l4d-fpyu).
+#[test]
+fn a_functions_result_never_binds_to_an_imported_global() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    write_sources(
+        root,
+        &[
+            (
+                "Main.pas",
+                "unit Main;\ninterface\nuses Globals;\nfunction Get: Integer;\nimplementation\nfunction Get: Integer;\nbegin\n  Result := 1;\nend;\nend.\n",
+            ),
+            (
+                "Globals.pas",
+                "unit Globals;\ninterface\nvar Result: Integer;\nimplementation\nend.\n",
+            ),
+        ],
+    );
+    let main = root.join("Main.pas");
+
+    let locations = definition(&mut workspace(root), &main, Position::new(7, 3));
+
+    assert!(
+        !locations
+            .iter()
+            .any(|location| location.uri == uri(&root.join("Globals.pas"))),
+        "{locations:?}"
+    );
+}

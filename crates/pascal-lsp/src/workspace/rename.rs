@@ -7616,6 +7616,8 @@ fn build_snapshot_with_policy(
                     // D54 (l4d-fpyu): parse the imports the feature's lookups
                     // go through and that can spell what they look up.
                     loader.index.clear_import_bindings(&uri);
+                    // The probe binds as the snapshot's answer will (D16).
+                    loader.index.set_best_effort_bindings(best_effort);
                     let walk = loader.walk_imports_with_probe(
                         &uri,
                         &context_key,
@@ -7629,6 +7631,8 @@ fn build_snapshot_with_policy(
                         },
                         &mut |workspace| probe.answers(&workspace.index, &uri, cancel),
                     )?;
+                    // The answer records its own relaxed bindings again.
+                    let _ = loader.index.take_relaxed_bindings();
                     crate::trace::trace!(
                         "  snapshot lazy import walk: answered {}, {} dependencies",
                         walk.answered,

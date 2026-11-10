@@ -386,3 +386,49 @@ fn a_hover_on_a_local_name_binds_the_imports_without_parsing_them() {
     assert_eq!(answer, expected);
     assert!(indexed.is_empty(), "{indexed:?}");
 }
+
+/// `EndsStr(.., Uppercase(Result.Name))` in a method: the hover parses the
+/// units declaring the call's names, never one that only spells `Result`
+/// (the function's implicit `Result` shadows every unit-level name).
+#[test]
+fn a_call_hover_in_a_function_parses_no_unit_for_its_result() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    write_sources(
+        root,
+        &[
+            (
+                "Main.pas",
+                "unit Main;\ninterface\nuses Info;\ntype TEnv = class(TInterfacedObject)\n  function Get: IInfo;\nend;\nimplementation\nuses StrU, SysU, Noise;\nfunction TEnv.Get: IInfo;\nbegin\n  if EndsStr('X', Uppercase(result.Name)) then;\nend;\nend.\n",
+            ),
+            (
+                "Info.pas",
+                "unit Info;\ninterface\ntype IInfo = interface\n  function GetName: string;\n  property Name: string read GetName;\nend;\nimplementation\nend.\n",
+            ),
+            (
+                "StrU.pas",
+                "unit StrU;\ninterface\nfunction EndsStr(const S, T: string): Boolean;\nimplementation\nfunction EndsStr(const S, T: string): Boolean; begin Result := False; end;\nend.\n",
+            ),
+            (
+                "SysU.pas",
+                "unit SysU;\ninterface\nfunction Uppercase(const S: string): string;\nimplementation\nfunction Uppercase(const S: string): string; begin Result := S; end;\nend.\n",
+            ),
+            (
+                "Noise.pas",
+                "unit Noise;\ninterface\nfunction Other: Integer;\nimplementation\nfunction Other: Integer; begin Result := 0; end;\nend.\n",
+            ),
+        ],
+    );
+    let expected = eagerly(root, "Main.pas", |warmed| {
+        hover_in(warmed, root, "Main.pas", Position::new(10, 6))
+    });
+
+    let (answer, indexed) = indexed_while(|| hover(root, "Main.pas", Position::new(10, 6)));
+
+    assert!(answer.is_some(), "EndsStr hovers");
+    assert_eq!(answer, expected);
+    assert!(
+        !indexed.iter().any(|name| name == "Noise.pas"),
+        "{indexed:?}"
+    );
+}

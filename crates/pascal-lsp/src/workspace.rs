@@ -7760,6 +7760,26 @@ impl Workspace {
                             wanted.merge(needed)
                         })
                 });
+            if crate::trace::enabled() {
+                let named = raw_demand
+                    .iter()
+                    .map(|(document, needed)| {
+                        format!(
+                            "{} {needed:?}",
+                            document
+                                .path_segments()
+                                .and_then(|mut s| s.next_back())
+                                .unwrap_or("?")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                crate::trace::trace!(
+                    "  import walk: answered {answered}, {} pending, demand [{}]",
+                    pending.len(),
+                    named.chars().take(2000).collect::<String>()
+                );
+            }
             if answered && pending.is_empty() && !unsettled {
                 if walk.settle && !visited.contains(uri) {
                     // A snapshot proves its document's imports resolved:
@@ -8455,6 +8475,17 @@ impl Workspace {
                         ),
                     _ => LazyImport::Parse,
                 };
+                if lazy.is_some() {
+                    crate::trace::trace!(
+                        "  lazy import {}: {}",
+                        dependency.source.path.display(),
+                        match &lazy_import {
+                            LazyImport::Parse => "parse",
+                            LazyImport::Unneeded => "unneeded",
+                            LazyImport::Absent(_) => "absent",
+                        }
+                    );
+                }
                 if !matches!(lazy_import, LazyImport::Parse) {
                     // Bound like a parsed unit, so a lookup through it
                     // demands it again (`bind_imports_lazily`).

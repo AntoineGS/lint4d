@@ -7844,6 +7844,15 @@ impl NavigationIndex {
             }
         }
 
+        // A function's implicit `Result` shadows every unit-level and
+        // imported name (l4d-fpyu): none of them is its binding.
+        if key == "result"
+            && document
+                .result_type_annotation_for_body_scope(scope)
+                .is_some()
+        {
+            return Ok(Vec::new());
+        }
         let region = document.region_at(offset);
         let Some(root_indices) = document
             .symbol_indices_by_scope_key
@@ -9431,6 +9440,15 @@ impl NavigationIndex {
         }
 
         let region = document.region_at(offset);
+        // A function's implicit `Result` shadows every unit-level and
+        // imported name (l4d-fpyu).
+        if key == "result"
+            && document
+                .result_type_annotation_for_body_scope(scope)
+                .is_some()
+        {
+            return Vec::new();
+        }
         let current = document
             .symbol_indices_by_scope_key
             .get(&(ROOT_SCOPE, key.clone()))

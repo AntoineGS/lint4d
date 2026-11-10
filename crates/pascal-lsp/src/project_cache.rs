@@ -8869,10 +8869,9 @@ struct StoredIndex {
     awaiting_room: HashSet<PathBuf>,
     /// A batch's wait for maintenance found no room; cleared by room.
     room_wait_failed: bool,
-    /// Extracted members whose publication found no memory for its
-    /// transient buffers in this process: they stay memory-only, without a
-    /// record, and the next start extracts them again (13b-3).
-    publications_refused: u64,
+    /// Why the store refused the first publication this process could
+    /// not store (`IndexCounts::store_refused`, l4d-8fz9).
+    store_refused_reason: Option<&'static str>,
     /// The kind of input the first `unprovable` member of this process
     /// read without a capture (`Workspace::uncaptured_input`).
     unprovable_kind: Option<&'static str>,
@@ -8969,7 +8968,8 @@ pub(crate) struct IndexStatusEntry {
     /// no baseline hint.
     pub(crate) snapshot: &'static str,
     pub(crate) validation_reads: u64,
-    /// `StoredIndex::publications_refused`.
+    /// `IndexCounts::store_refused` (members that could not be stored
+    /// this session).
     pub(crate) publications_refused: u64,
     pub(crate) gaps: Vec<String>,
 }
@@ -9065,10 +9065,17 @@ impl IndexStatusEntry {
                 stored.unprovable_kind.unwrap_or("unknown")
             ));
         }
-        if stored.publications_refused > 0 {
+        if counts.store_refused > 0 {
             gaps.push(format!(
-                "{} members found no memory to publish and are extracted again by the next start",
-                stored.publications_refused
+                "{} members could not be stored this session (first: {}) and are extracted again by the next start",
+                counts.store_refused,
+                stored.store_refused_reason.unwrap_or("store error")
+            ));
+        }
+        let awaiting_room = stored.unrecorded_among(&stored.awaiting_room).len();
+        if awaiting_room > 0 {
+            gaps.push(format!(
+                "{awaiting_room} members wait for room in the store; the snapshot is sealed once they are stored"
             ));
         }
         if counts.deferred > 0 {
@@ -9098,14 +9105,16 @@ impl IndexStatusEntry {
             anchor_truncated,
             counts,
             membership_complete,
-            complete: membership_complete && eligible_pending == 0,
+            // A member whose record waits for room is not done either:
+            // the batches prove it again and only then seal (l4d-8fz9).
+            complete: membership_complete && eligible_pending == 0 && awaiting_room == 0,
             snapshot: match stored.baseline.as_ref() {
                 None => "none",
                 Some(hint) if hint.sealed() => "sealed",
                 Some(_) => "held",
             },
             validation_reads: stored.validation_reads,
-            publications_refused: stored.publications_refused,
+            publications_refused: counts.store_refused as u64,
             gaps,
         }
     }
@@ -9510,7 +9519,7 @@ impl ProjectCache {
                     memory_only: HashSet::new(),
                     awaiting_room: HashSet::new(),
                     room_wait_failed: false,
-                    publications_refused: 0,
+                    store_refused_reason: None,
                     unprovable_kind: None,
                     summaries: Default::default(),
                 });
@@ -9964,10 +9973,18 @@ impl ProjectCache {
         }
     }
 
-    /// An extracted member of `key` found no memory to publish (13b-3).
-    pub(crate) fn note_index_publication_refused(&self, key: &ContextKey) {
+    /// The store refused the publication of `key`'s Fresh member `path`
+    /// for a reason no batch of this process retries (`reason`, a short
+    /// label): it could not be stored this session (l4d-8fz9).
+    pub(crate) fn mark_index_store_refused(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        reason: &'static str,
+    ) {
         if let Some(stored) = self.index().contexts.get_mut(key) {
-            stored.publications_refused = stored.publications_refused.saturating_add(1);
+            stored.index.mark_store_refused(path);
+            stored.store_refused_reason.get_or_insert(reason);
         }
     }
 

@@ -27443,13 +27443,16 @@ mod tests {
     }
 
     #[test]
-    fn correction_r7_charges_upcast_parent_resolution_to_the_shared_budget() {
+    fn correction_r7_discards_partial_upcast_results_when_the_shared_budget_runs_out() {
         let provider_uri =
             Url::parse("file:///tmp/semantic-correction-r7-provider.pas").expect("provider URI");
         let consumer_uri =
             Url::parse("file:///tmp/semantic-correction-r7-consumer.pas").expect("consumer URI");
-        // Generic parameter lookups are indexed by parameter name (l4d-3ia4):
-        // routines with a `TBase` parameter keep the parent lookup expensive.
+        // 3,000 provider routines make resolving the upcast's provider types
+        // expensive enough to exhaust the shared budget; the partial result
+        // (the `B := I` mismatch) must then be discarded. That the generic
+        // parameter lookup itself is charged is pinned by
+        // `semantic_diagnostics_charge_generic_parameter_lookups_to_the_budget`.
         let mut provider = String::from("unit Provider;\ninterface\n");
         for index in 1..=3_000 {
             writeln!(&mut provider, "procedure G{index}<TBase>;").expect("write provider symbol");
@@ -28113,6 +28116,8 @@ mod tests {
         let sources = [
             "unit G1;\ninterface\ntype\n  TBox<T> = class\n    function Map<T, U>(const Value: T): U;\n    procedure Run<V>(A: V; B: T);\n  end;\nfunction Free<T>(X: T): T; overload;\nfunction Free<T, W>(X: T; Y: W): W; overload;\nimplementation\nfunction TBox<T>.Map<T, U>(const Value: T): U;\nvar Local: U;\nbegin\n  Result := Local;\nend;\nprocedure TBox<T>.Run<V>(A: V; B: T);\nbegin\nend;\nfunction Free<T>(X: T): T;\nbegin\n  Result := X;\nend;\nfunction Free<T, W>(X: T; Y: W): W;\n  function Inner<T>(Z: T): T;\n  begin\n    Result := Z;\n  end;\nbegin\n  Result := Y;\nend;\nend.\n",
             "program G2;\nprocedure Swap<T>(var A, B: T);\nvar Tmp: T;\nbegin\n  Tmp := A; A := B; B := Tmp;\nend;\nprocedure Twice<T, T>(A: T);\nbegin\nend;\nvar I, J: Integer;\nbegin\n  Swap<Integer>(I, J);\nend.\n",
+            // A forward declaration and its definition, spelled in mixed case.
+            "unit G3;\ninterface\nimplementation\nprocedure Fwd<T>(A: t); forward;\nprocedure Other;\nvar X: Integer;\nbegin\n  Fwd<Integer>(X);\nend;\nprocedure Fwd<t>(A: T);\nvar Local: t;\nbegin\n  Local := A;\nend;\nend.\n",
         ];
         for (number, source) in sources.into_iter().enumerate() {
             let uri = Url::parse(&format!("file:///GenericIndex{number}.pas")).expect("test URI");
@@ -28143,14 +28148,41 @@ mod tests {
     }
 
     #[test]
-    fn semantic_diagnostics_charge_provider_generic_symbol_scans() {
+    fn semantic_diagnostics_charge_generic_parameter_lookups_to_the_budget() {
+        // Every reference to the local `Value` runs the generic parameter
+        // lookup, which examines the 3,000 routines declaring a `Value`
+        // parameter. Nothing else here is expensive: the local resolves in its
+        // own scope. Charged, the lookups exhaust the budget; uncharged, the
+        // report would be complete (l4d-3ia4).
+        let uri = Url::parse("file:///tmp/semantic-generic-lookup-budget.pas").expect("URI");
+        let mut source = String::from("unit GenericLookupBudget;\ninterface\n");
+        for index in 1..=3_000 {
+            writeln!(&mut source, "procedure G{index}<Value>;").expect("write routine");
+        }
+        source.push_str("implementation\nprocedure Run;\nvar\n  Value: Integer;\nbegin\n");
+        for _ in 0..40 {
+            source.push_str("  Value := Value;\n");
+        }
+        source.push_str("end;\nend.\n");
+        let mut index = NavigationIndex::new();
+        index.update(uri.clone(), source).expect("fixture parses");
+
+        let report = index
+            .semantic_diagnostic_report_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("bounded semantic diagnostics complete");
+
+        assert_eq!(report.gaps, vec![SemanticCoverageGap::Budget], "{report:?}");
+    }
+
+    #[test]
+    fn semantic_diagnostics_leave_a_typo_unclaimed_after_with_lookups_exhaust_the_budget() {
         let provider_uri =
             Url::parse("file:///tmp/semantic-budget-provider.pas").expect("provider URI");
         let consumer_uri =
             Url::parse("file:///tmp/semantic-budget-consumer.pas").expect("consumer URI");
-        // Generic parameter lookups are indexed by parameter name (l4d-3ia4),
-        // so the provider declares many routines with a `Value` parameter to
-        // keep each lookup expensive.
+        // 3,000 provider routines make each `with Box do Value` lookup into the
+        // provider expensive enough that the shared budget runs out before the
+        // typo, which must then stay unclaimed with a `Budget` gap.
         let mut provider = String::from("unit Provider;\ninterface\n");
         for index in 1..=3_000 {
             writeln!(&mut provider, "procedure G{index}<Value>;").expect("write provider symbol");
@@ -28197,8 +28229,8 @@ mod tests {
             Url::parse("file:///tmp/semantic-budget-early-provider.pas").expect("provider URI");
         let consumer_uri =
             Url::parse("file:///tmp/semantic-budget-early-consumer.pas").expect("consumer URI");
-        // Generic parameter lookups are indexed by parameter name (l4d-3ia4),
-        // so many routines with a `Value` parameter keep each lookup expensive.
+        // 3,000 provider routines make the `with` lookups expensive enough to
+        // exhaust the budget after the first finding, which must be kept.
         let mut provider = String::from("unit Provider;\ninterface\n");
         for index in 1..=3_000 {
             writeln!(&mut provider, "procedure G{index}<Value>;").expect("write provider symbol");

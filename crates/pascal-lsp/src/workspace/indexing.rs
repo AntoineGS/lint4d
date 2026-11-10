@@ -437,6 +437,14 @@ impl IndexBound {
         }
     }
 
+    /// This bound, taking members for at most `time`.
+    pub(crate) fn within(self, time: Duration) -> Self {
+        Self {
+            time: Some(self.time.map_or(time, |own| own.min(time))),
+            ..self
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn with_mode(self, mode: IndexMode) -> Self {
         Self { mode, ..self }

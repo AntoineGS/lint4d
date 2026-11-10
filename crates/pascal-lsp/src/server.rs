@@ -12035,6 +12035,7 @@ fn event_loop(
                 let warmer_idle = warmer.is_idle();
                 let jobs_idle = jobs.is_empty();
                 let diagnostics_due = workspace.next_diagnostic_timeout().is_some();
+                let (watch_paths, watch_overflows) = watch_events.applied();
                 send_ok(
                     connection,
                     request.id,
@@ -12043,6 +12044,8 @@ fn event_loop(
                         "warmer": warmer_idle,
                         "jobs": jobs_idle,
                         "diagnosticsDue": diagnostics_due,
+                        "watchPaths": watch_paths,
+                        "watchOverflows": watch_overflows,
                     }),
                 )?;
             }

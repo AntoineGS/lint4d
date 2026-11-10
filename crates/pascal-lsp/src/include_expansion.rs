@@ -57,6 +57,11 @@ impl<'a> MappingBudget<'a> {
     pub(crate) fn cancellation(&self) -> &AtomicBool {
         self.cancel
     }
+
+    /// The work charged so far.
+    pub(crate) fn work(&self) -> usize {
+        self.work
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -287,13 +292,24 @@ impl SourceMap {
             return Ok(VirtualMapping::Unmapped);
         }
 
+        // Segments are appended in ascending, disjoint virtual order, so the
+        // first one ending after `range.start` is found by binary search:
+        // one unit per probe and per segment used, not per segment before
+        // the range (l4d-110).
+        let (mut low, mut high) = (0, self.segments.len());
+        while low < high {
+            budget.charge()?;
+            let middle = low + (high - low) / 2;
+            if self.segments[middle].virtual_range.end <= range.start {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
         let mut cursor = range.start;
         let mut spans = Vec::new();
-        for segment in &self.segments {
+        for segment in &self.segments[low..] {
             budget.charge()?;
-            if segment.virtual_range.end <= range.start {
-                continue;
-            }
             if segment.virtual_range.start >= range.end {
                 break;
             }
@@ -686,11 +702,12 @@ fn expand_shared_source<R: IncludeResolver>(
 #[cfg(test)]
 mod tests {
     use super::{
-        ExpandedSource, ExpansionLimits, IncludeResolver, PhysicalSpan, ResolvedInclude,
-        VirtualMapping, expand_source,
+        ExpandedSource, ExpansionLimits, IncludeResolver, MappingBudget, PhysicalSpan,
+        ResolvedInclude, SegmentMapping, VirtualMapping, expand_source,
     };
     use lsp_types::Url;
     use std::collections::HashMap;
+    use std::ops::Range;
     use std::sync::atomic::AtomicBool;
 
     /// A file URI for a fixture path written Unix-style; Windows needs a drive.
@@ -773,6 +790,153 @@ mod tests {
                 },
             ])
         );
+    }
+
+    /// An include root shaped like a large unit: `includes` include
+    /// directives, each giving a root segment, a synthetic separator and an
+    /// include segment, with `tokens` five-byte tokens spread over the root
+    /// segments. Returns the source and the token ranges in source order.
+    fn many_include_root(tokens: usize, includes: usize) -> (ExpandedSource, Vec<Range<usize>>) {
+        let root = uri("/workspace/Main.pas");
+        let include = uri("/workspace/Shared.inc");
+        let mut expanded = ExpandedSource::new();
+        let mut ranges = Vec::with_capacity(tokens);
+        let mut root_offset = 0;
+        for chunk in 0..includes {
+            let count = tokens / includes + usize::from(chunk < tokens % includes);
+            let text = "tok; ".repeat(count);
+            let range = expanded.push_physical_range(root.clone(), &text, root_offset, None);
+            root_offset += text.len();
+            ranges.extend((0..count).map(|token| {
+                let start = range.start + token * 5;
+                start..start + 3
+            }));
+            expanded.push_synthetic("\n");
+            expanded.push_physical(include.clone(), "// shared\n");
+        }
+        (expanded, ranges)
+    }
+
+    #[test]
+    fn mapping_every_token_of_a_root_with_many_includes_stays_well_inside_one_budget() {
+        let (expanded, ranges) = many_include_root(20_000, 60);
+        assert_eq!(expanded.segment_count(), 180);
+        let cancel = AtomicBool::new(false);
+        let limit = crate::workspace::rename::MAX_SNAPSHOT_MAPPING_WORK;
+        let mut budget = MappingBudget::new(&cancel, limit);
+
+        for range in &ranges {
+            let mapping = expanded
+                .map_range_with_budget(range.clone(), &mut budget)
+                .expect("mapping a root's tokens must not exhaust the budget");
+            assert!(matches!(mapping, VirtualMapping::Exact(_)), "{mapping:?}");
+        }
+
+        // Each lookup is a binary search: a few units, not one per segment
+        // before the token.
+        assert!(
+            budget.work() <= ranges.len() * 16,
+            "work {} for {} tokens over {} segments",
+            budget.work(),
+            ranges.len(),
+            expanded.segment_count()
+        );
+    }
+
+    /// The linear scan `SourceMap::map_range` used before l4d-110, kept as
+    /// the reference its results must equal.
+    fn linear_map_range(expanded: &ExpandedSource, range: Range<usize>) -> VirtualMapping {
+        if range.start >= range.end || range.end > expanded.text.len() {
+            return VirtualMapping::Unmapped;
+        }
+        let mut cursor = range.start;
+        let mut spans = Vec::new();
+        for segment in &expanded.map.segments {
+            if segment.virtual_range.end <= range.start {
+                continue;
+            }
+            if segment.virtual_range.start >= range.end {
+                break;
+            }
+            let start = range.start.max(segment.virtual_range.start);
+            if start > cursor {
+                return VirtualMapping::Unmapped;
+            }
+            let end = range.end.min(segment.virtual_range.end);
+            if end <= start {
+                continue;
+            }
+            let span = match &segment.mapping {
+                SegmentMapping::Physical {
+                    uri, source_start, ..
+                } => PhysicalSpan {
+                    uri: uri.clone(),
+                    range: source_start + (start - segment.virtual_range.start)
+                        ..source_start + (end - segment.virtual_range.start),
+                },
+                SegmentMapping::Synthetic => return VirtualMapping::Unmapped,
+            };
+            spans.push(span);
+            cursor = end;
+        }
+        if cursor != range.end || spans.is_empty() {
+            return VirtualMapping::Unmapped;
+        }
+        if spans.len() == 1 {
+            VirtualMapping::Exact(spans.remove(0))
+        } else {
+            VirtualMapping::Many(spans)
+        }
+    }
+
+    #[test]
+    fn mapping_equals_the_linear_scan_for_every_range_of_small_maps() {
+        let root = uri("/workspace/Main.pas");
+        let include = uri("/workspace/Shared.inc");
+        let other = uri("/workspace/Other.inc");
+        let mut sources = vec![ExpandedSource::new()];
+        let mut nested = ExpandedSource::new();
+        nested.push_physical(include.clone(), "ab");
+        nested.push_synthetic("\n");
+        nested.push_physical_range(other.clone(), "cde", 7, None);
+        for shape in 1..64u32 {
+            let mut expanded = ExpandedSource::new();
+            let mut root_offset = 0;
+            for step in 0..6 {
+                match (shape >> step) & 3 {
+                    0 => {
+                        expanded.push_physical_range(root.clone(), "xyz", root_offset, None);
+                        root_offset += 3;
+                    }
+                    1 => {
+                        expanded.push_synthetic(if step % 2 == 0 { "\n" } else { "" });
+                    }
+                    2 => {
+                        expanded.push_physical(include.clone(), &"i".repeat(step + 1));
+                    }
+                    _ => expanded.append(&nested),
+                }
+            }
+            sources.push(expanded);
+        }
+
+        let cancel = AtomicBool::new(false);
+        for expanded in &sources {
+            let len = expanded.text.len();
+            for start in 0..=len + 1 {
+                for end in 0..=len + 1 {
+                    let mut budget = MappingBudget::new(&cancel, usize::MAX);
+                    assert_eq!(
+                        expanded
+                            .map_range_with_budget(start..end, &mut budget)
+                            .expect("unbounded budget"),
+                        linear_map_range(expanded, start..end),
+                        "range {start}..{end} of {:?}",
+                        expanded.map.segments
+                    );
+                }
+            }
+        }
     }
 
     #[derive(Default)]

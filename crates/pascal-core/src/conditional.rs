@@ -1802,15 +1802,24 @@ impl DirectiveScanner {
     }
 
     /// Whether the directive read so far is `HPPEMIT`, whose body is raw C++
-    /// text: DCC ends it at the first closer, whatever quotes or comment
-    /// openers it holds (ShlObj's `'#pragma link "shell32.lib"}`, StdVCL's
-    /// `'… we don't '*)`, DXFile's `'#include "dxfile.h"'{*)`).
+    /// text, or `REGION`/`ENDREGION`, whose body is an IDE folding caption:
+    /// DCC ends it at the first closer, whatever quotes or comment openers it
+    /// holds (ShlObj's `'#pragma link "shell32.lib"}`, StdVCL's
+    /// `'… we don't '*)`, DXFile's `'#include "dxfile.h"'{*)`, multidev
+    /// PosMainForm's `{$REGION '… l''état 'R' y monte … d'y appeler …'}`).
+    /// The byte being classified is not yet pending, so a body that is just
+    /// the keyword is opaque too (cpsPos's `{$ENDREGION'}`).
     fn opaque_body(&self) -> bool {
-        const KEYWORD: &str = "HPPEMIT";
+        const KEYWORDS: [&str; 3] = ["HPPEMIT", "REGION", "ENDREGION"];
         let body = self.pending.get(self.prefix..).unwrap_or("").trim_start();
-        body.len() > KEYWORD.len()
-            && body.as_bytes()[..KEYWORD.len()].eq_ignore_ascii_case(KEYWORD.as_bytes())
-            && !is_identifier_byte(body.as_bytes()[KEYWORD.len()])
+        KEYWORDS.iter().any(|keyword| {
+            body.len() >= keyword.len()
+                && body.as_bytes()[..keyword.len()].eq_ignore_ascii_case(keyword.as_bytes())
+                && body
+                    .as_bytes()
+                    .get(keyword.len())
+                    .is_none_or(|&byte| !is_identifier_byte(byte))
+        })
     }
 
     fn append(

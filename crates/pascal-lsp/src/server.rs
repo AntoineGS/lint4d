@@ -71,7 +71,21 @@ use std::time::{Duration, Instant};
 
 const SERVER_NAME: &str = "pascal-lsp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-const MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+/// A JSON string may spell one source byte as `\u00XX`.
+const MAX_JSON_ESCAPE_EXPANSION: usize = 6;
+const MAX_MESSAGE_ENVELOPE_BYTES: usize = 1024 * 1024;
+/// A full-text didOpen/didChange of a file at the `maxFileBytes` ceiling
+/// always fits, however its client escapes it. A larger message is read,
+/// discarded and refused without ending the session.
+const MAX_PAYLOAD_BYTES: usize = crate::workspace::MAX_FILE_BYTES_CEILING
+    * MAX_JSON_ESCAPE_EXPANSION
+    + MAX_MESSAGE_ENVELOPE_BYTES;
+/// Stands in for a request over `MAX_PAYLOAD_BYTES`; answered with an error
+/// under the original id.
+const OVERSIZED_REQUEST_METHOD: &str = "$/lint4d/oversizedRequest";
+/// Params key marking a didOpen/didChange stand-in for a notification over
+/// `MAX_PAYLOAD_BYTES`; its value is the rejection reason.
+const OVERSIZED_MESSAGE_PARAM: &str = "lint4d/oversizedMessage";
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const MAX_GENERAL_ANALYSIS_JOBS: usize = 2;
 // One additional slot is reserved for interactive work. Bulk analysis and
@@ -10716,7 +10730,22 @@ fn bounded_stdio(
         .spawn(move || {
             let stdin = io::stdin();
             let mut stdin = BoundedReader::new(stdin.lock());
-            while let Some(mut message) = Message::read(&mut stdin)? {
+            loop {
+                let mut message = match Message::read(&mut stdin) {
+                    Ok(Some(message)) => message,
+                    Ok(None) => break,
+                    Err(error) => {
+                        let Some(bytes) = stdin.take_oversized() else {
+                            return Err(error);
+                        };
+                        let oversized = discard_oversized_payload(&mut stdin, bytes)?;
+                        eprintln!("pascal-lsp: warning: {}", oversized.describe());
+                        match oversized.stand_in() {
+                            Some(message) => message,
+                            None => continue,
+                        }
+                    }
+                };
                 reader_uri_spellings
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -10778,6 +10807,7 @@ struct BoundedReader<R> {
     header_bytes: usize,
     content_length: Option<usize>,
     payload_remaining: Option<usize>,
+    oversized: Option<usize>,
 }
 
 impl<R> BoundedReader<R> {
@@ -10787,7 +10817,14 @@ impl<R> BoundedReader<R> {
             header_bytes: 0,
             content_length: None,
             payload_remaining: None,
+            oversized: None,
         }
+    }
+
+    /// The length of a refused payload that is still unread: the next
+    /// `payload_remaining` bytes must be discarded before the next header.
+    fn take_oversized(&mut self) -> Option<usize> {
+        self.oversized.take()
     }
 
     fn process_header_line(&mut self, line: &str) -> io::Result<()> {
@@ -10805,15 +10842,18 @@ impl<R> BoundedReader<R> {
             let content_length = self.content_length.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
             })?;
-            if content_length > MAX_PAYLOAD_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "LSP payload exceeds the 8 MiB limit",
-                ));
-            }
             self.payload_remaining = Some(content_length);
             self.header_bytes = 0;
             self.content_length = None;
+            if content_length > MAX_PAYLOAD_BYTES {
+                self.oversized = Some(content_length);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "LSP payload of {content_length} bytes exceeds the {MAX_PAYLOAD_BYTES}-byte message limit"
+                    ),
+                ));
+            }
         } else if let Some((name, value)) = line.split_once(": ") {
             if name.eq_ignore_ascii_case("Content-Length") {
                 self.content_length = Some(
@@ -10904,6 +10944,119 @@ impl<R: BufRead> BufRead for BoundedReader<R> {
             }
         }
     }
+}
+
+/// What could be read from a payload refused for its size.
+#[derive(Debug, Default, PartialEq)]
+struct OversizedMessage {
+    bytes: usize,
+    id: Option<RequestId>,
+    method: Option<String>,
+    uri: Option<String>,
+    version: Option<i32>,
+}
+
+impl OversizedMessage {
+    fn reason(&self) -> String {
+        format!(
+            "{} message of {} bytes exceeds the {MAX_PAYLOAD_BYTES}-byte inbound LSP message limit",
+            self.method.as_deref().unwrap_or("an unidentified"),
+            self.bytes
+        )
+    }
+
+    fn describe(&self) -> String {
+        match &self.uri {
+            Some(uri) => format!("{} for {uri}; message discarded", self.reason()),
+            None => format!("{}; message discarded", self.reason()),
+        }
+    }
+
+    /// The small message the server handles in place of the discarded one:
+    /// a request is answered with an error, a didOpen/didChange rejects its
+    /// document. Anything else (a response, another notification) is only
+    /// logged.
+    fn stand_in(&self) -> Option<Message> {
+        let method = self.method.as_deref()?;
+        if let Some(id) = &self.id {
+            return Some(Message::Request(Request::new(
+                id.clone(),
+                OVERSIZED_REQUEST_METHOD.to_string(),
+                serde_json::json!({ "method": method, "message": self.reason() }),
+            )));
+        }
+        if !matches!(method, "textDocument/didOpen" | "textDocument/didChange") {
+            return None;
+        }
+        Some(Message::Notification(Notification::new(
+            method.to_string(),
+            serde_json::json!({
+                "textDocument": { "uri": self.uri.as_deref()?, "version": self.version? },
+                OVERSIZED_MESSAGE_PARAM: self.reason(),
+            }),
+        )))
+    }
+}
+
+/// Reads and discards the `bytes`-byte payload `reader` refused, extracting
+/// its id, method and document identity on the way without retaining the
+/// rest (ignored JSON strings are skipped, not buffered).
+fn discard_oversized_payload<R: BufRead>(
+    reader: &mut BoundedReader<R>,
+    bytes: usize,
+) -> io::Result<OversizedMessage> {
+    #[derive(Deserialize)]
+    struct Probe {
+        #[serde(default)]
+        id: Option<Value>,
+        #[serde(default)]
+        method: Option<String>,
+        #[serde(default)]
+        params: Option<ParamsProbe>,
+    }
+    #[derive(Deserialize)]
+    struct ParamsProbe {
+        #[serde(default, rename = "textDocument")]
+        text_document: Option<TextDocumentProbe>,
+    }
+    #[derive(Deserialize)]
+    struct TextDocumentProbe {
+        #[serde(default)]
+        uri: Option<String>,
+        #[serde(default)]
+        version: Option<i64>,
+    }
+
+    let mut payload = io::BufReader::with_capacity(64 * 1024, &mut *reader);
+    let probe = Probe::deserialize(&mut serde_json::Deserializer::from_reader(&mut payload)).ok();
+    io::copy(&mut payload, &mut io::sink())?;
+    let mut oversized = OversizedMessage {
+        bytes,
+        ..OversizedMessage::default()
+    };
+    if let Some(probe) = probe {
+        oversized.id = probe
+            .id
+            .and_then(|id| serde_json::from_value::<RequestId>(id).ok());
+        oversized.method = probe.method;
+        if let Some(document) = probe.params.and_then(|params| params.text_document) {
+            oversized.uri = document.uri;
+            oversized.version = document
+                .version
+                .and_then(|version| i32::try_from(version).ok());
+        }
+    }
+    Ok(oversized)
+}
+
+/// The rejection reason a didOpen/didChange stand-in for an oversized
+/// notification carries.
+fn oversized_message_reason(notification: &Notification) -> Option<String> {
+    notification
+        .params
+        .get(OVERSIZED_MESSAGE_PARAM)?
+        .as_str()
+        .map(str::to_owned)
 }
 
 #[cfg(feature = "test-support")]
@@ -12017,6 +12170,16 @@ fn event_loop(
                 deferred_workspace_message_bytes = 0;
                 send_ok(connection, request.id, ())?;
                 shutdown_received = true;
+            }
+            // Unordered: the request was never read, only its id.
+            Message::Request(request) if request.method == OVERSIZED_REQUEST_METHOD => {
+                let message = request
+                    .params
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("request exceeds the inbound LSP message limit")
+                    .to_string();
+                send_error(connection, request.id, ErrorCode::RequestFailed, message)?;
             }
             // Unordered: the handle needs no workspace, so it is answered
             // ahead of deferred workspace and configuration work.
@@ -14895,13 +15058,26 @@ fn handle_notification_with_control_inner(
     match notification.method.as_str() {
         "initialized" => Ok(DiagnosticNotificationEffect::default()),
         "textDocument/didOpen" => {
-            let params: DidOpenTextDocumentParams = parse_notification(&notification)?;
-            let uri = params.text_document.uri.clone();
-            if let Err(error) = workspace.open_document(
-                params.text_document.uri,
-                params.text_document.text,
-                params.text_document.version,
-            ) {
+            let (uri, opened) = if let Some(reason) = oversized_message_reason(&notification) {
+                let (uri, version) = notification_document_attribution(&notification)
+                    .ok_or_else(|| format!("unattributable oversized didOpen: {reason}"))?;
+                (
+                    uri.clone(),
+                    workspace.refuse_open_document(uri, version, reason),
+                )
+            } else {
+                let params: DidOpenTextDocumentParams = parse_notification(&notification)?;
+                let uri = params.text_document.uri.clone();
+                (
+                    uri,
+                    workspace.open_document(
+                        params.text_document.uri,
+                        params.text_document.text,
+                        params.text_document.version,
+                    ),
+                )
+            };
+            if let Err(error) = opened {
                 eprintln!("pascal-lsp: didOpen ignored: {error}");
                 if workspace.analysis_admission_fenced() {
                     let mut effect = DiagnosticNotificationEffect::default();
@@ -14945,12 +15121,11 @@ fn handle_notification_with_control_inner(
             let params: DidChangeTextDocumentParams = match parse_notification(&notification) {
                 Ok(params) => params,
                 Err(error) => {
-                    if let Some((uri, version)) = malformed_did_change_attribution(&notification)
-                        && workspace.reject_malformed_change(
-                            &uri,
-                            version,
-                            format!("{error}; a full-document replacement is required"),
-                        )
+                    let reason = oversized_message_reason(&notification).unwrap_or_else(|| {
+                        format!("{error}; a full-document replacement is required")
+                    });
+                    if let Some((uri, version)) = notification_document_attribution(&notification)
+                        && workspace.reject_malformed_change(&uri, version, reason)
                     {
                         mark_publication_root_stale(connection, workspace, &uri);
                         let mut effect = DiagnosticNotificationEffect::default();
@@ -15737,7 +15912,7 @@ fn parse_notification<T: DeserializeOwned>(notification: &Notification) -> Resul
         .map_err(|error| format!("invalid parameters for {}: {error}", notification.method))
 }
 
-fn malformed_did_change_attribution(notification: &Notification) -> Option<(Url, i32)> {
+fn notification_document_attribution(notification: &Notification) -> Option<(Url, i32)> {
     let text_document = notification.params.get("textDocument")?.as_object()?;
     let uri = Url::parse(text_document.get("uri")?.as_str()?).ok()?;
     let version = i32::try_from(text_document.get("version")?.as_i64()?).ok()?;
@@ -16363,10 +16538,11 @@ mod tests {
         MAX_PARTIAL_RESULT_BYTES_PER_CHUNK, MAX_PARTIAL_RESULT_ITEMS_PER_CHUNK, MAX_PAYLOAD_BYTES,
         MAX_PENDING_OUTBOUND_CONTROL_BYTES, MAX_PENDING_OUTBOUND_CONTROL_MESSAGES,
         MAX_PENDING_OUTBOUND_DATA_MESSAGES, MAX_WATCHER_REGISTRATION_RETRIES, NavigationTarget,
-        OutboundClass, OutboundQueue, OutputError, PartialDelivery, PartialDeliveryRecipient,
-        PartialDeliveryValidation, PartialResultPayload, PendingAnalysis, PriorityQueue,
-        ProtocolSender, TestBarrierConfig, WorkspaceRevision, deliver_analysis_result,
-        event_loop_receive_timeout, handle_request, invalidate_analysis_result,
+        OutboundClass, OutboundQueue, OutputError, OversizedMessage, PartialDelivery,
+        PartialDeliveryRecipient, PartialDeliveryValidation, PartialResultPayload, PendingAnalysis,
+        PriorityQueue, ProtocolSender, TestBarrierConfig, WorkspaceRevision,
+        deliver_analysis_result, discard_oversized_payload, event_loop_receive_timeout,
+        handle_request, invalidate_analysis_result, oversized_message_reason,
         pump_pending_diagnostic_publications, select_workspace_event_message,
         spawn_workspace_file_notification, supports_diagnostic_refresh,
         supports_workspace_diagnostic_reports,
@@ -21574,6 +21750,68 @@ mod tests {
         let mut reader = BoundedReader::new(Cursor::new(header.into_bytes()));
         let error = Message::read(&mut reader).expect_err("oversized frame must be rejected");
         assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert_eq!(
+            reader.take_oversized(),
+            Some(MAX_PAYLOAD_BYTES.saturating_add(1))
+        );
+    }
+
+    #[test]
+    fn inbound_limit_admits_a_fully_escaped_file_at_the_max_file_bytes_ceiling() {
+        assert!(
+            MAX_PAYLOAD_BYTES
+                > crate::workspace::MAX_FILE_BYTES_CEILING * "\\u0001".len() + 64 * 1024
+        );
+    }
+
+    #[test]
+    fn bounded_reader_discards_an_oversized_payload_and_reads_the_next_message() {
+        let text_document = serde_json::json!({
+            "text": "x".repeat(MAX_PAYLOAD_BYTES),
+            "languageId": "pascal",
+            "version": 3,
+            "uri": "file:///w/Huge.pas",
+        });
+        let oversized = serde_json::to_vec(&serde_json::json!({
+            "params": {"textDocument": text_document},
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+        }))
+        .expect("encode oversized didOpen");
+        let mut stream = format!("Content-Length: {}\r\n\r\n", oversized.len()).into_bytes();
+        stream.extend_from_slice(&oversized);
+        Message::Request(Request::new(
+            RequestId::from(7),
+            "shutdown".to_string(),
+            serde_json::Value::Null,
+        ))
+        .write(&mut stream)
+        .expect("encode follow-up");
+
+        let mut reader = BoundedReader::new(Cursor::new(stream));
+        Message::read(&mut reader).expect_err("oversized frame is refused");
+        let bytes = reader.take_oversized().expect("refused payload length");
+        assert_eq!(bytes, oversized.len());
+        let discarded = discard_oversized_payload(&mut reader, bytes).expect("discard payload");
+        assert_eq!(
+            discarded,
+            OversizedMessage {
+                bytes,
+                id: None,
+                method: Some("textDocument/didOpen".to_string()),
+                uri: Some("file:///w/Huge.pas".to_string()),
+                version: Some(3),
+            }
+        );
+        let Some(Message::Notification(stand_in)) = discarded.stand_in() else {
+            panic!("an oversized didOpen has a notification stand-in");
+        };
+        assert_eq!(stand_in.method, "textDocument/didOpen");
+        assert!(oversized_message_reason(&stand_in).is_some());
+        match Message::read(&mut reader).expect("next message") {
+            Some(Message::Request(request)) => assert_eq!(request.method, "shutdown"),
+            other => panic!("the next frame must follow the discarded one: {other:?}"),
+        }
     }
 
     #[test]

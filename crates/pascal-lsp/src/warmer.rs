@@ -50,6 +50,10 @@ pub(crate) struct InteractiveGate {
     /// diagnostics, Bulk): the slots parallel reuse validation leaves them
     /// (R8-1).
     running_general: std::sync::atomic::AtomicUsize,
+    /// Since when requests have held index batches back without a quantum,
+    /// over consecutive batches (a stream of short requests stops each batch
+    /// at its first member), and when last (l4d-zh7i, D52).
+    index_hold: Mutex<Option<IndexHold>>,
     /// Test seam: after this many passing `try_wait_idle` or
     /// `index_may_run` checks, mark the gate busy so a pause lands at an
     /// exact unit boundary.
@@ -93,10 +97,41 @@ const CRAWL_SLICE: Duration = Duration::from_secs(2);
 /// `maxCacheBytes` (D51), so it does not stop again at once.
 const CRAWL_RESUME_ROOM_SHARE: usize = 64;
 
+/// The longest requests hold an index batch back at once (D52, amending D33
+/// and D50): Bulk requests, references, workspace/symbol and rename. The
+/// batch then runs for `INDEX_QUANTUM` beside them and waits again
+/// (l4d-zh7i): a stream of such requests slows the index down but does not
+/// stall it, or after a burst of file changes every request would answer
+/// from the stale index for as long as requests keep coming. Navigation
+/// requests and requests waiting for a worker still hold it back.
+pub(crate) const INDEX_HOLD_LIMIT: Duration = BACKGROUND_PAUSE_LIMIT;
+
+/// How long an index batch runs beside the requests of `INDEX_HOLD_LIMIT`
+/// once they held it back for that long.
+pub(crate) const INDEX_QUANTUM: Duration = Duration::from_millis(250);
+
+/// Requests holding index batches back, over consecutive batches (D52).
+#[derive(Debug, Clone, Copy)]
+struct IndexHold {
+    since: Instant,
+    last: Instant,
+}
+
+impl IndexHold {
+    /// Whether a hold seen at `now` continues this one: nothing held the
+    /// index for `INDEX_HOLD_LIMIT` since its last hold, which resets it.
+    fn continues_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last) < INDEX_HOLD_LIMIT
+    }
+}
+
 /// What `wait_index_turn` decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IndexTurn {
     Go,
+    /// Only requests that let a quantum run (D52) held the batch back, for
+    /// `INDEX_HOLD_LIMIT`: it runs for `INDEX_QUANTUM` beside them.
+    Quantum,
     /// A crawl is queued: the batch stops, its anchor requeued.
     Yield,
     Cancelled,
@@ -244,7 +279,71 @@ impl InteractiveGate {
         self.index_may_run_with(busy)
     }
 
-    /// Waits, without a time limit, until `index_may_run` would pass. The
+    /// Whether an index batch on its quantum (`IndexTurn::Quantum`) may take
+    /// its next step: as `index_may_run`, but Bulk and workspace-wide
+    /// requests no longer hold it back (D52).
+    pub(crate) fn index_quantum_may_run(&self, cancel: &AtomicBool) -> bool {
+        self.tick_test_seams();
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.index_quantum_may_run_now() && !cancel.load(Ordering::Relaxed)
+    }
+
+    /// An index batch was held back: by requests that let a quantum run
+    /// (`background_may_run`) only, which starts or extends the hold its
+    /// quantum ends.
+    pub(crate) fn note_index_held(&self) {
+        let busy = *self.busy.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.background_may_run(busy) {
+            self.note_index_held_at(Instant::now());
+        }
+    }
+
+    fn index_hold(&self) -> std::sync::MutexGuard<'_, Option<IndexHold>> {
+        self.index_hold
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn note_index_held_at(&self, now: Instant) {
+        let mut hold = self.index_hold();
+        match hold.as_mut() {
+            Some(hold) if hold.continues_at(now) => hold.last = now,
+            _ => {
+                *hold = Some(IndexHold {
+                    since: now,
+                    last: now,
+                })
+            }
+        }
+    }
+
+    /// An index batch ran without being held back, or got its quantum.
+    pub(crate) fn clear_index_held(&self) {
+        *self.index_hold() = None;
+    }
+
+    /// Whether requests have held index batches back for
+    /// `INDEX_HOLD_LIMIT`, over consecutive batches, as of `now`.
+    fn index_quantum_due_at(&self, now: Instant) -> bool {
+        self.index_hold().is_some_and(|hold| {
+            hold.continues_at(now) && now.duration_since(hold.since) >= INDEX_HOLD_LIMIT
+        })
+    }
+
+    /// Whether at most Bulk and workspace-wide requests hold index batches
+    /// back now (D52):
+    /// no interactive request runs or is queued and no client request waits
+    /// for a worker, so a batch held back may get its quantum.
+    pub(crate) fn index_quantum_may_run_now(&self) -> bool {
+        let busy = *self.busy.lock().unwrap_or_else(PoisonError::into_inner);
+        self.background_may_run(busy)
+    }
+
+    /// Waits, without a time limit, until `index_may_run` would pass, or
+    /// until only Bulk and workspace-wide requests have held it back for
+    /// `INDEX_HOLD_LIMIT` (`IndexTurn::Quantum`, D52). The
     /// warmer has one thread, so a batch does not wait while a crawl is
     /// queued: it yields instead, and the crawl runs under its own gate. A
     /// `Full` batch yields to a queued crawl at once, a `Reuse` one only
@@ -278,6 +377,14 @@ impl InteractiveGate {
             // warmer thread would park in the crawl's wait (D50).
             if crawl_queued && self.bulk_runs() && !self.warm_paused() {
                 break IndexTurn::Yield;
+            }
+            if !held && self.background_may_run(*busy) {
+                let now = Instant::now();
+                self.note_index_held_at(now);
+                if self.index_quantum_due_at(now) {
+                    self.clear_index_held();
+                    break IndexTurn::Quantum;
+                }
             }
             busy = self
                 .idle
@@ -1264,9 +1371,16 @@ impl Warmer {
         // An extraction batch is dispatched only when it can run now; one
         // waiting for its turn would hold the crawl back (one warmer
         // thread).
+        // One held back only by requests that let a quantum run (Bulk,
+        // references, workspace/symbol, rename: D52) is dispatched too: it
+        // waits for its quantum in `wait_index_turn`. A Full batch yields to a
+        // crawl queued meanwhile; a Reuse one waits, as the crawl is paused
+        // by the same workspace-wide request or goes first for Bulk work.
         let gate = self.gate.clone();
-        let index_fits =
-            || gate.index_may_run_now() && workspace.project_cache().index_batch_fits();
+        let index_fits = || {
+            (gate.index_may_run_now() || gate.index_quantum_may_run_now())
+                && workspace.project_cache().index_batch_fits()
+        };
         // 1. A reuse pass, even while a crawl is queued (D33). Only Bulk work
         // lets the crawl go first: interactive work would pause the crawl as
         // well, so the pass waits for it in `wait_index_turn`. A
@@ -1296,9 +1410,11 @@ impl Warmer {
         if !persisting || self.index_queue.is_empty() {
             self.interleave = false;
         }
+        // It does not wait for a quantum: it would hold the queued crawl back.
         if !self.busy
             && self.interleave
-            && index_fits()
+            && gate.index_may_run_now()
+            && workspace.project_cache().index_batch_fits()
             && let Some(anchor) = self.index_queue.pop_front()
         {
             self.interleave = false;
@@ -1676,10 +1792,16 @@ fn run_index_job(
             generation: job.generation,
         });
     };
-    match gate.wait_index_turn(&job.cancel, crawl_pending, mode) {
-        IndexTurn::Go => {}
+    let quantum = match gate.wait_index_turn(&job.cancel, crawl_pending, mode) {
+        IndexTurn::Go => false,
+        IndexTurn::Quantum => true,
         IndexTurn::Yield => return stopped(true),
         IndexTurn::Cancelled => return stopped(false),
+    };
+    if quantum {
+        crate::trace::trace!(
+            "index batch {anchor:?} runs {INDEX_QUANTUM:?} beside Bulk and workspace-wide requests"
+        );
     }
     // A batch dispatched while the store was opening or reopening would
     // index memory-only, and its members would keep no record for the rest
@@ -1713,24 +1835,35 @@ fn run_index_job(
     // A reuse pass runs before the crawl by design (D33); extraction yields
     // to a queued crawl.
     let mut before_io = || {
-        if (mode == IndexMode::Reuse || !crawl_pending.load(Ordering::Relaxed))
-            && gate.index_may_run(&job.cancel)
-        {
-            Ok(())
-        } else {
-            Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string())
+        if mode == IndexMode::Full && crawl_pending.load(Ordering::Relaxed) {
+            return Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string());
         }
+        if quantum {
+            if gate.index_quantum_may_run(&job.cancel) {
+                return Ok(());
+            }
+        } else if gate.index_may_run(&job.cancel) {
+            return Ok(());
+        } else {
+            gate.note_index_held();
+        }
+        Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string())
     };
     let bound = match mode {
         IndexMode::Reuse => IndexBound::reuse_pass(),
         IndexMode::Full => IndexBound::extraction(),
+    };
+    let bound = if quantum {
+        bound.within(INDEX_QUANTUM)
+    } else {
+        bound
     };
     // A reuse pass validates on the free general analysis slots (R8-1);
     // its workers stop at their next member once interactive work arrives,
     // and the extra ones as diagnostics take the slots.
     // Extraction workers also stop for a queued crawl, as `before_io` does.
     let may_run = || {
-        gate.index_may_run_now()
+        (gate.index_may_run_now() || quantum && gate.index_quantum_may_run_now())
             && !job.cancel.load(Ordering::Relaxed)
             && (mode == IndexMode::Reuse || !crawl_pending.load(Ordering::Relaxed))
     };
@@ -1749,6 +1882,9 @@ fn run_index_job(
     );
     match result {
         Ok(progress) => {
+            if !quantum {
+                gate.clear_index_held();
+            }
             crate::trace::trace!(
                 "index batch {anchor:?} mode={mode:?} indexed={} refreshed={} refused={} limited={} deferred={} skipped_open={} pending={} reused={} reuse_pending={} persisted={} complete={} memory={} left_large={} left_large_bytes={} elapsed_ms={:.1} reserved_index_bytes={}",
                 progress.indexed,
@@ -3545,8 +3681,8 @@ mod tests {
     }
 
     /// D50: an extraction batch stops at its next member when a
-    /// workspace-wide request arrives, stays queued while it runs, and
-    /// resumes once it ends.
+    /// workspace-wide request arrives, waits while it runs (here held at
+    /// its turn, so it gets no quantum), and resumes once it ends.
     #[test]
     fn an_index_batch_stops_between_members_for_a_workspace_wide_request() {
         let (_temp, workspace, anchor) = index_fixture(6, Default::default());
@@ -3582,13 +3718,16 @@ mod tests {
             "{events:?}"
         );
         assert!(gate.warm_paused() && !gate.index_may_run_now());
+        gate.hold_index_turns.store(true, Ordering::Relaxed);
         warmer.poll(&workspace);
         assert!(
-            !warmer.busy && warmer.index_queue.contains(&anchor),
-            "the paused anchor waits in the queue while the request runs"
+            warmer.busy && warmer.index_in_flight == Some((anchor.clone(), IndexMode::Full)),
+            "the paused anchor waits for its turn while the request runs"
         );
+        wait_for_turn_waiter(&gate);
 
         gate.set_warm_busy(0);
+        gate.hold_index_turns.store(false, Ordering::Relaxed);
         let events = poll_until(&mut warmer, &workspace, |events| {
             events.iter().any(is_index_event)
         });
@@ -3597,6 +3736,102 @@ mod tests {
         };
         assert_eq!(progress.indexed, total - 2, "the published members stayed");
         assert!(progress.complete);
+    }
+
+    /// l4d-zh7i: a workspace-wide request that does not end holds the
+    /// index back for `INDEX_HOLD_LIMIT` at a time, not forever: the batch
+    /// then indexes beside it.
+    #[test]
+    fn a_workspace_wide_request_holds_an_index_batch_back_only_until_its_quantum() {
+        let (_temp, workspace, anchor) = index_fixture(6, Default::default());
+        let gate = Arc::new(InteractiveGate::default());
+        gate.set_warm_busy(1);
+        let mut warmer = Warmer::start(gate.clone());
+        warmer.request_index(anchor.clone());
+        let held = Instant::now();
+        let events = poll_until(&mut warmer, &workspace, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, WarmEvent::IndexProgress { .. }))
+        });
+        assert!(held.elapsed() >= INDEX_HOLD_LIMIT, "{events:?}");
+        let Some(WarmEvent::IndexProgress { progress, .. }) = events
+            .iter()
+            .find(|event| matches!(event, WarmEvent::IndexProgress { .. }))
+        else {
+            unreachable!()
+        };
+        assert!(progress.indexed > 0, "{progress:?}");
+        assert!(gate.warm_paused(), "the request still runs");
+        warmer.shutdown();
+    }
+
+    /// l4d-zh7i: the hold spans consecutive batches, so a stream of short
+    /// workspace-wide requests, each stopping a batch at its first member,
+    /// does not hold the index back forever either.
+    #[test]
+    fn the_hold_before_a_quantum_spans_consecutive_batches() {
+        let gate = InteractiveGate::default();
+        let no_crawl = AtomicBool::new(false);
+        gate.set_warm_busy(1);
+        let first = Instant::now();
+        gate.note_index_held();
+        assert_eq!(
+            gate.wait_index_turn(&AtomicBool::new(false), &no_crawl, IndexMode::Full),
+            IndexTurn::Quantum
+        );
+        assert!(first.elapsed() >= INDEX_HOLD_LIMIT);
+        // A new hold; a batch let go between two requests (`Go`), then
+        // stopped by the next one, does not end it: the next wait gets its
+        // quantum `INDEX_HOLD_LIMIT` after the hold began.
+        let second = Instant::now();
+        gate.note_index_held();
+        gate.set_warm_busy(0);
+        assert_eq!(
+            gate.wait_index_turn(&AtomicBool::new(false), &no_crawl, IndexMode::Full),
+            IndexTurn::Go
+        );
+        gate.set_warm_busy(1);
+        assert_eq!(
+            gate.wait_index_turn(&AtomicBool::new(false), &no_crawl, IndexMode::Full),
+            IndexTurn::Quantum
+        );
+        assert!(second.elapsed() >= INDEX_HOLD_LIMIT);
+        // An interactive request holds the batch back for as long as it runs.
+        gate.set(1);
+        gate.note_index_held();
+        assert!(!gate.index_quantum_may_run_now());
+        gate.set(0);
+    }
+
+    /// D52 (l4d-zh7i review M1): the hold resets once nothing has held the
+    /// index for `INDEX_HOLD_LIMIT`, so the first request after an idle
+    /// spell holds it for the whole limit; holds closer together continue
+    /// one hold.
+    #[test]
+    fn the_hold_resets_once_nothing_held_the_index_for_the_limit() {
+        let gate = InteractiveGate::default();
+        let start = Instant::now();
+        let at = |millis: u64| start + Duration::from_millis(millis);
+        let limit = INDEX_HOLD_LIMIT.as_millis() as u64;
+        // Holds every 100 ms continue one hold: due once it lasted the limit.
+        for step in 0..limit / 100 {
+            gate.note_index_held_at(at(step * 100));
+        }
+        assert!(!gate.index_quantum_due_at(at(limit - 1)));
+        gate.note_index_held_at(at(limit));
+        assert!(gate.index_quantum_due_at(at(limit)));
+        // Then nothing holds for longer than the limit: a new hold starts.
+        let idle = 3 * limit;
+        gate.note_index_held_at(at(idle));
+        assert!(
+            !gate.index_quantum_due_at(at(idle)),
+            "an idle spell resets the hold"
+        );
+        gate.note_index_held_at(at(idle + limit - 1));
+        assert!(!gate.index_quantum_due_at(at(idle + limit - 1)));
+        gate.note_index_held_at(at(idle + limit));
+        assert!(gate.index_quantum_due_at(at(idle + limit)));
     }
 
     #[test]
@@ -4221,7 +4456,8 @@ mod tests {
         fn a_crawl_dispatched_while_the_store_opens_publishes_its_units() {
             let gate = Arc::new(InteractiveGate::default());
             let (temp, _store, workspace, cache, release, main) = opening_workspace(&gate);
-            // Bulk work holds every index batch back: only the crawl runs.
+            // Bulk work holds index batches back while the crawl runs; one
+            // gets its quantum beside it only once no crawl is queued (D52).
             gate.set_running_bulk(1);
             let mut warmer = Warmer::start(gate.clone());
             warmer.open(main);
@@ -5057,7 +5293,8 @@ mod tests {
             first
                 .open_document(main.clone(), main_text.clone(), 1)
                 .unwrap();
-            // Bulk work holds every index batch back: only the crawl runs.
+            // Bulk work holds index batches back while the crawl runs; one
+            // gets its quantum beside it only once no crawl is queued (D52).
             gate.set_running_bulk(1);
             let mut warmer = Warmer::start(gate.clone());
             warmer.open(main.clone());
@@ -5333,7 +5570,8 @@ mod tests {
         fn a_crawl_publishes_the_disk_units_it_analyses() {
             let gate = Arc::new(InteractiveGate::default());
             let (temp, store, workspace, main) = wide_fixture(&gate);
-            // Bulk work holds every index batch back: only the crawl runs.
+            // Bulk work holds index batches back while the crawl runs; one
+            // gets its quantum beside it only once no crawl is queued (D52).
             gate.set_running_bulk(1);
             let mut warmer = Warmer::start(gate.clone());
             warmer.open(main);
@@ -5448,8 +5686,9 @@ mod tests {
                 )
                 .unwrap();
             gate.crawl_slice_over.store(true, Ordering::Relaxed);
-            // Bulk work holds every index batch back: the queued extraction
-            // never runs, so it stays queued.
+            // Bulk work holds index batches back while the crawl runs, so the
+            // queued extraction does not run before the crawl's end (D52
+            // gives it a quantum beside the Bulk work only after).
             gate.set_running_bulk(1);
             let project = IndexAnchor::Project(temp.path().join("App.dproj"));
             let mut warmer = Warmer::start(gate.clone());
@@ -5469,7 +5708,13 @@ mod tests {
             );
             assert_eq!(yields[0], 1, "{yields:?}");
             assert!(!events.iter().any(is_index_event), "{events:?}");
-            assert!(warmer.index_queue.contains(&project), "still queued");
+            // Once the crawl ended, the batch is queued or already waits for
+            // its quantum beside the Bulk work (D52).
+            assert!(
+                warmer.index_queue.contains(&project)
+                    || warmer.index_in_flight == Some((project.clone(), IndexMode::Full)),
+                "still queued"
+            );
             assert!(
                 warmer.interleave,
                 "the interleave the gate held back is still due"

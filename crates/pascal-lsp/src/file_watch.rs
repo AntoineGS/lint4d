@@ -1,16 +1,23 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::Condvar;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
 use lsp_types::Url;
 use notify::event::ModifyKind;
 use notify::{RecursiveMode, Watcher};
 
 use crate::project_cache::ProjectCache;
 
-pub(crate) const WATCH_EVENT_CAPACITY: usize = 1024;
+/// Distinct changed paths held between two drains. A burst of more (a
+/// branch switch over the whole tree) is an overflow; a build or a pull
+/// usually changes far fewer distinct paths than it reports events, each
+/// write reporting one or two (l4d-zh7i: Delphi builds of the multidev
+/// tree wrote 1,200-3,350 compiled units beside the sources and overflowed
+/// a queue of 1,024 events, staling every index member).
+pub(crate) const MAX_PENDING_WATCH_PATHS: usize = 32 * 1024;
 pub(crate) const MAX_WATCH_EVENTS_PER_TURN: usize = 256;
 
 /// Non-recursive directory watch registration. Returns `false` when the
@@ -29,76 +36,238 @@ pub(crate) enum WatchEvent {
     Overflow,
 }
 
+/// How a pending path changed: `Changed` covers what `Modified` does and
+/// also the parent's listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Change {
+    Modified,
+    Changed,
+}
+
+/// The paths changed since the last drain, each once, in the order they
+/// first changed (l4d-zh7i: a burst is applied once per path).
+#[derive(Default)]
+struct Pending {
+    order: VecDeque<PathBuf>,
+    changes: HashMap<PathBuf, Change>,
+    overflowed: bool,
+}
+
+#[derive(Default)]
+struct Queue {
+    pending: Mutex<Pending>,
+    #[cfg(test)]
+    arrived: Condvar,
+}
+
+impl Queue {
+    fn pending(&self) -> std::sync::MutexGuard<'_, Pending> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn push(&self, event: WatchEvent) {
+        let mut pending = self.pending();
+        let (paths, change) = match event {
+            WatchEvent::Overflow => {
+                overflow(&mut pending);
+                drop(pending);
+                self.notify();
+                return;
+            }
+            WatchEvent::Modified(paths) => (paths, Change::Modified),
+            WatchEvent::Changed(paths) => (paths, Change::Changed),
+        };
+        for path in paths {
+            if let Some(known) = pending.changes.get_mut(&path) {
+                if change == Change::Changed {
+                    *known = Change::Changed;
+                }
+                continue;
+            }
+            if pending.changes.len() >= MAX_PENDING_WATCH_PATHS {
+                overflow(&mut pending);
+                break;
+            }
+            pending.changes.insert(path.clone(), change);
+            pending.order.push_back(path);
+        }
+        drop(pending);
+        self.notify();
+    }
+
+    fn notify(&self) {
+        #[cfg(test)]
+        self.arrived.notify_all();
+    }
+}
+
+/// An overflow loses which paths changed; what is pending is covered by it.
+fn overflow(pending: &mut Pending) {
+    pending.overflowed = true;
+    pending.order.clear();
+    pending.changes.clear();
+}
+
 pub(crate) struct WatchEventSender {
-    sender: Sender<WatchEvent>,
-    overflowed: Arc<AtomicBool>,
+    queue: Arc<Queue>,
+}
+
+impl WatchEventSender {
+    fn send(&self, event: WatchEvent) {
+        self.queue.push(event);
+    }
 }
 
 pub(crate) struct WatchEvents {
-    receiver: Receiver<WatchEvent>,
-    overflowed: Arc<AtomicBool>,
+    queue: Arc<Queue>,
+    /// Paths applied and overflows applied, for `pascal/testBackgroundIdle`.
+    applied: AtomicU64,
+    overflows: AtomicU64,
+    /// Set when a drain applied an overflow, until `take_overflowed`.
+    overflowed: AtomicBool,
+    /// Every path applied, for `pascal/testBackgroundIdle`.
+    #[cfg(feature = "test-support")]
+    applied_paths: Mutex<HashSet<PathBuf>>,
 }
 
 impl WatchEvents {
     pub(crate) fn channel() -> (WatchEventSender, Self) {
-        let (sender, receiver) = bounded(WATCH_EVENT_CAPACITY);
-        let overflowed = Arc::new(AtomicBool::new(false));
+        let queue = Arc::new(Queue::default());
         (
             WatchEventSender {
-                sender,
-                overflowed: Arc::clone(&overflowed),
+                queue: Arc::clone(&queue),
             },
             Self {
-                receiver,
-                overflowed,
+                queue,
+                applied: AtomicU64::new(0),
+                overflows: AtomicU64::new(0),
+                overflowed: AtomicBool::new(false),
+                #[cfg(feature = "test-support")]
+                applied_paths: Mutex::default(),
             },
         )
     }
 
-    /// Apply at most `limit` events. Paths `ignored` holds (the store's own
-    /// files, l4d-vrw0) are dropped before anything is invalidated.
+    /// Apply at most `limit` changed paths (an overflow counts as one), each
+    /// path once however many events reported it. Paths `ignored` holds
+    /// (the store's own files, l4d-vrw0) are dropped before anything is
+    /// invalidated.
     pub(crate) fn drain(
         &self,
         cache: &ProjectCache,
         limit: usize,
         ignored: &dyn Fn(&Path) -> bool,
     ) -> Vec<Url> {
-        let mut affected = Vec::new();
         let mut remaining = limit;
-        if remaining > 0 && self.overflowed.swap(false, Ordering::AcqRel) {
+        let (overflowed, taken) = {
+            let mut pending = self.queue.pending();
+            let overflowed = remaining > 0 && std::mem::take(&mut pending.overflowed);
+            if overflowed {
+                remaining -= 1;
+            }
+            let mut taken = Vec::new();
+            while taken.len() < remaining {
+                let Some(path) = pending.order.pop_front() else {
+                    break;
+                };
+                let change = pending
+                    .changes
+                    .remove(&path)
+                    .expect("a pending path has its change");
+                taken.push((path, change));
+            }
+            (overflowed, taken)
+        };
+        if overflowed {
             apply_watch_event(cache, WatchEvent::Overflow);
-            remaining -= 1;
+            self.overflows.fetch_add(1, Ordering::Relaxed);
+            self.overflowed.store(true, Ordering::Relaxed);
         }
-        for _ in 0..remaining {
-            let event = match self.receiver.try_recv() {
-                Ok(event) => event,
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            };
-            let event = match event {
-                WatchEvent::Modified(paths) => {
-                    WatchEvent::Modified(without_ignored(paths, ignored))
-                }
-                WatchEvent::Changed(paths) => WatchEvent::Changed(without_ignored(paths, ignored)),
-                WatchEvent::Overflow => WatchEvent::Overflow,
-            };
-            if matches!(&event, WatchEvent::Modified(paths) | WatchEvent::Changed(paths) if paths.is_empty())
-            {
+        let mut affected = Vec::new();
+        let mut seen = HashSet::new();
+        for (path, change) in taken {
+            if ignored(&path) {
                 continue;
             }
-            affected.extend(apply_watch_event(cache, event));
+            self.applied.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "test-support")]
+            self.applied_paths
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(path.clone());
+            let event = match change {
+                Change::Modified => WatchEvent::Modified(vec![path]),
+                Change::Changed => WatchEvent::Changed(vec![path]),
+            };
+            for uri in apply_watch_event(cache, event) {
+                if seen.insert(uri.clone()) {
+                    affected.push(uri);
+                }
+            }
         }
         affected
     }
-}
 
-fn without_ignored(mut paths: Vec<PathBuf>, ignored: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
-    paths.retain(|path| !ignored(path));
-    paths
-}
+    /// Whether a drain applied an overflow since the last call. The paths
+    /// pending at the overflow are not known any more, so the caller rewarms
+    /// every open document, as their events would have.
+    pub(crate) fn take_overflowed(&self) -> bool {
+        self.overflowed.swap(false, Ordering::Relaxed)
+    }
 
-fn enqueue(sender: &Sender<WatchEvent>, overflowed: &AtomicBool, event: WatchEvent) {
-    if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) = sender.try_send(event) {
-        overflowed.store(true, Ordering::Release);
+    /// Whether changes wait for a drain.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn pending(&self) -> bool {
+        let pending = self.queue.pending();
+        pending.overflowed || !pending.order.is_empty()
+    }
+
+    /// Whether `path` was applied since the last call that returned true
+    /// for it.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn take_applied(&self, path: &Path) -> bool {
+        self.applied_paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(path)
+    }
+
+    /// How many paths and how many overflows were applied so far.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn applied(&self) -> (u64, u64) {
+        (
+            self.applied.load(Ordering::Relaxed),
+            self.overflows.load(Ordering::Relaxed),
+        )
+    }
+
+    /// The next pending change as one event, without applying it, waiting
+    /// at most `timeout` for one.
+    #[cfg(test)]
+    fn recv_timeout(&self, timeout: std::time::Duration) -> Option<WatchEvent> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut pending = self.queue.pending();
+        loop {
+            if std::mem::take(&mut pending.overflowed) {
+                return Some(WatchEvent::Overflow);
+            }
+            if let Some(path) = pending.order.pop_front() {
+                return Some(match pending.changes.remove(&path) {
+                    Some(Change::Modified) => WatchEvent::Modified(vec![path]),
+                    _ => WatchEvent::Changed(vec![path]),
+                });
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            pending = self
+                .queue
+                .arrived
+                .wait_timeout(pending, remaining)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
     }
 }
 
@@ -123,7 +292,7 @@ impl NotifyWatcher {
                 Ok(event) => WatchEvent::Changed(event.paths),
                 Err(_) => WatchEvent::Overflow,
             };
-            enqueue(&events.sender, &events.overflowed, event);
+            events.send(event);
         })
         .map_err(|error| format!("directory watcher unavailable: {error}"))?;
         Ok(Self { inner })
@@ -219,15 +388,15 @@ mod tests {
         let mut seen = Vec::new();
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            match events.receiver.recv_timeout(remaining) {
-                Ok(WatchEvent::Modified(paths) | WatchEvent::Changed(paths)) => {
+            match events.recv_timeout(remaining) {
+                Some(WatchEvent::Modified(paths) | WatchEvent::Changed(paths)) => {
                     if paths.iter().any(|path| path.ends_with("New.pas")) {
                         return;
                     }
                     seen.extend(paths);
                 }
-                Ok(WatchEvent::Overflow) => return,
-                Err(_) => panic!("no event for New.pas; saw {seen:?}"),
+                Some(WatchEvent::Overflow) => return,
+                None => panic!("no event for New.pas; saw {seen:?}"),
             }
         }
     }
@@ -240,12 +409,7 @@ mod tests {
         assert!(watcher.watch(temp.path()));
         watcher.unwatch(temp.path());
         std::fs::write(temp.path().join("New.pas"), "unit New;").unwrap();
-        assert!(
-            events
-                .receiver
-                .recv_timeout(Duration::from_millis(500))
-                .is_err()
-        );
+        assert!(events.recv_timeout(Duration::from_millis(500)).is_none());
     }
 
     // Linux reports an in-place write as Modify(Data). Backends that report
@@ -274,7 +438,6 @@ mod tests {
 
         std::fs::write(&unrelated, "unit Unrelated; interface implementation end.").unwrap();
         let event = events
-            .receiver
             .recv_timeout(Duration::from_secs(5))
             .expect("unrelated file write must reach the watcher");
         let mut affected = apply_watch_event(&cache, event);
@@ -364,7 +527,6 @@ mod tests {
                 _ => unreachable!(),
             }
             let event = events
-                .receiver
                 .recv_timeout(Duration::from_secs(5))
                 .expect("directory membership event");
             assert_eq!(apply_watch_event(&cache, event), vec![main], "{operation}");
@@ -417,6 +579,10 @@ mod tests {
         assert_eq!(cache.stats().imports, 0);
     }
 
+    fn overflowed(events: &WatchEvents) -> bool {
+        events.queue.pending().overflowed
+    }
+
     #[test]
     fn full_watch_event_queue_flags_overflow_and_drops_imports() {
         let temp = tempfile::tempdir().unwrap();
@@ -425,23 +591,63 @@ mod tests {
         store_import(&cache, &main, vec![]);
         let (sender, events) = WatchEvents::channel();
 
-        for _ in 0..WATCH_EVENT_CAPACITY {
-            enqueue(
-                &sender.sender,
-                &sender.overflowed,
-                WatchEvent::Changed(Vec::new()),
-            );
+        for index in 0..MAX_PENDING_WATCH_PATHS {
+            sender.send(WatchEvent::Changed(vec![
+                temp.path().join(format!("{index}")),
+            ]));
         }
-        enqueue(
-            &sender.sender,
-            &sender.overflowed,
-            WatchEvent::Changed(Vec::new()),
-        );
-        assert!(sender.overflowed.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!overflowed(&events));
+        sender.send(WatchEvent::Changed(vec![temp.path().join("one more")]));
+        assert!(overflowed(&events));
 
         events.drain(&cache, MAX_WATCH_EVENTS_PER_TURN, &|_| false);
-        assert!(!sender.overflowed.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!overflowed(&events));
+        assert_eq!(
+            events.applied(),
+            (0, 1),
+            "the overflow covers what was pending"
+        );
+        // The paths it covered are unknown: the caller rewarms open documents.
+        assert!(events.take_overflowed());
+        assert!(!events.take_overflowed());
         assert_eq!(cache.stats().imports, 0);
+    }
+
+    /// l4d-zh7i: a build reports each compiled unit it writes once or
+    /// twice; however many events name a path, it is pending once, and
+    /// many more events than distinct paths do not overflow.
+    #[test]
+    fn events_for_one_path_are_applied_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = ProjectCache::new(1 << 20);
+        let main = Url::from_file_path(temp.path().join("Main.pas")).unwrap();
+        store_import(&cache, &main, vec![]);
+        let (sender, events) = WatchEvents::channel();
+        let built = (0..1024)
+            .map(|index| temp.path().join(format!("Unit{index}.dcu")))
+            .collect::<Vec<_>>();
+        for _ in 0..3 {
+            for path in &built {
+                sender.send(WatchEvent::Changed(vec![path.clone()]));
+                sender.send(WatchEvent::Modified(vec![path.clone()]));
+            }
+        }
+        assert!(!overflowed(&events));
+        for _ in 0..built.len().div_ceil(MAX_WATCH_EVENTS_PER_TURN) {
+            events.drain(&cache, MAX_WATCH_EVENTS_PER_TURN, &|_| false);
+        }
+        assert_eq!(events.applied(), (built.len() as u64, 0));
+        assert_eq!(cache.stats().imports, 1, "nothing observed the units");
+
+        // A Modified then Changed path is applied as Changed, once.
+        let main_path = main.to_file_path().unwrap();
+        sender.send(WatchEvent::Modified(vec![main_path.clone()]));
+        sender.send(WatchEvent::Changed(vec![main_path]));
+        assert_eq!(
+            events.recv_timeout(Duration::ZERO),
+            Some(WatchEvent::Changed(vec![temp.path().join("Main.pas")]))
+        );
+        assert_eq!(events.recv_timeout(Duration::ZERO), None);
     }
 
     /// l4d-vrw0: events for the store's own files invalidate nothing.
@@ -463,7 +669,7 @@ mod tests {
             WatchEvent::Modified(vec![store.join("analysis-v7.sqlite3")]),
             WatchEvent::Changed(vec![store.clone(), store.join("namespaces")]),
         ] {
-            enqueue(&sender.sender, &sender.overflowed, event);
+            sender.send(event);
         }
         let ignored = |path: &Path| path.starts_with(&store);
         assert!(
@@ -474,11 +680,9 @@ mod tests {
         assert_eq!(cache.stats().imports, 1);
 
         // The same events, not ignored, invalidate the import.
-        enqueue(
-            &sender.sender,
-            &sender.overflowed,
-            WatchEvent::Changed(vec![store.join("analysis-v7.sqlite3-wal")]),
-        );
+        sender.send(WatchEvent::Changed(vec![
+            store.join("analysis-v7.sqlite3-wal"),
+        ]));
         assert_eq!(
             events.drain(&cache, MAX_WATCH_EVENTS_PER_TURN, &|_| false),
             vec![main]
@@ -497,11 +701,7 @@ mod tests {
         }
         let (sender, events) = WatchEvents::channel();
         for uri in &uris {
-            enqueue(
-                &sender.sender,
-                &sender.overflowed,
-                WatchEvent::Changed(vec![uri.to_file_path().unwrap()]),
-            );
+            sender.send(WatchEvent::Changed(vec![uri.to_file_path().unwrap()]));
         }
 
         assert_eq!(events.drain(&cache, 2, &|_| false), uris[..2]);

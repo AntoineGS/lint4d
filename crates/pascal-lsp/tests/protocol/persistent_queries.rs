@@ -436,7 +436,7 @@ fn wait_contexts(server: &mut TestServer, predicate: impl Fn(&[Value]) -> bool) 
 /// reuse pass; once that pass has reloaded every member from the store, the
 /// same request answers fully.
 #[test]
-fn an_evicted_target_answers_partially_then_fully_after_its_reuse_pass() {
+fn an_evicted_target_gives_the_proven_warm_answer_before_its_reuse_pass() {
     const EVICTED: FixtureSpec = FixtureSpec {
         units: 300,
         importers: 5,
@@ -497,6 +497,12 @@ fn an_evicted_target_answers_partially_then_fully_after_its_reuse_pass() {
             .any(|note| note.contains("units of App.dproj are not indexed yet")),
         "every candidate was validated on demand: {notes:?}"
     );
+    // The members the stored rows did not select are within the bound of
+    // direct reads, so none is left out on their word.
+    assert!(
+        !notes.iter().any(|note| note.contains("not re-validated")),
+        "{notes:?}"
+    );
     assert_eq!(partial, expected, "only proven locations, all of them");
 
     let reloaded = wait_contexts(&mut server, |contexts| {
@@ -521,7 +527,7 @@ fn an_evicted_target_answers_partially_then_fully_after_its_reuse_pass() {
 /// (l4d-c8l2), so it gives the warm answer without the "not indexed yet"
 /// gap; after `complete` it answers alike.
 #[test]
-fn a_query_during_the_reuse_pass_answers_proven_partial_results() {
+fn a_query_during_the_reuse_pass_gives_the_proven_warm_answer() {
     const HELD: usize = 5;
     let environment = tempfile::tempdir().unwrap();
     let root = query_fixture(environment.path(), &SPEC);
@@ -576,6 +582,10 @@ fn a_query_during_the_reuse_pass_answers_proven_partial_results() {
         "the response arrived before complete: {held}"
     );
     assert!(!not_indexed(&notes), "{notes:?}");
+    assert!(
+        !notes.iter().any(|note| note.contains("not re-validated")),
+        "the unselected members are within the bound of direct reads: {notes:?}"
+    );
     assert_eq!(partial, expected, "only proven locations, all of them");
 
     fs::write(&barrier.release, b"").unwrap();

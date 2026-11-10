@@ -72,10 +72,10 @@ pub use store::{
     MAX_SCRATCH_BYTES, MAX_SNAPSHOT_CANDIDATES, MAX_SNAPSHOT_MEMBERS, MAX_SUPPLEMENTAL_BYTES,
     MAX_WAIT, MIN_BUDGET_TO_WAL_RATIO, MIN_CONNECTION_PAGE_CACHE_BYTES, MIN_HEALTH_BACKOFF,
     MIN_SQLITE_VERSION_NUMBER, MIN_WAL_THRESHOLD_BYTES, Maintenance, MaintenanceLimits,
-    MaintenanceLimitsError, Malformed, MemberBatch, MemberRecordHeader, MemberRecordReader, Miss,
-    ObservationBatch, Phase, PolicyError, PolicyState, Pressure, Published, PublishedEvidence,
-    PublishedRecord, PublishedSet, ROW_OVERHEAD_BYTES, Reclaimed, RetireReport, RetireStep,
-    RootMismatch, RowBatch, SQLITE_LENGTH_LIMIT, Scope, SealRefusal, SnapshotBuilder,
+    MaintenanceLimitsError, Malformed, MemberBatch, MemberRecordHeader, MemberRecordReader,
+    MembersWithRows, Miss, ObservationBatch, Phase, PolicyError, PolicyState, Pressure, Published,
+    PublishedEvidence, PublishedRecord, PublishedSet, ROW_OVERHEAD_BYTES, Reclaimed, RetireReport,
+    RetireStep, RootMismatch, RowBatch, SQLITE_LENGTH_LIMIT, Scope, SealRefusal, SnapshotBuilder,
     SnapshotHeader, SnapshotId, SnapshotMember, SnapshotReader, SnapshotSeal, StepBudget,
     StepReport, Store, StoreLimits, StoreLocation, StorePolicy, StoredRow, TooLarge, Unhealthy,
     Usage, default_directory,
@@ -89,7 +89,8 @@ pub use store::INDEX_QUERY_FOR_TEST;
 #[cfg(feature = "test-support")]
 pub use store::{
     CONTAINING_FILTER_FOR_TEST, EQUAL_FILTER_FOR_TEST, IMPORTERS_QUERY_FOR_TEST,
-    MEMBER_QUERY_FOR_TEST, members_with_rows_query_for_test,
+    MEMBER_QUERY_FOR_TEST, MEMBERS_OBSERVING_QUERY_FOR_TEST, MEMBERS_WITH_ARTIFACTS_QUERY_FOR_TEST,
+    members_with_rows_query_for_test,
 };
 #[cfg(feature = "test-support")]
 pub use store::{HeldConnection, MaintenanceLockHold, ScratchHold};

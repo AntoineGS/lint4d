@@ -60,9 +60,11 @@ pub use outcome::{Bypass, Integrity, LocationIssue, Lookup, Malformed, Miss, Pub
 pub use queries::{
     CONTAINING_FILTER as CONTAINING_FILTER_FOR_TEST, EQUAL_FILTER as EQUAL_FILTER_FOR_TEST,
     IMPORTERS_QUERY as IMPORTERS_QUERY_FOR_TEST, MEMBER_QUERY as MEMBER_QUERY_FOR_TEST,
+    MEMBERS_OBSERVING_QUERY as MEMBERS_OBSERVING_QUERY_FOR_TEST,
+    MEMBERS_WITH_ARTIFACTS_QUERY as MEMBERS_WITH_ARTIFACTS_QUERY_FOR_TEST,
     members_with_rows_query as members_with_rows_query_for_test,
 };
-pub use queries::{Dependency, ImporterHit, ImporterPage, IndexKeyMatch};
+pub use queries::{Dependency, ImporterHit, ImporterPage, IndexKeyMatch, MembersWithRows};
 pub use reader::{ArtifactReader, RowBatch, StoredRow};
 pub use records::{BindingBatch, MemberRecordHeader, MemberRecordReader, PublishedRecord};
 pub use snapshots::{

@@ -298,9 +298,6 @@ struct Member {
     admission_limit: Option<&'static str>,
     /// The proven record of this member's state, set by this process.
     record: Option<Digest>,
-    /// Invalidated (a watcher or edit event) while it was never indexed in
-    /// this process: its stored facts are known to describe older bytes.
-    invalidated: bool,
 }
 
 /// The deferral reason of a member whose previous refusal is tried again.
@@ -704,15 +701,16 @@ impl ContextIndex {
             .collect()
     }
 
-    /// Members never indexed in this process, not invalidated since it
-    /// started and not asked of the store yet, in path order: what the
-    /// reuse pass has still to validate from the stored facts (l4d-c8l2).
+    /// Members never indexed by this index and not asked of the store yet,
+    /// nor deferred, in path order: what the reuse pass has still to
+    /// validate from the stored facts (l4d-c8l2). Whether one changed since
+    /// the process started is the project cache's record
+    /// (`ProjectCache::changed_since_start`), which survives an eviction.
     pub(crate) fn awaiting_first_reuse(&self) -> Vec<PathBuf> {
         self.pending_members()
             .filter(|member| {
                 matches!(member.state(), MemberState::Unindexed)
                     && !member.reuse_tried
-                    && !member.invalidated
                     && member.deferred == 0
             })
             .map(|member| member.path.clone())
@@ -1051,7 +1049,6 @@ impl ContextIndex {
         member.state = Some(MemberState::Fresh);
         member.charged = charged;
         member.reuse_tried = false;
-        member.invalidated = false;
         let path = member.path.clone();
         self.member_bytes += charged;
         self.name_bytes += paid.saturating_sub(charged);
@@ -1132,11 +1129,7 @@ impl ContextIndex {
                 member.admission_limit = None;
                 true
             }
-            MemberState::Unindexed => {
-                member.invalidated = true;
-                false
-            }
-            MemberState::Stale => false,
+            MemberState::Unindexed | MemberState::Stale => false,
         }
     }
 

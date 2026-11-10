@@ -80,9 +80,62 @@ pub fn members_with_rows_query(filter: &str) -> String {
 /// needle is matched bytewise, so a caller matching case-insensitively
 /// passes it ASCII-lowercased against ASCII-lowercased keys and keeps every
 /// key it could not compare that way.
-pub const CONTAINING_FILTER: &str = "(instr(r.index_key, ?6) > 0 \
+/// A scan covers one page of keys, `?9 <= key < ?10`, so a caller can
+/// stop between pages.
+pub const CONTAINING_FILTER: &str = "r.index_key >= ?9 AND r.index_key < ?10 \
+     AND (instr(r.index_key, ?6) > 0 \
      OR length(CAST(r.index_key AS TEXT)) <> length(r.index_key))";
-pub const EQUAL_FILTER: &str = "r.index_key = ?6";
+pub const EQUAL_FILTER: &str = "r.index_key = ?6 AND ?9 IS NOT NULL AND ?10 IS NOT NULL";
+
+/// The source keys of one snapshot's live members whose live record has a
+/// live artifact (l4d-c8l2): the members whose stored rows a
+/// `find_members_with_rows` answer covers. `CROSS JOIN` pins the order:
+/// the snapshot's members by their primary key, their records, then the
+/// artifact by its unique key. `pub` only so `test-support` can re-export it.
+pub const MEMBERS_WITH_ARTIFACTS_QUERY: &str = "SELECT length(m.source_key), m.source_key \
+     FROM snapshot_members m CROSS JOIN member_records mr CROSS JOIN artifacts a \
+     WHERE m.namespace_id = ?1 AND m.reset_epoch = ?2 AND m.snapshot_id = ?3 \
+     AND mr.namespace_id = ?1 AND mr.reset_epoch = ?2 AND mr.record_id = m.record_id \
+     AND mr.lifecycle = ?4 AND mr.artifact_id IS NOT NULL \
+     AND a.namespace_id = ?1 AND a.reset_epoch = ?2 AND a.artifact_id = mr.artifact_id \
+     AND a.lifecycle = ?4";
+
+/// The source keys of one snapshot's live members whose live member
+/// evidence observed the canonical path `?4` (l4d-c8l2): an include, or any
+/// other payload, their stored facts were extracted from. `CROSS JOIN` pins
+/// the order: the observations of the path (`observation_content_by_path`),
+/// the evidence sets holding them, the records naming those as member
+/// evidence (the partial `member_records_by_evidence`, named), and their
+/// membership. `pub` only so `test-support` can re-export it.
+pub const MEMBERS_OBSERVING_QUERY: &str = "SELECT DISTINCT length(m.source_key), m.source_key \
+     FROM observation_content o CROSS JOIN evidence_observations eo \
+     CROSS JOIN evidence_sets e \
+     CROSS JOIN member_records mr INDEXED BY member_records_by_evidence \
+     CROSS JOIN snapshot_members m \
+     WHERE o.namespace_id = ?1 AND o.reset_epoch = ?2 AND o.path_key = ?4 \
+     AND eo.observation = o.observation \
+     AND e.evidence_ref = eo.evidence_ref AND e.lifecycle = ?5 \
+     AND mr.namespace_id = ?1 AND mr.reset_epoch = ?2 AND mr.member_evidence = e.evidence_id \
+     AND mr.member_evidence IS NOT NULL AND mr.lifecycle = ?5 \
+     AND m.namespace_id = ?1 AND m.reset_epoch = ?2 AND m.record_id = mr.record_id \
+     AND m.snapshot_id = ?3";
+
+/// What `find_members_with_rows` found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MembersWithRows {
+    /// The matching members' source keys, in no particular order.
+    Found(Vec<Vec<u8>>),
+    /// More than the limit match.
+    OverLimit,
+    /// The caller's `stop` asked to end the scan.
+    Stopped,
+}
+
+/// One page of a row scan: the needle, then `low <= key < high`.
+type KeyPage<'a> = (&'a [u8], Vec<u8>, Vec<u8>);
+
+/// How often the member listings check `stop`, in rows.
+const STOP_EVERY_ROWS: usize = 1024;
 
 /// Which index keys `find_members_with_rows` keeps.
 #[derive(Debug, Clone, Copy)]
@@ -366,18 +419,20 @@ impl Store {
 
     /// The canonical source keys (`path_key`) of the live members of
     /// `snapshot` whose live artifact holds a row of `row_kind` whose index
-    /// key `matching` keeps, in no particular order; `None` when more than
-    /// `limit` members match (l4d-c8l2). A hit selects a candidate to
+    /// key `matching` keeps (l4d-c8l2). A hit selects a candidate to
     /// re-validate: the artifact and record are unverified until read (spec
     /// §6.1, §7), and a member absent from the answer is proven nothing.
-    /// Each kept key is charged to the scratch as it is read.
+    /// A `Containing` scan runs in pages of keys by their first byte and
+    /// asks `stop` before each page; `Equal` asks before each key. Each kept
+    /// key is charged to the scratch as it is read.
     pub fn find_members_with_rows(
         &self,
         snapshot: &SnapshotHeader,
         row_kind: u8,
         matching: IndexKeyMatch<'_>,
         limit: usize,
-    ) -> Result<Lookup<Option<Vec<Vec<u8>>>>, Bypass> {
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Lookup<MembersWithRows>, Bypass> {
         self.guarded(Access::Read, || {
             if snapshot.scope != self.scope {
                 return Err(Bypass::Fenced);
@@ -389,17 +444,40 @@ impl Store {
                 return Ok(Lookup::Miss(miss));
             }
             let Some(scope_ref) = scope_ref(&transaction, self.scope)? else {
-                return Ok(Lookup::Hit(Some(Vec::new())));
+                return Ok(Lookup::Hit(MembersWithRows::Found(Vec::new())));
             };
             let read = |error: rusqlite::Error| classify_read(&error).map(Lookup::Miss);
-            let (filter, needles): (&str, Vec<&[u8]>) = match matching {
-                IndexKeyMatch::Containing(needle) => (CONTAINING_FILTER, vec![needle]),
-                IndexKeyMatch::Equal(keys) => (EQUAL_FILTER, keys.to_vec()),
+            // (needle, low, high): `low <= key < high`; the last page's high
+            // bound is past any stored key.
+            let past_every_key = vec![0xff_u8; MAX_INDEX_KEY_BYTES + 1];
+            let (filter, pages): (&str, Vec<KeyPage<'_>>) = match matching {
+                IndexKeyMatch::Containing(needle) => (
+                    CONTAINING_FILTER,
+                    (0..=u8::MAX)
+                        .map(|first| {
+                            let low = if first == 0 { Vec::new() } else { vec![first] };
+                            let high = match first.checked_add(1) {
+                                Some(next) => vec![next],
+                                None => past_every_key.clone(),
+                            };
+                            (needle, low, high)
+                        })
+                        .collect(),
+                ),
+                IndexKeyMatch::Equal(keys) => (
+                    EQUAL_FILTER,
+                    keys.iter()
+                        .map(|key| (*key, Vec::new(), Vec::new()))
+                        .collect(),
+                ),
             };
             let query = members_with_rows_query(filter);
             let mut found = std::collections::HashSet::<Vec<u8>>::new();
             let mut leases = Vec::new();
-            for needle in needles {
+            for (needle, low, high) in pages {
+                if stop() {
+                    return Ok(Lookup::Hit(MembersWithRows::Stopped));
+                }
                 if needle.len() > MAX_INDEX_KEY_BYTES {
                     continue;
                 }
@@ -416,15 +494,11 @@ impl Store {
                         i64::from(row_kind),
                         needle,
                         LIVE,
-                        i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX)
+                        i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX),
+                        low,
+                        high
                     ],
-                    |row| {
-                        let length = row.get::<_, i64>(0)?;
-                        usize::try_from(length)
-                            .is_ok_and(|length| length <= MAX_INDEX_KEY_BYTES)
-                            .then(|| row.get::<_, Vec<u8>>(1))
-                            .transpose()
-                    },
+                    source_key,
                 );
                 let rows = match rows {
                     Ok(rows) => rows,
@@ -440,7 +514,7 @@ impl Store {
                         continue;
                     }
                     if found.len() >= limit {
-                        return Ok(Lookup::Hit(None));
+                        return Ok(Lookup::Hit(MembersWithRows::OverLimit));
                     }
                     let Some(lease) = self.scratch.reserve(source.len() as u64) else {
                         return Err(Bypass::ScratchExhausted);
@@ -449,9 +523,116 @@ impl Store {
                     found.insert(source);
                 }
             }
-            Ok(Lookup::Hit(Some(found.into_iter().collect())))
+            Ok(Lookup::Hit(MembersWithRows::Found(
+                found.into_iter().collect(),
+            )))
         })
     }
+
+    /// The canonical source keys of the live members of `snapshot` whose
+    /// live record has a live artifact: those whose stored rows
+    /// `find_members_with_rows` searched (l4d-c8l2). A member without one
+    /// (an artifact-less refusal or over-size record) has no stored index.
+    /// `None` when `stop` asked to end the listing (checked every 1,024
+    /// rows). Each key is charged to the scratch as it is read.
+    pub fn find_members_with_artifacts(
+        &self,
+        snapshot: &SnapshotHeader,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Lookup<Option<Vec<Vec<u8>>>>, Bypass> {
+        self.members_of(snapshot, MEMBERS_WITH_ARTIFACTS_QUERY, None, stop)
+    }
+
+    /// The canonical source keys of the live members of `snapshot` whose
+    /// live member evidence observed `path` (l4d-c8l2): the members whose
+    /// stored facts a change to `path`, an include for instance, may make
+    /// stale. `None` when `stop` asked to end the listing.
+    pub fn find_members_observing(
+        &self,
+        snapshot: &SnapshotHeader,
+        path: &Path,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Lookup<Option<Vec<Vec<u8>>>>, Bypass> {
+        if over_long(path) {
+            return Ok(Lookup::Hit(Some(Vec::new())));
+        }
+        self.members_of(
+            snapshot,
+            MEMBERS_OBSERVING_QUERY,
+            Some(path_key(path)),
+            stop,
+        )
+    }
+
+    /// The source keys `query` lists for `snapshot`, its fourth parameter
+    /// `key` (else `LIVE`) and its fifth `LIVE`.
+    fn members_of(
+        &self,
+        snapshot: &SnapshotHeader,
+        query: &str,
+        key: Option<Vec<u8>>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Lookup<Option<Vec<Vec<u8>>>>, Bypass> {
+        self.guarded(Access::Read, || {
+            if snapshot.scope != self.scope {
+                return Err(Bypass::Fenced);
+            }
+            let mut reader = self.reader()?;
+            let transaction = begin(&mut reader, TransactionBehavior::Deferred)?;
+            ensure_live(&transaction, self.scope)?;
+            if let Some(miss) = snapshot_ineligible(&transaction, self.scope, snapshot.id)? {
+                return Ok(Lookup::Miss(miss));
+            }
+            let read = |error: rusqlite::Error| classify_read(&error).map(Lookup::Miss);
+            let mut statement = match transaction.prepare_cached(query) {
+                Ok(statement) => statement,
+                Err(error) => return read(error),
+            };
+            let namespace = self.scope.namespace.as_bytes().as_slice();
+            let id = snapshot.id.as_bytes().as_slice();
+            let rows = match &key {
+                Some(key) => statement.query_map(
+                    params![namespace, epoch(self.scope), id, key.as_slice(), LIVE],
+                    source_key,
+                ),
+                None => {
+                    statement.query_map(params![namespace, epoch(self.scope), id, LIVE], source_key)
+                }
+            };
+            let rows = match rows {
+                Ok(rows) => rows,
+                Err(error) => return read(error),
+            };
+            let mut found = Vec::new();
+            let mut leases = Vec::new();
+            for (at, row) in rows.enumerate() {
+                if at % STOP_EVERY_ROWS == 0 && stop() {
+                    return Ok(Lookup::Hit(None));
+                }
+                let source = match row {
+                    Ok(Some(source)) => source,
+                    Ok(None) => return Ok(Lookup::Miss(Miss::Malformed(Malformed::Snapshot))),
+                    Err(error) => return read(error),
+                };
+                let Some(lease) = self.scratch.reserve(source.len() as u64) else {
+                    return Err(Bypass::ScratchExhausted);
+                };
+                leases.push(lease);
+                found.push(source);
+            }
+            Ok(Lookup::Hit(Some(found)))
+        })
+    }
+}
+
+/// A listed source key after its length: one over any stored key's bound
+/// is `None` and never loaded.
+fn source_key(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<Vec<u8>>> {
+    let length = row.get::<_, i64>(0)?;
+    usize::try_from(length)
+        .is_ok_and(|length| length <= MAX_INDEX_KEY_BYTES)
+        .then(|| row.get::<_, Vec<u8>>(1))
+        .transpose()
 }
 
 /// Whether `path`'s key would exceed any key the store writes, from its

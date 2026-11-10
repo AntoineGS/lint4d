@@ -476,13 +476,33 @@ fn snapshot_queries_use_their_indexes_without_sorting() {
         let rows = plan(
             directory.path(),
             &pascal_cache::members_with_rows_query_for_test(filter),
-            8,
+            10,
         );
         assert!(!rows.contains("SCAN"), "{rows}");
         assert!(rows.contains("INDEX artifact_rows_by_index_key "), "{rows}");
         assert!(rows.contains("INDEX member_records_by_artifact "), "{rows}");
         assert!(rows.contains("INDEX snapshot_members_by_record "), "{rows}");
     }
+    let listed = plan(
+        directory.path(),
+        pascal_cache::MEMBERS_WITH_ARTIFACTS_QUERY_FOR_TEST,
+        4,
+    );
+    assert!(!listed.contains("SCAN"), "{listed}");
+    let observing = plan(
+        directory.path(),
+        pascal_cache::MEMBERS_OBSERVING_QUERY_FOR_TEST,
+        5,
+    );
+    assert!(!observing.contains("SCAN"), "{observing}");
+    assert!(
+        observing.contains("INDEX observation_content_by_path "),
+        "{observing}"
+    );
+    assert!(
+        observing.contains("INDEX member_records_by_evidence "),
+        "{observing}"
+    );
 }
 
 /// Spec §10: a query's result vector is charged to the scratch before it is
@@ -842,7 +862,7 @@ fn sources(paths: &[&str]) -> BTreeSet<Vec<u8>> {
 /// equals one of a list. A selection hint only, before re-validation.
 #[test]
 fn members_with_matching_rows_come_from_one_snapshot() {
-    use pascal_cache::{DECLARATION_ROW, IndexKeyMatch};
+    use pascal_cache::{DECLARATION_ROW, IndexKeyMatch, MembersWithRows};
     let directory = private_tempdir();
     let store = open(directory.path());
     let a = member_with_rows(
@@ -879,12 +899,16 @@ fn members_with_matching_rows_come_from_one_snapshot() {
     let header = sealed(&store, &[a, b, c, d, e, unindexed]);
     let present: [&[u8]; 2] = [b"tdatabaseinfo", b"zz"];
     let absent: [&[u8]; 1] = [b"databaseinfo"];
+    let never = || false;
     let found = |row_kind, matching, limit| match store
-        .find_members_with_rows(&header, row_kind, matching, limit)
+        .find_members_with_rows(&header, row_kind, matching, limit, &never)
         .unwrap()
     {
-        Lookup::Hit(found) => found.map(|found| found.into_iter().collect::<BTreeSet<_>>()),
-        Lookup::Miss(miss) => panic!("{miss:?}"),
+        Lookup::Hit(MembersWithRows::Found(found)) => {
+            Some(found.into_iter().collect::<BTreeSet<_>>())
+        }
+        Lookup::Hit(MembersWithRows::OverLimit) => None,
+        other => panic!("{other:?}"),
     };
     assert_eq!(
         found(
@@ -919,6 +943,17 @@ fn members_with_matching_rows_come_from_one_snapshot() {
         None,
         "more members than the limit"
     );
+    // Only the members with a live artifact have stored rows to search:
+    // the binding-free record `U0` has none.
+    let with_artifacts =
+        |store: &Store| match store.find_members_with_artifacts(&header, &never).unwrap() {
+            Lookup::Hit(Some(found)) => found.into_iter().collect::<BTreeSet<_>>(),
+            other => panic!("{other:?}"),
+        };
+    assert_eq!(
+        with_artifacts(&store),
+        sources(&["/w/A.pas", "/w/B.pas", "/w/C.pas", "/w/D.pas", "/w/E.pas"])
+    );
     assert!(store.retire_member_record(b).unwrap());
     assert_eq!(
         found(
@@ -929,6 +964,11 @@ fn members_with_matching_rows_come_from_one_snapshot() {
         Some(sources(&["/w/A.pas", "/w/D.pas"])),
         "a retired record is not a member"
     );
+    assert_eq!(
+        with_artifacts(&store),
+        sources(&["/w/A.pas", "/w/C.pas", "/w/D.pas", "/w/E.pas"]),
+        "nor a member with stored rows"
+    );
     assert!(store.retire_snapshot(header.id()).unwrap());
     assert_eq!(
         store
@@ -936,10 +976,143 @@ fn members_with_matching_rows_come_from_one_snapshot() {
                 &header,
                 DECLARATION_ROW,
                 IndexKeyMatch::Containing(b"x"),
-                10
+                10,
+                &never
             )
             .unwrap(),
         Lookup::Miss(Miss::Retired)
     );
     assert_eq!(store.scratch_in_use(), 0, "nothing stays reserved");
+}
+
+/// l4d-c8l2: a scan asks its caller before each page of keys, so a
+/// cancelled request does not pay for the rest of it.
+#[test]
+fn a_row_scan_stops_when_asked() {
+    use pascal_cache::{DECLARATION_ROW, IndexKeyMatch, MembersWithRows};
+    use std::cell::Cell;
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    let members = ["a", "m", "z"]
+        .iter()
+        .map(|name| {
+            member_with_rows(
+                &store,
+                &format!("/w/{name}.pas"),
+                name,
+                DECLARATION_ROW,
+                &[format!("{name}key").as_bytes()],
+            )
+        })
+        .collect::<Vec<_>>();
+    let header = sealed(&store, &members);
+    let asked = Cell::new(0);
+    let stop_after_two = || {
+        asked.set(asked.get() + 1);
+        asked.get() > 2
+    };
+    assert_eq!(
+        store
+            .find_members_with_rows(
+                &header,
+                DECLARATION_ROW,
+                IndexKeyMatch::Containing(b"key"),
+                10,
+                &stop_after_two
+            )
+            .unwrap(),
+        Lookup::Hit(MembersWithRows::Stopped)
+    );
+    assert_eq!(
+        asked.get(),
+        3,
+        "asked before each page, stopped at the third"
+    );
+    asked.set(0);
+    let Lookup::Hit(MembersWithRows::Found(all)) = store
+        .find_members_with_rows(
+            &header,
+            DECLARATION_ROW,
+            IndexKeyMatch::Containing(b"key"),
+            10,
+            &|| {
+                asked.set(asked.get() + 1);
+                false
+            },
+        )
+        .unwrap()
+    else {
+        panic!("a full scan answers")
+    };
+    assert_eq!(all.len(), 3);
+    assert_eq!(asked.get(), 256, "one page per first byte");
+    assert_eq!(
+        store
+            .find_members_with_artifacts(&header, &|| true)
+            .unwrap(),
+        Lookup::Hit(None)
+    );
+    assert_eq!(store.scratch_in_use(), 0);
+}
+
+/// l4d-c8l2: the members whose stored member evidence observed a path (an
+/// include) are found through the observation's path index.
+#[test]
+fn members_observing_an_include_come_from_one_snapshot() {
+    use pascal_cache::{
+        ArtifactKeyRef, EvidenceWrite, ExpandedArtifactKey, LocalArtifactKey, Observation,
+        SourceContent,
+    };
+    use pascal_project::{ConditionalContext, SourceOrigin};
+    let directory = private_tempdir();
+    let store = open(directory.path());
+    let mut published = Vec::new();
+    for (path, include) in [("/w/A.pas", "/w/Shared.inc"), ("/w/B.pas", "/w/Other.inc")] {
+        let root = LocalArtifactKey::new(
+            &SourceContent::from_bytes(path.as_bytes()),
+            &ConditionalContext::default(),
+            SourceOrigin::ProjectCompiled,
+        );
+        let expanded = ExpandedArtifactKey::new(&root, &[]).unwrap();
+        let key = ArtifactKeyRef::expanded(&expanded, &root).unwrap();
+        let observations = [Observation::Presence {
+            path: include.into(),
+            entry: None,
+            present: true,
+        }];
+        let facts = pascal_core::facts::ArtifactFacts {
+            slot_lengths: vec![12],
+            expanded_length: 12,
+            ..pascal_core::facts::ArtifactFacts::default()
+        };
+        store
+            .publish_facts_with_evidence(
+                key,
+                &facts,
+                &EvidenceWrite {
+                    context: &context(),
+                    observations: &observations,
+                },
+            )
+            .unwrap();
+        let Lookup::Hit(headers) = store.find_evidence(&context(), &root).unwrap() else {
+            panic!("artifact evidence is live")
+        };
+        let mut record = member(path, &[], pascal_cache::Digest::from_bytes([0; 32]));
+        record.header.artifact = Some(key.digest());
+        record.header.member_evidence = Some(headers[0].evidence_id());
+        published.push(store.publish_member_record(&record).unwrap().record_id);
+    }
+    let header = sealed(&store, &published);
+    let observing = |path: &str| match store
+        .find_members_observing(&header, Path::new(path), &|| false)
+        .unwrap()
+    {
+        Lookup::Hit(Some(found)) => found.into_iter().collect::<BTreeSet<_>>(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(observing("/w/Shared.inc"), sources(&["/w/A.pas"]));
+    assert_eq!(observing("/w/Other.inc"), sources(&["/w/B.pas"]));
+    assert_eq!(observing("/w/None.inc"), BTreeSet::new());
+    assert_eq!(store.scratch_in_use(), 0);
 }

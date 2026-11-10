@@ -4781,7 +4781,7 @@ impl Workspace {
                 let left = before - unverified.len();
                 if left > 0 {
                     result.gaps.push(format!(
-                        "{left} units of {display} are not re-validated since the start yet; their stored index selected none of them, so they were not searched"
+                        "{left} units of {display} are not re-validated since the start yet; their stored index holds no match, so they were not searched"
                     ));
                 }
             }
@@ -5003,12 +5003,20 @@ impl RootFiles {
 /// snapshot: at most this many; more fall back to the bounded direct reads.
 const MAX_ON_DEMAND_REUSE: usize = 1024;
 
+/// Paths changed since the start that a request maps to the snapshot
+/// members whose stored evidence read them; more turn the selection off.
+const MAX_CHANGED_TO_MAP: usize = 256;
+
+/// A cached symbol selection a longer query reuses when it holds at most
+/// this many members: validating them costs less than a new scan.
+const MAX_REUSED_SUPERSET: usize = 64;
+
 /// What a request took from the stored index of one target ahead of the
 /// reuse pass (l4d-c8l2).
 struct PersistedSelection {
-    /// `path_key`s of the members awaiting their first reuse that the
-    /// snapshot lists but whose stored facts the request does not select:
-    /// left out, best-effort, with a note.
+    /// `path_key`s of the members awaiting their first reuse whose live
+    /// stored rows the request searched without a match: left out,
+    /// best-effort, with a note.
     unselected: HashSet<String>,
 }
 
@@ -5017,7 +5025,7 @@ struct PersistedSelection {
 /// when the stored keys cannot be a superset of what the index would
 /// select (a non-ASCII or non-identifier query, a name without a posting
 /// key).
-fn stored_selection(selection: Selection<'_>) -> Option<(u8, Vec<Vec<u8>>, bool)> {
+fn stored_selection(selection: Selection<'_>) -> Option<StoredSelection> {
     match selection {
         Selection::Symbols {
             query,
@@ -5030,13 +5038,7 @@ fn stored_selection(selection: Selection<'_>) -> Option<(u8, Vec<Vec<u8>>, bool)
                 && query
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
-            .then(|| {
-                (
-                    pascal_cache::DECLARATION_ROW,
-                    vec![query.to_ascii_lowercase().into_bytes()],
-                    true,
-                )
-            })
+            .then(|| StoredSelection::Declarations(query.to_ascii_lowercase().into_bytes()))
         }
         Selection::Candidates(Some(query)) => {
             let keys = query
@@ -5045,26 +5047,61 @@ fn stored_selection(selection: Selection<'_>) -> Option<(u8, Vec<Vec<u8>>, bool)
                 .map(|name| crate::workspace_index::posting_key(name))
                 .collect::<Option<Vec<_>>>()?;
             (!keys.is_empty()).then(|| {
-                (
-                    pascal_cache::POSTING_ROW,
-                    keys.into_iter().map(String::into_bytes).collect(),
-                    false,
-                )
+                StoredSelection::Postings(keys.into_iter().map(String::into_bytes).collect())
             })
         }
         _ => None,
     }
 }
 
+/// The stored rows a request selects members by.
+enum StoredSelection {
+    /// Declarations whose key contains this needle.
+    Declarations(Vec<u8>),
+    /// Postings of one of these names.
+    Postings(Vec<Vec<u8>>),
+}
+
+impl StoredSelection {
+    fn row_kind(&self) -> u8 {
+        match self {
+            Self::Declarations(_) => pascal_cache::DECLARATION_ROW,
+            Self::Postings(_) => pascal_cache::POSTING_ROW,
+        }
+    }
+
+    fn needles(&self) -> Vec<Vec<u8>> {
+        match self {
+            Self::Declarations(needle) => vec![needle.clone()],
+            Self::Postings(keys) => keys.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static STORED_ROW_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Store scans of stored rows a request made since the last call
+/// (l4d-c8l2).
+#[cfg(test)]
+pub(crate) fn take_stored_row_scans() -> usize {
+    STORED_ROW_SCANS.with(|count| count.replace(0))
+}
+
 impl Workspace {
     /// Before the reuse pass has validated `key`'s members, select the
     /// candidates of `selection` from the stored index of its held sealed
-    /// snapshot and validate those now (l4d-c8l2, D48/D49). A stored row is
-    /// a hint only: a selected member answers once its stored facts are
+    /// snapshot and validate those now (l4d-c8l2, D48/D49/D55). A stored row
+    /// is a hint only: a selected member answers once its stored facts are
     /// proven current like the reuse pass proves them, and a selected member
-    /// that fails stays unverified (read directly, as before). `None` when
-    /// nothing awaits a first reuse, without a store or snapshot, or when the
-    /// stored rows cannot select (`stored_selection`).
+    /// that fails stays unverified (read directly, as before). Only a member
+    /// with a live stored artifact can be left out unselected; one changed
+    /// since the start, or whose stored evidence read a path that changed,
+    /// keeps the previous path. `None` when nothing awaits a first reuse,
+    /// without a store or snapshot, when the changes since the start are
+    /// unknown, or when the stored rows cannot select (`stored_selection`).
     fn persisted_selection(
         &mut self,
         input: &WorkspaceInput,
@@ -5077,7 +5114,7 @@ impl Workspace {
         if !self.persistent_cache().is_enabled() {
             return Ok(None);
         }
-        let Some((row_kind, keys, containing)) = stored_selection(selection) else {
+        let Some(stored_selection) = stored_selection(selection) else {
             return Ok(None);
         };
         let waiting = self
@@ -5085,6 +5122,12 @@ impl Workspace {
             .read_index(key, |index, _| index.awaiting_first_reuse())
             .unwrap_or_default();
         if waiting.is_empty() {
+            return Ok(None);
+        }
+        let Some(changed) = self.project_cache.changed_since_start() else {
+            return Ok(None);
+        };
+        if changed.len() > MAX_CHANGED_TO_MAP {
             return Ok(None);
         }
         let started = Instant::now();
@@ -5099,52 +5142,134 @@ impl Workspace {
         let Some(hint) = self.project_cache.baseline_hint(key) else {
             return Ok(None);
         };
-        let Some(job) = self.persistent_cache().job() else {
+        let snapshot = hint.header().id();
+        let adopted = started.elapsed();
+        let stop = || cancel.load(Ordering::Relaxed);
+        let stopped = || -> Result<Option<PersistedSelection>, String> {
+            if stop() {
+                Err(CANCELLATION_MESSAGE.to_owned())
+            } else {
+                Ok(None)
+            }
+        };
+        let row_kind = stored_selection.row_kind();
+        let query = (snapshot, row_kind, stored_selection.needles());
+        let cached = match &stored_selection {
+            StoredSelection::Declarations(needle) => {
+                self.project_cache.stored_rows_selected(&query).or_else(|| {
+                    self.project_cache
+                        .stored_rows_containing(snapshot, row_kind, needle, MAX_REUSED_SUPERSET)
+                        .map(Some)
+                })
+            }
+            StoredSelection::Postings(_) => self.project_cache.stored_rows_selected(&query),
+        };
+        let named = match cached {
+            Some(found) => found,
+            None => {
+                let Some(job) = self.persistent_cache().job() else {
+                    return Ok(None);
+                };
+                #[cfg(test)]
+                STORED_ROW_SCANS.with(|count| count.set(count.get() + 1));
+                let needles = query.2.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                let matching = match &stored_selection {
+                    StoredSelection::Declarations(needle) => {
+                        pascal_cache::IndexKeyMatch::Containing(needle)
+                    }
+                    StoredSelection::Postings(_) => pascal_cache::IndexKeyMatch::Equal(&needles),
+                };
+                let found = match job.store().find_members_with_rows(
+                    hint.header(),
+                    row_kind,
+                    matching,
+                    MAX_ON_DEMAND_REUSE,
+                    &stop,
+                ) {
+                    Ok(pascal_cache::Lookup::Hit(pascal_cache::MembersWithRows::Found(found))) => {
+                        Some(Arc::new(found.into_iter().collect::<HashSet<_>>()))
+                    }
+                    Ok(pascal_cache::Lookup::Hit(pascal_cache::MembersWithRows::OverLimit)) => None,
+                    Ok(pascal_cache::Lookup::Hit(pascal_cache::MembersWithRows::Stopped)) => {
+                        return stopped();
+                    }
+                    Ok(pascal_cache::Lookup::Miss(_)) => return Ok(None),
+                    Err(bypass) => {
+                        job.observe(&bypass);
+                        return Ok(None);
+                    }
+                };
+                self.project_cache
+                    .remember_stored_rows_selected(query.clone(), found.clone());
+                found
+            }
+        };
+        let Some(named) = named else {
             return Ok(None);
         };
-        let store = job.store();
-        let adopted = started.elapsed();
-        let key_refs = keys.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        let matching = if containing {
-            pascal_cache::IndexKeyMatch::Containing(&keys[0])
-        } else {
-            pascal_cache::IndexKeyMatch::Equal(&key_refs)
-        };
-        let named = match store.find_members_with_rows(
-            hint.header(),
-            row_kind,
-            matching,
-            MAX_ON_DEMAND_REUSE,
-        ) {
-            Ok(pascal_cache::Lookup::Hit(Some(named))) => named.into_iter().collect::<HashSet<_>>(),
-            Ok(_) => return Ok(None),
-            Err(bypass) => {
-                job.observe(&bypass);
-                return Ok(None);
-            }
-        };
         let found = started.elapsed();
-        let mut listed = HashSet::new();
-        let mut reader = store.read_snapshot(hint.header());
-        loop {
-            check_workspace_cancel(Some(cancel))?;
-            match reader.next_batch() {
-                Ok(pascal_cache::Lookup::Hit(Some(batch))) => listed.extend(
-                    batch
-                        .members()
-                        .iter()
-                        .map(|member| member.source_key.clone()),
-                ),
-                Ok(pascal_cache::Lookup::Hit(None)) => break,
-                Ok(pascal_cache::Lookup::Miss(_)) => return Ok(None),
-                Err(bypass) => {
-                    job.observe(&bypass);
+        let with_artifacts = match self.project_cache.stored_rows_with_artifacts(snapshot) {
+            Some(listed) => listed,
+            None => {
+                let Some(job) = self.persistent_cache().job() else {
                     return Ok(None);
+                };
+                match job
+                    .store()
+                    .find_members_with_artifacts(hint.header(), &stop)
+                {
+                    Ok(pascal_cache::Lookup::Hit(Some(listed))) => {
+                        let listed = Arc::new(listed.into_iter().collect::<HashSet<_>>());
+                        self.project_cache
+                            .remember_stored_rows_with_artifacts(snapshot, Arc::clone(&listed));
+                        listed
+                    }
+                    Ok(pascal_cache::Lookup::Hit(None)) => return stopped(),
+                    Ok(pascal_cache::Lookup::Miss(_)) => return Ok(None),
+                    Err(bypass) => {
+                        job.observe(&bypass);
+                        return Ok(None);
+                    }
                 }
             }
+        };
+        // Members a change since the start reached: their own path, or a
+        // path their stored evidence read (an include).
+        let mut reached = HashSet::new();
+        let mut changed_keys = HashSet::new();
+        for path in &changed {
+            let local = path_key(path);
+            let observing = match self.project_cache.stored_rows_observing(snapshot, &local) {
+                Some(observing) => observing,
+                None => {
+                    let Some(job) = self.persistent_cache().job() else {
+                        return Ok(None);
+                    };
+                    match job
+                        .store()
+                        .find_members_observing(hint.header(), path, &stop)
+                    {
+                        Ok(pascal_cache::Lookup::Hit(Some(observing))) => {
+                            let observing = Arc::new(observing.into_iter().collect::<HashSet<_>>());
+                            self.project_cache.remember_stored_rows_observing(
+                                snapshot,
+                                local.clone(),
+                                Arc::clone(&observing),
+                            );
+                            observing
+                        }
+                        Ok(pascal_cache::Lookup::Hit(None)) => return stopped(),
+                        Ok(pascal_cache::Lookup::Miss(_)) => return Ok(None),
+                        Err(bypass) => {
+                            job.observe(&bypass);
+                            return Ok(None);
+                        }
+                    }
+                }
+            };
+            reached.extend(observing.iter().cloned());
+            changed_keys.insert(local);
         }
-        drop(reader);
-        drop(job);
         let read = started.elapsed();
         let mut validate = Vec::new();
         let mut unselected = HashSet::new();
@@ -5156,7 +5281,10 @@ impl Workspace {
             let stored = pascal_cache::path_key(&path);
             if named.contains(&stored) {
                 validate.push(path);
-            } else if listed.contains(&stored) {
+            } else if with_artifacts.contains(&stored)
+                && !reached.contains(&stored)
+                && !changed_keys.contains(&local)
+            {
                 unselected.insert(local);
             }
         }
@@ -5171,11 +5299,13 @@ impl Workspace {
         }
         let reused = view.reuse_members_now(key, &validate, cancel)?;
         crate::trace::trace!(
-            "  persisted selection {}: {} named, {reused} validated, {} left to the reuse pass, {} listed, {:.1} ms (adoption {:.1}, rows {:.1}, listing {:.1})",
+            "  persisted selection {}: {} named, {reused} validated, {} left to the reuse pass, {} with stored rows, {} changed reaching {}, {:.1} ms (adoption {:.1}, rows {:.1}, listing {:.1})",
             anchor_display(anchor),
             validate.len(),
             unselected.len(),
-            listed.len(),
+            with_artifacts.len(),
+            changed.len(),
+            reached.len(),
             started.elapsed().as_secs_f64() * 1000.0,
             adopted.as_secs_f64() * 1000.0,
             (found - adopted).as_secs_f64() * 1000.0,
@@ -10998,12 +11128,32 @@ pub(in crate::workspace) mod tests {
 
             /// The first process: every member indexed, published and sealed.
             pub(super) fn sealed_store(root: &Path, store: &Path) -> (ContextKey, IndexAnchor) {
+                sealed_store_with(root, store, &[], UNITS + 3)
+            }
+
+            /// `sealed_store` with `extra` files under `lib/`, `persisted` of
+            /// all members published with an artifact.
+            pub(super) fn sealed_store_with(
+                root: &Path,
+                store: &Path,
+                extra: &[(&str, String)],
+                persisted: usize,
+            ) -> (ContextKey, IndexAnchor) {
                 caller(root, "CallerA");
                 caller(root, "CallerB");
+                for (name, text) in extra {
+                    write(&root.join("lib").join(name), text);
+                }
                 let (workspace, key, anchor) = indexed_project(root, UNITS + 1, configured(root));
+                // `Big.pas`, when given, passes its extraction deadline: it is
+                // Limited with an artifact-less record (R8-3).
+                let _slow = extra
+                    .iter()
+                    .any(|(name, _)| *name == "Big.pas")
+                    .then(|| slow_member_for_test(&root.join("lib/Big.pas")));
                 let (mut first, cache) = persisting_view(&workspace, store);
                 let progress = advance(&mut first, &anchor, IndexBound::all());
-                assert_eq!(progress.persisted, UNITS + 3, "{progress:?}");
+                assert_eq!(progress.persisted, persisted, "{progress:?}");
                 assert_eq!(
                     first.seal_baseline_if_due(&key, &mut || Ok(())),
                     crate::workspace::baseline::SealOutcome::Sealed
@@ -11066,6 +11216,13 @@ pub(in crate::workspace) mod tests {
                 // P1, P10..P19: eleven units validated, nothing parsed.
                 assert_eq!(take_on_demand_reused(), 11, "{:?}", early.coverage);
                 assert_eq!(crate::navigation::test_document_parse_count(), 0);
+                assert!(
+                    format!("{:?}", early.coverage).contains(
+                        "22 units of App.dproj are not re-validated since the start yet; their stored index holds no match"
+                    ),
+                    "{:?}",
+                    early.coverage
+                );
                 assert_eq!(
                     awaiting(&view, &key),
                     UNITS + 3 - 11,
@@ -11180,6 +11337,134 @@ pub(in crate::workspace) mod tests {
                         ("U3.pas".to_owned(), 4),
                     ]
                 );
+                cache.shutdown();
+            }
+
+            /// Review I1: a member whose record has no stored artifact (here
+            /// one past its extraction deadline, R8-3) has no stored rows to
+            /// search; its missing rows prove nothing, so it is read like any
+            /// unverified member, never left out.
+            #[test]
+            fn members_without_stored_rows_are_read_not_left_out() {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path();
+                let store = private_dir();
+                let (key, _) = sealed_store_with(
+                    root,
+                    store.path(),
+                    &[
+                        (
+                            "Big.pas",
+                            "unit Big;\ninterface\n{$I BigX.inc}\nconst P1Big = 2;\nimplementation\nuses U3;\nprocedure Q;\nbegin\n  P3;\nend;\nend.\n"
+                                .to_owned(),
+                        ),
+                        // The include gives its load a compile-time session,
+                        // the work the member deadline bounds.
+                        ("BigX.inc", "const X = 1;\n".to_owned()),
+                    ],
+                    UNITS + 3,
+                );
+                let (view, cache) = reopened(root, store.path());
+                {
+                    let _caps = override_caps(|caps| caps.unverified_symbols = Some(2));
+                    let found = names(&symbols(&view, "P1").value);
+                    assert!(found.contains(&"P1Big".to_owned()), "{found:?}");
+                }
+                let _caps = override_caps(|caps| caps.unverified = Some(2));
+                let (located, _) = reference_locations(&view, root);
+                assert!(located.contains(&("Big.pas".to_owned(), 8)), "{located:?}");
+                assert!(awaiting(&view, &key) > 0, "the reuse pass did not run");
+                cache.shutdown();
+            }
+
+            /// Review I2: an include saved since the start reaches the members
+            /// whose stored evidence read it, although no member is indexed in
+            /// this process yet to know its includes.
+            #[test]
+            fn an_include_changed_since_the_start_reaches_the_members_that_read_it() {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path();
+                let store = private_dir();
+                let (key, anchor) = sealed_store_with(
+                    root,
+                    store.path(),
+                    &[
+                        (
+                            "Inc.pas",
+                            "unit Inc;\ninterface\nimplementation\nuses U3;\n{$I Shared.inc}\nend.\n"
+                                .to_owned(),
+                        ),
+                        ("Shared.inc", "procedure R;\nbegin\nend;\n".to_owned()),
+                    ],
+                    UNITS + 4,
+                );
+                let (mut view, cache) = reopened(root, store.path());
+                advance(
+                    &mut view,
+                    &anchor,
+                    IndexBound::units(0).with_mode(IndexMode::Reuse),
+                );
+                write(
+                    &root.join("lib/Shared.inc"),
+                    "procedure R;\nbegin\n  P3;\nend;\n",
+                );
+                view.project_cache
+                    .invalidate_path(&root.join("lib/Shared.inc"));
+                // References follow includes; a direct read for workspace
+                // symbols does not expand them (R9-5), so references show it.
+                let _caps = override_caps(|caps| caps.unverified = Some(2));
+                let (located, _) = reference_locations(&view, root);
+                assert!(
+                    located.contains(&("Shared.inc".to_owned(), 2)),
+                    "{located:?}"
+                );
+                assert!(awaiting(&view, &key) > 0);
+                cache.shutdown();
+            }
+
+            /// Review I2: an evicted index forgets its members, not what
+            /// changed since the start.
+            #[test]
+            fn an_evicted_index_keeps_what_changed_since_the_start() {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path();
+                let store = private_dir();
+                let (key, anchor) = sealed_store(root, store.path());
+                let (mut view, cache) = reopened(root, store.path());
+                advance(
+                    &mut view,
+                    &anchor,
+                    IndexBound::units(0).with_mode(IndexMode::Reuse),
+                );
+                named_unit(&root.join("lib/U25.pas"), "P1Gained");
+                view.project_cache
+                    .invalidate_path(&root.join("lib/U25.pas"));
+                view.project_cache.evict_index_for_test(&key);
+                let _caps = override_caps(|caps| caps.unverified_symbols = Some(2));
+                let found = names(&symbols(&view, "P1").value);
+                assert!(found.contains(&"P1Gained".to_owned()), "{found:?}");
+                cache.shutdown();
+            }
+
+            /// Cost: a repeated query scans the store once; a longer query
+            /// whose shorter one selected few members reuses that answer.
+            #[test]
+            fn repeated_and_longer_queries_reuse_the_stored_selection() {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path();
+                let store = private_dir();
+                sealed_store(root, store.path());
+                let (view, cache) = reopened(root, store.path());
+                let _caps = override_caps(|caps| caps.unverified_symbols = Some(0));
+                take_stored_row_scans();
+                let first = names(&symbols(&view, "P1").value);
+                assert_eq!(take_stored_row_scans(), 1);
+                assert_eq!(names(&symbols(&view, "P1").value), first);
+                assert_eq!(take_stored_row_scans(), 0, "the same query is cached");
+                assert_eq!(names(&symbols(&view, "P12").value), ["P12"]);
+                assert_eq!(take_stored_row_scans(), 0, "P1's members hold P12's");
+                assert_eq!(names(&symbols(&view, "P2").value).len(), 11);
+                assert_eq!(take_stored_row_scans(), 1, "a new query scans");
                 cache.shutdown();
             }
         }

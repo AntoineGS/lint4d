@@ -9238,9 +9238,12 @@ struct IndexStore {
     /// across evictions; past `MAX_CHANGED_SINCE_START` paths, or after an
     /// overflow that lost which paths changed, it is `None`.
     changed_since_start: Option<HashMap<String, PathBuf>>,
-    /// What sealed snapshots' stored rows answered (l4d-c8l2): a held
-    /// snapshot's records and artifacts are never retired, so the answers
-    /// stay true while its id is the key.
+    /// What sealed snapshots' stored rows answered (l4d-c8l2). Garbage
+    /// collection never retires a record an unretired sealed snapshot lists,
+    /// nor the artifacts and evidence such a record references (spec
+    /// zf1b.10 reachability), but an unheld snapshot may itself be retired:
+    /// entries are kept and used only while a context holds the snapshot as
+    /// its baseline, and dropped when it stops doing so.
     stored_rows: StoredRows,
 }
 
@@ -9262,6 +9265,15 @@ struct StoredRows {
     with_artifacts: HashMap<pascal_cache::SnapshotId, Arc<HashSet<Vec<u8>>>>,
     /// The members whose stored evidence observed a path (`path_key`).
     observing: HashMap<(pascal_cache::SnapshotId, String), Arc<HashSet<Vec<u8>>>>,
+}
+
+impl StoredRows {
+    /// Forget everything answered about `snapshot`.
+    fn forget(&mut self, snapshot: pascal_cache::SnapshotId) {
+        self.selected.retain(|(id, _, _), _| *id != snapshot);
+        self.with_artifacts.remove(&snapshot);
+        self.observing.retain(|(id, _), _| *id != snapshot);
+    }
 }
 
 fn bounded_insert<K: std::hash::Hash + Eq, V>(map: &mut HashMap<K, V>, key: K, value: V) {
@@ -9319,6 +9331,9 @@ impl IndexStore {
             .map(|(key, _)| key.clone())?;
         let stored = self.contexts.remove(&victim)?;
         self.owners.retain(|_, owner| *owner != victim);
+        if let Some(hint) = stored.baseline.as_ref() {
+            self.stored_rows.forget(hint.header().id());
+        }
         if let Some(hint) = stored.baseline.as_ref().filter(|hint| hint.held()) {
             self.released.push(hint.header().id());
         }
@@ -10083,6 +10098,23 @@ impl ProjectCache {
             .cloned()
     }
 
+    /// Whether anything about `snapshot` is cached.
+    #[cfg(test)]
+    pub(crate) fn caches_stored_rows_of(&self, snapshot: pascal_cache::SnapshotId) -> bool {
+        let store = self.index();
+        store.stored_rows.with_artifacts.contains_key(&snapshot)
+            || store
+                .stored_rows
+                .selected
+                .keys()
+                .any(|(id, _, _)| *id == snapshot)
+            || store
+                .stored_rows
+                .observing
+                .keys()
+                .any(|(id, _)| *id == snapshot)
+    }
+
     pub(crate) fn remember_stored_rows_with_artifacts(
         &self,
         snapshot: pascal_cache::SnapshotId,
@@ -10124,10 +10156,11 @@ impl ProjectCache {
     #[cfg(test)]
     pub(crate) fn evict_index_for_test(&self, key: &ContextKey) {
         let mut store = self.index();
-        let charge = store
-            .contexts
-            .remove(key)
-            .map(|stored| stored.total_charge());
+        let removed = store.contexts.remove(key);
+        if let Some(hint) = removed.as_ref().and_then(|stored| stored.baseline.as_ref()) {
+            store.stored_rows.forget(hint.header().id());
+        }
+        let charge = removed.map(|stored| stored.total_charge());
         store.owners.retain(|_, owner| owner != key);
         drop(store);
         if let Some(charge) = charge {
@@ -10153,10 +10186,15 @@ impl ProjectCache {
         key: &ContextKey,
         hint: crate::workspace::baseline::BaselineHint,
     ) -> Option<Option<crate::workspace::baseline::BaselineHint>> {
-        self.index()
+        let mut store = self.index();
+        let replaced = store
             .contexts
             .get_mut(key)
-            .map(|stored| stored.baseline.replace(hint))
+            .map(|stored| stored.baseline.replace(hint))?;
+        if let Some(old) = replaced.as_ref() {
+            store.stored_rows.forget(old.header().id());
+        }
+        Some(replaced)
     }
 
     /// Drop `key`'s baseline if it is still snapshot `id`; returns it.
@@ -10172,7 +10210,9 @@ impl ProjectCache {
             .as_ref()
             .is_some_and(|hint| hint.header().id() == id)
         {
-            stored.baseline.take()
+            let dropped = stored.baseline.take();
+            store.stored_rows.forget(id);
+            dropped
         } else {
             None
         }
@@ -10458,10 +10498,20 @@ impl ProjectCache {
             .file_name()
             .is_some_and(|name| name.to_string_lossy().starts_with('\u{0}'));
         if !synthetic && let Some(changed) = store.changed_since_start.as_mut() {
-            if changed.len() < MAX_CHANGED_SINCE_START {
-                changed.insert(crate::workspace::rename::path_key(path), path.to_path_buf());
-            } else {
-                store.changed_since_start = None;
+            // A creation, deletion or rename changes the parent's listing too:
+            // a member whose stored evidence holds that listing (a missing
+            // include, one a new file may now shadow) is reached through it.
+            let paths = std::iter::once(path).chain(path.parent().filter(|_| include_parent));
+            for changed_path in paths {
+                if changed.len() < MAX_CHANGED_SINCE_START {
+                    changed.insert(
+                        crate::workspace::rename::path_key(changed_path),
+                        changed_path.to_path_buf(),
+                    );
+                } else {
+                    store.changed_since_start = None;
+                    break;
+                }
             }
         }
         let parent = path.parent();

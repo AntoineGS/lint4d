@@ -5154,7 +5154,11 @@ impl Workspace {
         };
         let row_kind = stored_selection.row_kind();
         let query = (snapshot, row_kind, stored_selection.needles());
+        // An unheld snapshot may be retired under the request: its answers
+        // are neither cached nor taken from the cache.
+        let cacheable = hint.held();
         let cached = match &stored_selection {
+            _ if !cacheable => None,
             StoredSelection::Declarations(needle) => {
                 self.project_cache.stored_rows_selected(&query).or_else(|| {
                     self.project_cache
@@ -5199,8 +5203,10 @@ impl Workspace {
                         return Ok(None);
                     }
                 };
-                self.project_cache
-                    .remember_stored_rows_selected(query.clone(), found.clone());
+                if cacheable {
+                    self.project_cache
+                        .remember_stored_rows_selected(query.clone(), found.clone());
+                }
                 found
             }
         };
@@ -5208,7 +5214,10 @@ impl Workspace {
             return Ok(None);
         };
         let found = started.elapsed();
-        let with_artifacts = match self.project_cache.stored_rows_with_artifacts(snapshot) {
+        let cached = cacheable
+            .then(|| self.project_cache.stored_rows_with_artifacts(snapshot))
+            .flatten();
+        let with_artifacts = match cached {
             Some(listed) => listed,
             None => {
                 let Some(job) = self.persistent_cache().job() else {
@@ -5220,8 +5229,10 @@ impl Workspace {
                 {
                     Ok(pascal_cache::Lookup::Hit(Some(listed))) => {
                         let listed = Arc::new(listed.into_iter().collect::<HashSet<_>>());
-                        self.project_cache
-                            .remember_stored_rows_with_artifacts(snapshot, Arc::clone(&listed));
+                        if cacheable {
+                            self.project_cache
+                                .remember_stored_rows_with_artifacts(snapshot, Arc::clone(&listed));
+                        }
                         listed
                     }
                     Ok(pascal_cache::Lookup::Hit(None)) => return stopped(),
@@ -5239,7 +5250,10 @@ impl Workspace {
         let mut changed_keys = HashSet::new();
         for path in &changed {
             let local = path_key(path);
-            let observing = match self.project_cache.stored_rows_observing(snapshot, &local) {
+            let cached = cacheable
+                .then(|| self.project_cache.stored_rows_observing(snapshot, &local))
+                .flatten();
+            let observing = match cached {
                 Some(observing) => observing,
                 None => {
                     let Some(job) = self.persistent_cache().job() else {
@@ -5251,11 +5265,13 @@ impl Workspace {
                     {
                         Ok(pascal_cache::Lookup::Hit(Some(observing))) => {
                             let observing = Arc::new(observing.into_iter().collect::<HashSet<_>>());
-                            self.project_cache.remember_stored_rows_observing(
-                                snapshot,
-                                local.clone(),
-                                Arc::clone(&observing),
-                            );
+                            if cacheable {
+                                self.project_cache.remember_stored_rows_observing(
+                                    snapshot,
+                                    local.clone(),
+                                    Arc::clone(&observing),
+                                );
+                            }
                             observing
                         }
                         Ok(pascal_cache::Lookup::Hit(None)) => return stopped(),
@@ -11139,12 +11155,36 @@ pub(in crate::workspace) mod tests {
                 extra: &[(&str, String)],
                 persisted: usize,
             ) -> (ContextKey, IndexAnchor) {
+                sealed_store_in(
+                    root,
+                    store,
+                    extra,
+                    persisted,
+                    "<DCC_UnitSearchPath>lib</DCC_UnitSearchPath>",
+                )
+            }
+
+            /// `sealed_store_with` under the project `properties`.
+            pub(super) fn sealed_store_in(
+                root: &Path,
+                store: &Path,
+                extra: &[(&str, String)],
+                persisted: usize,
+                properties: &str,
+            ) -> (ContextKey, IndexAnchor) {
                 caller(root, "CallerA");
                 caller(root, "CallerB");
                 for (name, text) in extra {
                     write(&root.join("lib").join(name), text);
                 }
-                let (workspace, key, anchor) = indexed_project(root, UNITS + 1, configured(root));
+                for index in 0..UNITS {
+                    named_unit(
+                        &root.join(format!("lib/U{index}.pas")),
+                        &format!("P{index}"),
+                    );
+                }
+                let (workspace, key) = project_workspace(root, properties, "", configured(root));
+                let anchor = IndexAnchor::Project(root.join("App.dproj"));
                 // `Big.pas`, when given, passes its extraction deadline: it is
                 // Limited with an artifact-less record (R8-3).
                 let _slow = extra
@@ -11419,6 +11459,78 @@ pub(in crate::workspace) mod tests {
                     "{located:?}"
                 );
                 assert!(awaiting(&view, &key) > 0);
+                cache.shutdown();
+            }
+
+            /// Re-review item 1: an include created since the start in an
+            /// earlier search directory, shadowing the one the member read
+            /// from a later directory, reaches the member whose stored
+            /// evidence holds the earlier directory's listing. The directive
+            /// spells the name in another case, so only the listing (the
+            /// case-insensitive fallback's) names the new file's directory,
+            /// never its exact path.
+            #[test]
+            fn an_include_created_since_the_start_reaches_the_members_that_missed_it() {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path();
+                let store = private_dir();
+                write(&root.join("include1/Other.inc"), "{ other }\n");
+                write(
+                    &root.join("include2/Missing.inc"),
+                    "procedure R;\nbegin\nend;\n",
+                );
+                let (key, anchor) = sealed_store_in(
+                    root,
+                    store.path(),
+                    &[(
+                        "Miss.pas",
+                        "unit Miss;\ninterface\nimplementation\nuses U3;\n{$I missing.inc}\nend.\n"
+                            .to_owned(),
+                    )],
+                    UNITS + 4,
+                    "<DCC_UnitSearchPath>lib</DCC_UnitSearchPath><DCC_IncludePath>include1;include2</DCC_IncludePath>",
+                );
+                let (mut view, cache) = reopened(root, store.path());
+                advance(
+                    &mut view,
+                    &anchor,
+                    IndexBound::units(0).with_mode(IndexMode::Reuse),
+                );
+                write(
+                    &root.join("include1/Missing.inc"),
+                    "procedure R;\nbegin\n  P3;\nend;\n",
+                );
+                view.project_cache
+                    .invalidate_path(&root.join("include1/Missing.inc"));
+                let _caps = override_caps(|caps| caps.unverified = Some(2));
+                let (located, _) = reference_locations(&view, root);
+                assert!(
+                    located.contains(&("Missing.inc".to_owned(), 2)),
+                    "{located:?}"
+                );
+                assert!(awaiting(&view, &key) > 0);
+                cache.shutdown();
+            }
+
+            /// Re-review item 2: what the store answered about a snapshot is
+            /// forgotten once no context holds it as its baseline.
+            #[test]
+            fn an_evicted_baseline_forgets_its_stored_answers() {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path();
+                let store = private_dir();
+                let (key, _) = sealed_store(root, store.path());
+                let (view, cache) = reopened(root, store.path());
+                symbols(&view, "P1");
+                let snapshot = view
+                    .project_cache
+                    .baseline_hint(&key)
+                    .expect("adopted")
+                    .header()
+                    .id();
+                assert!(view.project_cache.caches_stored_rows_of(snapshot));
+                view.project_cache.evict_index_for_test(&key);
+                assert!(!view.project_cache.caches_stored_rows_of(snapshot));
                 cache.shutdown();
             }
 

@@ -7828,6 +7828,29 @@ impl ProjectCache {
             .collect()
     }
 
+    /// Removes the provider interfaces whose source path ends with
+    /// `suffix`, as an eviction would, without measuring.
+    #[cfg(test)]
+    pub(crate) fn evict_provider_graphs_for_test(&self, suffix: &str) {
+        let mut state = lock(&self.inner);
+        let doomed = state
+            .provider_graphs
+            .entries
+            .keys()
+            .filter(|key| key.1.source.as_str().ends_with(suffix))
+            .cloned()
+            .collect::<Vec<_>>();
+        for id in doomed {
+            if let Some(entry) = state.provider_graphs.entries.remove(&id) {
+                state.provider_graphs.bytes -= entry.bytes;
+                state.reserved[ReservationKind::ProviderGraphs.index()] -= entry.bytes;
+            }
+            if let Some(tick) = state.provider_graphs.ticks.remove(&id) {
+                state.provider_graphs.lru.remove(&tick);
+            }
+        }
+    }
+
     /// Removes every provider interface and returns the bytes the test
     /// allocator saw this thread free, with how many other holders each
     /// graph still had.

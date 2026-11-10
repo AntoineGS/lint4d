@@ -879,10 +879,39 @@ fn extended<T: Clone>(base: &Arc<Vec<T>>, more: &[T]) -> Arc<Vec<T>> {
     Arc::new(all)
 }
 
-/// What a shared interface keeps besides what other store entries charge
-/// (the nested providers' graphs it references): its declaration state, its
-/// provider sources' bytes and decoded text, its reports, dependencies,
-/// scans, nested parts, lookup trace and key (l4d-4nbs review I1).
+/// What a shared interface keeps: its declaration state, its provider
+/// sources' bytes and decoded text, the interfaces of the providers its
+/// compilation read (each once), its reports, dependencies, scans, nested
+/// parts, lookup trace and key (l4d-4nbs review I1). A nested provider's
+/// interface is counted even when the store holds it too: the store may
+/// evict it while this one keeps it (l4d-10: SFClient2's
+/// ZDbcGenericResolver was charged 2.7 MB and kept 168 MB).
+/// The interfaces `state` binds through, and theirs, each counted once:
+/// declaration state and the source bytes it keeps.
+fn nested_interface_bytes(
+    state: &CompileTimeState,
+    seen: &mut std::collections::HashSet<*const CompileTimeState>,
+) -> usize {
+    let mut total = 0usize;
+    for interface in &state.interfaces {
+        let Some(graph) = &interface.graph else {
+            continue;
+        };
+        let nested: &CompileTimeState = graph;
+        if !seen.insert(std::ptr::from_ref(nested)) {
+            continue;
+        }
+        let _ = nested.visit_snapshot_payload(&mut |n| {
+            total = total.saturating_add(n);
+            Ok(())
+        });
+        total = total
+            .saturating_add(nested.retained_source_bytes())
+            .saturating_add(nested_interface_bytes(nested, seen));
+    }
+    total
+}
+
 fn shared_retained_bytes(
     graph: Option<&AdmittedInterfaceGraph>,
     names: Option<&InterfaceNames>,
@@ -905,6 +934,8 @@ fn shared_retained_bytes(
             add(source.bytes.len());
             add(source.decoded_text.as_ref().map_or(0, |text| text.len()));
         }
+        let mut seen = std::collections::HashSet::new();
+        add(nested_interface_bytes(graph, &mut seen));
     }
     add(observations_payload(&origin.observations));
     add(observations_payload(&origin.trace));

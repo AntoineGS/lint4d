@@ -2386,6 +2386,47 @@ mod tests {
         );
     }
 
+    /// l4d-10: an interface keeps the interfaces of the providers its own
+    /// compilation read. Once the store evicts those, the importer alone
+    /// keeps them: SFClient2's ZDbcGenericResolver was charged 2.7 MB and
+    /// kept 168 MB, VCL's Clipbrd 0.2 MB and 18 MB.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_interface_is_charged_for_the_provider_interfaces_it_keeps() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source = "unit Main; interface uses A; {$IF A.Flag = 8} const Eight = 8; {$IFEND} implementation end.";
+        std::fs::write(root.join("Main.pas"), source).unwrap();
+        let declarations = (0..2_000)
+            .map(|n| format!("C{n} = {n};\n"))
+            .collect::<String>();
+        std::fs::write(
+            root.join("B.pas"),
+            format!("unit B; interface const\n{declarations}Flag = 8; implementation end."),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("A.pas"),
+            "unit A; interface uses B; const {$IF B.Flag = 8} Flag = 8; {$ELSE} Flag = 0; {$IFEND} implementation end.",
+        )
+        .unwrap();
+        pascal_project::backdate_tree_for_test(root);
+        let mut workspace = Workspace::with_override_session(
+            vec![root.into()],
+            Default::default(),
+            OverrideSession::new(None),
+        );
+        let uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+        let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+        drop(expand_main(&workspace, &uri, source, &key));
+        assert_eq!(workspace.project_cache.provider_graph_count(), 2);
+        // The store gives B's interface up; A's still holds it.
+        workspace
+            .project_cache
+            .evict_provider_graphs_for_test("B.pas");
+        assert_graphs_charged_within_a_fifth(&workspace);
+    }
+
     #[cfg(target_os = "linux")]
     fn assert_graphs_charged_within_a_fifth(workspace: &Workspace) {
         assert_eq!(workspace.project_cache.provider_graph_count(), 1);

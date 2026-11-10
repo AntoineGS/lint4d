@@ -3992,3 +3992,67 @@ fn an_include_of_a_build_product_name_records_exact_listings() {
         "{ordinary:?}"
     );
 }
+
+/// l4d-qk5t round 2: a unit lookup lists the directory first; the include
+/// of a build-product name then reuses that listing from the resolver's
+/// cache. The reuse must still record the listing `EXACT_LISTING`, so the
+/// directory holds only by its stamp (the unit listing's fingerprint leaves
+/// `Settings.RES` out).
+#[test]
+fn an_include_of_a_build_product_name_reusing_a_cached_listing_records_it_exact() {
+    let directory = tempdir().expect("include root");
+    let root = directory.path();
+    fs::write(
+        root.join("Main.pas"),
+        "unit Main; interface implementation end.",
+    )
+    .unwrap();
+    let mut context = configured_disk_context(root);
+    edit_context(&mut context, |p| {
+        p.include_path_entries = vec![ProjectPathEntry::configured(root.to_path_buf())];
+        p.search_path_entries = vec![ProjectPathEntry::configured(root.to_path_buf())];
+    });
+    let mut resolver = UnitResolver::new(
+        context,
+        vec![root.to_path_buf()],
+        FilesystemSourceStore::new(),
+        Default::default(),
+    );
+    let unit = resolver.resolve_unit(
+        UnitResolveRequest {
+            requested_name: "nope",
+            importer_path: &root.join("Main.pas"),
+            legacy_route: None,
+        },
+        &NoCancellation,
+    );
+    assert!(!matches!(unit.result, Resolution::Found(_)));
+    let include = resolver.resolve_include(
+        pascal_core::IncludeResolveRequest {
+            including_path: &root.join("Main.pas"),
+            byte_range: 0..1,
+            requested_name: "Settings.RES",
+            legacy_route: None,
+        },
+        &NoCancellation,
+    );
+    assert!(!matches!(include.result, Resolution::Found(_)));
+    let listings = resolver
+        .finish()
+        .observations
+        .into_iter()
+        .filter_map(|observation| match observation {
+            ResolutionObservation::Directory {
+                path,
+                listed: true,
+                resolvable,
+                ..
+            } if path == root => Some(resolvable),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        listings.contains(&Some(pascal_core::resolver::EXACT_LISTING)),
+        "{listings:?}"
+    );
+}

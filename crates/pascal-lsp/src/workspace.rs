@@ -11976,13 +11976,10 @@ impl Workspace {
         // into: its reads, watched paths and the memberships of other
         // sources' directories may be stale, and a merge would keep them
         // (l4d-z473). Its other owners find it again through rediscovery.
+        // An open buffer of a deleted legacy file is not a change: such a
+        // state is not evicted on every install.
         if let Some(state) = self.contexts.get(&key)
-            && !context_state_is_fresh_for_binding_with_cancel(
-                state,
-                self.request_generation,
-                cancel,
-                budget,
-            )?
+            && !self.context_state_is_fresh_for_reinstall(state, cancel, budget)?
         {
             self.contexts.remove(&key);
             for owner in self.document_owners.values_mut() {
@@ -12322,6 +12319,29 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<bool, String> {
+        self.context_state_is_fresh_with_open_documents_settled(state, true, cancel, budget)
+    }
+
+    /// `context_state_is_fresh_with_open_documents` for a state that may
+    /// have been built in this request generation: such a state compares
+    /// its own stamps with plain equality, as the binding gates do.
+    fn context_state_is_fresh_for_reinstall(
+        &self,
+        state: &ContextState,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<bool, String> {
+        let built_here = state.built_generation == Some(self.request_generation);
+        self.context_state_is_fresh_with_open_documents_settled(state, !built_here, cancel, budget)
+    }
+
+    fn context_state_is_fresh_with_open_documents_settled(
+        &self,
+        state: &ContextState,
+        require_settled: bool,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<bool, String> {
         let deleted_paths = self.deleted_path_snapshot_with_control(cancel, budget)?;
         let mut open_overlay_paths = Vec::new();
         for (uri, document) in &self.open_documents {
@@ -12355,7 +12375,7 @@ impl Workspace {
             &open_overlay_paths,
             &deleted_paths,
             budget,
-            true,
+            require_settled,
         )
     }
 
@@ -24948,14 +24968,6 @@ BDS = '/fake/37'
         assert_eq!(merged.len(), 4, "{merged:?}");
     }
 
-    /// l4d-z473: Headless-Delphi rewrites the installation's
-    /// `environment.proj` (outside the roots, same content, new inode) on
-    /// every build. A context rediscovered for an explicit owner is installed
-    /// over its stale state under the same key; the rediscovery's read of the
-    /// file must replace the stale one. Before, the stale read survived the
-    /// merge while the watched stamp took the new one: the context then
-    /// passed freshness, and every request's own records carried the old
-    /// stamp, so strict revalidation refused every request after the build.
     fn reinstall_key(root: &Path) -> ContextKey {
         ContextKey {
             installation_id: Some("7.0".to_owned()),
@@ -25060,6 +25072,76 @@ BDS = '/fake/37'
         );
     }
 
+    /// l4d-z473 round 2: a context whose watched legacy source was deleted
+    /// on disk but stays open in the editor is not stale for that: installs
+    /// of its other sources merge into it instead of evicting it each time.
+    #[test]
+    fn an_open_buffer_of_a_deleted_legacy_source_does_not_evict_the_context() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        let legacy = root.join("Legacy.pas");
+        let text = "unit Legacy; interface implementation end.";
+        fs::write(&legacy, text).unwrap();
+        let context = Arc::new(ProjectContext::from_parts(
+            pascal_project::ProjectContextParts {
+                discovery_complete: true,
+                search_path_entries: vec![ProjectPathEntry::legacy(root.clone())],
+                ..pascal_project::ProjectContextParts::default()
+            },
+        ));
+        let key = reinstall_key(&root);
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let install = |workspace: &mut Workspace, file: &Path| {
+            let read = ProjectReadObservation {
+                path: legacy.clone(),
+                stamp: pascal_project::path_stamp_result(&legacy)
+                    .unwrap()
+                    .unwrap_or_else(|| {
+                        workspace.contexts[&key].project_read_observations[0]
+                            .stamp
+                            .clone()
+                    }),
+                content_hash: 0,
+                content_bytes: None,
+            };
+            workspace
+                .install_context(
+                    key.clone(),
+                    context.clone(),
+                    ProjectObservations {
+                        metadata_files: vec![legacy.clone()],
+                        ..ProjectObservations::default()
+                    },
+                    vec![read],
+                    HashMap::new(),
+                    file,
+                    None,
+                    None,
+                )
+                .expect("install context");
+        };
+        install(&mut workspace, &root.join("a/A.pas"));
+        fs::remove_file(&legacy).unwrap();
+        workspace.open_documents.insert(
+            Url::from_file_path(&legacy).unwrap(),
+            OpenDocument {
+                text: Some(text.into()),
+                version: 1,
+                rejection: None,
+                identity_generation: 1,
+            },
+        );
+        install(&mut workspace, &root.join("b/B.pas"));
+        let memberships = &workspace.contexts[&key].project_candidate_memberships;
+        assert!(
+            memberships.contains_key(&root.join("a")),
+            "A's directory is still observed: {:?}",
+            memberships.keys().collect::<Vec<_>>()
+        );
+    }
+
     /// l4d-z473 round 1: a context reinstalled over its stale state watches
     /// what the rediscovery read, not every path any earlier install did.
     #[test]
@@ -25113,6 +25195,14 @@ BDS = '/fake/37'
         );
     }
 
+    /// l4d-z473: Headless-Delphi rewrites the installation's
+    /// `environment.proj` (outside the roots, same content, new inode) on
+    /// every build. A context rediscovered for an explicit owner is installed
+    /// over its stale state under the same key; the rediscovery's read of the
+    /// file must replace the stale one. Before, the stale read survived the
+    /// merge while the watched stamp took the new one: the context then
+    /// passed freshness, and every request's own records carried the old
+    /// stamp, so strict revalidation refused every request after the build.
     #[cfg(unix)]
     #[test]
     fn a_reinstalled_context_records_the_new_read_of_a_rewritten_metadata_file() {

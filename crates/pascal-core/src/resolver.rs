@@ -5944,6 +5944,24 @@ impl<S: SourceStore> UnitResolver<S> {
                     .len()
                     .saturating_add(listing.directories.len()),
             );
+            // The listing's own observation carries the fingerprint of the
+            // lookup that read it, which leaves build products out: an
+            // include of a build-product name reusing it holds the
+            // directory by its stamp only.
+            if self.exact_listings {
+                self.record_observation_build(
+                    report_path_payload(&key, Some(entry)),
+                    cancel,
+                    || ResolutionObservation::Directory {
+                        path: key.clone(),
+                        entry: entry.clone(),
+                        stamp: listing.stamp.clone(),
+                        complete: listing.complete,
+                        listed: true,
+                        resolvable: listing.complete.then_some(EXACT_LISTING),
+                    },
+                )?;
+            }
             return Ok(DirectoryAccess::Legacy(listing));
         }
         let request = DirectoryRequest {

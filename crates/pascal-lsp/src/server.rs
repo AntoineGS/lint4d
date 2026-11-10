@@ -1343,6 +1343,9 @@ pub struct TestBarrierConfig {
     workspace_fifo_probe: Option<WorkspaceFifoProbePaths>,
     dispatch: Option<PathBuf>,
     analysis_metrics: bool,
+    store_fault: Option<crate::persistent_cache::test_faults::StoreFaultSpec>,
+    store_growth_pages: Option<i64>,
+    build_fingerprint: Option<pascal_cache::Digest>,
 }
 
 #[cfg(feature = "test-support")]
@@ -1398,7 +1401,35 @@ impl TestBarrierConfig {
             workspace_fifo_probe: None,
             dispatch: None,
             analysis_metrics: false,
+            store_fault: None,
+            store_growth_pages: None,
+            build_fingerprint: None,
         }
+    }
+
+    /// Arms every store this process opens with a fault point; see
+    /// `PASCAL_LSP_TEST_STORE_FAULT`.
+    pub fn with_store_fault(mut self, spec: Option<&str>) -> Result<Self, String> {
+        self.store_fault = spec
+            .map(crate::persistent_cache::test_faults::StoreFaultSpec::parse)
+            .transpose()?;
+        Ok(self)
+    }
+
+    /// Limits the growth of every store this process opens, in pages.
+    pub fn with_store_growth_pages(mut self, pages: Option<i64>) -> Self {
+        self.store_growth_pages = pages;
+        self
+    }
+
+    /// Opens every store under the namespace of this build fingerprint (64
+    /// hex characters) instead of the real one; see
+    /// `PASCAL_LSP_TEST_NAMESPACE`.
+    pub fn with_namespace(mut self, fingerprint: Option<&str>) -> Result<Self, String> {
+        self.build_fingerprint = fingerprint
+            .map(crate::persistent_cache::test_faults::parse_build_fingerprint)
+            .transpose()?;
+        Ok(self)
     }
 
     /// Serves `pascal/testAnalysisMetrics`; never enabled by `run_stdio`.
@@ -1677,16 +1708,25 @@ fn wait_at_uninterruptible_test_barrier(
     let Some(paths) = config.paths(barrier) else {
         return Ok(());
     };
+    hold_at_test_paths(&paths.entered, &paths.release)
+}
+
+/// Record entry in `entered`, then wait for `release` to exist.
+#[cfg(feature = "test-support")]
+pub(crate) fn hold_at_test_paths(
+    entered: &std::path::Path,
+    release: &std::path::Path,
+) -> Result<(), String> {
     let mut marker = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
-        .open(&paths.entered)
+        .open(entered)
         .map_err(|error| format!("could not enter test barrier: {error}"))?;
     marker
         .write_all(b"x")
         .map_err(|error| format!("could not record test barrier entry: {error}"))?;
     drop(marker);
-    while !paths.release.exists() {
+    while !release.exists() {
         thread::sleep(ANALYSIS_POLL_INTERVAL);
     }
     Ok(())
@@ -10549,6 +10589,12 @@ pub fn run_stdio_with_test_barriers(
 fn run_stdio_with_config(
     test_barriers: TestBarrierConfig,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    #[cfg(feature = "test-support")]
+    crate::persistent_cache::test_faults::install(
+        test_barriers.store_fault.clone(),
+        test_barriers.store_growth_pages,
+        test_barriers.build_fingerprint,
+    );
     let (connection, priority_receiver, io_threads) = bounded_stdio(test_barriers.clone());
     let connection = ProtocolConnection::new(connection, priority_receiver, &test_barriers);
     let outcome = run_connection(&connection, test_barriers);
@@ -10864,6 +10910,13 @@ const CACHE_STATUS_METHOD: &str = "pascal/cacheStatus";
 const INDEX_STATUS_METHOD: &str = "pascal/indexStatus";
 #[cfg(feature = "test-support")]
 const TEST_CACHE_SETTLE_METHOD: &str = "pascal/testCacheSettle";
+/// `{"extraPages": n}` limits the open store's growth; `{"applied": bool}`.
+#[cfg(feature = "test-support")]
+const TEST_STORE_GROWTH_METHOD: &str = "pascal/testStoreGrowth";
+/// `{"advanceMs": n}` advances the open store's test clock (its health
+/// backoff); `{"applied": bool}`.
+#[cfg(feature = "test-support")]
+const TEST_STORE_CLOCK_METHOD: &str = "pascal/testStoreClock";
 /// Whether the server has background work: a warmer crawl or index batch,
 /// an analysis job or a diagnostic deadline. Answered in message order.
 #[cfg(feature = "test-support")]
@@ -12055,6 +12108,47 @@ fn event_loop(
             }
             #[cfg(feature = "test-support")]
             Message::Request(request)
+                if request.method == TEST_STORE_GROWTH_METHOD
+                    && !shutdown_received
+                    && !configuration.is_preparing() =>
+            {
+                let applied = request
+                    .params
+                    .get("extraPages")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|pages| {
+                        crate::persistent_cache::test_faults::limit_growth(persistent, pages)
+                    });
+                send_ok(
+                    connection,
+                    request.id,
+                    serde_json::json!({ "applied": applied }),
+                )?;
+            }
+            #[cfg(feature = "test-support")]
+            Message::Request(request)
+                if request.method == TEST_STORE_CLOCK_METHOD
+                    && !shutdown_received
+                    && !configuration.is_preparing() =>
+            {
+                let applied = request
+                    .params
+                    .get("advanceMs")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|millis| {
+                        crate::persistent_cache::test_faults::advance_clock(
+                            persistent,
+                            Duration::from_millis(millis),
+                        )
+                    });
+                send_ok(
+                    connection,
+                    request.id,
+                    serde_json::json!({ "applied": applied }),
+                )?;
+            }
+            #[cfg(feature = "test-support")]
+            Message::Request(request)
                 if request.method == TEST_BACKGROUND_IDLE_METHOD
                     && !shutdown_received
                     && !configuration.is_preparing() =>
@@ -12905,7 +12999,11 @@ fn request_partial_result_token(request: &Request) -> Result<Option<ProgressToke
 
 fn request_requires_configuration(method: &str) -> bool {
     #[cfg(feature = "test-support")]
-    if method == TEST_CACHE_SETTLE_METHOD || method == TEST_BACKGROUND_IDLE_METHOD {
+    if method == TEST_CACHE_SETTLE_METHOD
+        || method == TEST_BACKGROUND_IDLE_METHOD
+        || method == TEST_STORE_GROWTH_METHOD
+        || method == TEST_STORE_CLOCK_METHOD
+    {
         return true;
     }
     matches!(

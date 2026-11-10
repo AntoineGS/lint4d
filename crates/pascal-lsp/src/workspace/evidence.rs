@@ -388,6 +388,7 @@ mod tests {
             stamp: None,
             complete,
             listed: true,
+            resolvable: None,
         };
         let captured = |listing: [u8; 32], overlay| CapturedListing {
             directory: directory.clone(),
@@ -497,6 +498,7 @@ mod tests {
             stamp: None,
             complete: true,
             listed,
+            resolvable: None,
         };
         let payload = |path: &str| ResolutionObservation::Payload {
             source_id: pascal_core::SourceId::new(format!("source:{path}")),
@@ -623,6 +625,7 @@ mod tests {
             stamp: None,
             complete: true,
             listed: true,
+            resolvable: None,
         };
         let absent = ResolutionObservation::Candidate {
             path: PathBuf::from("/w/a/U.pas"),

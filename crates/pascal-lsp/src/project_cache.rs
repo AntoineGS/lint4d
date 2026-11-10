@@ -799,6 +799,7 @@ mod probe_tests {
                 stamp,
                 complete: true,
                 listed: true,
+                resolvable: None,
             }
         };
         let a = temp.path().join("a");

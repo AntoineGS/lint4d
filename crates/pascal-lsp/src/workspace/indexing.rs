@@ -437,6 +437,14 @@ impl IndexBound {
         }
     }
 
+    /// This bound, taking members for at most `time`.
+    pub(crate) fn within(self, time: Duration) -> Self {
+        Self {
+            time: Some(self.time.map_or(time, |own| own.min(time))),
+            ..self
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn with_mode(self, mode: IndexMode) -> Self {
         Self { mode, ..self }
@@ -2590,6 +2598,11 @@ impl Workspace {
             listing.incomplete |= !catalogue.is_complete()
                 || catalogue.limit().is_some()
                 || !catalogue.unreadable().is_empty();
+            for (directory, _) in catalogue.directories() {
+                if let Some(fingerprint) = catalogue.listing(directory) {
+                    listing.listings.insert(directory.clone(), fingerprint);
+                }
+            }
             listing
                 .directories
                 .extend(catalogue.directories().iter().cloned());
@@ -4559,6 +4572,7 @@ impl Workspace {
             let listing_incomplete = match listing {
                 Some(listing) => {
                     result.baseline.extend(listing.directories);
+                    result.listings.extend(listing.listings);
                     listing.incomplete
                 }
                 None if !searched => {
@@ -5031,6 +5045,8 @@ fn target_view(
 #[derive(Default)]
 struct MembershipListing {
     directories: Vec<(PathBuf, Option<PathStamp>)>,
+    /// `Catalogue::listing` of each of `directories` listed whole.
+    listings: HashMap<PathBuf, u64>,
     /// A catalogue stopped at a limit or could not read a directory.
     incomplete: bool,
 }

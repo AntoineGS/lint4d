@@ -134,6 +134,25 @@ fn has_extension(path: &Path, extension: &str) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case(extension))
 }
 
+/// `resolvable_listing_fingerprint` of a directory's `children`, classified
+/// as the source store lists them (a symlink is a file name); `None` when an
+/// entry's kind could not be read.
+fn listing_fingerprint(children: &[fs::DirEntry]) -> Option<u64> {
+    let (mut files, mut directories) = (Vec::new(), Vec::new());
+    for child in children {
+        let kind = child.file_type().ok()?;
+        if kind.is_dir() {
+            directories.push(child.path());
+        } else if kind.is_file() || kind.is_symlink() {
+            files.push(child.path());
+        }
+    }
+    Some(pascal_core::resolver::resolvable_listing_fingerprint(
+        &files,
+        &directories,
+    ))
+}
+
 fn stamp(path: &Path) -> Option<ProjectReadStamp> {
     pascal_project::path_stamp_result(path).ok().flatten()
 }
@@ -149,6 +168,9 @@ pub(crate) struct Catalogue {
     root_kind: RootKind,
     /// Listed directories with the stamp taken before listing them, root first.
     directories: Vec<(PathBuf, Option<ProjectReadStamp>)>,
+    /// `pascal_core::resolver::resolvable_listing_fingerprint` of each
+    /// directory listed whole, every entry read.
+    listings: HashMap<PathBuf, u64>,
     files: Vec<PathBuf>,
     /// Lowercase `.pas` file name to indices into `files`.
     by_name: HashMap<Box<str>, Vec<usize>>,
@@ -195,6 +217,7 @@ impl Catalogue {
             depth,
             root_kind: RootKind::Directory,
             directories: Vec::new(),
+            listings: HashMap::new(),
             files: Vec::new(),
             by_name: HashMap::new(),
             packages: HashMap::new(),
@@ -251,6 +274,7 @@ impl Catalogue {
                 }
             };
             let mut children = Vec::new();
+            let mut read_whole = true;
             for entry in entries {
                 before_io()?;
                 self.visits += 1;
@@ -260,10 +284,16 @@ impl Catalogue {
                 }
                 match entry {
                     Ok(entry) => children.push(entry),
-                    Err(error) => self.note_unreadable(&directory, &error),
+                    Err(error) => {
+                        read_whole = false;
+                        self.note_unreadable(&directory, &error);
+                    }
                 }
             }
             children.sort_by_key(fs::DirEntry::path);
+            if read_whole && let Some(fingerprint) = listing_fingerprint(&children) {
+                self.listings.insert(directory.clone(), fingerprint);
+            }
             self.frontier.pop_front();
             if !self.admit_children(children, limits, excluded, before_io)? {
                 return Ok(());
@@ -405,6 +435,12 @@ impl Catalogue {
 
     pub(crate) fn directories(&self) -> &[(PathBuf, Option<ProjectReadStamp>)] {
         &self.directories
+    }
+
+    /// The resolvable-entry fingerprint of `directory`'s listing, when it
+    /// was listed whole.
+    pub(crate) fn listing(&self, directory: &Path) -> Option<u64> {
+        self.listings.get(directory).copied()
     }
 
     pub(crate) fn files(&self) -> &[PathBuf] {

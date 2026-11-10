@@ -20,6 +20,8 @@ pub(crate) mod exclusion;
 pub(crate) mod names;
 pub(crate) mod options;
 pub(crate) mod status;
+#[cfg(feature = "test-support")]
+pub mod test_faults;
 mod worker;
 
 pub(crate) use counters::Counters;
@@ -535,7 +537,10 @@ impl PersistentCache {
         project_cache: ProjectCache,
         gate: Arc<InteractiveGate>,
     ) -> Self {
-        Self::start_with(options, project_cache, gate, Namespace::current().clone())
+        let namespace = Namespace::current().clone();
+        #[cfg(feature = "test-support")]
+        let namespace = test_faults::namespace_override().unwrap_or(namespace);
+        Self::start_with(options, project_cache, gate, namespace)
     }
 
     pub(crate) fn start_with(

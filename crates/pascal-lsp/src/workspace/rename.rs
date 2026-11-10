@@ -491,6 +491,56 @@ pub(crate) struct SourceRecord {
     /// Bounded semantic observations used to prove that auto-import provider
     /// uniqueness remains fresh without invalidating on unrelated comments.
     pub(crate) auto_import_scopes: Vec<AutoImportProviderScope>,
+    /// What the computation read of this directory (`directory_observation`)
+    /// beyond its stamp. A changed stamp with the same resolvable entries is
+    /// a build writing its products beside the sources (l4d-qk5t).
+    pub(crate) directory_listing: DirectoryListingWitness,
+}
+
+/// The resolvable entries (`pascal_core::resolver::resolvable_listing_fingerprint`)
+/// a computation saw in a directory it observed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) enum DirectoryListingWitness {
+    /// Nothing beyond the directory's stamp: a search marker, a traced
+    /// lookup, or not a directory observation. Any stamp change refuses.
+    #[default]
+    Stamp,
+    /// Every observation of the directory read a complete listing with
+    /// these resolvable entries, or was taken in the same directory state.
+    Resolvable(u64),
+    /// Observations of the directory disagree: any stamp change refuses.
+    Conflicting,
+}
+
+impl DirectoryListingWitness {
+    /// The witness of one directory observed as `self` at `stamp` and as
+    /// `other` at `other_stamp`.
+    pub(crate) fn merge(
+        self,
+        stamp: &Option<PathStamp>,
+        other: Self,
+        other_stamp: &Option<PathStamp>,
+    ) -> Self {
+        match (self, other) {
+            (Self::Conflicting, _) | (_, Self::Conflicting) => Self::Conflicting,
+            (Self::Resolvable(left), Self::Resolvable(right)) if left == right => self,
+            (Self::Resolvable(_), Self::Resolvable(_)) => Self::Conflicting,
+            (Self::Stamp, Self::Stamp) => Self::Stamp,
+            // A marker or a trace says no more than the listing of the same
+            // directory state; of another state it may have seen other
+            // entries.
+            (Self::Resolvable(_), Self::Stamp) | (Self::Stamp, Self::Resolvable(_))
+                if stamp == other_stamp =>
+            {
+                if matches!(self, Self::Resolvable(_)) {
+                    self
+                } else {
+                    other
+                }
+            }
+            _ => Self::Conflicting,
+        }
+    }
 }
 
 pub(crate) fn source_record_owned_bytes(record: &SourceRecord) -> usize {
@@ -1505,6 +1555,9 @@ struct BaselinePath {
     read_policy: Option<ReadPolicy>,
     path_entry: Option<ProjectPathEntry>,
     include_payload: bool,
+    /// What the observations of a directory that took its stamp showed
+    /// (`SourceRecord::directory_listing`); `None` before the first.
+    listing: Option<DirectoryListingWitness>,
 }
 
 #[derive(Debug, Default)]
@@ -1517,9 +1570,23 @@ struct BaselineAccumulator {
 
 impl BaselineAccumulator {
     fn add_path(&mut self, path: PathBuf, stamp: Option<PathStamp>) {
+        self.add_observed_path(path, stamp, DirectoryListingWitness::Stamp);
+    }
+
+    /// `add_path` for a directory whose listing showed `listing`.
+    fn add_observed_path(
+        &mut self,
+        path: PathBuf,
+        stamp: Option<PathStamp>,
+        listing: DirectoryListingWitness,
+    ) {
         let key = path_key(&path);
         if let Some(index) = self.lookup_index(&key) {
             let existing = &mut self.paths[index];
+            existing.listing = Some(match existing.listing {
+                Some(known) => known.merge(&existing.stamp, listing, &stamp),
+                None => listing,
+            });
             if existing.stamp.is_none() && existing.read_policy.is_none() {
                 existing.stamp = stamp;
             }
@@ -1534,6 +1601,7 @@ impl BaselineAccumulator {
             read_policy: None,
             path_entry: None,
             include_payload: false,
+            listing: Some(listing),
         });
     }
 
@@ -1545,7 +1613,17 @@ impl BaselineAccumulator {
     ) {
         let key = path_key(&path);
         if let Some(index) = self.lookup_index(&key) {
-            self.paths[index].candidate_membership = Some(membership);
+            let existing = &mut self.paths[index];
+            if observe_directory_stamp {
+                let stamp = path_stamp(&path);
+                existing.listing = Some(match existing.listing {
+                    Some(known) => {
+                        known.merge(&existing.stamp, DirectoryListingWitness::Stamp, &stamp)
+                    }
+                    None => DirectoryListingWitness::Stamp,
+                });
+            }
+            existing.candidate_membership = Some(membership);
             return;
         }
         let index = self.paths.len();
@@ -1558,6 +1636,7 @@ impl BaselineAccumulator {
             read_policy: None,
             path_entry: None,
             include_payload: false,
+            listing: observe_directory_stamp.then_some(DirectoryListingWitness::Stamp),
         });
     }
 
@@ -1578,6 +1657,7 @@ impl BaselineAccumulator {
                 read_policy: None,
                 path_entry: None,
                 include_payload: false,
+                listing: None,
             });
             index
         });
@@ -1607,6 +1687,7 @@ impl BaselineAccumulator {
                 read_policy: None,
                 path_entry: None,
                 include_payload: false,
+                listing: None,
             });
             index
         });
@@ -1636,6 +1717,7 @@ impl BaselineAccumulator {
                 read_policy: None,
                 path_entry: None,
                 include_payload: false,
+                listing: None,
             });
             index
         });
@@ -1876,6 +1958,15 @@ impl Workspace {
     pub(crate) fn revalidate_records(&self, records: &[SourceRecord]) -> Result<(), String> {
         let cancel = AtomicBool::new(false);
         let deleted_paths = deleted_override_paths(&self.deleted_overrides);
+        let open_documents = || {
+            open_paths(
+                self.open_documents
+                    .iter()
+                    .filter(|(_, document)| document.text.is_some())
+                    .map(|(uri, _)| uri),
+            )
+        };
+        let relist = Relisting::new(&open_documents);
         for record in records {
             if let Some(path) = &record.path {
                 if record.missing_provider_candidate {
@@ -1899,7 +1990,7 @@ impl Workspace {
                         ));
                     }
                 }
-                revalidate_path_record(path, record, &cancel, true, &deleted_paths)?;
+                revalidate_path_record(path, record, &cancel, true, &deleted_paths, &relist)?;
                 continue;
             }
             if record.open {
@@ -2052,6 +2143,8 @@ fn revalidate_records(
     cancel: &AtomicBool,
     validate_transport_observations: bool,
 ) -> Result<(), String> {
+    let open_buffers = || open_paths(overlays.keys());
+    let relist = Relisting::new(&open_buffers);
     for record in records {
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
@@ -2069,6 +2162,7 @@ fn revalidate_records(
                 cancel,
                 validate_transport_observations,
                 deleted_paths,
+                &relist,
             )?;
             // A retained path-backed record can become superseded by a newly
             // admitted overlay.  Effective owner validation must compare the
@@ -2171,6 +2265,7 @@ fn revalidate_path_record(
     cancel: &AtomicBool,
     validate_transport_observations: bool,
     deleted_paths: &[PathBuf],
+    relist: &Relisting<'_>,
 ) -> Result<(), String> {
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
@@ -2246,6 +2341,17 @@ fn revalidate_path_record(
         } else {
             actual_path_stamp != record.path_stamp
         };
+        let path_stamp_changed = path_stamp_changed
+            && !(validate_transport_observations
+                && !effective_path_changed
+                && directory_resolves_alike(
+                    path,
+                    record,
+                    &actual_path_stamp,
+                    relist,
+                    deleted_paths,
+                    cancel,
+                )?);
         if (validate_transport_observations && path_stamp_changed) || effective_path_changed {
             let kind = if is_configuration_file(path) {
                 "configuration"
@@ -2303,6 +2409,125 @@ fn revalidate_path_record(
         return Err(CANCELLATION_MESSAGE.to_string());
     }
     Ok(())
+}
+
+/// The paths of the open documents among `uris`.
+fn open_paths<'a>(uris: impl Iterator<Item = &'a Url>) -> Vec<PathBuf> {
+    uris.filter_map(|uri| uri.to_file_path().ok()).collect()
+}
+
+/// The most entries `directory_resolves_alike` lists in one directory, and
+/// in all the directories of one revalidation, before it gives up and the
+/// stamp check refuses.
+const MAX_REVALIDATED_LISTING_ENTRIES: usize = 65_536;
+const MAX_REVALIDATED_LISTING_TOTAL: usize = 262_144;
+
+/// One revalidation's listings of directories whose stamps changed: the
+/// open buffers they join and the entries they have read so far.
+pub(crate) struct Relisting<'a> {
+    open_paths: &'a dyn Fn() -> Vec<PathBuf>,
+    listed: std::cell::Cell<usize>,
+}
+
+impl<'a> Relisting<'a> {
+    pub(crate) fn new(open_paths: &'a dyn Fn() -> Vec<PathBuf>) -> Self {
+        Self {
+            open_paths,
+            listed: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Counts one more listed entry; false past the bound.
+    fn admit(&self) -> bool {
+        let listed = self.listed.get().saturating_add(1);
+        self.listed.set(listed);
+        listed <= MAX_REVALIDATED_LISTING_TOTAL
+    }
+}
+
+/// Whether the directory `path` of a directory observation whose stamp
+/// changed still holds the resolvable entries the computation saw
+/// (`DirectoryListingWitness::Resolvable`): only entries no lookup selects
+/// (build products beside their sources) were created or removed, so every
+/// lookup there resolves as it did (l4d-qk5t).
+///
+/// The listing approximates the computation's source store rather than
+/// copying it: it joins every open buffer in the directory (the store joins
+/// only authorized ones), leaves out the files deleted in the editor (the
+/// store keeps them) and keeps the cache directory (the store drops it).
+/// Each difference, like any read error or a bound, can only make the
+/// fingerprints differ, which refuses; none can hold a changed directory.
+fn directory_resolves_alike(
+    path: &Path,
+    record: &SourceRecord,
+    actual: &Option<PathStamp>,
+    relist: &Relisting<'_>,
+    deleted_paths: &[PathBuf],
+    cancel: &AtomicBool,
+) -> Result<bool, String> {
+    let DirectoryListingWitness::Resolvable(expected) = record.directory_listing else {
+        return Ok(false);
+    };
+    if record.document_link_missing_candidate || record.missing_provider_scope.is_some() {
+        return Ok(false);
+    }
+    // A directory that became a symlink or a file is not listed alike.
+    if let (Some(actual), Some(expected)) = (actual, &record.path_stamp)
+        && !path_kind_matches(&Some(actual.clone()), &Some(expected.clone()))
+    {
+        return Ok(false);
+    }
+    if actual
+        .as_ref()
+        .is_some_and(|actual| !actual.is_dir || actual.is_symlink)
+    {
+        return Ok(false);
+    }
+    let (mut files, mut directories) = (Vec::new(), Vec::new());
+    if actual.is_some() {
+        let Ok(entries) = fs::read_dir(path) else {
+            return Ok(false);
+        };
+        for (count, entry) in entries.enumerate() {
+            if count % 256 == 0 && is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            if count >= MAX_REVALIDATED_LISTING_ENTRIES || !relist.admit() {
+                return Ok(false);
+            }
+            let Ok(entry) = entry else {
+                return Ok(false);
+            };
+            let Ok(kind) = entry.file_type() else {
+                return Ok(false);
+            };
+            if kind.is_dir() {
+                directories.push(entry.path());
+            } else if kind.is_file() || kind.is_symlink() {
+                files.push(entry.path());
+            }
+        }
+    }
+    files.retain(|file| {
+        !deleted_paths
+            .iter()
+            .any(|deleted| shared_resolver::path_equivalent(deleted, file))
+    });
+    for open in (relist.open_paths)() {
+        if open
+            .parent()
+            .is_some_and(|parent| shared_resolver::path_equivalent(parent, path))
+            && !files
+                .iter()
+                .any(|file| shared_resolver::path_equivalent(file, &open))
+        {
+            files.push(open);
+        }
+    }
+    if is_cancelled(cancel) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    Ok(pascal_core::resolver::resolvable_listing_fingerprint(&files, &directories) == expected)
 }
 
 /// Every path an include request could have probed: the request resolved
@@ -2617,6 +2842,7 @@ pub(super) fn path_record_at(
         missing_provider_scope: None,
         auto_import_provider_observation: false,
         auto_import_scopes: Vec::new(),
+        directory_listing: Default::default(),
     })
 }
 
@@ -2723,6 +2949,7 @@ pub(crate) fn source_for_input_with_cancel(
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
+                directory_listing: Default::default(),
             },
         ));
     }
@@ -2772,6 +2999,7 @@ pub(crate) fn source_for_input_with_owner(
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
+                directory_listing: Default::default(),
             },
         ));
     }
@@ -2835,6 +3063,7 @@ pub(crate) fn source_for_input_with_owner(
         missing_provider_scope: None,
         auto_import_provider_observation: false,
         auto_import_scopes: Vec::new(),
+        directory_listing: Default::default(),
     };
     Ok((disk.text, record))
 }
@@ -6256,7 +6485,7 @@ pub(crate) enum SnapshotScope {
     Walk,
     /// The candidates an index chose (l4d-33 §6): no walk, no owner discovery
     /// and no mapped-root walk.
-    Indexed(IndexedSources),
+    Indexed(Box<IndexedSources>),
 }
 
 /// The sources of an indexed snapshot, each with the target context that
@@ -6267,6 +6496,9 @@ pub(crate) struct IndexedSources {
     /// What proves the members left out still current (A7): their stamps and
     /// the directories of the catalogues their membership came from.
     pub(crate) baseline: Vec<(PathBuf, Option<PathStamp>)>,
+    /// The resolvable-entry fingerprints of the catalogue directories in
+    /// `baseline` that were listed whole (`DirectoryListingWitness`).
+    pub(crate) listings: HashMap<PathBuf, u64>,
     pub(crate) gaps: Vec<String>,
     /// Unchanged members left out because an include does not resolve (R9-4).
     pub(crate) unresolved: usize,
@@ -6296,7 +6528,7 @@ pub(crate) fn build_indexed_snapshot(
         priority_seed,
         &[],
         false,
-        SnapshotScope::Indexed(sources),
+        SnapshotScope::Indexed(Box::new(sources)),
         cancel,
     )
 }
@@ -6781,6 +7013,7 @@ fn build_snapshot_with_policy(
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
+                    directory_listing: Default::default(),
                 },
                 overlay.text.len(),
             )
@@ -6873,6 +7106,7 @@ fn build_snapshot_with_policy(
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
+                    directory_listing: Default::default(),
                 },
                 scan.bytes,
             )
@@ -7565,6 +7799,7 @@ fn build_snapshot_with_policy(
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
+                    directory_listing: Default::default(),
                 },
             )
         } else {
@@ -7610,6 +7845,7 @@ fn build_snapshot_with_policy(
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
+                    directory_listing: Default::default(),
                 },
             )
         };
@@ -7767,6 +8003,10 @@ fn build_snapshot_with_policy(
                 baseline.path_entry,
                 baseline.include_payload,
             )
+            .map(|mut record| {
+                record.directory_listing = baseline.listing.unwrap_or_default();
+                record
+            })
         })
         .collect::<Vec<_>>();
     for record in &mut baseline_records {
@@ -8044,6 +8284,7 @@ fn include_record(
         missing_provider_scope: None,
         auto_import_provider_observation: false,
         auto_import_scopes: Vec::new(),
+        directory_listing: Default::default(),
     };
     if let Some(document) = loader.open_documents.get(uri) {
         let Some(open_source) = document.text.as_ref() else {
@@ -8456,7 +8697,13 @@ fn enumerate_sources(
             }
         }
         for (path, stamp) in &indexed.baseline {
-            add_baseline_path_with_stamp(&mut result.baseline, path.clone(), stamp.clone());
+            let listing = indexed.listings.get(path).copied().map_or(
+                DirectoryListingWitness::Stamp,
+                DirectoryListingWitness::Resolvable,
+            );
+            result
+                .baseline
+                .add_observed_path(path.clone(), stamp.clone(), listing);
         }
     }
 
@@ -8727,7 +8974,11 @@ fn snapshot_catalogue_gap(
 /// Every directory `catalogue` listed, with the stamp taken before listing it.
 fn add_catalogue_directories(baseline: &mut BaselineAccumulator, catalogue: &Catalogue) {
     for (directory, stamp) in catalogue.directories() {
-        add_baseline_path_with_stamp(baseline, directory.clone(), stamp.clone());
+        let listing = catalogue.listing(directory).map_or(
+            DirectoryListingWitness::Stamp,
+            DirectoryListingWitness::Resolvable,
+        );
+        baseline.add_observed_path(directory.clone(), stamp.clone(), listing);
     }
 }
 
@@ -9700,7 +9951,14 @@ impl IncludeAuditor<'_> {
         self.loader.merge_resolution_report(context_key, report);
         for observation in &report.observations {
             if let Some((path, stamp)) = resolver_observation_baseline(observation) {
-                add_baseline_path_with_stamp(self.baseline, path, stamp);
+                let listing = match observation {
+                    pascal_core::resolver::ResolutionObservation::Directory {
+                        resolvable: Some(resolvable),
+                        ..
+                    } => DirectoryListingWitness::Resolvable(*resolvable),
+                    _ => DirectoryListingWitness::Stamp,
+                };
+                self.baseline.add_observed_path(path, stamp, listing);
             }
         }
     }
@@ -11898,8 +12156,15 @@ mod tests {
         assert!(record.read_policy.is_some());
         assert!(record.path_entry.is_some());
         let cancel = AtomicBool::new(false);
-        super::revalidate_path_record(&candidate, &record, &cancel, true, &[])
-            .expect("unchanged discarded candidate must revalidate");
+        super::revalidate_path_record(
+            &candidate,
+            &record,
+            &cancel,
+            true,
+            &[],
+            &super::Relisting::new(&Vec::new),
+        )
+        .expect("unchanged discarded candidate must revalidate");
 
         let original_mtime = fs::metadata(&candidate)
             .expect("candidate metadata")
@@ -11913,8 +12178,15 @@ mod tests {
             .set_times(FileTimes::new().set_modified(original_mtime))
             .expect("restore candidate mtime");
 
-        let error = super::revalidate_path_record(&candidate, &record, &cancel, true, &[])
-            .expect_err("same-stamp discarded candidate mutation must stale");
+        let error = super::revalidate_path_record(
+            &candidate,
+            &record,
+            &cancel,
+            true,
+            &[],
+            &super::Relisting::new(&Vec::new),
+        )
+        .expect_err("same-stamp discarded candidate mutation must stale");
         assert!(
             error.contains("changed") || error.contains("metadata"),
             "unexpected discarded candidate revalidation error: {error}"
@@ -14373,6 +14645,7 @@ mod tests {
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
+            directory_listing: Default::default(),
         };
 
         let error = read_record_content_hash(&include, &record, &AtomicBool::new(false))
@@ -14494,5 +14767,127 @@ mod tests {
             None
         );
         assert_eq!(variant_for(&[("selected.inc", Some(&variant))]), None);
+    }
+
+    /// The record of a lookup that listed `directory` as it is now.
+    fn listed_directory_record(directory: &std::path::Path) -> super::SourceRecord {
+        let (mut files, mut directories) = (Vec::new(), Vec::new());
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                directories.push(entry.path());
+            } else {
+                files.push(entry.path());
+            }
+        }
+        let observation = ResolutionObservation::Directory {
+            path: directory.to_path_buf(),
+            entry: ProjectPathEntry::configured(directory.to_path_buf()),
+            stamp: pascal_project::path_stamp_result(directory).unwrap(),
+            complete: true,
+            listed: true,
+            resolvable: Some(pascal_core::resolver::resolvable_listing_fingerprint(
+                &files,
+                &directories,
+            )),
+        };
+        super::shared_resolver::observation_record(&observation).expect("directory record")
+    }
+
+    fn revalidate_directory(record: &super::SourceRecord) -> Result<(), String> {
+        super::revalidate_path_record(
+            record.path.as_deref().unwrap(),
+            record,
+            &AtomicBool::new(false),
+            true,
+            &[],
+            &super::Relisting::new(&Vec::new),
+        )
+    }
+
+    /// l4d-qk5t: a build writes its products into a directory a request
+    /// listed; the request's evidence still holds. A new unit, in any case,
+    /// or a new subdirectory refuses it, as does any change of a directory
+    /// whose listing the request did not read.
+    #[test]
+    fn a_listed_directory_holds_through_build_products_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let lib = temp.path().join("lib");
+        fs::create_dir_all(&lib).unwrap();
+        fs::write(
+            lib.join("Shared.pas"),
+            "unit Shared; interface implementation end.",
+        )
+        .unwrap();
+        pascal_project::backdate_tree_for_test(temp.path());
+        let record = listed_directory_record(&lib);
+        let stamp_only = super::SourceRecord {
+            directory_listing: super::DirectoryListingWitness::Stamp,
+            ..record.clone()
+        };
+        revalidate_directory(&record).expect("unchanged");
+
+        for product in [
+            "Shared.dcu",
+            "shared.DCU",
+            "App.exe",
+            "Pkg.dcp",
+            "App.res",
+            "App.vrc",
+        ] {
+            fs::write(lib.join(product), b"built").unwrap();
+        }
+        revalidate_directory(&record).expect("build products resolve nothing");
+        let error = revalidate_directory(&stamp_only).expect_err("a stamp-only witness");
+        assert!(error.contains("retry the request"), "{error}");
+        fs::remove_file(lib.join("App.exe")).unwrap();
+        revalidate_directory(&record).expect("a removed build product");
+
+        fs::write(lib.join("Vendor.dcu"), b"built").unwrap();
+        let error = revalidate_directory(&record).expect_err("a lone compiled unit");
+        assert!(error.contains("retry the request"), "{error}");
+        fs::remove_file(lib.join("Vendor.dcu")).unwrap();
+
+        fs::write(
+            lib.join("Late.Pas"),
+            "unit Late; interface implementation end.",
+        )
+        .unwrap();
+        let error = revalidate_directory(&record).expect_err("a new unit");
+        assert!(error.contains("retry the request"), "{error}");
+        fs::remove_file(lib.join("Late.Pas")).unwrap();
+        revalidate_directory(&record).expect("the unit is gone again");
+
+        fs::create_dir(lib.join("Win32")).unwrap();
+        let error = revalidate_directory(&record).expect_err("a new directory");
+        assert!(error.contains("retry the request"), "{error}");
+    }
+
+    /// Two observations of one directory agree only on the same entries,
+    /// or a marker in the same state as a listing.
+    #[test]
+    fn directory_listing_witnesses_merge_only_what_agrees() {
+        use super::DirectoryListingWitness::{Conflicting, Resolvable, Stamp};
+        let temp = tempfile::tempdir().unwrap();
+        let before = pascal_project::path_stamp_result(temp.path()).unwrap();
+        fs::write(temp.path().join("A.pas"), "unit A;").unwrap();
+        let after = pascal_project::path_stamp_result(temp.path()).unwrap();
+        assert_ne!(before, after);
+        assert_eq!(
+            Resolvable(1).merge(&before, Resolvable(1), &after),
+            Resolvable(1)
+        );
+        assert_eq!(
+            Resolvable(1).merge(&before, Resolvable(2), &before),
+            Conflicting
+        );
+        assert_eq!(Stamp.merge(&before, Resolvable(1), &before), Resolvable(1));
+        assert_eq!(Resolvable(1).merge(&before, Stamp, &before), Resolvable(1));
+        assert_eq!(Stamp.merge(&before, Resolvable(1), &after), Conflicting);
+        assert_eq!(Stamp.merge(&before, Stamp, &after), Stamp);
+        assert_eq!(
+            Conflicting.merge(&before, Resolvable(1), &before),
+            Conflicting
+        );
     }
 }

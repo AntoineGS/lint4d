@@ -1310,6 +1310,8 @@ enum TestBarrier {
     CompletionResolution,
     WorkspaceSymbols,
     References,
+    #[cfg(feature = "test-support")]
+    ReferencesValidation,
     PartialValidation,
     ProjectOperation,
     ProjectOperationPrepared,
@@ -1329,6 +1331,7 @@ pub struct TestBarrierConfig {
     completion_resolution: Option<TestBarrierPaths>,
     workspace_symbols: Option<TestBarrierPaths>,
     references: Option<TestBarrierPaths>,
+    references_validation: Option<TestBarrierPaths>,
     partial_validation: Option<TestBarrierPaths>,
     project_operation: Option<TestBarrierPaths>,
     project_operation_prepared: Option<TestBarrierPaths>,
@@ -1341,6 +1344,9 @@ pub struct TestBarrierConfig {
     workspace_fifo_probe: Option<WorkspaceFifoProbePaths>,
     dispatch: Option<PathBuf>,
     analysis_metrics: bool,
+    store_fault: Option<crate::persistent_cache::test_faults::StoreFaultSpec>,
+    store_growth_pages: Option<i64>,
+    build_fingerprint: Option<pascal_cache::Digest>,
 }
 
 #[cfg(feature = "test-support")]
@@ -1383,6 +1389,7 @@ impl TestBarrierConfig {
             completion_resolution: None,
             workspace_symbols: None,
             references: None,
+            references_validation: None,
             partial_validation: None,
             project_operation: None,
             project_operation_prepared: None,
@@ -1395,7 +1402,35 @@ impl TestBarrierConfig {
             workspace_fifo_probe: None,
             dispatch: None,
             analysis_metrics: false,
+            store_fault: None,
+            store_growth_pages: None,
+            build_fingerprint: None,
         }
+    }
+
+    /// Arms every store this process opens with a fault point; see
+    /// `PASCAL_LSP_TEST_STORE_FAULT`.
+    pub fn with_store_fault(mut self, spec: Option<&str>) -> Result<Self, String> {
+        self.store_fault = spec
+            .map(crate::persistent_cache::test_faults::StoreFaultSpec::parse)
+            .transpose()?;
+        Ok(self)
+    }
+
+    /// Limits the growth of every store this process opens, in pages.
+    pub fn with_store_growth_pages(mut self, pages: Option<i64>) -> Self {
+        self.store_growth_pages = pages;
+        self
+    }
+
+    /// Opens every store under the namespace of this build fingerprint (64
+    /// hex characters) instead of the real one; see
+    /// `PASCAL_LSP_TEST_NAMESPACE`.
+    pub fn with_namespace(mut self, fingerprint: Option<&str>) -> Result<Self, String> {
+        self.build_fingerprint = fingerprint
+            .map(crate::persistent_cache::test_faults::parse_build_fingerprint)
+            .transpose()?;
+        Ok(self)
     }
 
     /// Serves `pascal/testAnalysisMetrics`; never enabled by `run_stdio`.
@@ -1504,6 +1539,17 @@ impl TestBarrierConfig {
         self
     }
 
+    /// Holds a computed references or workspace/symbol result before its
+    /// final revalidation.
+    pub fn with_references_validation(
+        mut self,
+        references_validation: Option<(PathBuf, PathBuf)>,
+    ) -> Self {
+        self.references_validation =
+            references_validation.map(|(entered, release)| TestBarrierPaths { entered, release });
+        self
+    }
+
     pub fn with_partial_validation(
         mut self,
         partial_validation: Option<(PathBuf, PathBuf)>,
@@ -1592,6 +1638,7 @@ impl TestBarrierConfig {
             TestBarrier::CompletionResolution => self.completion_resolution.as_ref(),
             TestBarrier::WorkspaceSymbols => self.workspace_symbols.as_ref(),
             TestBarrier::References => self.references.as_ref(),
+            TestBarrier::ReferencesValidation => self.references_validation.as_ref(),
             TestBarrier::PartialValidation => self.partial_validation.as_ref(),
             TestBarrier::ProjectOperation => self.project_operation.as_ref(),
             TestBarrier::ProjectOperationPrepared => self.project_operation_prepared.as_ref(),
@@ -1662,16 +1709,25 @@ fn wait_at_uninterruptible_test_barrier(
     let Some(paths) = config.paths(barrier) else {
         return Ok(());
     };
+    hold_at_test_paths(&paths.entered, &paths.release)
+}
+
+/// Record entry in `entered`, then wait for `release` to exist.
+#[cfg(feature = "test-support")]
+pub(crate) fn hold_at_test_paths(
+    entered: &std::path::Path,
+    release: &std::path::Path,
+) -> Result<(), String> {
     let mut marker = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
-        .open(&paths.entered)
+        .open(entered)
         .map_err(|error| format!("could not enter test barrier: {error}"))?;
     marker
         .write_all(b"x")
         .map_err(|error| format!("could not record test barrier entry: {error}"))?;
     drop(marker);
-    while !paths.release.exists() {
+    while !release.exists() {
         thread::sleep(ANALYSIS_POLL_INTERVAL);
     }
     Ok(())
@@ -2492,6 +2548,7 @@ fn diagnostic_record_fingerprint(record: &SourceRecord) -> u64 {
     record.document_link_missing_candidate.hash(&mut hasher);
     record.document_link_case_variant.hash(&mut hasher);
     record.directory_observation.hash(&mut hasher);
+    record.directory_listing.hash(&mut hasher);
     record.document_link_ancestor.hash(&mut hasher);
     record.auto_import_provider_observation.hash(&mut hasher);
     hash_debug(&mut hasher, &record.candidate_membership);
@@ -6796,6 +6853,18 @@ impl AnalysisJobs {
                 ) {
                     invalidate_analysis_result(&mut result, error);
                 }
+                #[cfg(feature = "test-support")]
+                if matches!(
+                    result.value,
+                    AnalysisResultValue::References(Ok(_))
+                        | AnalysisResultValue::WorkspaceSymbols(Ok(_))
+                ) && let Err(error) = wait_at_test_barrier(
+                    TestBarrier::ReferencesValidation,
+                    &test_barriers,
+                    &worker_cancellation,
+                ) {
+                    invalidate_analysis_result(&mut result, error);
+                }
                 if let Err(error) = rename::revalidate_input(
                     &validation_input,
                     &result.records,
@@ -10522,6 +10591,12 @@ pub fn run_stdio_with_test_barriers(
 fn run_stdio_with_config(
     test_barriers: TestBarrierConfig,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    #[cfg(feature = "test-support")]
+    crate::persistent_cache::test_faults::install(
+        test_barriers.store_fault.clone(),
+        test_barriers.store_growth_pages,
+        test_barriers.build_fingerprint,
+    );
     let (connection, priority_receiver, io_threads) = bounded_stdio(test_barriers.clone());
     let connection = ProtocolConnection::new(connection, priority_receiver, &test_barriers);
     let outcome = run_connection(&connection, test_barriers);
@@ -10837,6 +10912,13 @@ const CACHE_STATUS_METHOD: &str = "pascal/cacheStatus";
 const INDEX_STATUS_METHOD: &str = "pascal/indexStatus";
 #[cfg(feature = "test-support")]
 const TEST_CACHE_SETTLE_METHOD: &str = "pascal/testCacheSettle";
+/// `{"extraPages": n}` limits the open store's growth; `{"applied": bool}`.
+#[cfg(feature = "test-support")]
+const TEST_STORE_GROWTH_METHOD: &str = "pascal/testStoreGrowth";
+/// `{"advanceMs": n}` advances the open store's test clock (its health
+/// backoff); `{"applied": bool}`.
+#[cfg(feature = "test-support")]
+const TEST_STORE_CLOCK_METHOD: &str = "pascal/testStoreClock";
 /// Whether the server has background work: a warmer crawl or index batch,
 /// an analysis job or a diagnostic deadline. Answered in message order.
 #[cfg(feature = "test-support")]
@@ -12028,6 +12110,47 @@ fn event_loop(
             }
             #[cfg(feature = "test-support")]
             Message::Request(request)
+                if request.method == TEST_STORE_GROWTH_METHOD
+                    && !shutdown_received
+                    && !configuration.is_preparing() =>
+            {
+                let applied = request
+                    .params
+                    .get("extraPages")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|pages| {
+                        crate::persistent_cache::test_faults::limit_growth(persistent, pages)
+                    });
+                send_ok(
+                    connection,
+                    request.id,
+                    serde_json::json!({ "applied": applied }),
+                )?;
+            }
+            #[cfg(feature = "test-support")]
+            Message::Request(request)
+                if request.method == TEST_STORE_CLOCK_METHOD
+                    && !shutdown_received
+                    && !configuration.is_preparing() =>
+            {
+                let applied = request
+                    .params
+                    .get("advanceMs")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|millis| {
+                        crate::persistent_cache::test_faults::advance_clock(
+                            persistent,
+                            Duration::from_millis(millis),
+                        )
+                    });
+                send_ok(
+                    connection,
+                    request.id,
+                    serde_json::json!({ "applied": applied }),
+                )?;
+            }
+            #[cfg(feature = "test-support")]
+            Message::Request(request)
                 if request.method == TEST_BACKGROUND_IDLE_METHOD
                     && !shutdown_received
                     && !configuration.is_preparing() =>
@@ -12035,6 +12158,12 @@ fn event_loop(
                 let warmer_idle = warmer.is_idle();
                 let jobs_idle = jobs.is_empty();
                 let diagnostics_due = workspace.next_diagnostic_timeout().is_some();
+                let (watch_paths, watch_overflows) = watch_events.applied();
+                let watch_path_applied = request
+                    .params
+                    .get("watchPath")
+                    .and_then(Value::as_str)
+                    .map(|path| watch_events.take_applied(Path::new(path)));
                 send_ok(
                     connection,
                     request.id,
@@ -12043,6 +12172,10 @@ fn event_loop(
                         "warmer": warmer_idle,
                         "jobs": jobs_idle,
                         "diagnosticsDue": diagnostics_due,
+                        "watchPaths": watch_paths,
+                        "watchOverflows": watch_overflows,
+                        "watchPending": watch_events.pending(),
+                        "watchPathApplied": watch_path_applied,
                     }),
                 )?;
             }
@@ -12617,6 +12750,9 @@ fn drain_watch_events(
     if let Some(source) = source.into_inner() {
         refuse_cache_directory(workspace, &source);
     }
+    if watch_events.take_overflowed() {
+        rewarm.extend(workspace.open_document_uris());
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12865,7 +13001,11 @@ fn request_partial_result_token(request: &Request) -> Result<Option<ProgressToke
 
 fn request_requires_configuration(method: &str) -> bool {
     #[cfg(feature = "test-support")]
-    if method == TEST_CACHE_SETTLE_METHOD || method == TEST_BACKGROUND_IDLE_METHOD {
+    if method == TEST_CACHE_SETTLE_METHOD
+        || method == TEST_BACKGROUND_IDLE_METHOD
+        || method == TEST_STORE_GROWTH_METHOD
+        || method == TEST_STORE_CLOCK_METHOD
+    {
         return true;
     }
     matches!(
@@ -18750,6 +18890,7 @@ mod tests {
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
+            directory_listing: Default::default(),
         };
         Some(
             super::prepare_diagnostic_dependency(&[record], 0, 0)
@@ -18955,6 +19096,7 @@ mod tests {
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
+            directory_listing: Default::default(),
         }
     }
 
@@ -19155,6 +19297,7 @@ mod tests {
             missing_provider_scope: Some(missing_provider_scope),
             auto_import_provider_observation: true,
             auto_import_scopes: vec![auto_import_scope],
+            directory_listing: Default::default(),
         }
     }
 

@@ -152,13 +152,21 @@ pub fn path_key(path: &Path) -> Vec<u8> {
     encoder.into_bytes()
 }
 
-/// The digest of a complete directory listing: its entries' final names,
-/// files and directories kept apart, sorted and deduplicated. The parent
-/// and the order the platform returned them in do not matter.
+/// The digest of a complete directory listing: the final names of its
+/// entries that can take part in resolution
+/// (`pascal_core::resolver::listing_entry_may_resolve`: every directory, every
+/// file but a build product), files and directories kept apart, sorted and
+/// deduplicated. The parent, the order the platform returned them in and the
+/// build products written beside the sources (l4d-qk5t) do not matter.
 pub fn listing_digest(files: &[PathBuf], directories: &[PathBuf]) -> Digest {
-    fn names(paths: &[PathBuf]) -> Vec<Vec<u8>> {
+    fn names(paths: &[PathBuf], directory: bool) -> Vec<Vec<u8>> {
         let mut names: Vec<Vec<u8>> = paths
             .iter()
+            .filter(|path| {
+                path.file_name().is_none_or(|name| {
+                    pascal_core::resolver::listing_entry_may_resolve(name, directory)
+                })
+            })
             .map(|path| path_key(path.file_name().map_or(path.as_path(), Path::new)))
             .collect();
         names.sort();
@@ -167,9 +175,11 @@ pub fn listing_digest(files: &[PathBuf], directories: &[PathBuf]) -> Digest {
     }
     let mut encoder = Encoder::new();
     encoder.field(1);
-    encoder.seq(names(files), |encoder, name| encoder.bytes(&name));
+    encoder.seq(names(files, false), |encoder, name| encoder.bytes(&name));
     encoder.field(2);
-    encoder.seq(names(directories), |encoder, name| encoder.bytes(&name));
+    encoder.seq(names(directories, true), |encoder, name| {
+        encoder.bytes(&name)
+    });
     Digest::derive(LISTING_DIGEST_CONTEXT, encoder.as_bytes())
 }
 

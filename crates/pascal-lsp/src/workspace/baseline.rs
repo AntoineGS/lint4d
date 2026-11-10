@@ -347,6 +347,12 @@ impl Workspace {
                 stamp: listing.stamp.clone(),
                 complete: listing.complete,
                 listed: true,
+                resolvable: listing.complete.then(|| {
+                    pascal_core::resolver::resolvable_listing_fingerprint(
+                        &listing.files,
+                        &listing.directories,
+                    )
+                }),
             });
         }
         let captured = capture_evidence(

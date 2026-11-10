@@ -864,6 +864,7 @@ pub(in crate::workspace) mod tests {
             stamp: None,
             complete: true,
             listed: true,
+            resolvable: None,
         };
         let mut captured = CapturedReads {
             listings: vec![CapturedListing {

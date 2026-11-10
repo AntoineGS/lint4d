@@ -9,6 +9,8 @@ const TEST_COMPLETION_RESOLUTION_BARRIER_ENV: &str =
     "PASCAL_LSP_TEST_COMPLETION_RESOLUTION_BARRIER";
 const TEST_WORKSPACE_SYMBOLS_BARRIER_ENV: &str = "PASCAL_LSP_TEST_WORKSPACE_SYMBOLS_BARRIER";
 const TEST_REFERENCES_BARRIER_ENV: &str = "PASCAL_LSP_TEST_REFERENCES_BARRIER";
+const TEST_REFERENCES_VALIDATION_BARRIER_ENV: &str =
+    "PASCAL_LSP_TEST_REFERENCES_VALIDATION_BARRIER";
 const TEST_PARTIAL_VALIDATION_BARRIER_ENV: &str = "PASCAL_LSP_TEST_PARTIAL_VALIDATION_BARRIER";
 const TEST_PROJECT_OPERATION_BARRIER_ENV: &str = "PASCAL_LSP_TEST_PROJECT_OPERATION_BARRIER";
 const TEST_PROJECT_OPERATION_PREPARED_BARRIER_ENV: &str =
@@ -21,6 +23,9 @@ const TEST_MANUAL_SELECTION_PREPARED_BARRIER_ENV: &str =
     "PASCAL_LSP_TEST_MANUAL_SELECTION_PREPARED_BARRIER";
 const TEST_COMPILED_CONTENT_BARRIER_ENV: &str = "PASCAL_LSP_TEST_COMPILED_CONTENT_BARRIER";
 const TEST_OUTBOUND_WRITER_BARRIER_ENV: &str = "PASCAL_LSP_TEST_OUTBOUND_WRITER_BARRIER";
+const TEST_STORE_FAULT_ENV: &str = "PASCAL_LSP_TEST_STORE_FAULT";
+const TEST_STORE_GROWTH_PAGES_ENV: &str = "PASCAL_LSP_TEST_STORE_GROWTH_PAGES";
+const TEST_NAMESPACE_ENV: &str = "PASCAL_LSP_TEST_NAMESPACE";
 const TEST_DISPATCH_LOG_ENV: &str = "PASCAL_LSP_TEST_DISPATCH_LOG";
 const TEST_WORKSPACE_FIFO_PROBE_ENV: &str = "PASCAL_LSP_TEST_WORKSPACE_FIFO_PROBE";
 
@@ -84,8 +89,21 @@ fn workspace_fifo_probe_from_environment(
     )))
 }
 
+fn store_growth_pages_from_environment() -> Result<Option<i64>, String> {
+    let Some(value) = std::env::var_os(TEST_STORE_GROWTH_PAGES_ENV) else {
+        return Ok(None);
+    };
+    value
+        .to_string_lossy()
+        .parse::<i64>()
+        .map(Some)
+        .map_err(|_| format!("{TEST_STORE_GROWTH_PAGES_ENV} must be an integer"))
+}
+
 fn test_barrier_config(analysis_metrics: bool) -> Result<TestBarrierConfig, String> {
-    Ok(TestBarrierConfig::new(
+    let store_fault = std::env::var(TEST_STORE_FAULT_ENV).ok();
+    let namespace = std::env::var(TEST_NAMESPACE_ENV).ok();
+    TestBarrierConfig::new(
         barrier_from_environment(TEST_NAVIGATION_BARRIER_ENV)?,
         barrier_from_environment(TEST_FORMATTING_BARRIER_ENV)?,
         barrier_from_environment(TEST_DIAGNOSTICS_BARRIER_ENV)?,
@@ -98,6 +116,9 @@ fn test_barrier_config(analysis_metrics: bool) -> Result<TestBarrierConfig, Stri
         TEST_WORKSPACE_SYMBOLS_BARRIER_ENV,
     )?)
     .with_references(barrier_from_environment(TEST_REFERENCES_BARRIER_ENV)?)
+    .with_references_validation(barrier_from_environment(
+        TEST_REFERENCES_VALIDATION_BARRIER_ENV,
+    )?)
     .with_partial_validation(barrier_from_environment(
         TEST_PARTIAL_VALIDATION_BARRIER_ENV,
     )?)
@@ -124,7 +145,12 @@ fn test_barrier_config(analysis_metrics: bool) -> Result<TestBarrierConfig, Stri
         TEST_WORKSPACE_FIFO_PROBE_ENV,
     )?)
     .with_dispatch(std::env::var_os(TEST_DISPATCH_LOG_ENV).map(PathBuf::from))
-    .with_analysis_metrics(analysis_metrics))
+    .with_analysis_metrics(analysis_metrics)
+    .with_store_fault(store_fault.as_deref())
+    .map_err(|error| format!("{TEST_STORE_FAULT_ENV}: {error}"))?
+    .with_store_growth_pages(store_growth_pages_from_environment()?)
+    .with_namespace(namespace.as_deref())
+    .map_err(|error| format!("{TEST_NAMESPACE_ENV}: {error}"))
 }
 
 fn main() {

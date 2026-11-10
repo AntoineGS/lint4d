@@ -532,3 +532,144 @@ fn a_helper_in_an_import_that_spells_no_looked_up_type_still_answers() {
 
     assert_eq!(locations, expected);
 }
+
+/// Review C1: a unit the index holds under older text is parsed again, never
+/// skipped: the lookup would read the stale copy.
+#[test]
+fn a_unit_indexed_under_older_text_is_parsed_again_not_skipped() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    lazy_import_fixture(root);
+    let main = root.join("Main.pas");
+    let rewrite = || {
+        fs::write(
+            root.join("Target.pas"),
+            "unit Target;\ninterface\ntype TOther = class end;\nimplementation\nend.\n",
+        )
+        .expect("rewrite")
+    };
+    let mut strict = strict_workspace(root);
+    definition(&mut strict, &main, Position::new(4, 6));
+    let mut workspace = workspace(root);
+    let first = definition(&mut workspace, &main, Position::new(4, 6));
+    assert_eq!(first.len(), 1, "{first:?}");
+    rewrite();
+    let expected = definition(&mut strict, &main, Position::new(4, 6));
+
+    let locations = definition(&mut workspace, &main, Position::new(4, 6));
+
+    assert_eq!(locations, expected);
+    assert!(locations.is_empty(), "{locations:?}");
+}
+
+/// `Global` binds through `Dep`; the helper `Helps` declares for `TDep` adds
+/// `Extra`, so the skipped `Helps` changes the answer once `Extra` is looked
+/// up (review M4).
+fn helper_answer_fixture(root: &Path, member: &str) {
+    write_sources(
+        root,
+        &[
+            (
+                "Main.pas",
+                &format!(
+                    "unit Main;\ninterface\nuses Dep, Helps;\nimplementation\nprocedure Run;\nbegin\n  Global.{member};\nend;\nend.\n"
+                ),
+            ),
+            (
+                "Dep.pas",
+                "unit Dep;\ninterface\nuses Base;\ntype TDep = class(TBase)\n  procedure Own;\nend;\nvar Global: TDep;\nimplementation\nprocedure TDep.Own; begin end;\nend.\n",
+            ),
+            (
+                "Base.pas",
+                "unit Base;\ninterface\ntype TBase = class\n  procedure BaseOwn;\nend;\nimplementation\nprocedure TBase.BaseOwn; begin end;\nend.\n",
+            ),
+            (
+                "Helps.pas",
+                "unit Helps;\ninterface\nuses Dep;\ntype TDepHelps = class helper for TDep\n  procedure Extra;\nend;\nimplementation\nprocedure TDepHelps.Extra; begin end;\nend.\n",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_helper_in_a_skipped_import_changes_the_answer_as_with_every_import_parsed() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    helper_answer_fixture(root, "Extra");
+    let main = root.join("Main.pas");
+    let expected = definition(&mut strict_workspace(root), &main, Position::new(6, 10));
+    let mut workspace = workspace(root);
+
+    let locations = definition(&mut workspace, &main, Position::new(6, 10));
+
+    assert_eq!(locations, expected);
+    assert_eq!(locations.len(), 1, "{locations:?}");
+    assert_eq!(locations[0].uri, uri(&root.join("Helps.pas")));
+}
+
+/// Review I2: at the walk limit, a lazily loaded document a lookup still
+/// needs is loaded again (it costs no new unit of work).
+#[test]
+fn a_lazy_reload_is_not_dropped_at_the_walk_limit() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    helper_answer_fixture(root, "Extra");
+    // At the limit once `Main`'s imports are loaded: `Dep`'s imports (for
+    // `TBase`) sort before `Main`'s reload (for the helper).
+    let main = root.join("Main.pas");
+    TEST_NAVIGATION_WALK_BYTES.with(|limit| limit.set(Some(1)));
+    let expected = definition(&mut strict_workspace(root), &main, Position::new(6, 10));
+    let mut workspace = workspace(root);
+
+    let locations = definition(&mut workspace, &main, Position::new(6, 10));
+    TEST_NAVIGATION_WALK_BYTES.with(|limit| limit.set(None));
+
+    let mut strict = strict_workspace(root);
+    TEST_NAVIGATION_WALK_BYTES.with(|limit| limit.set(Some(1)));
+    definition(&mut strict, &main, Position::new(6, 10));
+    TEST_NAVIGATION_WALK_BYTES.with(|limit| limit.set(None));
+    assert_eq!(locations, expected);
+    assert!(indexed(&strict, root, "Helps.pas"));
+    assert!(
+        indexed(&workspace, root, "Helps.pas"),
+        "the helper lookup through Main's skipped Helps must be served"
+    );
+}
+
+/// Review I3: an answer waiting on a lazily skipped import loads that import
+/// only, not the other documents its lookups went through.
+#[test]
+fn an_answer_waiting_on_a_lazy_import_loads_only_that_import() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    helper_answer_fixture(root, "Own");
+    // `Own` overloads one `TBase` declares: its lookup goes through `Dep`'s
+    // imports for `TBase` too.
+    write_sources(
+        root,
+        &[
+            (
+                "Dep.pas",
+                "unit Dep;\ninterface\nuses Base;\ntype TDep = class(TBase)\n  procedure Own; overload;\nend;\nvar Global: TDep;\nimplementation\nprocedure TDep.Own; begin end;\nend.\n",
+            ),
+            (
+                "Base.pas",
+                "unit Base;\ninterface\ntype TBase = class\n  procedure Own(A: Integer); overload;\nend;\nimplementation\nprocedure TBase.Own(A: Integer); begin end;\nend.\n",
+            ),
+        ],
+    );
+    let main = root.join("Main.pas");
+    let mut strict = strict_workspace(root);
+    let expected = definition(&mut strict, &main, Position::new(6, 10));
+    let mut workspace = workspace(root);
+
+    let locations = definition(&mut workspace, &main, Position::new(6, 10));
+
+    assert_eq!(locations, expected);
+    assert_eq!(locations.len(), 1, "{locations:?}");
+    assert_eq!(
+        indexed(&workspace, root, "Base.pas"),
+        indexed(&strict, root, "Base.pas"),
+        "laziness must not load more of the closure than the full walk"
+    );
+}

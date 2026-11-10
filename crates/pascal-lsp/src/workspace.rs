@@ -7634,28 +7634,61 @@ impl Workspace {
             // widens level by level as before. Strict navigation (the
             // implementation lens) keeps the whole walk, so a dependency that
             // fails to load still fails it.
-            let mut demand = Vec::new();
-            for (document, needed) in self.index.take_import_demand() {
-                if !lazy_walk || (visited.contains(&document) && !lazy.contains_key(&document)) {
-                    continue;
-                }
-                let changed = match requested.entry(document.clone()) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(needed);
-                        true
-                    }
-                    Entry::Occupied(mut entry) => entry.get_mut().merge(&needed),
-                };
-                if changed {
-                    demand.push(document);
+            let raw_demand = self
+                .index
+                .take_import_demand()
+                .into_iter()
+                .filter(|(document, _)| {
+                    lazy_walk && (!visited.contains(document) || lazy.contains_key(document))
+                })
+                .collect::<Vec<_>>();
+            // The lazily loaded documents a lookup needs more of: what is
+            // requested of them exceeds what their last load served (review
+            // I2 compares the two, so a merged but unserved demand stays
+            // pending).
+            for (document, needed) in &raw_demand {
+                if lazy.contains_key(document) {
+                    requested
+                        .entry(document.clone())
+                        .or_insert_with(|| crate::navigation::ImportDemand::Units(HashMap::new()))
+                        .merge(needed);
                 }
             }
-            if !locations.is_empty() && !demand.iter().any(|document| lazy.contains_key(document)) {
+            let mut pending = lazy
+                .iter()
+                .filter(|(document, served)| {
+                    requested
+                        .get(*document)
+                        .is_some_and(|wanted| wanted != *served)
+                })
+                .map(|(document, _)| document.clone())
+                .collect::<Vec<_>>();
+            if !locations.is_empty() && pending.is_empty() {
                 self.validate_compiled_navigation_locations(&locations)?;
                 return Ok(locations);
             }
+            let mut demand = Vec::new();
+            if locations.is_empty() {
+                for (document, needed) in raw_demand {
+                    if lazy.contains_key(&document) {
+                        continue;
+                    }
+                    let changed = match requested.entry(document.clone()) {
+                        Entry::Vacant(entry) => {
+                            entry.insert(needed);
+                            true
+                        }
+                        Entry::Occupied(mut entry) => entry.get_mut().merge(&needed),
+                    };
+                    if changed {
+                        demand.push(document);
+                    }
+                }
+            }
             // An answer that looked through an import a lazy load left
-            // unparsed is resolved again once it is loaded.
+            // unparsed is resolved again once that import is handled; only
+            // those documents are loaded for it (review I3).
+            demand.append(&mut pending);
             if demand.is_empty() && !lazy.is_empty() {
                 // Before the walk widens past what the queries named, the
                 // lazily loaded documents are loaded whole, as without
@@ -7673,7 +7706,11 @@ impl Workspace {
                 deferred.retain(|dependency| !demand.contains(dependency));
                 frontier = demand;
             }
-            if frontier.is_empty() || walk_exhausted {
+            // A lazily loaded document is loaded again past the walk limit:
+            // that costs no new unit of work (review I2).
+            if frontier.is_empty()
+                || (walk_exhausted && !frontier.iter().any(|document| lazy.contains_key(document)))
+            {
                 break;
             }
 
@@ -7689,11 +7726,13 @@ impl Workspace {
                     continue;
                 }
                 if !reload {
-                    if work > 0
-                        && (work >= MAX_NAVIGATION_WALK_WORK || walked_bytes >= walk_byte_limit)
+                    if walk_exhausted
+                        || work > 0
+                            && (work >= MAX_NAVIGATION_WALK_WORK || walked_bytes >= walk_byte_limit)
                     {
+                        // Past the limit only reloads proceed (review I2).
                         walk_exhausted = true;
-                        break;
+                        continue;
                     }
                     visited.insert(current.clone());
                     work += 1;
@@ -7904,6 +7943,7 @@ impl Workspace {
             .get(&effective_context_key)
             .map(|state| (state.context.clone(), state.context_observations.clone()))
         else {
+            self.lazy_import_load = lazy;
             return Ok(Vec::new());
         };
         let mut bindings = HashMap::new();
@@ -8291,15 +8331,19 @@ impl Workspace {
                         &dependency_text,
                     );
                 let lazy_import = match lazy.as_mut() {
-                    Some(lazy) if !already_indexed && !released => self.lazy_import(
-                        lazy,
-                        dependency,
-                        lazy_names
-                            .get(&dependency.source.id)
-                            .map_or(&[][..], Vec::as_slice),
-                        &effective_context_key,
-                        cancel.unwrap_or(&no_cancel),
-                    ),
+                    // Only a unit the index does not hold is skipped: a lookup
+                    // through an indexed copy (older text, another context)
+                    // would read it (l4d-ucux review C1).
+                    Some(lazy) if !self.index.contains(&dependency_uri) && !released => self
+                        .lazy_import(
+                            lazy,
+                            dependency,
+                            lazy_names
+                                .get(&dependency.source.id)
+                                .map_or(&[][..], Vec::as_slice),
+                            &effective_context_key,
+                            cancel.unwrap_or(&no_cancel),
+                        ),
                     _ => LazyImport::Parse,
                 };
                 if !matches!(lazy_import, LazyImport::Parse) {
@@ -8334,6 +8378,9 @@ impl Workspace {
                     }
                     if let Some(lazy) = lazy.as_mut() {
                         lazy.skipped = true;
+                    }
+                    if let Some(hook) = &self.dependency_hook {
+                        hook(&dependency_uri, index + 1, total)?;
                     }
                     continue;
                 }

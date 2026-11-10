@@ -2151,6 +2151,26 @@ mod tests {
         );
     }
 
+    /// l4d-10: a provider interface is charged within a fifth of the heap
+    /// it keeps, counted by the test allocator when the store drops it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_provider_interface_is_charged_within_a_fifth_of_its_heap() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, uri, source, key) = provider_workspace(temp.path());
+        drop(expand_main(&workspace, &uri, &source, &key));
+        assert_eq!(workspace.project_cache.provider_graph_count(), 1);
+        let charged = workspace.project_cache.provider_graph_bytes();
+        let (freed, holders) = workspace.project_cache.drop_provider_graphs_for_test();
+        assert_eq!(holders, vec![0], "only the store holds the interface");
+        let error = charged.abs_diff(freed as usize) as f64 / freed as f64;
+        assert!(
+            error <= 0.2,
+            "charged {charged} bytes for an interface that kept {freed} ({:.0}% off)",
+            error * 100.0
+        );
+    }
+
     /// Rootcause A1: a provider whose interface looks up many units over a
     /// search path is replayed with one listing per directory, so a session
     /// that reuses it captures every directory once.

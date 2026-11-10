@@ -986,6 +986,10 @@ pub(crate) struct Warmer {
     /// Batches of each anchor asked for again in a row for members refused
     /// for room.
     room_retries: HashMap<IndexAnchor, usize>,
+    /// Anchors whose room retries ran out while records wait for room:
+    /// asked for again by the next event that shows the store taking
+    /// writes (l4d-8fz9).
+    room_parked: HashSet<IndexAnchor>,
     /// Reuse batches of each anchor run again in a row that met only
     /// retryable misses.
     reuse_retries: HashMap<IndexAnchor, usize>,
@@ -1045,6 +1049,7 @@ impl Warmer {
             reuse_done: HashSet::new(),
             seal_retries: HashMap::new(),
             room_retries: HashMap::new(),
+            room_parked: HashSet::new(),
             reuse_retries: HashMap::new(),
             index_in_flight: None,
             configured_project: None,
@@ -1208,6 +1213,7 @@ impl Warmer {
         self.reuse_done.clear();
         self.seal_retries.clear();
         self.room_retries.clear();
+        self.room_parked.clear();
         self.reuse_retries.clear();
         self.interleave = false;
         self.crawl_resume.clear();
@@ -1300,6 +1306,9 @@ impl Warmer {
             }
             if self.accept_event(&event, cache) {
                 if let WarmEvent::End { uri, .. } | WarmEvent::BudgetStopped { uri, .. } = &event {
+                    if matches!(event, WarmEvent::End { .. }) {
+                        self.unpark_room();
+                    }
                     self.request_index(IndexAnchor::Document(uri.clone()));
                     if let Some(project) = self.configured_project.clone() {
                         self.request_index(IndexAnchor::Project(project));
@@ -1534,6 +1543,15 @@ impl Warmer {
         events
     }
 
+    /// Ask again for the anchors parked out of room retries, each with its
+    /// retries starting over.
+    fn unpark_room(&mut self) {
+        for anchor in std::mem::take(&mut self.room_parked) {
+            self.room_retries.remove(&anchor);
+            self.request_index(anchor);
+        }
+    }
+
     /// Where a batch of `mode` for `anchor` goes back to: the front of
     /// `reuse_queue` until its pass is done, else the index queue.
     fn requeue_index(&mut self, anchor: &IndexAnchor, mode: IndexMode) {
@@ -1677,6 +1695,11 @@ impl Warmer {
                 // Members refused for room hold `complete` back; a batch
                 // that found no room settled nothing and is not requeued,
                 // so nothing else would ask for the anchor again.
+                // A batch that stored something, or a seal outcome, shows
+                // the store taking writes: parked anchors go again first.
+                if progress.persisted > 0 || seal.is_some() {
+                    self.unpark_room();
+                }
                 if progress.complete || settled {
                     self.room_retries.remove(anchor);
                 } else if !requeued && progress.awaiting_room > 0 {
@@ -1684,6 +1707,11 @@ impl Warmer {
                     if *retries < MAX_ROOM_RETRIES {
                         *retries += 1;
                         self.request_index(anchor.clone());
+                    } else {
+                        // Out of retries: parked until the store takes
+                        // writes again, so the context still seals
+                        // (l4d-8fz9).
+                        self.room_parked.insert(anchor.clone());
                     }
                 }
                 if requeued {
@@ -5514,6 +5542,62 @@ mod tests {
             }
             assert!(!accept(&mut warmer, &batch(5, 0)), "the pass ends");
             assert!(warmer.reuse_done.contains(&anchor));
+            workspace.persistent_cache().shutdown();
+        }
+
+        /// l4d-8fz9 fix round 1 (M3): once its room retries ran out, an
+        /// anchor whose records wait for room is parked, not forgotten: the
+        /// next event that shows the store taking writes again (a batch
+        /// that persisted something, a crawl's end, a seal outcome) asks
+        /// for it again, so the context still seals this session.
+        #[test]
+        fn an_anchor_out_of_room_retries_is_asked_again_once_the_store_takes_writes() {
+            let gate = Arc::new(InteractiveGate::default());
+            let (_temp, _store, workspace, main) = fixture_persisting(&gate);
+            let mut warmer = Warmer::start(gate);
+            let waiting = IndexAnchor::Document(main.clone());
+            let other = IndexAnchor::Project("/p/Other.dproj".into());
+            let key = crate::workspace::ContextKey::for_test("/room");
+            let batch = |anchor: &IndexAnchor, awaiting: usize, persisted: usize| {
+                let mut progress = IndexProgress::new(key.clone(), IndexMode::Full);
+                progress.awaiting_room = awaiting;
+                progress.persisted = persisted;
+                progress.indexed = persisted;
+                progress.complete = awaiting == 0;
+                WarmEvent::IndexProgress {
+                    anchor: anchor.clone(),
+                    progress: Box::new(progress),
+                    seal: None,
+                    generation: 0,
+                }
+            };
+            let accept = |warmer: &mut Warmer, event: &WarmEvent| {
+                warmer.busy = true;
+                assert!(warmer.accept_event(event, workspace.project_cache()));
+                let asked = warmer.index_queue.contains(&waiting);
+                warmer.index_queue.clear();
+                asked
+            };
+            for _ in 0..MAX_ROOM_RETRIES {
+                assert!(accept(&mut warmer, &batch(&waiting, 1, 0)), "retried");
+            }
+            assert!(
+                !accept(&mut warmer, &batch(&waiting, 1, 0)),
+                "the retries ran out"
+            );
+            assert!(
+                warmer.room_parked.contains(&waiting),
+                "parked: {:?}",
+                warmer.room_parked
+            );
+            // Another context's batch stored something: the store has room.
+            assert!(
+                accept(&mut warmer, &batch(&other, 0, 3)),
+                "asked again once the store took writes"
+            );
+            assert!(warmer.room_parked.is_empty());
+            // Its retries start over.
+            assert!(accept(&mut warmer, &batch(&waiting, 1, 0)), "retried");
             workspace.persistent_cache().shutdown();
         }
 

@@ -1851,6 +1851,12 @@ mod tests {
         assert_eq!(first.awaiting_room, 1, "{first:?}");
         let status = view.project_cache.index_status(&|_| false);
         assert!(!status[0].complete, "awaiting room: {:?}", status[0]);
+        assert!(
+            status[0].gaps.iter().any(|gap| gap
+                == "1 members wait for room in the store; the snapshot is sealed once they are stored"),
+            "{:?}",
+            status[0]
+        );
         assert_eq!(
             seal(&view, &key),
             SealOutcome::NotDue,
@@ -1874,10 +1880,11 @@ mod tests {
     /// l4d-8fz9: an extracted member whose publication the store refused
     /// for a reason no later batch of this process retries (here low disk
     /// space) is no longer left without a record, which withheld the seal
-    /// for good (`Unproven`): it is recorded artifact-less and counted as
-    /// unprovable, so the context seals with it as a gap.
+    /// for good (`Unproven`): it is recorded artifact-less and reported as
+    /// a member that could not be stored this session (not as unprovable,
+    /// not as persisted), so the context seals with it as a gap.
     #[test]
-    fn a_publication_refused_for_good_seals_as_an_unprovable_gap() {
+    fn a_publication_refused_for_good_seals_as_a_gap_that_could_not_be_stored() {
         let temp = tempfile::tempdir().unwrap();
         let store = private_dir();
         let (workspace, key, anchor) = indexed_project(temp.path(), 3, WorkspaceOptions::default());
@@ -1896,29 +1903,83 @@ mod tests {
             "{progress:?}"
         );
         let status = view.project_cache.index_status(&|_| false);
-        assert_eq!(status[0].counts.unprovable, 1, "{:?}", status[0]);
+        assert_eq!(
+            (
+                status[0].counts.store_refused,
+                status[0].counts.unprovable,
+                status[0].counts.persisted,
+                status[0].counts.fresh
+            ),
+            (1, 0, 2, 3),
+            "{:?}",
+            status[0]
+        );
+        assert!(
+            status[0].gaps.iter().any(|gap| gap
+                == "1 members could not be stored this session (first: low disk space) and are extracted again by the next start"),
+            "{:?}",
+            status[0]
+        );
         assert_eq!(seal(&view, &key), SealOutcome::Sealed);
         cache.shutdown();
     }
 
-    /// l4d-8fz9: a sealed snapshot lists a gap member (here refused for
-    /// the per-file limit) by its artifact-less record. A process that
-    /// adopts the snapshot treats it as not indexed: a candidate search
-    /// keeps it as an unverified candidate, never excludes it as proven
-    /// absent, while the members proven through the snapshot are excluded.
+    /// l4d-8fz9 fix round 1 (M4): a publication refused because the store
+    /// was fenced is not a refusal for good: the member is neither recorded
+    /// artifact-less nor reported as a gap that could not be stored (the
+    /// reopened store's memory-only reprove path proves it).
     #[test]
-    fn an_adopted_snapshot_s_gap_member_stays_an_unverified_candidate() {
+    fn a_publication_refused_by_a_fenced_store_is_no_stored_gap() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = private_dir();
+        let (workspace, key, anchor) = indexed_project(temp.path(), 3, WorkspaceOptions::default());
+        let target = temp.path().join("lib/U1.pas");
+        let (mut view, cache) = persisting_view(&workspace, store.path());
+        let refused = target.clone();
+        let mut once = false;
+        cache.set_publish_fault_for_test(Some(Box::new(move |path| {
+            (path == refused && !std::mem::replace(&mut once, true))
+                .then_some(pascal_cache::Bypass::Fenced)
+        })));
+        advance(&mut view, &anchor, IndexBound::all());
+        assert!(!view.project_cache.index_member_has_record(&key, &target));
+        let status = view.project_cache.index_status(&|_| false);
+        assert_eq!(
+            (status[0].counts.store_refused, status[0].counts.unprovable),
+            (0, 0),
+            "{:?}",
+            status[0]
+        );
+        cache.shutdown();
+    }
+
+    /// l4d-8fz9: a sealed snapshot lists gap members by their artifact-less
+    /// records: here one refused for the per-file limit and one whose
+    /// publication the store refused for good (low disk space). A process
+    /// that adopts the snapshot treats both as not indexed: a candidate
+    /// search keeps them as unverified candidates, never excludes them as
+    /// proven absent, while the members proven through the snapshot are
+    /// not candidates.
+    #[test]
+    fn an_adopted_snapshot_s_gap_members_stay_unverified_candidates() {
         let temp = tempfile::tempdir().unwrap();
         let store = private_dir();
         let mut options = WorkspaceOptions::default();
         options.limits.max_file_bytes = 300;
-        let (session, key, anchor) = indexed_project(temp.path(), 3, options.clone());
+        let (session, key, anchor) = indexed_project(temp.path(), 4, options.clone());
         let big = temp.path().join("lib/U1.pas");
         named_unit(&big, &"Long".repeat(60));
+        let unstored = temp.path().join("lib/U2.pas");
         pascal_project::backdate_tree_for_test(temp.path());
         let (mut first, cache) = persisting_view(&session, store.path());
+        let refused = unstored.clone();
+        cache.set_publish_fault_for_test(Some(Box::new(move |path| {
+            (path == refused).then_some(pascal_cache::Bypass::LowDiskSpace)
+        })));
         let progress = advance(&mut first, &anchor, IndexBound::all());
         assert_eq!(progress.refused, 1, "{progress:?}");
+        let status = first.project_cache.index_status(&|_| false);
+        assert_eq!(status[0].counts.store_refused, 1, "{:?}", status[0]);
         assert_eq!(seal(&first, &key), SealOutcome::Sealed);
         cache.shutdown();
 
@@ -1928,7 +1989,7 @@ mod tests {
             &anchor,
             IndexBound::all().with_mode(IndexMode::Reuse),
         );
-        assert_eq!((reuse.reused, reuse.retrying), (2, 1), "{reuse:?}");
+        assert_eq!((reuse.reused, reuse.retrying), (2, 2), "{reuse:?}");
         assert!(second.project_cache.baseline_hint(&key).is_some());
         let candidates = second
             .project_cache
@@ -1941,18 +2002,18 @@ mod tests {
             })
             .unwrap();
         assert!(candidates.selected.is_empty(), "{candidates:?}");
-        assert_eq!(candidates.unverified, vec![big.clone()], "{candidates:?}");
-        let proven = [
-            temp.path().join("lib/U0.pas"),
-            temp.path().join("lib/U2.pas"),
-        ];
-        assert!(
-            proven
-                .iter()
-                .all(|path| candidates.excluded.contains(path)
-                    || !candidates.unverified.contains(path)),
+        assert_eq!(
+            candidates.unverified,
+            vec![big.clone(), unstored.clone()],
             "{candidates:?}"
         );
+        for proven in [
+            temp.path().join("lib/U0.pas"),
+            temp.path().join("lib/U3.pas"),
+        ] {
+            assert!(!candidates.unverified.contains(&proven), "{candidates:?}");
+            assert!(!candidates.selected.contains(&proven), "{candidates:?}");
+        }
         cache.shutdown();
     }
 

@@ -5103,6 +5103,7 @@ impl Workspace {
             return Ok(None);
         };
         let store = job.store();
+        let adopted = started.elapsed();
         let key_refs = keys.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let matching = if containing {
             pascal_cache::IndexKeyMatch::Containing(&keys[0])
@@ -5122,6 +5123,7 @@ impl Workspace {
                 return Ok(None);
             }
         };
+        let found = started.elapsed();
         let mut listed = HashSet::new();
         let mut reader = store.read_snapshot(hint.header());
         loop {
@@ -5143,6 +5145,7 @@ impl Workspace {
         }
         drop(reader);
         drop(job);
+        let read = started.elapsed();
         let mut validate = Vec::new();
         let mut unselected = HashSet::new();
         for path in waiting {
@@ -5168,12 +5171,15 @@ impl Workspace {
         }
         let reused = view.reuse_members_now(key, &validate, cancel)?;
         crate::trace::trace!(
-            "  persisted selection {}: {} named, {reused} validated, {} left to the reuse pass, {} listed, {:.1} ms",
+            "  persisted selection {}: {} named, {reused} validated, {} left to the reuse pass, {} listed, {:.1} ms (adoption {:.1}, rows {:.1}, listing {:.1})",
             anchor_display(anchor),
             validate.len(),
             unselected.len(),
             listed.len(),
-            started.elapsed().as_secs_f64() * 1000.0
+            started.elapsed().as_secs_f64() * 1000.0,
+            adopted.as_secs_f64() * 1000.0,
+            (found - adopted).as_secs_f64() * 1000.0,
+            (read - found).as_secs_f64() * 1000.0,
         );
         Ok(Some(PersistedSelection { unselected }))
     }

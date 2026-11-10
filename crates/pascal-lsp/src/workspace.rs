@@ -7761,6 +7761,23 @@ impl Workspace {
                         })
                 });
             if answered && pending.is_empty() && !unsettled {
+                if walk.settle && !visited.contains(uri) {
+                    // A snapshot proves its document's imports resolved:
+                    // bind them, parsing none (nothing looked through them).
+                    self.lazy_import_load = Some(LazyImportLoad {
+                        demand: crate::navigation::ImportDemand::Units(HashMap::new()),
+                        ..std::mem::take(&mut lazy_state)
+                    });
+                    let loaded = self.load_imports_with_session_cache(
+                        uri,
+                        context_key,
+                        pinned,
+                        cancel,
+                        &resolver_session_cache,
+                    );
+                    self.lazy_import_load = None;
+                    outcome.loaded.extend(loaded?);
+                }
                 outcome.answered = true;
                 return Ok(outcome);
             }

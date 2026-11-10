@@ -362,3 +362,27 @@ fn prefix_completion_parses_only_the_imports_spelling_the_prefix() {
         "an include spelling the prefix keeps its unit: {indexed:?}"
     );
 }
+
+/// A hover answered from the document itself, before any import is looked
+/// through, still proves the document's imports resolved: they are bound,
+/// none parsed.
+#[test]
+fn a_hover_on_a_local_name_binds_the_imports_without_parsing_them() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    type_fixture(root);
+    fs::write(
+        root.join("Main.pas"),
+        "unit Main;\ninterface\nuses Noise, Target;\nprocedure Local;\nimplementation\nprocedure Local;\nbegin\n  Local;\nend;\nend.\n",
+    )
+    .expect("main");
+    let expected = eagerly(root, "Main.pas", |warmed| {
+        hover_in(warmed, root, "Main.pas", Position::new(7, 3))
+    });
+
+    let (answer, indexed) = indexed_while(|| hover(root, "Main.pas", Position::new(7, 3)));
+
+    assert!(answer.is_some(), "Local hovers");
+    assert_eq!(answer, expected);
+    assert!(indexed.is_empty(), "{indexed:?}");
+}

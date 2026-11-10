@@ -1379,7 +1379,7 @@ fn indexed_reference_snapshot(
         phase_one.as_ref(),
         cancel,
     ) {
-        Ok(Some(sources)) => Some(SnapshotScope::Indexed(sources)),
+        Ok(Some(sources)) => Some(SnapshotScope::Indexed(Box::new(sources))),
         Ok(None) => None,
         Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
         Err(error) => {
@@ -2700,6 +2700,7 @@ pub(crate) fn document_links_from_input(
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
+                directory_listing: Default::default(),
             });
             if let Err(error) =
                 record_document_link_ancestors(&target_path, &mut resource_records, cancel)
@@ -2859,6 +2860,7 @@ fn record_document_link_ancestors(
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
+            directory_listing: Default::default(),
         });
         directory = path.parent();
     }

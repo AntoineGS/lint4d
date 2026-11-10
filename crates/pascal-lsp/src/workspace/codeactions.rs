@@ -2621,6 +2621,7 @@ fn fix_all_dependency_fingerprint_bounded(
         record.include_payload.hash(&mut hasher);
         record.missing_provider_candidate.hash(&mut hasher);
         record.directory_observation.hash(&mut hasher);
+        record.directory_listing.hash(&mut hasher);
         record.document_link_ancestor.hash(&mut hasher);
         for observation in &record.candidate_observations {
             observation.path.hash(&mut hasher);
@@ -5356,6 +5357,7 @@ fn same_record_observation(left: &SourceRecord, right: &SourceRecord) -> bool {
         && left.content_hash == right.content_hash
         && left.content_bytes == right.content_bytes
         && left.directory_observation == right.directory_observation
+        && left.directory_listing == right.directory_listing
         && left.document_link_ancestor == right.document_link_ancestor
 }
 
@@ -6039,6 +6041,7 @@ fn lint_configuration_for_input(
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
+                directory_listing: Default::default(),
             })
         })
         .collect();

@@ -9689,6 +9689,7 @@ impl Workspace {
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
+                directory_listing: Default::default(),
             },
         );
     }
@@ -10129,6 +10130,7 @@ impl Workspace {
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
+                directory_listing: Default::default(),
             },
         );
     }
@@ -10173,6 +10175,7 @@ impl Workspace {
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
+                directory_listing: Default::default(),
             },
         );
     }
@@ -10370,6 +10373,7 @@ impl Workspace {
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
+                    directory_listing: Default::default(),
                 },
             );
         }
@@ -11968,6 +11972,22 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<(), String> {
+        // A state of this key that is no longer fresh is evicted, not merged
+        // into: its reads, watched paths and the memberships of other
+        // sources' directories may be stale, and a merge would keep them
+        // (l4d-z473). Its other owners find it again through rediscovery.
+        // An open buffer of a deleted legacy file is not a change: such a
+        // state is not evicted on every install.
+        if let Some(state) = self.contexts.get(&key)
+            && !self.context_state_is_fresh_for_reinstall(state, cancel, budget)?
+        {
+            self.contexts.remove(&key);
+            for owner in self.document_owners.values_mut() {
+                if owner.key == key {
+                    owner.needs_revalidation = true;
+                }
+            }
+        }
         let initial_metadata_count = context_observations.metadata_files.len()
             + usize::from(context.project_file().is_some())
             + usize::from(context.main_source().is_some());
@@ -12115,12 +12135,18 @@ impl Workspace {
                 .unwrap_or_else(|| path_stamp(&path));
             staged_watched.insert(path, stamp);
         }
+        // This discovery's reads and memberships replace the retained ones of
+        // the same paths: the retained state may be stale (a context
+        // rediscovered for a known owner is installed over it under the same
+        // key). Keeping a stale read beside the new watched stamp made the
+        // context fresh while every request's records carried the old stamp
+        // (l4d-z473).
         let (staged_observations, staged_memberships) = if let Some(state) = self.contexts.get(&key)
         {
             (
                 merge_project_read_observations_indexed(
-                    &state.project_read_observations,
                     &observations,
+                    &state.project_read_observations,
                     cancel,
                     budget,
                 )?,
@@ -12293,6 +12319,29 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<bool, String> {
+        self.context_state_is_fresh_with_open_documents_settled(state, true, cancel, budget)
+    }
+
+    /// `context_state_is_fresh_with_open_documents` for a state that may
+    /// have been built in this request generation: such a state compares
+    /// its own stamps with plain equality, as the binding gates do.
+    fn context_state_is_fresh_for_reinstall(
+        &self,
+        state: &ContextState,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<bool, String> {
+        let built_here = state.built_generation == Some(self.request_generation);
+        self.context_state_is_fresh_with_open_documents_settled(state, !built_here, cancel, budget)
+    }
+
+    fn context_state_is_fresh_with_open_documents_settled(
+        &self,
+        state: &ContextState,
+        require_settled: bool,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<bool, String> {
         let deleted_paths = self.deleted_path_snapshot_with_control(cancel, budget)?;
         let mut open_overlay_paths = Vec::new();
         for (uri, document) in &self.open_documents {
@@ -12326,7 +12375,7 @@ impl Workspace {
             &open_overlay_paths,
             &deleted_paths,
             budget,
-            true,
+            require_settled,
         )
     }
 
@@ -13860,6 +13909,7 @@ impl Workspace {
                         missing_provider_scope: None,
                         auto_import_provider_observation: false,
                         auto_import_scopes: Vec::new(),
+                        directory_listing: Default::default(),
                     });
                 }
                 Entry::Occupied(mut entry) => {
@@ -13919,6 +13969,7 @@ impl Workspace {
                     missing_provider_scope: Some(scope),
                     auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
+                    directory_listing: Default::default(),
                 });
             }
             Entry::Occupied(mut entry) => {
@@ -16110,6 +16161,8 @@ fn merge_metadata_observations_indexed(
     Ok(result)
 }
 
+/// `incoming`, computed now, and the memberships of `existing` for the
+/// directories it does not cover.
 fn merge_candidate_memberships_indexed(
     existing: &HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
     incoming: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
@@ -16130,16 +16183,15 @@ fn merge_candidate_memberships_indexed(
     let mut keys = HashSet::new();
     keys.try_reserve(capacity)
         .map_err(|error| format!("could not reserve candidate membership index: {error}"))?;
-    for (path, membership) in existing {
-        check_workspace_cancel(cancel)?;
-        let key = project_path_lookup_key(path);
-        keys.insert(key);
-        result.insert(path.clone(), membership.clone());
-    }
     for (path, membership) in incoming {
         check_workspace_cancel(cancel)?;
-        if keys.insert(project_path_lookup_key(&path)) {
-            result.insert(path, membership);
+        keys.insert(project_path_lookup_key(&path));
+        result.insert(path, membership);
+    }
+    for (path, membership) in existing {
+        check_workspace_cancel(cancel)?;
+        if keys.insert(project_path_lookup_key(path)) {
+            result.insert(path.clone(), membership.clone());
         }
     }
     Ok(result)
@@ -16176,6 +16228,9 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
     budget: Option<&ReconciliationBudget>,
     require_settled: bool,
 ) -> Result<bool, String> {
+    if !reads_agree_with_watched_stamps(state, ignored_paths) {
+        return Ok(false);
+    }
     for (path, stamp) in &state.watched_paths {
         check_workspace_cancel(cancel)?;
         if let Some(budget) = budget {
@@ -16264,6 +16319,22 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
         }
     }
     Ok(true)
+}
+
+/// Whether every metadata read of `state` is of the file state its watched
+/// stamp names, in memory. A disagreement (a stale read kept beside a new
+/// watched stamp) would pass every stat below while each request's records,
+/// built from the read, are refused: the state is rebuilt instead (l4d-z473).
+/// The memberships need no such check: freshness recomputes each one.
+fn reads_agree_with_watched_stamps(state: &ContextState, ignored_paths: &[PathBuf]) -> bool {
+    state.project_read_observations.iter().all(|read| {
+        ignored_paths
+            .iter()
+            .any(|ignored| package_paths_equal(ignored, &read.path))
+            || state.watched_paths.get(&read.path).is_none_or(|watched| {
+                watched.as_ref() == Some(&path_stamp_from_project_read(&read.stamp))
+            })
+    })
 }
 
 /// The path and read limit of a metadata payload that a freshness pass
@@ -19175,6 +19246,7 @@ mod tests {
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
+                    directory_listing: Default::default(),
                 }
             })
             .collect::<Vec<_>>();
@@ -19268,6 +19340,7 @@ mod tests {
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
+                    directory_listing: Default::default(),
                 }],
             ));
             consumers.push(consumer_uri);
@@ -19358,6 +19431,7 @@ mod tests {
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
+                directory_listing: Default::default(),
             }],
         );
         let cancellation = std::sync::Arc::new(AtomicBool::new(false));
@@ -23626,6 +23700,7 @@ BDS = '/fake/37'
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
+            directory_listing: Default::default(),
         };
         assert!(
             workspace
@@ -24891,6 +24966,347 @@ BDS = '/fake/37'
                 .expect("merge");
 
         assert_eq!(merged.len(), 4, "{merged:?}");
+    }
+
+    fn reinstall_key(root: &Path) -> ContextKey {
+        ContextKey {
+            installation_id: Some("7.0".to_owned()),
+            project_file: Some(root.join("App.dproj")),
+            workspace_root: Some(root.to_path_buf()),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            conditional_context: Default::default(),
+            build_selection_modes: None,
+            context_fingerprint: None,
+            overrides: EffectiveOverrides::default(),
+        }
+    }
+
+    fn install_for(workspace: &mut Workspace, key: &ContextKey, metadata: &[PathBuf], file: &Path) {
+        let reads = metadata
+            .iter()
+            .map(|path| ProjectReadObservation {
+                path: path.clone(),
+                stamp: pascal_project::path_stamp_result(path)
+                    .expect("stamp")
+                    .expect("present"),
+                content_hash: 0,
+                content_bytes: None,
+            })
+            .collect();
+        workspace
+            .install_context(
+                key.clone(),
+                Arc::default(),
+                ProjectObservations {
+                    metadata_files: metadata.to_vec(),
+                    ..ProjectObservations::default()
+                },
+                reads,
+                HashMap::new(),
+                file,
+                None,
+                None,
+            )
+            .expect("install context");
+    }
+
+    /// l4d-z473 round 1 (the reviewer's scenario): sources A and B of one
+    /// context live in different directories; a project appears in B's
+    /// directory and no watcher event says so. A's owner is rediscovered and
+    /// installed over the state, which failed freshness: the state is
+    /// evicted, not merged, so B's stale membership does not refuse every
+    /// request on A.
+    #[test]
+    fn a_reinstall_over_a_stale_state_evicts_the_other_sources_memberships() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        let project = root.join("App.dproj");
+        fs::write(&project, "<Project />").unwrap();
+        let (a, b) = (root.join("a/A.pas"), root.join("b/B.pas"));
+        fs::write(&a, "unit A; interface implementation end.").unwrap();
+        fs::write(&b, "unit B; interface implementation end.").unwrap();
+        let key = reinstall_key(&root);
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        install_for(&mut workspace, &key, std::slice::from_ref(&project), &a);
+        install_for(&mut workspace, &key, std::slice::from_ref(&project), &b);
+        assert!(
+            workspace.contexts[&key]
+                .project_candidate_memberships
+                .contains_key(&root.join("b"))
+        );
+
+        fs::write(root.join("b/Other.dproj"), "<Project />").unwrap();
+        let generation = workspace.request_generation;
+        assert!(
+            !super::context_state_is_fresh_for_binding_with_cancel(
+                &workspace.contexts[&key],
+                generation,
+                None,
+                None
+            )
+            .unwrap(),
+            "B's directory changed"
+        );
+        install_for(&mut workspace, &key, std::slice::from_ref(&project), &a);
+
+        let state = &workspace.contexts[&key];
+        let cancel = AtomicBool::new(false);
+        // The membership records each request on A revalidates.
+        let records = super::rename::consumed_context_records(state, &cancel)
+            .expect("records")
+            .into_iter()
+            .filter(|record| record.candidate_membership.is_some())
+            .collect::<Vec<_>>();
+        assert!(!records.is_empty());
+        super::rename::revalidate_input(&workspace.analysis_input(), &records, &cancel)
+            .expect("a request on A answers");
+        assert!(
+            super::context_state_is_fresh_for_binding_with_cancel(state, generation, None, None)
+                .unwrap()
+        );
+    }
+
+    /// l4d-z473 round 2: a context whose watched legacy source was deleted
+    /// on disk but stays open in the editor is not stale for that: installs
+    /// of its other sources merge into it instead of evicting it each time.
+    #[test]
+    fn an_open_buffer_of_a_deleted_legacy_source_does_not_evict_the_context() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        let legacy = root.join("Legacy.pas");
+        let text = "unit Legacy; interface implementation end.";
+        fs::write(&legacy, text).unwrap();
+        let context = Arc::new(ProjectContext::from_parts(
+            pascal_project::ProjectContextParts {
+                discovery_complete: true,
+                search_path_entries: vec![ProjectPathEntry::legacy(root.clone())],
+                ..pascal_project::ProjectContextParts::default()
+            },
+        ));
+        let key = reinstall_key(&root);
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let install = |workspace: &mut Workspace, file: &Path| {
+            let read = ProjectReadObservation {
+                path: legacy.clone(),
+                stamp: pascal_project::path_stamp_result(&legacy)
+                    .unwrap()
+                    .unwrap_or_else(|| {
+                        workspace.contexts[&key].project_read_observations[0]
+                            .stamp
+                            .clone()
+                    }),
+                content_hash: 0,
+                content_bytes: None,
+            };
+            workspace
+                .install_context(
+                    key.clone(),
+                    context.clone(),
+                    ProjectObservations {
+                        metadata_files: vec![legacy.clone()],
+                        ..ProjectObservations::default()
+                    },
+                    vec![read],
+                    HashMap::new(),
+                    file,
+                    None,
+                    None,
+                )
+                .expect("install context");
+        };
+        install(&mut workspace, &root.join("a/A.pas"));
+        fs::remove_file(&legacy).unwrap();
+        workspace.open_documents.insert(
+            Url::from_file_path(&legacy).unwrap(),
+            OpenDocument {
+                text: Some(text.into()),
+                version: 1,
+                rejection: None,
+                identity_generation: 1,
+            },
+        );
+        install(&mut workspace, &root.join("b/B.pas"));
+        let memberships = &workspace.contexts[&key].project_candidate_memberships;
+        assert!(
+            memberships.contains_key(&root.join("a")),
+            "A's directory is still observed: {:?}",
+            memberships.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// l4d-z473 round 1: a context reinstalled over its stale state watches
+    /// what the rediscovery read, not every path any earlier install did.
+    #[test]
+    fn a_reinstall_over_a_stale_state_drops_the_paths_it_no_longer_watches() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let (old, new) = (root.join("Old.optset"), root.join("New.optset"));
+        fs::write(&old, "<Project />").unwrap();
+        fs::write(&new, "<Project />").unwrap();
+        let source = root.join("Main.pas");
+        let key = reinstall_key(&root);
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        install_for(&mut workspace, &key, std::slice::from_ref(&old), &source);
+        fs::write(&old, "<Project><PropertyGroup /></Project>").unwrap();
+        install_for(&mut workspace, &key, std::slice::from_ref(&new), &source);
+        let watched = &workspace.contexts[&key].watched_paths;
+        assert!(watched.contains_key(&new));
+        assert!(!watched.contains_key(&old), "{watched:?}");
+    }
+
+    /// l4d-z473 round 1: a state whose read of a metadata file disagrees
+    /// with its watched stamp of that file is not fresh: it is rebuilt once
+    /// instead of serving records every request refuses.
+    #[cfg(unix)]
+    #[test]
+    fn a_state_whose_reads_disagree_with_its_watched_stamps_is_not_fresh() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let environment = root.join("environment.proj");
+        fs::write(&environment, "<Project />").unwrap();
+        let key = reinstall_key(&root);
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        install_for(
+            &mut workspace,
+            &key,
+            std::slice::from_ref(&environment),
+            &root.join("Main.pas"),
+        );
+        let replacement = root.join("environment.proj.tmp");
+        fs::write(&replacement, "<Project />").unwrap();
+        fs::rename(&replacement, &environment).unwrap();
+        let generation = workspace.request_generation;
+        let state = workspace.contexts.get_mut(&key).unwrap();
+        state
+            .watched_paths
+            .insert(environment.clone(), super::path_stamp(&environment));
+        assert!(
+            !super::context_state_is_fresh_for_binding_with_cancel(state, generation, None, None)
+                .unwrap(),
+            "the read of environment.proj is older than its watched stamp"
+        );
+    }
+
+    /// l4d-z473: Headless-Delphi rewrites the installation's
+    /// `environment.proj` (outside the roots, same content, new inode) on
+    /// every build. A context rediscovered for an explicit owner is installed
+    /// over its stale state under the same key; the rediscovery's read of the
+    /// file must replace the stale one. Before, the stale read survived the
+    /// merge while the watched stamp took the new one: the context then
+    /// passed freshness, and every request's own records carried the old
+    /// stamp, so strict revalidation refused every request after the build.
+    #[cfg(unix)]
+    #[test]
+    fn a_reinstalled_context_records_the_new_read_of_a_rewritten_metadata_file() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().join("workspace");
+        let ide = temp.path().join("ide");
+        fs::create_dir_all(&root).expect("root");
+        fs::create_dir_all(&ide).expect("ide");
+        let environment = ide.join("environment.proj");
+        let content = "<Project><PropertyGroup /></Project>";
+        fs::write(&environment, content).expect("environment.proj");
+        let source = root.join("Main.pas");
+        let read = |path: &Path| ProjectReadObservation {
+            path: path.to_path_buf(),
+            stamp: pascal_project::path_stamp_result(path)
+                .expect("stamp")
+                .expect("present"),
+            content_hash: super::content_hash_bytes(content.as_bytes()),
+            content_bytes: Some(content.as_bytes().to_vec()),
+        };
+        let observations = ProjectObservations {
+            metadata_files: vec![environment.clone()],
+            ..ProjectObservations::default()
+        };
+        let key = ContextKey {
+            installation_id: Some("7.0".to_owned()),
+            project_file: None,
+            workspace_root: Some(root.clone()),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            conditional_context: Default::default(),
+            build_selection_modes: None,
+            context_fingerprint: None,
+            overrides: EffectiveOverrides::default(),
+        };
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let install = |workspace: &mut Workspace,
+                       memberships: HashMap<
+            PathBuf,
+            Result<super::ProjectCandidateMembership, String>,
+        >| {
+            workspace
+                .install_context(
+                    key.clone(),
+                    Arc::default(),
+                    observations.clone(),
+                    vec![read(&environment)],
+                    memberships,
+                    &source,
+                    None,
+                    None,
+                )
+                .expect("install context");
+        };
+        install(&mut workspace, HashMap::new());
+        let membership = |workspace: &Workspace| {
+            workspace.contexts[&key]
+                .project_candidate_memberships
+                .get(&root)
+                .cloned()
+                .expect("the source directory's membership")
+        };
+        let before = membership(&workspace);
+
+        let replacement = ide.join("environment.proj.tmp");
+        fs::write(&replacement, content).expect("replacement");
+        fs::rename(&replacement, &environment).expect("rewrite");
+        // The same build added a project beside the source.
+        fs::write(root.join("Other.dproj"), "<Project />").expect("project");
+        let after =
+            pascal_project::project_candidate_membership_with_deleted_paths(&root, None, &[]);
+        assert_ne!(after, before, "the new project changed the membership");
+        let current = super::path_stamp(&environment);
+        let state = workspace.contexts.get(&key).expect("installed");
+        assert_ne!(
+            state.watched_paths.get(&environment).cloned().flatten(),
+            current,
+            "the rewrite gave the file a new stamp"
+        );
+        install(&mut workspace, HashMap::new());
+
+        assert_eq!(
+            membership(&workspace),
+            after,
+            "the rediscovery's membership replaces the stale one"
+        );
+        let state = workspace.contexts.get(&key).expect("reinstalled");
+        assert_eq!(
+            state.watched_paths.get(&environment).cloned().flatten(),
+            current
+        );
+        let records = super::rename::consumed_context_records(state, &AtomicBool::new(false))
+            .expect("context records");
+        let record = records
+            .iter()
+            .find(|record| record.path.as_deref() == Some(environment.as_path()))
+            .expect("environment.proj record");
+        assert_eq!(
+            record.path_stamp, current,
+            "the request's record carries the stamp the context was rebuilt from"
+        );
     }
 
     #[test]
@@ -26436,6 +26852,7 @@ BDS = '/fake/37'
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
+            directory_listing: Default::default(),
         };
 
         assert!(

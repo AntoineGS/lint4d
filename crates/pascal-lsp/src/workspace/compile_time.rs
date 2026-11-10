@@ -1556,6 +1556,7 @@ mod tests {
             stamp: None,
             complete: true,
             listed: true,
+            resolvable: None,
         };
         let listing = DirectoryListing {
             files: Vec::new(),

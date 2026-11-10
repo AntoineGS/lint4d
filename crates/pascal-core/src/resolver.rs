@@ -564,6 +564,10 @@ pub enum ResolutionObservation {
         /// it consults with a stat-only observation (`false`) and lists it
         /// only when the exact name misses there.
         listed: bool,
+        /// `resolvable_listing_fingerprint` of the listing the lookup read,
+        /// when it read one: what in the directory can take part in
+        /// resolution. `None` for a search marker or a traced lookup.
+        resolvable: Option<u64>,
     },
     Candidate {
         path: PathBuf,
@@ -678,6 +682,7 @@ fn observation_action(
                     stamp,
                     complete,
                     listed,
+                    resolvable,
                 },
                 ResolutionObservation::Directory {
                     path: old_path,
@@ -685,13 +690,19 @@ fn observation_action(
                     stamp: old_stamp,
                     complete: old_complete,
                     listed: old_listed,
+                    resolvable: old_resolvable,
                 },
             ) if path == old_path
                 && entry == old_entry
                 && stamp == old_stamp
-                && complete == old_complete =>
+                && complete == old_complete
+                && (resolvable == old_resolvable
+                    || resolvable.is_none()
+                    || old_resolvable.is_none()) =>
             {
-                return if *listed && !*old_listed {
+                return if (*listed && !*old_listed)
+                    || (resolvable.is_some() && old_resolvable.is_none())
+                {
                     ReportAction::Replace(index)
                 } else {
                     ReportAction::Discard
@@ -1513,6 +1524,9 @@ pub struct UnitResolver<S> {
     /// Directories unit lookups consulted while a session traces them
     /// (l4d-4nbs review C1), with their stamps when consulted.
     lookup_trace: Option<Vec<(PathBuf, ProjectPathEntry, Option<ProjectReadStamp>)>>,
+    /// An include search for a build-product name is running: the listings
+    /// it reads are recorded `EXACT_LISTING`.
+    exact_listings: bool,
     /// Include lookups that found nothing, shared beyond this resolver's
     /// sessions (l4d-ig6b), bound to this resolver's configuration.
     shared_include_failures: Option<Arc<dyn SharedIncludeFailures>>,
@@ -3040,6 +3054,7 @@ impl<S: SourceStore> UnitResolver<S> {
             stop_when_incomplete: false,
             shared_provider_graphs: None,
             lookup_trace: None,
+            exact_listings: false,
             shared_include_failures: None,
             include_failure_trace: None,
             report_messages: 0,
@@ -5929,6 +5944,24 @@ impl<S: SourceStore> UnitResolver<S> {
                     .len()
                     .saturating_add(listing.directories.len()),
             );
+            // The listing's own observation carries the fingerprint of the
+            // lookup that read it, which leaves build products out: an
+            // include of a build-product name reusing it holds the
+            // directory by its stamp only.
+            if self.exact_listings {
+                self.record_observation_build(
+                    report_path_payload(&key, Some(entry)),
+                    cancel,
+                    || ResolutionObservation::Directory {
+                        path: key.clone(),
+                        entry: entry.clone(),
+                        stamp: listing.stamp.clone(),
+                        complete: listing.complete,
+                        listed: true,
+                        resolvable: listing.complete.then_some(EXACT_LISTING),
+                    },
+                )?;
+            }
             return Ok(DirectoryAccess::Legacy(listing));
         }
         let request = DirectoryRequest {
@@ -5968,6 +6001,7 @@ impl<S: SourceStore> UnitResolver<S> {
             complete,
             ..listing
         };
+        let resolvable = complete.then(|| self.listing_resolvable(&listing));
         self.record_observation_build(report_path_payload(&key, Some(entry)), cancel, || {
             ResolutionObservation::Directory {
                 path: key.clone(),
@@ -5975,6 +6009,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 stamp: listing.stamp.clone(),
                 complete,
                 listed: true,
+                resolvable,
             }
         })?;
         if !complete {
@@ -6044,6 +6079,7 @@ impl<S: SourceStore> UnitResolver<S> {
             })
             .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
         if let Some(listing) = self.reusable_directory(&probe, &canonical, &mut budget)? {
+            let resolvable = Some(self.listing_resolvable(&listing));
             self.record_observation_build(
                 report_path_payload(&canonical, Some(entry)),
                 cancel,
@@ -6053,6 +6089,7 @@ impl<S: SourceStore> UnitResolver<S> {
                     stamp: listing.stamp.clone(),
                     complete: true,
                     listed: true,
+                    resolvable,
                 },
             )?;
             return Ok(DirectoryAccess::Admitted(listing));
@@ -6127,6 +6164,7 @@ impl<S: SourceStore> UnitResolver<S> {
         let complete =
             listing.complete && self.scanned_entries <= self.limits.max_directory_entries;
         listing.value_mut().complete = complete;
+        let resolvable = complete.then(|| self.listing_resolvable(&listing));
         self.record_observation_build(
             report_path_payload(&canonical, Some(entry)),
             cancel,
@@ -6136,6 +6174,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 stamp: listing.stamp.clone(),
                 complete,
                 listed: true,
+                resolvable,
             },
         )?;
         if !complete {
@@ -6873,6 +6912,29 @@ impl<S: SourceStore> UnitResolver<S> {
         request: IncludeResolveRequest<'_>,
         cancel: &dyn CancellationToken,
     ) -> Result<Resolution<ResolvedSource>, ResolverError> {
+        let exact = is_build_product_name(request.requested_name);
+        let outer = self.exact_listings;
+        self.exact_listings = outer || exact;
+        let result = self.search_include_entries(request, cancel);
+        self.exact_listings = outer;
+        result
+    }
+
+    /// What a listing read now proves (`ResolutionObservation::Directory`'s
+    /// `resolvable`).
+    fn listing_resolvable(&self, listing: &DirectoryListing) -> u64 {
+        if self.exact_listings {
+            EXACT_LISTING
+        } else {
+            resolvable_listing_fingerprint(&listing.files, &listing.directories)
+        }
+    }
+
+    fn search_include_entries(
+        &mut self,
+        request: IncludeResolveRequest<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<Resolution<ResolvedSource>, ResolverError> {
         let mut entries = self.context.include_search_entries(request.including_path);
         if let Some(owner_directory) = request.including_path.parent()
             && let Some(owner_entry) =
@@ -7113,6 +7175,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 stamp: path_stamp_result(&entry.path).ok().flatten(),
                 complete: true,
                 listed: false,
+                resolvable: None,
             },
         )
     }
@@ -8628,6 +8691,7 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
                 complete: true,
                 listed: true,
                 stamp,
+                resolvable: None,
             })
             .collect()
     }
@@ -9679,6 +9743,134 @@ fn filename_tiers(unit_name: &str, namespaces: &[String]) -> Vec<Vec<String>> {
         tier.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
     }
     tiers
+}
+
+/// Extensions of what a Delphi or Free Pascal build, and the IDE beside it,
+/// writes into source and output directories: compiled units and packages,
+/// executables and libraries, resources (`.vrc` is the version resource a
+/// build writes beside the project and removes), maps, debug and IDE
+/// state, and the C++Builder interop outputs (`.hpp` headers, `.lib`
+/// import libraries, `.pdb` debug databases), which are not Pascal text.
+/// An include naming one of these still sees every listing it reads by
+/// stamp (`EXACT_LISTING`).
+///
+/// This is not the project cache's `ARTIFACT_EXTENSIONS`: that list says
+/// which watched changes cannot stale a cache entry, so it leaves out the
+/// compiled units and packages the compiled-unit and package lookups read
+/// (`.dcu`, `.dcp`, `.bpl`) and holds tool state (`.ini`, `.log`, `.tmp`,
+/// ...) that an include may name. This one says which entries no
+/// directory-listing lookup selects.
+const BUILD_PRODUCT_EXTENSIONS: &[&str] = &[
+    "dcu",
+    "dcuil",
+    "dcp",
+    "dcpil",
+    "bpl",
+    "bpi",
+    "exe",
+    "dll",
+    "so",
+    "dylib",
+    "res",
+    "dres",
+    "drc",
+    "map",
+    "rsm",
+    "tds",
+    "jdbg",
+    "obj",
+    "o",
+    "a",
+    "ppu",
+    "identcache",
+    "dsk",
+    "stat",
+    "local",
+    "vrc",
+    "hpp",
+    "lib",
+    "pdb",
+];
+
+/// Whether `name` has a build-product extension (`BUILD_PRODUCT_EXTENSIONS`).
+pub fn is_build_product_name(name: &str) -> bool {
+    Path::new(name).extension().is_some_and(|extension| {
+        BUILD_PRODUCT_EXTENSIONS
+            .iter()
+            .any(|product| extension.eq_ignore_ascii_case(product))
+    })
+}
+
+/// Whether a directory entry named `name` can take part in resolution.
+/// Every directory can (a dotted unit or an include path descends into it,
+/// a package catalogue walks it); unit lookups select `<name>.pas`, package
+/// catalogues `.pas`, `.dpk` and `.dproj`, and an include may name any file,
+/// so a file can unless it is a build product no directive names. The
+/// persistent listing digest uses this rule; a request's fingerprint also
+/// counts lone compiled units (`resolvable_listing_fingerprint`).
+pub fn listing_entry_may_resolve(name: &std::ffi::OsStr, directory: bool) -> bool {
+    directory
+        || !Path::new(name).extension().is_some_and(|extension| {
+            BUILD_PRODUCT_EXTENSIONS
+                .iter()
+                .any(|product| extension.eq_ignore_ascii_case(product))
+        })
+}
+
+/// The `resolvable` of a directory listing read for an include whose
+/// requested name has a build-product extension: the fingerprint leaves
+/// such files out, so the listing holds only while its stamp does.
+/// `resolvable_listing_fingerprint` never returns it.
+pub const EXACT_LISTING: u64 = 0;
+
+/// A fingerprint of the entries of a complete listing that can take part in
+/// resolution (`listing_entry_may_resolve`), and of each compiled unit
+/// (`.dcu`) with no `.pas` or `.pp` of its stem (case-insensitive) in the
+/// same listing: the compiled-unit fallback binds an import to a lone
+/// `.dcu`, never to one beside its source. Exact names, files and
+/// directories apart, in any order. Two listings with equal fingerprints
+/// resolve every lookup alike; build products written beside their sources
+/// leave it unchanged. Never `EXACT_LISTING`.
+pub fn resolvable_listing_fingerprint(files: &[PathBuf], directories: &[PathBuf]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    fn has_extension(path: &Path, wanted: &str) -> bool {
+        path.extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case(wanted))
+    }
+    let stem = |path: &PathBuf| {
+        path.file_stem()
+            .map(|stem| stem.to_string_lossy().to_ascii_lowercase())
+    };
+    let sources: HashSet<String> = files
+        .iter()
+        .filter(|path| has_extension(path, "pas") || has_extension(path, "pp"))
+        .filter_map(stem)
+        .collect();
+    let mut file_names: Vec<_> = files
+        .iter()
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| listing_entry_may_resolve(name, false))
+                || (has_extension(path, "dcu")
+                    && stem(path).is_some_and(|stem| !sources.contains(&stem)))
+        })
+        .filter_map(|path| path.file_name())
+        .collect();
+    file_names.sort();
+    file_names.dedup();
+    let mut directory_names: Vec<_> = directories
+        .iter()
+        .filter_map(|path| path.file_name())
+        .collect();
+    directory_names.sort();
+    directory_names.dedup();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    file_names.hash(&mut hasher);
+    directory_names.hash(&mut hasher);
+    match hasher.finish() {
+        EXACT_LISTING => EXACT_LISTING.wrapping_add(1),
+        fingerprint => fingerprint,
+    }
 }
 
 /// The file name an include directive body requests, as the resolver looks it up.
@@ -21127,5 +21319,78 @@ mod tests {
             .expect("second catalogue");
         assert!(first.entries.contains_key("latiny.pas"));
         assert!(second.entries.contains_key("latinp.pas"));
+    }
+
+    /// l4d-qk5t: what a Delphi build writes beside the sources, in any case,
+    /// leaves a listing's resolvable entries alike; a source, an include or
+    /// a directory does not.
+    #[test]
+    fn build_products_leave_the_resolvable_listing_alike() {
+        let p = |name: &str| PathBuf::from(format!("/lib/{name}"));
+        let files = [p("Shared.pas"), p("Common.inc")];
+        let directories = [p("sub")];
+        let listing = resolvable_listing_fingerprint(&files, &directories);
+        let mut built = files.to_vec();
+        built.extend(
+            [
+                "Shared.dcu",
+                "shared.DCU",
+                "App.Exe",
+                "P.dcp",
+                "P.bpl",
+                "App.res",
+            ]
+            .map(p),
+        );
+        assert_eq!(
+            resolvable_listing_fingerprint(&built, &directories),
+            listing
+        );
+        for source in [
+            "Late.Pas",
+            "late.INC",
+            "App.dpr",
+            "P.dpk",
+            "App.dproj",
+            "notes",
+        ] {
+            let mut changed = files.to_vec();
+            changed.push(p(source));
+            assert_ne!(
+                resolvable_listing_fingerprint(&changed, &directories),
+                listing,
+                "{source}"
+            );
+        }
+        assert_ne!(
+            resolvable_listing_fingerprint(&files, &[p("sub"), p("Win32")]),
+            listing
+        );
+        assert!(listing_entry_may_resolve(
+            std::ffi::OsStr::new("Win32.dcu"),
+            true
+        ));
+    }
+
+    /// l4d-qk5t round 1: a compiled unit with no `.pas`/`.pp` of its stem
+    /// beside it can be bound by the compiled-unit fallback, so it counts in
+    /// the fingerprint; one beside its source does not. The persistent
+    /// digest's predicate leaves every `.dcu` out (bindings are recomputed).
+    #[test]
+    fn an_orphan_compiled_unit_counts_in_the_resolvable_listing() {
+        let p = |name: &str| PathBuf::from(format!("/lib/{name}"));
+        let files = [p("Shared.pas"), p("Legacy.PP")];
+        let listing = resolvable_listing_fingerprint(&files, &[]);
+        let mut beside = files.to_vec();
+        beside.extend(["shared.DCU", "Legacy.dcu", "App.vrc"].map(p));
+        assert_eq!(resolvable_listing_fingerprint(&beside, &[]), listing);
+        let mut orphan = files.to_vec();
+        orphan.push(p("Vendor.dcu"));
+        assert_ne!(resolvable_listing_fingerprint(&orphan, &[]), listing);
+        assert!(!listing_entry_may_resolve(
+            std::ffi::OsStr::new("Vendor.dcu"),
+            false
+        ));
+        assert_ne!(listing, EXACT_LISTING);
     }
 }

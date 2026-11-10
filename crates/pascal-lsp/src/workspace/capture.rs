@@ -728,6 +728,7 @@ mod tests {
             stamp: None,
             complete: true,
             listed: true,
+            resolvable: None,
         }
     }
 

@@ -1027,6 +1027,7 @@ pub(crate) fn source_record_for_loaded(
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
+            directory_listing: Default::default(),
         }),
         SourceRevision::Disk {
             stamp,
@@ -1057,6 +1058,7 @@ pub(crate) fn source_record_for_loaded(
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
+            directory_listing: Default::default(),
         }),
     }
 }
@@ -1097,6 +1099,7 @@ fn payload_record(
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
+            directory_listing: Default::default(),
         }),
         SourceRevision::Overlay {
             version,
@@ -1127,11 +1130,13 @@ fn payload_record(
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
+            directory_listing: Default::default(),
         }),
     }
 }
 
 pub(crate) fn observation_record(observation: &ResolutionObservation) -> Option<SourceRecord> {
+    let mut directory_listing = super::rename::DirectoryListingWitness::Stamp;
     let (path, stamp, missing_provider_candidate, directory_observation, candidate_observation) =
         match observation {
             ResolutionObservation::Directory {
@@ -1140,7 +1145,14 @@ pub(crate) fn observation_record(observation: &ResolutionObservation) -> Option<
                 complete: _,
                 entry: _,
                 listed: _,
-            } => (path, stamp.clone(), false, true, None),
+                resolvable,
+            } => {
+                if let Some(resolvable) = resolvable {
+                    directory_listing =
+                        super::rename::DirectoryListingWitness::Resolvable(*resolvable);
+                }
+                (path, stamp.clone(), false, true, None)
+            }
             ResolutionObservation::Candidate {
                 path,
                 stamp,
@@ -1186,6 +1198,7 @@ pub(crate) fn observation_record(observation: &ResolutionObservation) -> Option<
         missing_provider_scope: None,
         auto_import_provider_observation: false,
         auto_import_scopes: Vec::new(),
+        directory_listing,
     })
 }
 
@@ -1295,6 +1308,7 @@ pub(crate) fn report_records(
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
+            directory_listing: Default::default(),
         };
         if let Some(existing) = records.get_mut(&uri) {
             if existing.path_stamp.is_none() {
@@ -1356,6 +1370,21 @@ pub(crate) fn merge_source_record(
     if existing.path.is_none() && !existing.open {
         existing.path = incoming.path.clone();
     }
+    // A directory observation's listing witness relaxes only its own stamp
+    // check: merged with another kind of record of the path, the strict
+    // check stays.
+    existing.directory_listing = match (
+        existing.directory_observation,
+        incoming.directory_observation,
+    ) {
+        (true, true) => existing.directory_listing.merge(
+            &existing.path_stamp,
+            incoming.directory_listing,
+            &incoming.path_stamp,
+        ),
+        (false, false) => existing.directory_listing,
+        _ => super::rename::DirectoryListingWitness::Conflicting,
+    };
     if existing.path_stamp.is_none() {
         existing.path_stamp = incoming.path_stamp.clone();
     }

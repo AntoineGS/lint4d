@@ -431,9 +431,10 @@ fn wait_contexts(server: &mut TestServer, predicate: impl Fn(&[Value]) -> bool) 
 
 /// AC4 (R9-6): the eight one-unit projects `others/p1..p8` fill the
 /// index store, evicting App.dproj's context index. A request on it then
-/// answers partially, the members past the bound of direct reads being the
-/// "not indexed yet" gap, and queues its reuse pass; once that pass has
-/// reloaded every member from the store, the same request answers fully.
+/// validates on demand the members its held snapshot's stored rows select
+/// (l4d-c8l2), so it answers with the proven warm locations, and queues its
+/// reuse pass; once that pass has reloaded every member from the store, the
+/// same request answers fully.
 #[test]
 fn an_evicted_target_answers_partially_then_fully_after_its_reuse_pass() {
     const EVICTED: FixtureSpec = FixtureSpec {
@@ -491,15 +492,12 @@ fn an_evicted_target_answers_partially_then_fully_after_its_reuse_pass() {
     let partial = references(&mut server, &shared, 2, 6);
     let notes = gaps(&mut server);
     assert!(
-        notes
+        !notes
             .iter()
             .any(|note| note.contains("units of App.dproj are not indexed yet")),
-        "{notes:?}"
+        "every candidate was validated on demand: {notes:?}"
     );
-    assert!(
-        partial.iter().all(|location| expected.contains(location)),
-        "{partial:?}"
-    );
+    assert_eq!(partial, expected, "only proven locations, all of them");
 
     let reloaded = wait_contexts(&mut server, |contexts| {
         contexts
@@ -516,10 +514,12 @@ fn an_evicted_target_answers_partially_then_fully_after_its_reuse_pass() {
     shutdown(server);
 }
 
-/// Spec §7 (D16): the second server's reuse pass is held at
+/// Spec §7 (D16, D48): the second server's reuse pass is held at
 /// `PASCAL_LSP_TEST_REUSE_PASS_BARRIER` once `HELD` members were reused.
-/// A request then answers before `complete` with only proven locations and
-/// the "not indexed yet" gap; after `complete` it answers fully.
+/// A request then answers before `complete` with only proven locations: the
+/// candidates its held snapshot's postings select are validated on demand
+/// (l4d-c8l2), so it gives the warm answer without the "not indexed yet"
+/// gap; after `complete` it answers alike.
 #[test]
 fn a_query_during_the_reuse_pass_answers_proven_partial_results() {
     const HELD: usize = 5;
@@ -575,15 +575,8 @@ fn a_query_during_the_reuse_pass_answers_proven_partial_results() {
             .is_some_and(|contexts| !contexts.iter().any(complete)),
         "the response arrived before complete: {held}"
     );
-    assert!(not_indexed(&notes), "{notes:?}");
-    assert!(
-        !partial.is_empty(),
-        "the declaring unit and open sources are proven: {partial:?}"
-    );
-    assert!(
-        partial.iter().all(|location| expected.contains(location)),
-        "only proven locations: {partial:?}"
-    );
+    assert!(!not_indexed(&notes), "{notes:?}");
+    assert_eq!(partial, expected, "only proven locations, all of them");
 
     fs::write(&barrier.release, b"").unwrap();
     let done = wait_index(&mut second, complete);

@@ -5157,6 +5157,15 @@ impl Workspace {
                 unselected.insert(local);
             }
         }
+        // Within the bound of direct reads the members are read as before:
+        // leaving them out would only lose completeness, not time.
+        let bound = match selection {
+            Selection::Symbols { .. } => max_unverified_symbol_candidates(),
+            Selection::Candidates(_) => max_unverified_candidates(),
+        };
+        if unselected.len() <= bound {
+            unselected.clear();
+        }
         let reused = view.reuse_members_now(key, &validate, cancel)?;
         crate::trace::trace!(
             "  persisted selection {}: {} named, {reused} validated, {} left to the reuse pass, {} listed, {:.1} ms",
@@ -11098,6 +11107,9 @@ pub(in crate::workspace) mod tests {
                 named_unit(&root.join("lib/U25.pas"), "P1Gained");
                 view.project_cache
                     .invalidate_path(&root.join("lib/U25.pas"));
+                // Two direct reads: U15 (failed validation) and U25; the
+                // members the stored index does not select are left out.
+                let _caps = override_caps(|caps| caps.unverified_symbols = Some(2));
                 take_on_demand_reused();
                 let early = symbols(&view, "P1");
                 let found = names(&early.value);

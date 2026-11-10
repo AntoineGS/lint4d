@@ -2159,6 +2159,41 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (workspace, uri, source, key) = provider_workspace(temp.path());
         drop(expand_main(&workspace, &uri, &source, &key));
+        assert_graphs_charged_within_a_fifth(&workspace);
+    }
+
+    /// l4d-10: an interface with a branch the session cannot decide keeps
+    /// the identifiers its text spells (D46). RAD Studio's `SysUtils` is
+    /// one: its graph was charged 30 KB for the 122 KB it kept.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_provider_interface_with_an_unknown_branch_is_charged_within_a_fifth_of_its_heap() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source = "unit Main; interface uses A; {$IF Declared(Flag)} const Eight = 8; {$IFEND} implementation end.";
+        std::fs::write(root.join("Main.pas"), source).unwrap();
+        let declarations = (0..2_000)
+            .map(|n| format!("C{n} = Base + Offset + Scale * Count;\n"))
+            .collect::<String>();
+        std::fs::write(
+            root.join("A.pas"),
+            format!("unit A; interface {{$IFDEF MSWINDOWS}} {{$ENDIF}} const\n{declarations}Flag = 8; implementation end."),
+        )
+        .unwrap();
+        pascal_project::backdate_tree_for_test(root);
+        let mut workspace = Workspace::with_override_session(
+            vec![root.into()],
+            Default::default(),
+            OverrideSession::new(None),
+        );
+        let uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+        let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+        drop(expand_main(&workspace, &uri, source, &key));
+        assert_graphs_charged_within_a_fifth(&workspace);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_graphs_charged_within_a_fifth(workspace: &Workspace) {
         assert_eq!(workspace.project_cache.provider_graph_count(), 1);
         let charged = workspace.project_cache.provider_graph_bytes();
         let (freed, holders) = workspace.project_cache.drop_provider_graphs_for_test();

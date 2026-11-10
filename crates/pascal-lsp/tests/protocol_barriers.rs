@@ -20,5 +20,11 @@ mod persistent_index;
 #[path = "protocol/persistent_queries.rs"]
 mod persistent_queries;
 
+#[path = "protocol/persistent_acceptance.rs"]
+mod persistent_acceptance;
+
+#[path = "protocol/persistent_processes.rs"]
+mod persistent_processes;
+
 #[path = "protocol/pull_storm.rs"]
 mod pull_storm;

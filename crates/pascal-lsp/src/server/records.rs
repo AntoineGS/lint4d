@@ -63,6 +63,7 @@ fn compact_source_record(
         missing_provider_scope: record.missing_provider_scope.clone(),
         auto_import_provider_observation: record.auto_import_provider_observation,
         auto_import_scopes: record.auto_import_scopes.clone(),
+        directory_listing: record.directory_listing,
     })
 }
 

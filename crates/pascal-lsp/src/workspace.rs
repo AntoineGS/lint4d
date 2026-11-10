@@ -9689,6 +9689,7 @@ impl Workspace {
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
+                directory_listing: Default::default(),
             },
         );
     }
@@ -10129,6 +10130,7 @@ impl Workspace {
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
+                directory_listing: Default::default(),
             },
         );
     }
@@ -10173,6 +10175,7 @@ impl Workspace {
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
+                directory_listing: Default::default(),
             },
         );
     }
@@ -10370,6 +10373,7 @@ impl Workspace {
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
+                    directory_listing: Default::default(),
                 },
             );
         }
@@ -13866,6 +13870,7 @@ impl Workspace {
                         missing_provider_scope: None,
                         auto_import_provider_observation: false,
                         auto_import_scopes: Vec::new(),
+                        directory_listing: Default::default(),
                     });
                 }
                 Entry::Occupied(mut entry) => {
@@ -13925,6 +13930,7 @@ impl Workspace {
                     missing_provider_scope: Some(scope),
                     auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
+                    directory_listing: Default::default(),
                 });
             }
             Entry::Occupied(mut entry) => {
@@ -19182,6 +19188,7 @@ mod tests {
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
+                    directory_listing: Default::default(),
                 }
             })
             .collect::<Vec<_>>();
@@ -19275,6 +19282,7 @@ mod tests {
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
+                    directory_listing: Default::default(),
                 }],
             ));
             consumers.push(consumer_uri);
@@ -19365,6 +19373,7 @@ mod tests {
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
+                directory_listing: Default::default(),
             }],
         );
         let cancellation = std::sync::Arc::new(AtomicBool::new(false));
@@ -23633,6 +23642,7 @@ BDS = '/fake/37'
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
+            directory_listing: Default::default(),
         };
         assert!(
             workspace
@@ -26557,6 +26567,7 @@ BDS = '/fake/37'
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
+            directory_listing: Default::default(),
         };
 
         assert!(

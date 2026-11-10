@@ -1310,6 +1310,7 @@ enum TestBarrier {
     CompletionResolution,
     WorkspaceSymbols,
     References,
+    ReferencesValidation,
     PartialValidation,
     ProjectOperation,
     ProjectOperationPrepared,
@@ -1329,6 +1330,7 @@ pub struct TestBarrierConfig {
     completion_resolution: Option<TestBarrierPaths>,
     workspace_symbols: Option<TestBarrierPaths>,
     references: Option<TestBarrierPaths>,
+    references_validation: Option<TestBarrierPaths>,
     partial_validation: Option<TestBarrierPaths>,
     project_operation: Option<TestBarrierPaths>,
     project_operation_prepared: Option<TestBarrierPaths>,
@@ -1383,6 +1385,7 @@ impl TestBarrierConfig {
             completion_resolution: None,
             workspace_symbols: None,
             references: None,
+            references_validation: None,
             partial_validation: None,
             project_operation: None,
             project_operation_prepared: None,
@@ -1504,6 +1507,17 @@ impl TestBarrierConfig {
         self
     }
 
+    /// Holds a computed references or workspace/symbol result before its
+    /// final revalidation.
+    pub fn with_references_validation(
+        mut self,
+        references_validation: Option<(PathBuf, PathBuf)>,
+    ) -> Self {
+        self.references_validation =
+            references_validation.map(|(entered, release)| TestBarrierPaths { entered, release });
+        self
+    }
+
     pub fn with_partial_validation(
         mut self,
         partial_validation: Option<(PathBuf, PathBuf)>,
@@ -1592,6 +1606,7 @@ impl TestBarrierConfig {
             TestBarrier::CompletionResolution => self.completion_resolution.as_ref(),
             TestBarrier::WorkspaceSymbols => self.workspace_symbols.as_ref(),
             TestBarrier::References => self.references.as_ref(),
+            TestBarrier::ReferencesValidation => self.references_validation.as_ref(),
             TestBarrier::PartialValidation => self.partial_validation.as_ref(),
             TestBarrier::ProjectOperation => self.project_operation.as_ref(),
             TestBarrier::ProjectOperationPrepared => self.project_operation_prepared.as_ref(),
@@ -2492,6 +2507,7 @@ fn diagnostic_record_fingerprint(record: &SourceRecord) -> u64 {
     record.document_link_missing_candidate.hash(&mut hasher);
     record.document_link_case_variant.hash(&mut hasher);
     record.directory_observation.hash(&mut hasher);
+    record.directory_listing.hash(&mut hasher);
     record.document_link_ancestor.hash(&mut hasher);
     record.auto_import_provider_observation.hash(&mut hasher);
     hash_debug(&mut hasher, &record.candidate_membership);
@@ -6791,6 +6807,17 @@ impl AnalysisJobs {
                         | AnalysisResultValue::TypeHierarchySubtypes(_)
                 ) && let Err(error) = wait_at_test_barrier(
                     TestBarrier::PartialValidation,
+                    &test_barriers,
+                    &worker_cancellation,
+                ) {
+                    invalidate_analysis_result(&mut result, error);
+                }
+                if matches!(
+                    result.value,
+                    AnalysisResultValue::References(Ok(_))
+                        | AnalysisResultValue::WorkspaceSymbols(Ok(_))
+                ) && let Err(error) = wait_at_test_barrier(
+                    TestBarrier::ReferencesValidation,
                     &test_barriers,
                     &worker_cancellation,
                 ) {
@@ -18763,6 +18790,7 @@ mod tests {
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
+            directory_listing: Default::default(),
         };
         Some(
             super::prepare_diagnostic_dependency(&[record], 0, 0)
@@ -18968,6 +18996,7 @@ mod tests {
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
+            directory_listing: Default::default(),
         }
     }
 
@@ -19168,6 +19197,7 @@ mod tests {
             missing_provider_scope: Some(missing_provider_scope),
             auto_import_provider_observation: true,
             auto_import_scopes: vec![auto_import_scope],
+            directory_listing: Default::default(),
         }
     }
 

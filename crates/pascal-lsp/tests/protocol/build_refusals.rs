@@ -7,7 +7,7 @@
 
 use super::persistent_cache::request;
 use super::persistent_index::wait_index;
-use super::persistent_queries::settle_background;
+use super::persistent_queries::{FixtureSpec, query_fixture, settle_background};
 use super::*;
 use std::path::PathBuf;
 
@@ -264,4 +264,249 @@ fn a_rewritten_environment_file_of_a_selected_project_refuses_no_later_request()
     }
     assert!(refused.is_empty(), "{refused:#?}");
     server.shutdown();
+}
+
+const SPEC: FixtureSpec = FixtureSpec {
+    units: 30,
+    importers: 5,
+    with_include_every: 10,
+    unresolved_includes: 0,
+    shared_name: "TShared",
+};
+const OPENS: [&str; 2] = ["App.dpr", "lib/Shared.pas"];
+
+/// A held request's barrier, between its computation and its final
+/// revalidation (`PASCAL_LSP_TEST_REFERENCES_VALIDATION_BARRIER`).
+fn validation_barrier(environment: &Path) -> (TestBarrier, String) {
+    let directory = environment.join("validation-barrier");
+    fs::create_dir_all(&directory).unwrap();
+    let barrier = TestBarrier {
+        entered: directory.join("entered"),
+        release: directory.join("release"),
+    };
+    let spec = format!(
+        "{}|{}",
+        barrier.entered.display(),
+        barrier.release.display()
+    );
+    // Requests pass until a test holds one.
+    barrier.release();
+    (barrier, spec)
+}
+
+/// A warm server over `query_fixture(SPEC)` (its store persisted by a first
+/// server), holding references and workspace/symbol results at `spec`.
+fn held_server(environment: &Path, root: &Path, spec: &str) -> TestServer {
+    let mut first = launch(environment, "held-first", &[]);
+    first.initialize(root, Value::Null);
+    for relative in OPENS {
+        open(&mut first, &root.join(relative));
+    }
+    wait_index(&mut first, super::persistent_index::persisted);
+    first.shutdown();
+    let mut server = launch(
+        environment,
+        "held",
+        &[("PASCAL_LSP_TEST_REFERENCES_VALIDATION_BARRIER", spec)],
+    );
+    server.initialize(root, Value::Null);
+    for relative in OPENS {
+        open(&mut server, &root.join(relative));
+    }
+    wait_index(&mut server, |context| context["complete"] == true);
+    settle_background(&mut server);
+    server
+}
+
+fn references_to_shared(root: &Path) -> Value {
+    json!({
+        "textDocument": {"uri": uri(&root.join("lib/Shared.pas"))},
+        "position": {"line": 2, "character": 6},
+        "context": {"includeDeclaration": true},
+    })
+}
+
+/// Sends `method`, waits until its computed result is held at `barrier`,
+/// runs `change`, then releases it and returns the answer.
+fn held_answer(
+    server: &mut TestServer,
+    barrier: &TestBarrier,
+    id: &str,
+    method: &str,
+    params: Value,
+    change: impl FnOnce(),
+) -> Result<Value, String> {
+    let _ = fs::remove_file(&barrier.entered);
+    fs::remove_file(&barrier.release).unwrap();
+    let request_id = RequestId::from(id.to_string());
+    server.send_request(request_id.clone(), method, params);
+    barrier.wait_until_entered();
+    change();
+    barrier.release();
+    let response = server.response(&request_id);
+    match response.error {
+        Some(error) => Err(format!("{} {}", error.code, error.message)),
+        None => Ok(response.result.unwrap_or(Value::Null)),
+    }
+}
+
+/// What a Delphi build writes beside the sources: compiled units (in both
+/// cases), the executable, a package, resources, a map.
+fn write_build_products(directory: &Path, round: usize) {
+    for name in [
+        format!("Other{round}.dcu"),
+        format!("Shared{round}.DCU"),
+        format!("App{round}.exe"),
+        format!("Pkg{round}.dcp"),
+        format!("App{round}.res"),
+        format!("App{round}.map"),
+        format!("App{round}.drc"),
+    ] {
+        fs::write(directory.join(name), b"built").unwrap();
+    }
+}
+
+/// l4d-qk5t: a build writes compiled units and other products into the
+/// search directory while a references request and a workspace/symbol
+/// request are computed. Neither can change what resolves, so both answer
+/// as before. Before, the directory's new stamp refused each (-32803
+/// "workspace metadata or membership changed while resolving …/lib").
+#[test]
+fn build_products_written_during_a_request_refuse_nothing() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &SPEC);
+    let (barrier, spec) = validation_barrier(environment.path());
+    let mut server = held_server(environment.path(), &root, &spec);
+    let before = answer(
+        &mut server,
+        "references-before",
+        "textDocument/references",
+        references_to_shared(&root),
+    )
+    .expect("references before the build");
+    assert!(locations(&before).len() > SPEC.importers, "{before}");
+
+    let lib = root.join("lib");
+    let references = held_answer(
+        &mut server,
+        &barrier,
+        "references-during-build",
+        "textDocument/references",
+        references_to_shared(&root),
+        || {
+            write_build_products(&lib, 0);
+            write_build_products(&root, 0);
+        },
+    )
+    .expect("references while the build wrote its products");
+    assert_eq!(locations(&references), locations(&before), "{references}");
+
+    let symbols = held_answer(
+        &mut server,
+        &barrier,
+        "symbols-during-build",
+        "workspace/symbol",
+        json!({"query": "TShared"}),
+        || write_build_products(&lib, 1),
+    )
+    .expect("workspace/symbol while the build wrote its products");
+    assert!(
+        symbol_units(&symbols, "TShared").contains(&"Shared.pas".to_string()),
+        "{symbols}"
+    );
+    server.shutdown();
+}
+
+/// l4d-qk5t: a new unit (a source the resolver can select; its extension
+/// in another case) created in the search directory while references are
+/// computed can change the answer: the request is refused, and the retry
+/// finds the new reference.
+#[test]
+fn a_source_created_during_a_request_still_refuses_it() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &SPEC);
+    let (barrier, spec) = validation_barrier(environment.path());
+    let mut server = held_server(environment.path(), &root, &spec);
+    let lib = root.join("lib");
+    let created = held_answer(
+        &mut server,
+        &barrier,
+        "references-new-unit",
+        "textDocument/references",
+        references_to_shared(&root),
+        || {
+            fs::write(
+                lib.join("Late.Pas"),
+                "unit Late;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nbegin\n  TShared.Create;\nend;\nend.\n",
+            )
+            .unwrap()
+        },
+    );
+    let error = created.expect_err("a new unit refuses the request in flight");
+    assert!(
+        error.starts_with("-32801 ") || error.starts_with("-32803 "),
+        "{error}"
+    );
+    assert!(error.contains("retry"), "{error}");
+    server.shutdown();
+}
+
+/// l4d-qk5t: a build between two sessions writes compiled units beside the
+/// persisted members. No source changed, so the next session reuses every
+/// member. Before, a member's stored listing of a directory its include
+/// search listed named every entry, so a new `.dcu` there made it stale and
+/// it was extracted again.
+#[test]
+fn build_products_written_between_sessions_keep_persisted_members() {
+    let done = index_after_a_build(|root| {
+        write_build_products(&root.join("lib"), 0);
+        write_build_products(root, 0);
+    });
+    assert_eq!(done["extracted"], 0, "{done}");
+    assert_eq!(done["reused"], done["members"], "{done}");
+}
+
+/// l4d-qk5t: the include the persisted units looked for appears between
+/// the sessions, its name in another case: their stored listing no longer
+/// holds, and they are extracted again.
+#[test]
+fn an_include_written_between_sessions_stales_the_members_that_missed_it() {
+    let done = index_after_a_build(|root| {
+        write_build_products(&root.join("lib"), 0);
+        fs::write(root.join("lib/MISSING.INC"), "{ found }\n").unwrap();
+    });
+    assert!(
+        done["extracted"].as_u64().unwrap() >= 3,
+        "the units including it are read again: {done}"
+    );
+}
+
+/// The index status of a second session over `query_fixture(SPEC)` with
+/// three units including the missing `Missing.inc` (they hold the listing
+/// of each directory their include search consulted), once a first session
+/// persisted every member and `build` changed the tree.
+fn index_after_a_build(build: impl FnOnce(&Path)) -> Value {
+    let spec = FixtureSpec {
+        unresolved_includes: 3,
+        ..SPEC
+    };
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &spec);
+    let mut first = launch(environment.path(), "persisted-first", &[]);
+    first.initialize(&root, Value::Null);
+    for relative in OPENS {
+        open(&mut first, &root.join(relative));
+    }
+    wait_index(&mut first, super::persistent_index::persisted);
+    first.shutdown();
+
+    build(&root);
+    let mut second = launch(environment.path(), "persisted", &[]);
+    second.initialize(&root, Value::Null);
+    for relative in OPENS {
+        open(&mut second, &root.join(relative));
+    }
+    let done = wait_index(&mut second, |context| context["complete"] == true);
+    second.shutdown();
+    done
 }

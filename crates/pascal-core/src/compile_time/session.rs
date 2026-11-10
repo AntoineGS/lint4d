@@ -7002,6 +7002,7 @@ mod tests {
             stamp: None,
             complete: true,
             listed: true,
+            resolvable: None,
         };
         append_observations(
             &mut analysis.value_mut().observations,

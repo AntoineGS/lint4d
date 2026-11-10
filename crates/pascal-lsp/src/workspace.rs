@@ -22725,6 +22725,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn semantic_tokens_cover_an_include_root_with_many_includes_and_tokens() {
+        // l4d-110: ~20k tokens over 60 include directives must not exhaust
+        // the source-map work limit (one lookup per token used to scan every
+        // segment before it). Mostly literals and operators, so identifier
+        // resolution stays inside its own traversal limit.
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        let main = root.join("Main.pas");
+        let mut main_source =
+            String::from("unit Main;\ninterface\nimplementation\nvar\n  X: Integer;\n");
+        for procedure in 0..60 {
+            main_source.push_str(&format!(
+                "{{$I Defs.inc}}\nprocedure Run{procedure};\nbegin\n"
+            ));
+            for _ in 0..25 {
+                main_source.push_str("  X := 1 + 2 + 3 + 4 + 5 + 6;\n");
+            }
+            main_source.push_str("end;\n");
+        }
+        main_source.push_str("end.\n");
+        let lines = main_source.lines().count() as u32;
+        fs::write(&main, &main_source).unwrap();
+        fs::write(root.join("Defs.inc"), "// shared\n").unwrap();
+        let main_uri = Url::from_file_path(&main).unwrap();
+        let workspace = test_workspace(vec![root.to_path_buf()], Default::default());
+
+        let full = super::queries::semantic_tokens_from_input(
+            workspace.analysis_input(),
+            &main_uri,
+            None,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("semantic tokens for a root with many includes");
+        assert!(
+            full.data.len() >= 60 * 25 * 13,
+            "{} tokens",
+            full.data.len()
+        );
+
+        let ranged = super::queries::semantic_tokens_from_input(
+            workspace.analysis_input(),
+            &main_uri,
+            Some(lsp_types::Range::new(
+                lsp_types::Position::new(lines / 2, 0),
+                lsp_types::Position::new(lines, 0),
+            )),
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("ranged semantic tokens for a root with many includes");
+        assert!(!ranged.data.is_empty());
+    }
+
     /// Returns the classified tokens on `Value.Free;` in a `Main` unit whose
     /// `Run(Value: TProvided)` parameter type comes from a `Provider` unit.
     fn provider_parameter_body_tokens(

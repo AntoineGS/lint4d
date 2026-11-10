@@ -2,8 +2,7 @@ use super::TreeParent as _;
 use super::{
     AssistanceBudget, BudgetedLookup, Document, GenericParameterContext, NavigationIndex, Origin,
     OwnerTypeContext, SemanticTokenResolutionMode, Span, Symbol, SymbolKind, TypeKind,
-    canonical_name, check_navigation_cancel, collect_nodes, field_identifier_nodes,
-    has_ancestor_kind, node_text,
+    canonical_name, check_navigation_cancel, collect_nodes, field_identifier_nodes, node_text,
 };
 use crate::text::{self, PositionIndex};
 use lsp_types::{
@@ -66,12 +65,84 @@ const MODIFIER_DEFINITION: u32 = 1 << 1;
 const MODIFIER_READONLY: u32 = 1 << 2;
 const MODIFIER_STATIC: u32 = 1 << 3;
 
-const MAX_SEMANTIC_NODES: usize = 1_000_000;
+/// Syntax nodes one response visits; past it the rest of the document gets
+/// no tokens. Sized for the largest real units (a 180,000-line, 8 MB unit).
+const MAX_SEMANTIC_NODES: usize = 16_000_000;
+/// One identifier's resolution, shared with hover. An identifier that needs
+/// more is left plain.
 pub(super) const MAX_SEMANTIC_RESOLUTION_WORK: usize = 512_000;
 pub(super) const MAX_SEMANTIC_RESOLUTION_BYTES: usize = 8 * 1024 * 1024;
+/// All identifiers of one response; past it the remaining identifiers are
+/// left plain instead of the response being refused. The largest real unit
+/// measured (8 MB, 214,000 resolved identifiers) needs about 144M units and
+/// 1.3 GB of scanned bytes (l4d-3ia4).
+const MAX_SEMANTIC_RESPONSE_WORK: usize = 256 * 1024 * 1024;
+/// Cumulative scanned/proved bytes, a work proxy, not memory: what one
+/// identifier materializes stays under `MAX_SEMANTIC_RESOLUTION_BYTES` and is
+/// dropped before the next.
+const MAX_SEMANTIC_RESPONSE_BYTES: usize = if usize::BITS >= 64 {
+    (4u64 * 1024 * 1024 * 1024) as usize
+} else {
+    usize::MAX
+};
+
+#[derive(Debug, Clone, Copy)]
+struct SemanticTokenLimits {
+    nodes: usize,
+    identifier_work: usize,
+    identifier_bytes: usize,
+    total_work: usize,
+    total_bytes: usize,
+}
+
+const SEMANTIC_TOKEN_LIMITS: SemanticTokenLimits = SemanticTokenLimits {
+    nodes: MAX_SEMANTIC_NODES,
+    identifier_work: MAX_SEMANTIC_RESOLUTION_WORK,
+    identifier_bytes: MAX_SEMANTIC_RESOLUTION_BYTES,
+    total_work: MAX_SEMANTIC_RESPONSE_WORK,
+    total_bytes: MAX_SEMANTIC_RESPONSE_BYTES,
+};
+
+fn semantic_token_limits() -> SemanticTokenLimits {
+    #[cfg(test)]
+    if let Some(limits) = SEMANTIC_TOKEN_LIMITS_OVERRIDE.with(Cell::get) {
+        return limits;
+    }
+    SEMANTIC_TOKEN_LIMITS
+}
+
+#[cfg(test)]
+struct SemanticTokenLimitsGuard(Option<SemanticTokenLimits>);
+
+#[cfg(test)]
+fn override_semantic_token_limits(limits: SemanticTokenLimits) -> SemanticTokenLimitsGuard {
+    SemanticTokenLimitsGuard(SEMANTIC_TOKEN_LIMITS_OVERRIDE.with(|cell| cell.replace(Some(limits))))
+}
+
+#[cfg(test)]
+impl Drop for SemanticTokenLimitsGuard {
+    fn drop(&mut self) {
+        SEMANTIC_TOKEN_LIMITS_OVERRIDE.with(|cell| cell.set(self.0.take()));
+    }
+}
+
+#[cfg(test)]
+fn record_semantic_resolution_work(work: usize) {
+    SEMANTIC_RESOLUTION_WORK_USED.with(|used| used.set(used.get().saturating_add(work)));
+}
+
+#[cfg(test)]
+fn take_semantic_resolution_work() -> usize {
+    SEMANTIC_RESOLUTION_WORK_USED.with(|used| used.replace(0))
+}
 
 #[cfg(test)]
 thread_local! {
+    static SEMANTIC_TOKEN_LIMITS_OVERRIDE: Cell<Option<SemanticTokenLimits>> =
+        const { Cell::new(None) };
+    static SEMANTIC_RESOLUTION_WORK_USED: Cell<usize> = const { Cell::new(0) };
+    static LAST_SEMANTIC_TOKEN_DEGRADATION: Cell<SemanticTokenDegradation> =
+        const { Cell::new(SemanticTokenDegradation { plain_identifiers: 0, node_bound_reached: false }) };
     static SPAN_QUERY_COMPARISONS: Cell<usize> = const { Cell::new(0) };
     static GENERIC_PARAMETER_NAME_COMPARISONS: Cell<usize> = const { Cell::new(0) };
     static SEMANTIC_TOKEN_CANCEL_AFTER_CHECKS: Cell<Option<usize>> = const { Cell::new(None) };
@@ -284,7 +355,9 @@ pub(crate) fn semantic_tokens_with_projection(
     let traversal_range = if projection.is_some() { None } else { range };
 
     let mut raw_tokens = Vec::new();
-    let mut pending = vec![document.tree.root_node()];
+    // Each pending node carries whether a `with` or `inherited` node is
+    // among its ancestors, so identifiers need no parent walk to know it.
+    let mut pending = vec![(document.tree.root_node(), false)];
     let parser_recovery = SpanIndex::new(document.parser_recovery_spans.clone());
     let conditional_unknown = SpanIndex::new(
         document
@@ -299,13 +372,15 @@ pub(crate) fn semantic_tokens_with_projection(
     );
     let opaque_ranges = SpanIndex::new(document.opaque_ranges.clone());
     let mut visited = 0usize;
-    let mut budget = AssistanceBudget::new(
-        MAX_SEMANTIC_RESOLUTION_WORK,
-        MAX_SEMANTIC_RESOLUTION_BYTES,
-        "semantic token resolution",
-    );
+    let limits = semantic_token_limits();
+    let mut response = ResponseBudget {
+        work: limits.total_work,
+        bytes: limits.total_bytes,
+        plain_identifiers: 0,
+        node_bound_reached: false,
+    };
 
-    while let Some(node) = pending.pop() {
+    while let Some((node, under_with_or_inherited)) = pending.pop() {
         check_semantic_token_cancel(cancel)?;
         #[cfg(test)]
         super::test_record_semantic_node_visit();
@@ -315,10 +390,9 @@ pub(crate) fn semantic_tokens_with_projection(
             continue;
         }
         visited = visited.saturating_add(1);
-        if visited > MAX_SEMANTIC_NODES {
-            return Err(format!(
-                "semantic token traversal exceeds the {MAX_SEMANTIC_NODES}-node limit"
-            ));
+        if visited > limits.nodes {
+            response.node_bound_reached = true;
+            break;
         }
 
         let span = Span::from_node(node);
@@ -331,8 +405,16 @@ pub(crate) fn semantic_tokens_with_projection(
             && !conditional_unknown.contains_offset(node.start_byte())
             && !parser_recovery.overlaps(span)
             && !opaque_ranges.contains(span)
-            && let Some((token_type, modifiers)) =
-                resolved_identifier_type(index, uri, document, node, cancel, &mut budget)?
+            && let Some((token_type, modifiers)) = bounded_identifier_type(
+                index,
+                uri,
+                document,
+                node,
+                under_with_or_inherited,
+                cancel,
+                limits,
+                &mut response,
+            )?
         {
             push_raw_token(
                 &mut raw_tokens,
@@ -344,18 +426,131 @@ pub(crate) fn semantic_tokens_with_projection(
             );
         }
 
+        let children_under_with_or_inherited =
+            under_with_or_inherited || matches!(node.kind(), "with" | "inherited");
+        let start_len = pending.len();
         if let Some((start, end)) = traversal_range {
-            pending.extend(children_overlapping_range(node, start, end));
+            pending.extend(
+                children_overlapping_range(node, start, end)
+                    .into_iter()
+                    .map(|child| (child, children_under_with_or_inherited)),
+            );
         } else {
             let mut cursor = node.walk();
-            pending.extend(node.children(&mut cursor));
+            pending.extend(
+                node.children(&mut cursor)
+                    .map(|child| (child, children_under_with_or_inherited)),
+            );
         }
+        // Reversed so nodes pop in source order: a response cut short by a
+        // bound keeps the start of the document.
+        pending[start_len..].reverse();
     }
+
+    response.report_degradation(uri, limits);
 
     if let Some(projection) = projection.as_mut() {
         raw_tokens = project_raw_tokens(raw_tokens, projection, cancel)?;
     }
     encode_tokens(encoded_source, raw_tokens, range, cancel)
+}
+
+/// What is left of the response-wide resolution bound, and how the response
+/// was cut short.
+struct ResponseBudget {
+    work: usize,
+    bytes: usize,
+    /// Identifiers left plain because a resolution bound ran out.
+    plain_identifiers: usize,
+    /// Whether the traversal stopped at the node bound.
+    node_bound_reached: bool,
+}
+
+/// How the last semantic-token response on this thread was cut short.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SemanticTokenDegradation {
+    plain_identifiers: usize,
+    node_bound_reached: bool,
+}
+
+#[cfg(test)]
+fn take_semantic_token_degradation() -> SemanticTokenDegradation {
+    LAST_SEMANTIC_TOKEN_DEGRADATION.with(|last| last.replace(SemanticTokenDegradation::default()))
+}
+
+impl ResponseBudget {
+    /// Logs a response cut short by a bound, so a document partly left plain
+    /// can be explained from the server log.
+    fn report_degradation(&self, uri: &lsp_types::Url, limits: SemanticTokenLimits) {
+        #[cfg(test)]
+        LAST_SEMANTIC_TOKEN_DEGRADATION.with(|last| {
+            last.set(SemanticTokenDegradation {
+                plain_identifiers: self.plain_identifiers,
+                node_bound_reached: self.node_bound_reached,
+            });
+        });
+        if self.node_bound_reached {
+            eprintln!(
+                "pascal-lsp: warning: semantic tokens for {uri} stop at the {}-node bound; the rest of the document has none",
+                limits.nodes
+            );
+        }
+        if self.plain_identifiers > 0 {
+            eprintln!(
+                "pascal-lsp: warning: semantic tokens for {uri} leave {} identifiers plain: their resolution exceeded the per-identifier or per-response bound",
+                self.plain_identifiers
+            );
+        }
+    }
+}
+
+/// Resolves one identifier under its own budget, charged to the response.
+/// Read-only features answer best effort (D16): an identifier whose
+/// resolution runs out of either bound is left plain rather than the whole
+/// response being refused.
+#[allow(clippy::too_many_arguments)]
+fn bounded_identifier_type(
+    index: &NavigationIndex,
+    uri: &lsp_types::Url,
+    document: &Document,
+    identifier: Node<'_>,
+    under_with_or_inherited: bool,
+    cancel: &AtomicBool,
+    limits: SemanticTokenLimits,
+    response: &mut ResponseBudget,
+) -> Result<Option<(u32, u32)>, String> {
+    let work = min(limits.identifier_work, response.work);
+    let bytes = min(limits.identifier_bytes, response.bytes);
+    let mut budget = AssistanceBudget::new(work, bytes, "semantic token resolution");
+    let resolved = resolved_identifier_type(
+        index,
+        uri,
+        document,
+        identifier,
+        under_with_or_inherited,
+        cancel,
+        &mut budget,
+    );
+    let used_work = work.saturating_sub(budget.remaining_work);
+    response.work = response.work.saturating_sub(used_work);
+    response.bytes = response
+        .bytes
+        .saturating_sub(bytes.saturating_sub(budget.remaining_bytes));
+    #[cfg(test)]
+    record_semantic_resolution_work(used_work);
+    match resolved {
+        Ok(classification) if !budget.exhausted() => Ok(classification),
+        Ok(_) => {
+            response.plain_identifiers += 1;
+            Ok(None)
+        }
+        Err(error) if budget.exhausted_by(&error, cancel) => {
+            response.plain_identifiers += 1;
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn project_raw_tokens(
@@ -404,6 +599,7 @@ fn resolved_identifier_type(
     uri: &lsp_types::Url,
     document: &Document,
     identifier: Node<'_>,
+    under_with_or_inherited: bool,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<Option<(u32, u32)>, String> {
@@ -435,7 +631,7 @@ fn resolved_identifier_type(
         }
         return Ok(classification);
     }
-    if has_ancestor_kind(identifier, "with") || has_ancestor_kind(identifier, "inherited") {
+    if under_with_or_inherited {
         return Ok(None);
     }
     match is_generic_parameter_reference(document, identifier, cancel, budget)? {
@@ -1468,5 +1664,197 @@ mod tests {
         assert!(!tokens.iter().any(|(position, length, token_type, _)| {
             *position == Position::new(11, 2) && *length == 1 && *token_type == TOKEN_TYPE_PARAMETER
         }));
+    }
+
+    /// A unit with `constants` global constants and a routine whose body is
+    /// `lines` lines of `X := X + 1;`, and the line of the first body line.
+    fn identifier_heavy_unit(lines: usize, constants: usize) -> (String, u32) {
+        use std::fmt::Write as _;
+
+        let mut source = String::from("unit Heavy;\ninterface\nconst\n  C = 0;\n");
+        for index in 0..constants {
+            writeln!(source, "  C{index} = {index};").expect("append constant");
+        }
+        source.push_str("implementation\nprocedure Run;\nvar\n  X: Integer;\nbegin\n");
+        let first_body_line = u32::try_from(source.matches('\n').count()).expect("line count");
+        source.push_str(&"  X := X + 1;\n".repeat(lines));
+        source.push_str("end;\nend.\n");
+        (source, first_body_line)
+    }
+
+    fn body_tokens(tokens: &SemanticTokens, body: std::ops::Range<u32>, token_type: u32) -> usize {
+        absolute_tokens(tokens)
+            .iter()
+            .filter(|(position, _, kind, _)| body.contains(&position.line) && *kind == token_type)
+            .count()
+    }
+
+    #[test]
+    fn semantic_tokens_resolve_identifier_heavy_units_with_linear_work() {
+        const LINES: u32 = 4_200;
+        let (source, first) = identifier_heavy_unit(LINES as usize, 2_000);
+        let uri = Url::parse("file:///Heavy.pas").expect("test URI");
+        let mut index = NavigationIndex::new();
+        index.update(uri.clone(), source).expect("index source");
+        let cancel = AtomicBool::new(false);
+        let references = 2 * LINES as usize;
+
+        take_semantic_resolution_work();
+        let full = semantic_tokens(&index, &uri, None, &cancel)
+            .expect("an identifier-heavy unit must get semantic tokens");
+        let full_work = take_semantic_resolution_work();
+        assert_eq!(
+            take_semantic_token_degradation(),
+            SemanticTokenDegradation::default(),
+            "nothing is cut short"
+        );
+        assert_eq!(
+            body_tokens(&full, first..first + LINES, TOKEN_VARIABLE),
+            references,
+            "every reference to X must be classified"
+        );
+        assert!(
+            full_work <= references * 64,
+            "resolution work must not grow with the unit's symbol count: {full_work} for {references} references"
+        );
+        assert!(
+            full_work.saturating_mul(4) <= SEMANTIC_TOKEN_LIMITS.total_work,
+            "the response bound must leave room for units many times larger: {full_work}"
+        );
+
+        let range = semantic_tokens(
+            &index,
+            &uri,
+            Some(&Range {
+                start: Position::new(first + 2_000, 0),
+                end: Position::new(first + 2_100, 0),
+            }),
+            &cancel,
+        )
+        .expect("range tokens");
+        let range_work = take_semantic_resolution_work();
+        assert_eq!(
+            body_tokens(&range, first + 2_000..first + 2_100, TOKEN_VARIABLE),
+            200
+        );
+        assert!(
+            range_work <= 200 * 64,
+            "a range request must pay only for its range: {range_work}"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_degrade_instead_of_refusing_when_the_response_bound_runs_out() {
+        const LINES: u32 = 200;
+        let (source, first) = identifier_heavy_unit(LINES as usize, 0);
+        let uri = Url::parse("file:///Degraded.pas").expect("test URI");
+        let mut index = NavigationIndex::new();
+        index.update(uri.clone(), source).expect("index source");
+        let cancel = AtomicBool::new(false);
+        let body = first..first + LINES;
+
+        let _limits = override_semantic_token_limits(SemanticTokenLimits {
+            total_work: 2_000,
+            ..SEMANTIC_TOKEN_LIMITS
+        });
+        let tokens = semantic_tokens(&index, &uri, None, &cancel)
+            .expect("an exhausted response bound must degrade, not refuse");
+        let classified = body_tokens(&tokens, body.clone(), TOKEN_VARIABLE);
+        assert!(
+            classified > 0 && classified < 2 * LINES as usize,
+            "references resolved before the bound keep their class, the rest stay plain: {classified}"
+        );
+        assert_eq!(
+            take_semantic_token_degradation(),
+            SemanticTokenDegradation {
+                plain_identifiers: 2 * LINES as usize - classified,
+                node_bound_reached: false,
+            },
+            "the response reports every reference it left plain"
+        );
+        assert_eq!(
+            body_tokens(&tokens, body.clone(), TOKEN_OPERATOR),
+            2 * LINES as usize,
+            "lexical tokens are still returned for the whole document"
+        );
+        let plain = absolute_tokens(&tokens);
+        let first_unclassified = (first..first + LINES)
+            .find(|line| {
+                !plain
+                    .iter()
+                    .any(|(position, _, kind, _)| position.line == *line && *kind == TOKEN_VARIABLE)
+            })
+            .expect("some line is left plain");
+        assert!(
+            (first_unclassified..first + LINES).all(|line| !plain
+                .iter()
+                .any(|(position, _, kind, _)| position.line == line && *kind == TOKEN_VARIABLE)),
+            "resolution proceeds in source order, so the classified prefix is contiguous"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_leave_identifiers_plain_when_their_own_bound_runs_out() {
+        const LINES: u32 = 20;
+        let (source, first) = identifier_heavy_unit(LINES as usize, 0);
+        let uri = Url::parse("file:///IdentifierBound.pas").expect("test URI");
+        let mut index = NavigationIndex::new();
+        index.update(uri.clone(), source).expect("index source");
+        let cancel = AtomicBool::new(false);
+
+        let _limits = override_semantic_token_limits(SemanticTokenLimits {
+            identifier_work: 1,
+            ..SEMANTIC_TOKEN_LIMITS
+        });
+        let tokens = semantic_tokens(&index, &uri, None, &cancel)
+            .expect("an identifier over its own bound must not refuse the response");
+        assert_eq!(
+            body_tokens(&tokens, first..first + LINES, TOKEN_VARIABLE),
+            0,
+            "an identifier whose resolution needs more than its bound stays plain"
+        );
+        let degradation = take_semantic_token_degradation();
+        assert!(
+            degradation.plain_identifiers >= 2 * LINES as usize && !degradation.node_bound_reached,
+            "{degradation:?}"
+        );
+        assert_eq!(
+            body_tokens(&tokens, first..first + LINES, TOKEN_OPERATOR),
+            2 * LINES as usize
+        );
+        assert!(
+            absolute_tokens(&tokens)
+                .iter()
+                .any(|(position, _, kind, modifiers)| position.line == first - 2
+                    && *kind == TOKEN_VARIABLE
+                    && modifiers & MODIFIER_DECLARATION != 0),
+            "declarations need no resolution and keep their class"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_return_the_leading_tokens_when_the_node_bound_runs_out() {
+        let (source, _) = identifier_heavy_unit(200, 0);
+        let uri = Url::parse("file:///NodeBound.pas").expect("test URI");
+        let mut index = NavigationIndex::new();
+        index.update(uri.clone(), source).expect("index source");
+        let cancel = AtomicBool::new(false);
+
+        let _limits = override_semantic_token_limits(SemanticTokenLimits {
+            nodes: 64,
+            ..SEMANTIC_TOKEN_LIMITS
+        });
+        let tokens = semantic_tokens(&index, &uri, None, &cancel)
+            .expect("an exhausted node bound must degrade, not refuse");
+        assert!(take_semantic_token_degradation().node_bound_reached);
+        let tokens = absolute_tokens(&tokens);
+        assert!(
+            tokens
+                .first()
+                .is_some_and(|(position, _, kind, _)| *position == Position::new(0, 0)
+                    && *kind == TOKEN_KEYWORD),
+            "the traversal covers the document from its start: {tokens:?}"
+        );
+        assert!(tokens.len() < 64, "the traversal stopped at the bound");
     }
 }

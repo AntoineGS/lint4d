@@ -6158,11 +6158,13 @@ end.
         result_position,
         NavigationTarget::Declaration,
     );
-    assert_eq!(definition.len(), 1);
-    assert_location_start(
-        &definition[0],
-        &provider_uri,
-        position_of(provider, "Result: TImportedField", 0),
+    // The function's implicit `Result` shadows the imported global
+    // (l4d-fpyu): it is not the declaration.
+    assert!(
+        !definition
+            .iter()
+            .any(|location| location.uri == provider_uri),
+        "{definition:?}"
     );
 
     let result = index.type_definitions(&consumer_uri, result_position);

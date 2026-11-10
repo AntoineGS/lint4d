@@ -879,39 +879,95 @@ fn extended<T: Clone>(base: &Arc<Vec<T>>, more: &[T]) -> Arc<Vec<T>> {
     Arc::new(all)
 }
 
-/// What a shared interface keeps: its declaration state, its provider
-/// sources' bytes and decoded text, the interfaces of the providers its
-/// compilation read (each once), its reports, dependencies, scans, nested
-/// parts, lookup trace and key (l4d-4nbs review I1). A nested provider's
-/// interface is counted even when the store holds it too: the store may
-/// evict it while this one keeps it (l4d-10: SFClient2's
-/// ZDbcGenericResolver was charged 2.7 MB and kept 168 MB).
-/// The interfaces `state` binds through, and theirs, each counted once:
-/// declaration state and the source bytes it keeps.
-fn nested_interface_bytes(
+/// A provider interface another one's state binds through (l4d-10).
+#[derive(Debug, Clone)]
+pub struct NestedInterface {
+    /// The same for every holder of this interface.
+    pub identity: usize,
+    /// What it keeps by itself: declaration state and source bytes, without
+    /// its own nested interfaces (listed separately).
+    pub bytes: usize,
+    /// Alive while any holder keeps it.
+    pub alive: std::sync::Weak<dyn std::any::Any + Send + Sync>,
+}
+
+fn interface_identity(graph: &AdmittedInterfaceGraph) -> usize {
+    Arc::as_ptr(graph).cast::<()>() as usize
+}
+
+fn interface_own_bytes(state: &CompileTimeState) -> usize {
+    let mut total = state.retained_source_bytes();
+    let _ = state.visit_snapshot_payload(&mut |n| {
+        total = total.saturating_add(n);
+        Ok(())
+    });
+    total
+}
+
+fn collect_nested(
     state: &CompileTimeState,
-    seen: &mut std::collections::HashSet<*const CompileTimeState>,
-) -> usize {
-    let mut total = 0usize;
+    seen: &mut std::collections::HashSet<usize>,
+    out: &mut Vec<NestedInterface>,
+) {
     for interface in &state.interfaces {
         let Some(graph) = &interface.graph else {
             continue;
         };
-        let nested: &CompileTimeState = graph;
-        if !seen.insert(std::ptr::from_ref(nested)) {
+        if !seen.insert(interface_identity(graph)) {
             continue;
         }
-        let _ = nested.visit_snapshot_payload(&mut |n| {
-            total = total.saturating_add(n);
-            Ok(())
+        let alive: Arc<dyn std::any::Any + Send + Sync> = graph.clone();
+        out.push(NestedInterface {
+            identity: interface_identity(graph),
+            bytes: interface_own_bytes(graph),
+            alive: Arc::downgrade(&alive),
         });
-        total = total
-            .saturating_add(nested.retained_source_bytes())
-            .saturating_add(nested_interface_bytes(nested, seen));
+        collect_nested(graph, seen, out);
     }
-    total
 }
 
+impl SharedProviderGraph {
+    /// Identity of this interface's own state, as `NestedInterface`s name
+    /// it; `None` when it could not be completed.
+    pub fn state_identity(&self) -> Option<usize> {
+        self.graph.as_ref().map(interface_identity)
+    }
+
+    /// What this interface's own state keeps (declaration state and source
+    /// bytes), without its nested interfaces: its charge once only an
+    /// importer keeps it.
+    pub fn state_bytes(&self) -> usize {
+        self.graph
+            .as_ref()
+            .map_or(0, |graph| interface_own_bytes(graph))
+    }
+
+    /// A handle alive while anything keeps this interface's state.
+    pub fn state_alive(&self) -> Option<std::sync::Weak<dyn std::any::Any + Send + Sync>> {
+        self.graph.as_ref().map(|graph| {
+            let alive: Arc<dyn std::any::Any + Send + Sync> = graph.clone();
+            Arc::downgrade(&alive)
+        })
+    }
+
+    /// The provider interfaces this one's state binds through, recursively,
+    /// each once. `retained_bytes` leaves them out: a store charges each
+    /// once, by its own entry while it holds one, else as kept by others.
+    pub fn nested_interfaces(&self) -> Vec<NestedInterface> {
+        let mut out = Vec::new();
+        if let Some(graph) = &self.graph {
+            let mut seen = std::collections::HashSet::from([interface_identity(graph)]);
+            collect_nested(graph, &mut seen, &mut out);
+        }
+        out
+    }
+}
+
+/// What a shared interface keeps besides the interfaces of the providers
+/// its compilation read (`SharedProviderGraph::nested_interfaces`, which a
+/// store charges once whoever holds them): its declaration state, its
+/// provider sources' bytes and decoded text, its reports, dependencies,
+/// scans, nested parts, lookup trace and key (l4d-4nbs review I1).
 fn shared_retained_bytes(
     graph: Option<&AdmittedInterfaceGraph>,
     names: Option<&InterfaceNames>,
@@ -934,8 +990,6 @@ fn shared_retained_bytes(
             add(source.bytes.len());
             add(source.decoded_text.as_ref().map_or(0, |text| text.len()));
         }
-        let mut seen = std::collections::HashSet::new();
-        add(nested_interface_bytes(graph, &mut seen));
     }
     add(observations_payload(&origin.observations));
     add(observations_payload(&origin.trace));

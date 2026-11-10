@@ -5165,9 +5165,16 @@ fn evict_oldest_graph(state: &mut State) -> bool {
     true
 }
 
-fn release_graph_bytes(state: &mut State, freed: usize) {
+/// The provider interfaces' reservation: their entries, and the states
+/// only other interfaces keep (l4d-10). `freed` is what the caller just
+/// removed from the entries.
+fn release_graph_bytes(state: &mut State, _freed: usize) {
+    state.provider_graphs.prune_kept();
     let index = ReservationKind::ProviderGraphs.index();
-    state.reserved[index] = state.reserved[index].saturating_sub(freed);
+    state.reserved[index] = state
+        .provider_graphs
+        .bytes
+        .saturating_add(state.provider_graphs.kept_bytes);
 }
 
 fn recover_poisoned_state<'a>(
@@ -6664,6 +6671,7 @@ fn prune_dead_leases(state: &mut State) {
         alive
     });
     state.outstanding_bytes = state.outstanding_bytes.saturating_sub(released);
+    release_graph_bytes(state, 0);
 }
 
 fn retain_fingerprints_locked(state: &mut State, keep: &HashSet<u64>) {
@@ -7779,6 +7787,8 @@ impl ProjectCache {
             return false;
         }
         let full = (configuration, key);
+        // Walked before the lock: a state can bind through many interfaces.
+        let nested = graph.nested_interfaces();
         let mut state = lock(&self.inner);
         let share = state.max_bytes / PROVIDER_GRAPH_BUDGET_SHARE;
         if bytes > share {
@@ -7794,7 +7804,6 @@ impl ProjectCache {
             self.release(state);
             return false;
         }
-        state.reserved[ReservationKind::ProviderGraphs.index()] += bytes;
         state.clock += 1;
         let tick = state.clock;
         state.provider_graphs.insert(
@@ -7806,7 +7815,9 @@ impl ProjectCache {
                 bytes,
             },
             tick,
+            nested,
         );
+        release_graph_bytes(&mut state, 0);
         self.release(state);
         true
     }
@@ -7841,14 +7852,9 @@ impl ProjectCache {
             .cloned()
             .collect::<Vec<_>>();
         for id in doomed {
-            if let Some(entry) = state.provider_graphs.entries.remove(&id) {
-                state.provider_graphs.bytes -= entry.bytes;
-                state.reserved[ReservationKind::ProviderGraphs.index()] -= entry.bytes;
-            }
-            if let Some(tick) = state.provider_graphs.ticks.remove(&id) {
-                state.provider_graphs.lru.remove(&tick);
-            }
+            state.provider_graphs.remove(&id);
         }
+        release_graph_bytes(&mut state, 0);
     }
 
     /// Removes every provider interface and returns the bytes the test
@@ -7859,9 +7865,7 @@ impl ProjectCache {
         let entries = {
             let mut state = lock(&self.inner);
             let entries = std::mem::take(&mut state.provider_graphs.entries);
-            state.provider_graphs.ticks.clear();
-            state.provider_graphs.lru.clear();
-            state.provider_graphs.bytes = 0;
+            state.provider_graphs = ProviderGraphStore::default();
             state.reserved[ReservationKind::ProviderGraphs.index()] = 0;
             entries
         };
@@ -7898,6 +7902,13 @@ struct ProviderGraphEntry {
     bytes: usize,
 }
 
+/// A provider interface's state that no entry holds but another interface
+/// does (l4d-10): charged until the last holder drops it.
+struct KeptInterface {
+    alive: std::sync::Weak<dyn std::any::Any + Send + Sync>,
+    bytes: usize,
+}
+
 /// Compiled provider interfaces by resolver configuration and provider key,
 /// least recently used first in `lru`.
 #[derive(Default)]
@@ -7907,6 +7918,13 @@ struct ProviderGraphStore {
     /// By the cache's clock, which unit entries share.
     lru: BTreeMap<u64, ProviderGraphId>,
     bytes: usize,
+    /// Entries by the identity of their interface's state.
+    by_state: HashMap<usize, ProviderGraphId>,
+    /// Interface states other interfaces keep that no entry holds: each
+    /// nested interface is charged once, by its entry while the store holds
+    /// one, else here (an importer's own estimate leaves them out).
+    kept: HashMap<usize, KeptInterface>,
+    kept_bytes: usize,
 }
 
 impl ProviderGraphStore {
@@ -7917,20 +7935,89 @@ impl ProviderGraphStore {
         self.lru.insert(tick, id.clone());
     }
 
-    /// The caller released whatever `id` held before.
-    fn insert(&mut self, id: ProviderGraphId, entry: ProviderGraphEntry, tick: u64) {
+    /// The caller released whatever `id` held before. `nested` are the
+    /// interfaces its state binds through: those no entry holds and nothing
+    /// charges yet are charged as kept.
+    fn insert(
+        &mut self,
+        id: ProviderGraphId,
+        entry: ProviderGraphEntry,
+        tick: u64,
+        nested: Vec<pascal_core::compile_time::NestedInterface>,
+    ) {
+        for interface in nested {
+            if self.by_state.contains_key(&interface.identity)
+                || self.kept.contains_key(&interface.identity)
+            {
+                continue;
+            }
+            self.kept_bytes = self.kept_bytes.saturating_add(interface.bytes);
+            self.kept.insert(
+                interface.identity,
+                KeptInterface {
+                    alive: interface.alive,
+                    bytes: interface.bytes,
+                },
+            );
+        }
+        if let Some(identity) = entry.graph.state_identity() {
+            // Its own entry charges it now.
+            if let Some(kept) = self.kept.remove(&identity) {
+                self.kept_bytes = self.kept_bytes.saturating_sub(kept.bytes);
+            }
+            self.by_state.insert(identity, id.clone());
+        }
         self.bytes = self.bytes.saturating_add(entry.bytes);
         self.entries.insert(id.clone(), entry);
         self.touch(&id, tick);
+    }
+
+    /// Drops an entry removed from `entries`; its state stays charged as
+    /// kept while another interface holds it.
+    fn release(&mut self, id: &ProviderGraphId, entry: ProviderGraphEntry) -> usize {
+        self.bytes = self.bytes.saturating_sub(entry.bytes);
+        let freed = entry.bytes;
+        let identity = entry.graph.state_identity();
+        if let Some(identity) = identity
+            && self.by_state.get(&identity) == Some(id)
+        {
+            self.by_state.remove(&identity);
+        }
+        let bytes = entry.graph.state_bytes();
+        let alive = entry.graph.state_alive();
+        drop(entry);
+        if let (Some(identity), Some(alive)) = (identity, alive)
+            && alive.strong_count() > 0
+            && !self.by_state.contains_key(&identity)
+            && !self.kept.contains_key(&identity)
+        {
+            self.kept_bytes = self.kept_bytes.saturating_add(bytes);
+            self.kept.insert(identity, KeptInterface { alive, bytes });
+        }
+        freed
+    }
+
+    /// Stops charging the kept interfaces nothing holds any more.
+    fn prune_kept(&mut self) {
+        let mut released = 0usize;
+        self.kept.retain(|_, kept| {
+            let alive = kept.alive.strong_count() > 0;
+            if !alive {
+                released = released.saturating_add(kept.bytes);
+            }
+            alive
+        });
+        self.kept_bytes = self.kept_bytes.saturating_sub(released);
     }
 
     fn remove(&mut self, id: &ProviderGraphId) -> usize {
         if let Some(tick) = self.ticks.remove(id) {
             self.lru.remove(&tick);
         }
-        let freed = self.entries.remove(id).map_or(0, |entry| entry.bytes);
-        self.bytes = self.bytes.saturating_sub(freed);
-        freed
+        match self.entries.remove(id) {
+            Some(entry) => self.release(id, entry),
+            None => 0,
+        }
     }
 
     /// Evicts least recently used entries until at most `limit` bytes remain.
@@ -7942,8 +8029,7 @@ impl ProviderGraphStore {
             };
             self.ticks.remove(&id);
             if let Some(entry) = self.entries.remove(&id) {
-                self.bytes = self.bytes.saturating_sub(entry.bytes);
-                freed = freed.saturating_add(entry.bytes);
+                freed = freed.saturating_add(self.release(&id, entry));
             }
         }
         freed
@@ -7977,9 +8063,13 @@ impl ProviderGraphStore {
 
     fn clear(&mut self) -> usize {
         let freed = self.bytes;
-        self.entries.clear();
+        let entries = std::mem::take(&mut self.entries);
         self.ticks.clear();
         self.lru.clear();
+        self.by_state.clear();
+        for (id, entry) in entries {
+            self.release(&id, entry);
+        }
         self.bytes = 0;
         freed
     }

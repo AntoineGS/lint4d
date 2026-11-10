@@ -2386,15 +2386,9 @@ mod tests {
         );
     }
 
-    /// l4d-10: an interface keeps the interfaces of the providers its own
-    /// compilation read. Once the store evicts those, the importer alone
-    /// keeps them: SFClient2's ZDbcGenericResolver was charged 2.7 MB and
-    /// kept 168 MB, VCL's Clipbrd 0.2 MB and 18 MB.
+    /// Main uses A, whose interface reads B's: both shared.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn an_interface_is_charged_for_the_provider_interfaces_it_keeps() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
+    fn nested_provider_workspace(root: &std::path::Path) -> Workspace {
         let source = "unit Main; interface uses A; {$IF A.Flag = 8} const Eight = 8; {$IFEND} implementation end.";
         std::fs::write(root.join("Main.pas"), source).unwrap();
         let declarations = (0..2_000)
@@ -2420,6 +2414,19 @@ mod tests {
         let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
         drop(expand_main(&workspace, &uri, source, &key));
         assert_eq!(workspace.project_cache.provider_graph_count(), 2);
+        workspace
+    }
+
+    /// l4d-10: an interface keeps the interfaces of the providers its own
+    /// compilation read. Once the store evicts one, the importer alone keeps
+    /// it, and it stays charged until that is dropped: SFClient2's
+    /// ZDbcGenericResolver was charged 2.7 MB and kept 168 MB, VCL's Clipbrd
+    /// 0.2 MB and 18 MB.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_interface_is_charged_for_the_provider_interfaces_it_keeps() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = nested_provider_workspace(temp.path());
         // The store gives B's interface up; A's still holds it.
         workspace
             .project_cache
@@ -2427,16 +2434,30 @@ mod tests {
         assert_graphs_charged_within_a_fifth(&workspace);
     }
 
+    /// l4d-10: a nested interface the store holds is charged once, by its
+    /// own entry; charging it to every importer too made the share churn
+    /// (SFClient2's index extraction ran ten times slower).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_nested_interface_the_store_holds_is_charged_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = nested_provider_workspace(temp.path());
+        assert_graphs_charged_within_a_fifth(&workspace);
+    }
+
     #[cfg(target_os = "linux")]
     fn assert_graphs_charged_within_a_fifth(workspace: &Workspace) {
-        assert_eq!(workspace.project_cache.provider_graph_count(), 1);
+        assert!(workspace.project_cache.provider_graph_count() > 0);
         let charged = workspace.project_cache.provider_graph_bytes();
         let (freed, holders) = workspace.project_cache.drop_provider_graphs_for_test();
-        assert_eq!(holders, vec![0], "only the store holds the interface");
+        assert!(
+            holders.iter().all(|holders| *holders == 0),
+            "only the store holds the interfaces: {holders:?}"
+        );
         let error = charged.abs_diff(freed as usize) as f64 / freed as f64;
         assert!(
             error <= 0.2,
-            "charged {charged} bytes for an interface that kept {freed} ({:.0}% off)",
+            "charged {charged} bytes for interfaces that kept {freed} ({:.0}% off)",
             error * 100.0
         );
     }

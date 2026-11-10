@@ -2268,6 +2268,49 @@ mod cache_tests {
         assert!(!ready(&cache, "C1.pas"));
     }
 
+    /// l4d-jfpy (multidev mf2 #4: a references request re-parsed the 45
+    /// units it had stored): evicting an entry the crawl still leases frees
+    /// nothing, so a request out of room while the crawl holds leases keeps
+    /// its own entries and goes past the budget by what the crawl holds,
+    /// until the crawl lets go.
+    #[test]
+    fn a_request_out_of_room_beside_crawl_leases_keeps_its_own_entries() {
+        let cache = ProjectCache::new(100);
+        let ctx = context("A.dproj");
+        as_role(request_role(), || {
+            store_unit_bytes(&cache, "R1.pas", &ctx, 30);
+            store_unit_bytes(&cache, "R2.pas", &ctx, 30);
+        });
+        let mut crawl_lease = None;
+        as_role(crawl_role(), || {
+            crawl_lease = Some(store_unit_leased_bytes(&cache, "C1.pas", &ctx, 40));
+            assert!(!crawl_admission_refused_on_this_thread());
+        });
+        as_role(request_role(), || {
+            store_unit_bytes(&cache, "R3.pas", &ctx, 30);
+            assert!(cache.reserve(ReservationKind::QueryTrees, 5).is_some());
+        });
+        for name in ["R1.pas", "R2.pas", "R3.pas"] {
+            assert!(ready(&cache, name), "the request's {name} stays");
+        }
+        assert!(
+            ready(&cache, "C1.pas"),
+            "the crawl's leased entry is not evicted for nothing"
+        );
+        assert!(cache.crawl_yield_requested(), "the crawl is asked to stop");
+
+        drop(crawl_lease);
+        let stats = cache.stats();
+        assert!(
+            stats.bytes + stats.outstanding_bytes + stats.reserved_bytes() <= 100,
+            "back within the budget once the crawl lets go: {stats:?}"
+        );
+        assert!(!ready(&cache, "C1.pas"), "the crawl's entry gives way");
+        for name in ["R1.pas", "R2.pas", "R3.pas"] {
+            assert!(ready(&cache, name), "the request's {name} stays");
+        }
+    }
+
     /// D51: the fingerprints used since a configuration reset are the
     /// current project's, which the sweep keeps.
     #[test]
@@ -2666,6 +2709,28 @@ mod cache_tests {
             disk: None,
         };
         cache.store_unit(claim, value, bytes, &no_cancel());
+    }
+
+    /// `store_unit_bytes` for work that keeps the parse in its own index.
+    fn store_unit_leased_bytes(
+        cache: &ProjectCache,
+        name: &str,
+        ctx: &ProjectContext,
+        bytes: usize,
+    ) -> CacheLease {
+        let Lookup::Compute(claim) = cache.unit(&uri(name), ctx, 1, &HashMap::new(), &no_cancel())
+        else {
+            panic!("expected a miss for {name}");
+        };
+        let value = UnitValue {
+            parsed: parsed_unit(name),
+            expansion: None,
+            probes: vec![],
+            disk: None,
+        };
+        cache
+            .store_unit_leased(claim, value, bytes, &no_cancel())
+            .expect("stored")
     }
 
     #[test]
@@ -4245,6 +4310,13 @@ struct State {
     /// Charges of leased parses that no entry holds any more. They stay in
     /// the budget until the last lease drops.
     outstanding_bytes: usize,
+    /// Charges of the parses the crawl leases, cached or outstanding: no
+    /// eviction frees them while the crawl holds them (l4d-jfpy).
+    crawl_leased_bytes: usize,
+    /// A request went past the budget by what the crawl leases rather than
+    /// evict its own entries: the crawl stops at its next dependency and
+    /// lets go (l4d-jfpy).
+    crawl_yield_requested: bool,
     /// Held reservations by `ReservationKind::index`. Poison recovery keeps
     /// them: their holders release them on drop.
     reserved: [usize; ReservationKind::COUNT],
@@ -4302,6 +4374,8 @@ impl Default for State {
             cached_parses: HashMap::new(),
             leases: HashMap::new(),
             outstanding_bytes: 0,
+            crawl_leased_bytes: 0,
+            crawl_yield_requested: false,
             reserved: [0; ReservationKind::COUNT],
             publication_pooled: 0,
             watch_counts: HashMap::new(),
@@ -4761,15 +4835,90 @@ fn make_room(state: &mut State, request: usize) -> bool {
     // The interfaces' charge is checked against `reserved`, not subtracted
     // from the request (13b-3, A2: a small request was refused before the
     // interfaces were evicted).
-    if !fits_committed(state, request) {
+    if !committed_bytes(state)
+        .checked_add(request)
+        .is_some_and(|total| total <= state.max_bytes.saturating_add(state.crawl_leased_bytes))
+    {
         return false;
     }
     while !fits(state, state.bytes, request) {
-        if !evict_oldest(state) {
-            return false;
+        match evict_for_request(state, request) {
+            RequestRoom::Evicted => {}
+            RequestRoom::CrawlLeases => return true,
+            RequestRoom::Full => return false,
         }
     }
     true
+}
+
+/// What one eviction step for a request did.
+enum RequestRoom {
+    Evicted,
+    /// What the crawl leases covers the shortfall (l4d-jfpy).
+    CrawlLeases,
+    Full,
+}
+
+/// One eviction step for a request short of `request` bytes: the crawl's
+/// oldest entry that no request used and that it does not lease, else, when
+/// what the crawl leases covers the rest, nothing: the request goes past the
+/// budget by it and the crawl is asked to stop and let go, since evicting the
+/// request's own entries would only make it parse them again (l4d-jfpy).
+/// Else the oldest entry.
+fn evict_for_request(state: &mut State, request: usize) -> RequestRoom {
+    if let Some(key) = oldest_background(state, None) {
+        state.evicted_for_room = true;
+        #[cfg(test)]
+        note_examined(state);
+        remove_ready(state, &key);
+        return RequestRoom::Evicted;
+    }
+    if state.crawl_leased_bytes > 0 && fits_beside_crawl_leases(state, request) {
+        if !state.crawl_yield_requested {
+            crate::trace::trace!(
+                "  cache past its budget by the crawl's {} leased bytes: the crawl yields",
+                state.crawl_leased_bytes
+            );
+        }
+        state.crawl_yield_requested = true;
+        return RequestRoom::CrawlLeases;
+    }
+    if evict_oldest(state) {
+        RequestRoom::Evicted
+    } else {
+        RequestRoom::Full
+    }
+}
+
+/// Whether `request` more bytes fit the budget raised by what the crawl
+/// leases.
+fn fits_beside_crawl_leases(state: &State, request: usize) -> bool {
+    state
+        .bytes
+        .checked_add(state.outstanding_bytes)
+        .and_then(|total| total.checked_add(budgeted_reserved_bytes(state)))
+        .and_then(|total| total.checked_add(request))
+        .is_some_and(|total| total <= state.max_bytes.saturating_add(state.crawl_leased_bytes))
+}
+
+/// The crawl's oldest unpinned entry no request used, but `spare`, whose
+/// parse it does not lease: evicting a leased one frees nothing (l4d-jfpy).
+fn oldest_background(state: &State, spare: Option<&Key>) -> Option<Key> {
+    state
+        .background_lru
+        .values()
+        .find(|key| Some(*key) != spare && !crawl_leases(state, key))
+        .cloned()
+}
+
+/// Whether the crawl leases the parse of the ready entry at `key`.
+fn crawl_leases(state: &State, key: &Key) -> bool {
+    let Some(Slot::Ready(entry)) = state.slots.get(key) else {
+        return false;
+    };
+    parse_address(&entry.value)
+        .and_then(|address| state.leases.get(&address))
+        .is_some_and(|lease| lease.crawl_holders > 0)
 }
 
 /// Makes room for `request` more bytes the crawl stores (D51), counting
@@ -4784,12 +4933,7 @@ fn make_room_for_crawl(
 ) -> bool {
     prune_dead_leases(state);
     while !fits(state, state.bytes.saturating_sub(credit), request) {
-        let Some(key) = state
-            .background_lru
-            .values()
-            .find(|key| Some(*key) != spare)
-            .cloned()
-        else {
+        let Some(key) = oldest_background(state, spare) else {
             return false;
         };
         state.evicted_for_room = true;
@@ -4814,8 +4958,9 @@ fn refuse_crawl_on_this_thread() {
 /// older. False when nothing is left.
 fn evict_oldest(state: &mut State) -> bool {
     state.evicted_for_room = true;
-    // The crawl's entries no request used give way first (D51).
-    if let Some(key) = state.background_lru.values().next().cloned() {
+    // The crawl's entries no request used give way first (D51), but those
+    // it leases free nothing (l4d-jfpy).
+    if let Some(key) = oldest_background(state, None) {
         #[cfg(test)]
         note_examined(state);
         remove_ready(state, &key);
@@ -5256,9 +5401,17 @@ impl ProjectCache {
         require_cached: bool,
     ) -> Option<(CacheLease, bool)> {
         let payload = Arc::as_ptr(parsed) as *const () as usize;
+        let crawl = crawl_admission_on_this_thread();
         let mut charged = false;
         if let Some(lease) = state.leases.get_mut(&payload) {
             lease.holders += 1;
+            if crawl {
+                lease.crawl_holders += 1;
+                if lease.crawl_holders == 1 {
+                    let bytes = lease.bytes;
+                    state.crawl_leased_bytes = state.crawl_leased_bytes.saturating_add(bytes);
+                }
+            }
         } else {
             let cached = state.cached_parses.get(&payload).map(|(_, bytes)| *bytes);
             if cached.is_none() && require_cached {
@@ -5269,11 +5422,15 @@ impl ProjectCache {
                 payload,
                 Lease {
                     holders: 1,
+                    crawl_holders: usize::from(crawl),
                     bytes,
                     evicted: cached.is_none(),
                     parsed: Arc::downgrade(parsed),
                 },
             );
+            if crawl {
+                state.crawl_leased_bytes = state.crawl_leased_bytes.saturating_add(bytes);
+            }
             if cached.is_none() {
                 state.outstanding_bytes = state.outstanding_bytes.saturating_add(bytes);
                 charged = true;
@@ -5283,6 +5440,7 @@ impl ProjectCache {
             CacheLease {
                 inner: self.inner.clone(),
                 payload,
+                crawl,
                 _parsed: Arc::downgrade(parsed),
             },
             charged,
@@ -6048,6 +6206,8 @@ fn insert_ready(state: &mut State, key: Key, entry: Entry) {
 #[derive(Debug)]
 struct Lease {
     holders: usize,
+    /// The holders that are the crawl's (l4d-jfpy).
+    crawl_holders: usize,
     bytes: usize,
     /// Whether no cache entry holds the parse, so `bytes` are outstanding.
     evicted: bool,
@@ -6062,6 +6222,8 @@ struct Lease {
 pub(crate) struct CacheLease {
     inner: Arc<Inner>,
     payload: usize,
+    /// Taken by the crawl (l4d-jfpy).
+    crawl: bool,
     /// Keeps the address from being reused while the lease exists, without
     /// keeping the parse alive once the request's index drops it.
     _parsed: std::sync::Weak<ParsedDocument>,
@@ -6083,14 +6245,26 @@ impl Drop for CacheLease {
             return;
         };
         lease.holders -= 1;
-        if lease.holders > 0 {
-            return;
+        let mut crawl_let_go = false;
+        if self.crawl {
+            lease.crawl_holders -= 1;
+            if lease.crawl_holders == 0 {
+                crawl_let_go = true;
+                let bytes = lease.bytes;
+                state.crawl_leased_bytes = state.crawl_leased_bytes.saturating_sub(bytes);
+            }
         }
-        let Some(lease) = state.leases.remove(&self.payload) else {
-            return;
-        };
-        if lease.evicted {
+        if state.leases[&self.payload].holders == 0
+            && let Some(lease) = state.leases.remove(&self.payload)
+            && lease.evicted
+        {
             state.outstanding_bytes = state.outstanding_bytes.saturating_sub(lease.bytes);
+        }
+        if crawl_let_go {
+            if state.crawl_leased_bytes == 0 {
+                state.crawl_yield_requested = false;
+            }
+            trim_background_to_budget(&mut state);
         }
     }
 }
@@ -6290,14 +6464,19 @@ fn remove_pin(state: &mut State, (uri, fingerprint): &(Url, u64)) {
 /// Stops charging leased parses that nothing holds any more.
 fn prune_dead_leases(state: &mut State) {
     let mut released = 0usize;
+    let mut crawl_released = 0usize;
     state.leases.retain(|_, lease| {
         let alive = lease.parsed.strong_count() > 0;
         if !alive && lease.evicted {
             released = released.saturating_add(lease.bytes);
         }
+        if !alive && lease.crawl_holders > 0 {
+            crawl_released = crawl_released.saturating_add(lease.bytes);
+        }
         alive
     });
     state.outstanding_bytes = state.outstanding_bytes.saturating_sub(released);
+    state.crawl_leased_bytes = state.crawl_leased_bytes.saturating_sub(crawl_released);
 }
 
 fn retain_fingerprints_locked(state: &mut State, keep: &HashSet<u64>) {
@@ -6333,9 +6512,26 @@ fn evict_to_budget(state: &mut State) {
         .saturating_add(budgeted_reserved_bytes(state))
         > state.max_bytes
     {
-        if !evict_oldest(state) {
+        if !matches!(evict_for_request(state, 0), RequestRoom::Evicted) {
             return;
         }
+    }
+}
+
+/// Once the crawl lets go of its leases, evicts its entries no request used
+/// until the cache is back within its budget (l4d-jfpy).
+fn trim_background_to_budget(state: &mut State) {
+    while state
+        .bytes
+        .saturating_add(state.outstanding_bytes)
+        .saturating_add(budgeted_reserved_bytes(state))
+        > state.max_bytes
+    {
+        let Some(key) = oldest_background(state, None) else {
+            return;
+        };
+        state.evicted_for_room = true;
+        remove_ready(state, &key);
     }
 }
 
@@ -6946,6 +7142,17 @@ impl ProjectCache {
 
     pub(crate) fn invalidation_epoch(&self) -> u64 {
         lock(&self.inner).invalidation_epoch
+    }
+
+    /// Whether a request went past the budget by what the crawl leases, so
+    /// the crawl should stop at its next dependency (l4d-jfpy).
+    pub(crate) fn crawl_yield_requested(&self) -> bool {
+        lock(&self.inner).crawl_yield_requested
+    }
+
+    /// Clears `crawl_yield_requested` when a crawl starts.
+    pub(crate) fn clear_crawl_yield_request(&self) {
+        lock(&self.inner).crawl_yield_requested = false;
     }
 
     pub(crate) fn stats(&self) -> CacheStats {

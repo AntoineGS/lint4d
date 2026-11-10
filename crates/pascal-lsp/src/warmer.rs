@@ -69,6 +69,10 @@ pub(crate) struct InteractiveGate {
     /// arrives.
     #[cfg(test)]
     warm_busy_after_checks: Mutex<Option<usize>>,
+    /// Test seam: as `warm_busy_after_checks`, counting only the crawl's
+    /// checks between the dependencies of a closure unit.
+    #[cfg(test)]
+    warm_busy_after_dependency_checks: Mutex<Option<usize>>,
     #[cfg(test)]
     warm_idle_waiters: std::sync::atomic::AtomicUsize,
     /// Test seam: the next seal after a complete batch finds the gate busy.
@@ -402,24 +406,23 @@ impl InteractiveGate {
         self.index_turn_waiters.load(Ordering::Relaxed)
     }
 
+    /// Whether the crawl may load the next dependency of a closure unit
+    /// (l4d-jfpy): the unit boundary's rule (`try_wait_warm_idle`), without
+    /// counting a check against the unit boundary's test seams.
+    pub(crate) fn crawl_may_continue(&self, cancel: &AtomicBool) -> bool {
+        #[cfg(test)]
+        if tick_seam(&self.warm_busy_after_dependency_checks) {
+            self.set_warm_busy(1);
+        }
+        !cancel.load(Ordering::Relaxed)
+            && self.warm_may_run(*self.busy.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
     /// Counts one passing check against the test seams.
     fn tick_test_seams(&self) {
         #[cfg(test)]
         {
-            let tick = |slot: &Mutex<Option<usize>>| {
-                let mut remaining = slot.lock().unwrap_or_else(PoisonError::into_inner);
-                match remaining.as_mut() {
-                    Some(0) => {
-                        *remaining = None;
-                        true
-                    }
-                    Some(checks) => {
-                        *checks -= 1;
-                        false
-                    }
-                    None => false,
-                }
-            };
+            let tick = tick_seam;
             if tick(&self.busy_after_checks) {
                 self.set(1);
             }
@@ -491,6 +494,23 @@ impl InteractiveGate {
         }
         *self.busy.lock().unwrap_or_else(PoisonError::into_inner) == 0
             && !cancel.load(Ordering::Relaxed)
+    }
+}
+
+/// Counts one check against a test seam: true at the check it fires on.
+#[cfg(test)]
+fn tick_seam(slot: &Mutex<Option<usize>>) -> bool {
+    let mut remaining = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    match remaining.as_mut() {
+        Some(0) => {
+            *remaining = None;
+            true
+        }
+        Some(checks) => {
+            *checks -= 1;
+            false
+        }
+        None => false,
     }
 }
 
@@ -2077,6 +2097,27 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
             }
             Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string())
         }
+    }));
+    // Between the dependencies of one closure unit too: a unit may load
+    // dozens over many seconds, and the crawl's leases on them hold room no
+    // eviction frees (l4d-jfpy). It stops for a request or for room as at a
+    // unit boundary, and the job's end lets go of its leases.
+    let cache = workspace.project_cache().clone();
+    cache.clear_crawl_yield_request();
+    let pause_gate = gate.clone();
+    let pause_cancel = job.cancel.clone();
+    let pause_paused = paused.clone();
+    workspace.set_dependency_pause(Arc::new(move || {
+        if crate::project_cache::crawl_admission_refused_on_this_thread() {
+            return Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string());
+        }
+        if pause_gate.crawl_may_continue(&pause_cancel) && !cache.crawl_yield_requested() {
+            return Ok(());
+        }
+        if !pause_cancel.load(Ordering::Relaxed) {
+            pause_paused.store(true, Ordering::Relaxed);
+        }
+        Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string())
     }));
     let result = workspace.warm_with_cancel(&uri, &job.cancel);
     // Entries stored before a pause or error are already in the shared cache,
@@ -4221,6 +4262,84 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, WarmEvent::Begin { .. })),
             "the crawl was dispatched again: {again:?}"
+        );
+        warmer.shutdown();
+    }
+
+    /// `Main` (open) uses `Hub`, whose interface uses `W1..W12`: one closure
+    /// unit with many dependencies.
+    fn hub_fixture() -> (tempfile::TempDir, crate::workspace::Workspace, Url, Url) {
+        let temp = tempfile::tempdir().unwrap();
+        let write_unit = |name: &str, uses: &str| {
+            let text = format!(
+                "unit {name};\ninterface\n{uses}procedure P{name};\nimplementation\nprocedure P{name};\nbegin\nend;\nend.\n"
+            );
+            std::fs::write(temp.path().join(format!("{name}.pas")), &text).unwrap();
+            text
+        };
+        let main_text = write_unit("Main", "uses Hub;\n");
+        let hub_uses = (1..=WIDE_UNITS)
+            .map(|index| format!("W{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        write_unit("Hub", &format!("uses {hub_uses};\n"));
+        for index in 1..=WIDE_UNITS {
+            write_unit(&format!("W{index}"), "");
+        }
+        let mut workspace = crate::workspace::Workspace::with_override_session(
+            vec![temp.path().to_path_buf()],
+            Default::default(),
+            pascal_project::delphi_overrides::OverrideSession::new(None),
+        );
+        let main = Url::from_file_path(temp.path().join("Main.pas")).unwrap();
+        let hub = Url::from_file_path(temp.path().join("Hub.pas")).unwrap();
+        workspace.open_document(main.clone(), main_text, 1).unwrap();
+        (temp, workspace, main, hub)
+    }
+
+    /// l4d-jfpy (multidev mf2: one SFClient2 closure unit loaded 55
+    /// dependencies over 13 s through a references request): the crawl
+    /// stops at the next dependency of a closure unit once a workspace-wide
+    /// request arrives, and still completes once requests stop.
+    #[test]
+    fn a_crawl_pauses_between_the_dependencies_of_one_closure_unit() {
+        let (_temp, workspace, main, hub) = hub_fixture();
+        let cache = workspace.project_cache();
+        let gate = Arc::new(InteractiveGate::default());
+        // The request arrives while Hub loads its third dependency.
+        *gate.warm_busy_after_dependency_checks.lock().unwrap() = Some(2);
+        let mut warmer = Warmer::start(gate.clone());
+        warmer.open(main.clone());
+        let events = poll_until(&mut warmer, &workspace, |events| {
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    WarmEvent::Paused { .. }
+                        | WarmEvent::End { .. }
+                        | WarmEvent::BudgetStopped { .. }
+                )
+            })
+        });
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, WarmEvent::Paused { .. })),
+            "the crawl paused: {:?}",
+            events.iter().map(event_kind).collect::<Vec<_>>()
+        );
+        let loaded = wide_units_ready(cache, &hub);
+        assert!(
+            loaded <= 3,
+            "the crawl stopped at the next dependency: {loaded} of {WIDE_UNITS} loaded"
+        );
+
+        gate.set_warm_busy(0);
+        let resumed = run_until_end(&mut warmer, &workspace);
+        assert_eq!(
+            wide_units_ready(cache, &hub),
+            WIDE_UNITS,
+            "the crawl completes once requests stop: {:?}",
+            resumed.iter().map(event_kind).collect::<Vec<_>>()
         );
         warmer.shutdown();
     }

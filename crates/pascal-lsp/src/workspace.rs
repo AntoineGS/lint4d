@@ -12115,12 +12115,18 @@ impl Workspace {
                 .unwrap_or_else(|| path_stamp(&path));
             staged_watched.insert(path, stamp);
         }
+        // This discovery's reads and memberships replace the retained ones of
+        // the same paths: the retained state may be stale (a context
+        // rediscovered for a known owner is installed over it under the same
+        // key). Keeping a stale read beside the new watched stamp made the
+        // context fresh while every request's records carried the old stamp
+        // (l4d-z473).
         let (staged_observations, staged_memberships) = if let Some(state) = self.contexts.get(&key)
         {
             (
                 merge_project_read_observations_indexed(
-                    &state.project_read_observations,
                     &observations,
+                    &state.project_read_observations,
                     cancel,
                     budget,
                 )?,
@@ -16110,6 +16116,8 @@ fn merge_metadata_observations_indexed(
     Ok(result)
 }
 
+/// `incoming`, computed now, and the memberships of `existing` for the
+/// directories it does not cover.
 fn merge_candidate_memberships_indexed(
     existing: &HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
     incoming: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
@@ -16130,16 +16138,15 @@ fn merge_candidate_memberships_indexed(
     let mut keys = HashSet::new();
     keys.try_reserve(capacity)
         .map_err(|error| format!("could not reserve candidate membership index: {error}"))?;
-    for (path, membership) in existing {
-        check_workspace_cancel(cancel)?;
-        let key = project_path_lookup_key(path);
-        keys.insert(key);
-        result.insert(path.clone(), membership.clone());
-    }
     for (path, membership) in incoming {
         check_workspace_cancel(cancel)?;
-        if keys.insert(project_path_lookup_key(&path)) {
-            result.insert(path, membership);
+        keys.insert(project_path_lookup_key(&path));
+        result.insert(path, membership);
+    }
+    for (path, membership) in existing {
+        check_workspace_cancel(cancel)?;
+        if keys.insert(project_path_lookup_key(path)) {
+            result.insert(path.clone(), membership.clone());
         }
     }
     Ok(result)
@@ -24891,6 +24898,120 @@ BDS = '/fake/37'
                 .expect("merge");
 
         assert_eq!(merged.len(), 4, "{merged:?}");
+    }
+
+    /// l4d-z473: Headless-Delphi rewrites the installation's
+    /// `environment.proj` (outside the roots, same content, new inode) on
+    /// every build. A context rediscovered for an explicit owner is installed
+    /// over its stale state under the same key; the rediscovery's read of the
+    /// file must replace the stale one. Before, the stale read survived the
+    /// merge while the watched stamp took the new one: the context then
+    /// passed freshness, and every request's own records carried the old
+    /// stamp, so strict revalidation refused every request after the build.
+    #[cfg(unix)]
+    #[test]
+    fn a_reinstalled_context_records_the_new_read_of_a_rewritten_metadata_file() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().join("workspace");
+        let ide = temp.path().join("ide");
+        fs::create_dir_all(&root).expect("root");
+        fs::create_dir_all(&ide).expect("ide");
+        let environment = ide.join("environment.proj");
+        let content = "<Project><PropertyGroup /></Project>";
+        fs::write(&environment, content).expect("environment.proj");
+        let source = root.join("Main.pas");
+        let read = |path: &Path| ProjectReadObservation {
+            path: path.to_path_buf(),
+            stamp: pascal_project::path_stamp_result(path)
+                .expect("stamp")
+                .expect("present"),
+            content_hash: super::content_hash_bytes(content.as_bytes()),
+            content_bytes: Some(content.as_bytes().to_vec()),
+        };
+        let observations = ProjectObservations {
+            metadata_files: vec![environment.clone()],
+            ..ProjectObservations::default()
+        };
+        let key = ContextKey {
+            installation_id: Some("7.0".to_owned()),
+            project_file: None,
+            workspace_root: Some(root.clone()),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            conditional_context: Default::default(),
+            build_selection_modes: None,
+            context_fingerprint: None,
+            overrides: EffectiveOverrides::default(),
+        };
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let install = |workspace: &mut Workspace,
+                       memberships: HashMap<
+            PathBuf,
+            Result<super::ProjectCandidateMembership, String>,
+        >| {
+            workspace
+                .install_context(
+                    key.clone(),
+                    Arc::default(),
+                    observations.clone(),
+                    vec![read(&environment)],
+                    memberships,
+                    &source,
+                    None,
+                    None,
+                )
+                .expect("install context");
+        };
+        install(&mut workspace, HashMap::new());
+        let membership = |workspace: &Workspace| {
+            workspace.contexts[&key]
+                .project_candidate_memberships
+                .get(&root)
+                .cloned()
+                .expect("the source directory's membership")
+        };
+        let before = membership(&workspace);
+
+        let replacement = ide.join("environment.proj.tmp");
+        fs::write(&replacement, content).expect("replacement");
+        fs::rename(&replacement, &environment).expect("rewrite");
+        // The same build added a project beside the source.
+        fs::write(root.join("Other.dproj"), "<Project />").expect("project");
+        let after =
+            pascal_project::project_candidate_membership_with_deleted_paths(&root, None, &[]);
+        assert_ne!(after, before, "the new project changed the membership");
+        let current = super::path_stamp(&environment);
+        let state = workspace.contexts.get(&key).expect("installed");
+        assert_ne!(
+            state.watched_paths.get(&environment).cloned().flatten(),
+            current,
+            "the rewrite gave the file a new stamp"
+        );
+        install(&mut workspace, HashMap::new());
+
+        assert_eq!(
+            membership(&workspace),
+            after,
+            "the rediscovery's membership replaces the stale one"
+        );
+        let state = workspace.contexts.get(&key).expect("reinstalled");
+        assert_eq!(
+            state.watched_paths.get(&environment).cloned().flatten(),
+            current
+        );
+        let records = super::rename::consumed_context_records(state, &AtomicBool::new(false))
+            .expect("context records");
+        let record = records
+            .iter()
+            .find(|record| record.path.as_deref() == Some(environment.as_path()))
+            .expect("environment.proj record");
+        assert_eq!(
+            record.path_stamp, current,
+            "the request's record carries the stamp the context was rebuilt from"
+        );
     }
 
     #[test]

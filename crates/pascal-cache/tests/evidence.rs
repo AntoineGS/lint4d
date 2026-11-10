@@ -81,6 +81,50 @@ fn malformed_observations_are_refused() {
     }
 }
 
+/// l4d-qk5t: a Delphi build writes its products (compiled units, packages,
+/// executables, resources) beside the sources; no lookup selects them, so a
+/// stored listing still holds. A new source or include, in any case, and a
+/// new directory change it.
+#[test]
+fn listing_digests_leave_out_build_products() {
+    let p = |text: &str| PathBuf::from(text);
+    let sources = [p("/x/A.pas"), p("/x/b.inc")];
+    let listing = listing_digest(&sources, &[p("/x/sub")]);
+    let mut built = sources.to_vec();
+    for product in [
+        "A.dcu", "B.DCU", "App.exe", "Pkg.dcp", "Pkg.bpl", "App.res", "App.map", "App.drc",
+    ] {
+        built.push(p(&format!("/x/{product}")));
+    }
+    assert_eq!(
+        listing,
+        listing_digest(&built, &[p("/x/sub")]),
+        "build products do not change a listing"
+    );
+    for source in [
+        "C.pas",
+        "D.Pas",
+        "e.INC",
+        "App.dpr",
+        "Pkg.dpk",
+        "App.dproj",
+        "notes.txt",
+    ] {
+        let mut changed = sources.to_vec();
+        changed.push(p(&format!("/x/{source}")));
+        assert_ne!(
+            listing,
+            listing_digest(&changed, &[p("/x/sub")]),
+            "{source} can be selected"
+        );
+    }
+    assert_ne!(
+        listing,
+        listing_digest(&sources, &[p("/x/sub"), p("/x/Win32")]),
+        "a new directory"
+    );
+}
+
 #[test]
 fn listing_digests_name_entries_and_their_kinds_only() {
     let p = |text: &str| PathBuf::from(text);

@@ -789,21 +789,21 @@ fn two_builds_alternating_through_the_protocol_reuse_each_others_facts() {
     }
 }
 
-/// With the default of three namespaces a fourth build retires the least
-/// recently used one: the status lists the other three, a warm restart of
+/// With the default of two namespaces a third build retires the least
+/// recently used one: the status lists the other two, a warm restart of
 /// build 2 still extracts nothing, and the retired build 1 starts cold with
 /// the right answers.
 #[test]
-fn a_fourth_build_retires_the_least_recently_used_namespace() {
+fn a_third_build_retires_the_least_recently_used_namespace() {
     let environment = tempfile::tempdir().unwrap();
     let root = query_fixture(environment.path(), &MATRIX);
-    for n in 1..=3u8 {
+    for n in 1..=2u8 {
         run_build(environment.path(), &root, n, Value::Null, n as u64);
     }
-    assert!((1..=3).all(|n| is_live(environment.path(), n)));
-    run_build(environment.path(), &root, 4, Value::Null, 4);
+    assert!((1..=2).all(|n| is_live(environment.path(), n)));
+    run_build(environment.path(), &root, 3, Value::Null, 3);
     assert!(!is_live(environment.path(), 1), "the oldest is retired");
-    assert!((2..=4).all(|n| is_live(environment.path(), n)));
+    assert!((2..=3).all(|n| is_live(environment.path(), n)));
 
     let uncached = uncached_answers(
         environment.path(),
@@ -817,7 +817,7 @@ fn a_fourth_build_retires_the_least_recently_used_namespace() {
     assert_eq!(done["extracted"], 0, "{done}");
     let found = answers(&mut server, &root, &BUILD_QUERIES);
     shutdown(server);
-    used_at(environment.path(), 2, 5);
+    used_at(environment.path(), 2, 4);
     assert_agree(&found, &uncached);
 
     let (mut server, done) = started_build(environment.path(), &root, 1, Value::Null);
@@ -827,6 +827,7 @@ fn a_fourth_build_retires_the_least_recently_used_namespace() {
     shutdown(server);
     assert_agree(&found, &uncached);
     assert!(is_live(environment.path(), 1));
+    assert!(is_live(environment.path(), 2));
     assert!(!is_live(environment.path(), 3), "build 3 was retired");
 }
 
@@ -876,7 +877,7 @@ fn gc_in_one_process_while_another_reads() {
     const HELD: usize = 5;
     let environment = tempfile::tempdir().unwrap();
     let root = query_fixture(environment.path(), &MATRIX);
-    for n in 1..=3u8 {
+    for n in 1..=2u8 {
         run_build(environment.path(), &root, n, Value::Null, n as u64);
     }
     let directory = environment.path().join("reuse-pass-barrier");
@@ -898,7 +899,7 @@ fn gc_in_one_process_while_another_reads() {
     started(&mut reader, &root, &OPENS);
     wait_barrier_entered(&barrier);
 
-    assert!(is_live(environment.path(), 2) && is_live(environment.path(), 3));
+    assert!(is_live(environment.path(), 1) && is_live(environment.path(), 2));
     let pruned = admin(
         environment.path(),
         &["--cache-prune", "--cache-max-namespaces", "1"],
@@ -912,7 +913,7 @@ fn gc_in_one_process_while_another_reads() {
         listed.iter().any(|(id, held)| *id == build_id(1) && *held),
         "the reader's namespace is held and kept: {listed:?}"
     );
-    assert!(!is_live(environment.path(), 2) && !is_live(environment.path(), 3));
+    assert!(!is_live(environment.path(), 2));
 
     barrier.release();
     let done = wait_index(&mut reader, complete);

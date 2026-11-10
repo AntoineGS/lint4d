@@ -1622,6 +1622,131 @@ mod tests {
         assert!(graphs.get(&key).is_some());
     }
 
+    /// l4d-10: SFClient2's business object interfaces probe the same
+    /// candidate paths in their observations, their trace and their nested
+    /// providers' lookups; the deduplicated probes kept the capacity of all
+    /// of them (BaseREPAIRHEADER: 7.4 MB kept, 0.15 MB charged). The store
+    /// charges what it keeps for an interface's probes and reads.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_shared_interface_with_repeated_probes_is_charged_within_a_fifth_of_its_heap() {
+        use pascal_core::SourceId;
+        use pascal_core::compile_time::{ProviderGraphKey, SharedProviderGraph};
+        use pascal_core::resolver::ResolutionObservation;
+        let candidate = |n: usize| ResolutionObservation::Candidate {
+            path: format!("/w/Common/BOBase/Source{:02}/BaseTABLE{n:04}.pas", n % 30).into(),
+            entry: None,
+            stamp: None,
+            present: false,
+        };
+        // 40 lookups seen 200 times each.
+        let observations = Arc::new((0..8_000).map(|n| candidate(n % 40)).collect::<Vec<_>>());
+        let graph = Arc::new(SharedProviderGraph {
+            occurrence: OccurrenceId(1),
+            graph: None,
+            // Kept alive by the test: only what the store adds is measured.
+            observations: Arc::clone(&observations),
+            warnings: Default::default(),
+            dependencies: Default::default(),
+            scanned: Default::default(),
+            children: Default::default(),
+            trace: Arc::clone(&observations),
+            revision: pascal_core::SourceRevision::Overlay {
+                version: 1,
+                content_hash: 1,
+            },
+            lookup: (0, 0),
+            names: None,
+            // What the graph's own estimate counts for its struct.
+            retained_bytes: std::mem::size_of::<SharedProviderGraph>(),
+        });
+        let key = ProviderGraphKey {
+            source: SourceId::new("/w/Common/BOBase/BaseREPAIRHEADER.pas"),
+            content_hash: 1,
+            disk_stamp: None,
+            overlay_version: Some(1),
+            context: Default::default(),
+            qualifiers: vec![],
+        };
+        let cache = crate::project_cache::ProjectCache::new(1 << 30);
+        let graphs = CachedProviderGraphs {
+            cache: cache.clone(),
+            configuration: 3,
+            overlays: Default::default(),
+            capture: Arc::new(crate::workspace::capture::ReadCapture::default()),
+        };
+        use pascal_core::compile_time::SharedProviderGraphs;
+        graphs.put(key, graph);
+        assert_eq!(cache.provider_graph_count(), 1);
+        let charged = cache.provider_graph_bytes();
+        let (freed, holders) = cache.drop_provider_graphs_for_test();
+        assert_eq!(holders, vec![0]);
+        let error = charged.abs_diff(freed as usize) as f64 / freed as f64;
+        assert!(
+            error <= 0.2,
+            "charged {charged} bytes for an interface that kept {freed} ({:.0}% off)",
+            error * 100.0
+        );
+    }
+
+    /// l4d-10: an interface compiled through nested providers collects each
+    /// provider it read once per nesting; deduplicated, the list kept the
+    /// room of every repeat (BaseREPAIRHEADER: 5.3 MB of dependencies).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_interfaces_keep_no_room_for_repeated_dependencies() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source = "unit Main; interface uses A; {$IF A.Flag = 8} const Eight = 8; {$IFEND} implementation end.";
+        std::fs::write(root.join("Main.pas"), source).unwrap();
+        std::fs::write(
+            root.join("C.pas"),
+            "unit C; interface const F = 1; implementation end.",
+        )
+        .unwrap();
+        let middles = (0..12).map(|n| format!("B{n}")).collect::<Vec<_>>();
+        for name in &middles {
+            std::fs::write(
+                root.join(format!("{name}.pas")),
+                format!("unit {name}; interface uses C; const {{$IF C.F = 1}} F = 1; {{$ELSE}} F = 0; {{$IFEND}} implementation end."),
+            )
+            .unwrap();
+        }
+        let checks = middles
+            .iter()
+            .map(|name| format!("{{$IF {name}.F = 1}} {name}Ok = 1; {{$IFEND}}"))
+            .collect::<String>();
+        std::fs::write(
+            root.join("A.pas"),
+            format!(
+                "unit A; interface uses C, {}; const {checks} Flag = 8; implementation end.",
+                middles.join(", ")
+            ),
+        )
+        .unwrap();
+        pascal_project::backdate_tree_for_test(root);
+        let mut workspace = Workspace::with_override_session(
+            vec![root.into()],
+            Default::default(),
+            OverrideSession::new(None),
+        );
+        let uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+        let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+        drop(expand_main(&workspace, &uri, source, &key));
+        let graphs = workspace.project_cache.provider_graphs_for_test();
+        assert!(graphs.len() > 2, "{} shared interfaces", graphs.len());
+        for graph in graphs {
+            assert_eq!(
+                graph.dependencies.capacity(),
+                graph.dependencies.len(),
+                "{} keeps room for {} dependencies, holds {}",
+                graph.occurrence.0,
+                graph.dependencies.capacity(),
+                graph.dependencies.len()
+            );
+        }
+    }
+
     fn provider_workspace(root: &std::path::Path) -> (Workspace, Url, String, ContextKey) {
         let source = "unit Main; interface uses A; {$IF A.Flag = 8} const Eight = 8; {$ELSE} const Other = 0; {$ENDIF} implementation end.";
         std::fs::write(root.join("Main.pas"), source).unwrap();
@@ -2149,6 +2274,390 @@ mod tests {
         assert_eq!(
             first.expanded.reads, second.expanded.reads,
             "the reuse replays what the compilation read"
+        );
+    }
+
+    /// l4d-10: a provider interface is charged within a fifth of the heap
+    /// it keeps, counted by the test allocator when the store drops it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_provider_interface_is_charged_within_a_fifth_of_its_heap() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, uri, source, key) = provider_workspace(temp.path());
+        drop(expand_main(&workspace, &uri, &source, &key));
+        assert_graphs_charged_within_a_fifth(&workspace);
+    }
+
+    /// l4d-10: an interface with a branch the session cannot decide keeps
+    /// the identifiers its text spells (D46). RAD Studio's `SysUtils` is
+    /// one: its graph was charged 30 KB for the 122 KB it kept.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_provider_interface_with_an_unknown_branch_is_charged_within_a_fifth_of_its_heap() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source = "unit Main; interface uses A; {$IF Declared(Flag)} const Eight = 8; {$IFEND} implementation end.";
+        std::fs::write(root.join("Main.pas"), source).unwrap();
+        let declarations = (0..2_000)
+            .map(|n| format!("C{n} = Base + Offset + Scale * Count;\n"))
+            .collect::<String>();
+        std::fs::write(
+            root.join("A.pas"),
+            format!("unit A; interface {{$IFDEF MSWINDOWS}} {{$ENDIF}} const\n{declarations}Flag = 8; implementation end."),
+        )
+        .unwrap();
+        pascal_project::backdate_tree_for_test(root);
+        let mut workspace = Workspace::with_override_session(
+            vec![root.into()],
+            Default::default(),
+            OverrideSession::new(None),
+        );
+        let uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+        let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+        drop(expand_main(&workspace, &uri, source, &key));
+        assert_graphs_charged_within_a_fifth(&workspace);
+    }
+
+    /// l4d-10 smoke probe, not a regression test (fix round 1, M7): it
+    /// passed before and after the interface fixes, since `max_work` stops a
+    /// single session before the large interfaces production builds over
+    /// many member sessions; the evidence for those is the in-process
+    /// SFClient2 measurement (report m14/m17). It checks that real providers'
+    /// shared interfaces, compiled under the production limits, are charged
+    /// within a fifth of the heap they keep. Needs RAD Studio 7.0's sources
+    /// (read only), and multidev's business objects when `MULTIDEV` is set:
+    /// `PASCAL_RTL=~/.local/share/Headless-Delphi/files/RAD\ Studio/7.0/source/Win32
+    ///  MULTIDEV=~/gits/multidev cargo test -p pascal-lsp --lib real_providers_smoke -- --ignored`
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs RAD Studio 7.0 sources"]
+    fn real_providers_smoke_probe() {
+        let rtl = std::path::PathBuf::from(std::env::var("PASCAL_RTL").expect("PASCAL_RTL"));
+        let mut paths = ["rtl/sys", "rtl/common", "rtl/win", "vcl", "db"]
+            .iter()
+            .map(|dir| rtl.join(dir))
+            .collect::<Vec<_>>();
+        let mut uses = vec!["SysConst", "Variants", "Types"];
+        if let Some(multidev) = std::env::var_os("MULTIDEV").map(std::path::PathBuf::from) {
+            for dir in ["Common", "Common/BO", "Common/BOBase", "Common/BORules"] {
+                paths.push(multidev.join(dir));
+            }
+            uses.extend([
+                "BusinessObject",
+                "BOFields",
+                "BOConnection",
+                "BaseREPAIRHEADER",
+            ]);
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let source = format!(
+            "unit Main; interface uses {}; {{$IF Declared(TObject)}} const Eight = 8; {{$IFEND}} implementation end.",
+            uses.join(", ")
+        );
+        std::fs::write(temp.path().join("Main.pas"), &source).unwrap();
+        let options = crate::workspace::WorkspaceOptions {
+            source_paths: paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            ..crate::workspace::WorkspaceOptions::default()
+        };
+        let mut workspace = Workspace::with_override_session(
+            vec![temp.path().into()],
+            options,
+            OverrideSession::new(None),
+        );
+        let uri = Url::from_file_path(temp.path().join("Main.pas")).unwrap();
+        let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+        // A session past max_work still shares what it compiled before.
+        drop(expand(
+            &workspace,
+            &uri,
+            &source,
+            &key,
+            workspace.include_expansion_limits(),
+            &AtomicBool::new(false),
+            None,
+        ));
+        assert!(workspace.project_cache.provider_graph_count() > 0);
+        let charged = workspace.project_cache.provider_graph_bytes();
+        let (freed, holders) = workspace.project_cache.drop_provider_graphs_for_test();
+        assert!(holders.iter().all(|holders| *holders == 0), "{holders:?}");
+        let error = charged.abs_diff(freed as usize) as f64 / freed as f64;
+        assert!(
+            error <= 0.2,
+            "charged {charged} bytes for interfaces that kept {freed} ({:.0}% off)",
+            error * 100.0
+        );
+    }
+
+    /// Main uses A, whose interface reads B's: both shared.
+    #[cfg(target_os = "linux")]
+    fn nested_provider_workspace(root: &std::path::Path) -> Workspace {
+        let source = "unit Main; interface uses A; {$IF A.Flag = 8} const Eight = 8; {$IFEND} implementation end.";
+        std::fs::write(root.join("Main.pas"), source).unwrap();
+        let declarations = (0..2_000)
+            .map(|n| format!("C{n} = {n};\n"))
+            .collect::<String>();
+        std::fs::write(
+            root.join("B.pas"),
+            format!("unit B; interface const\n{declarations}Flag = 8; implementation end."),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("A.pas"),
+            "unit A; interface uses B; const {$IF B.Flag = 8} Flag = 8; {$ELSE} Flag = 0; {$IFEND} implementation end.",
+        )
+        .unwrap();
+        pascal_project::backdate_tree_for_test(root);
+        let mut workspace = Workspace::with_override_session(
+            vec![root.into()],
+            Default::default(),
+            OverrideSession::new(None),
+        );
+        let uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+        let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+        drop(expand_main(&workspace, &uri, source, &key));
+        assert_eq!(workspace.project_cache.provider_graph_count(), 2);
+        workspace
+    }
+
+    /// l4d-10: an interface keeps the interfaces of the providers its own
+    /// compilation read. Once the store evicts one, the importer alone keeps
+    /// it, and it stays charged until that is dropped: SFClient2's
+    /// ZDbcGenericResolver was charged 2.7 MB and kept 168 MB, VCL's Clipbrd
+    /// 0.2 MB and 18 MB.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_interface_is_charged_for_the_provider_interfaces_it_keeps() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = nested_provider_workspace(temp.path());
+        // The store gives B's interface up; A's still holds it.
+        workspace
+            .project_cache
+            .evict_provider_graphs_for_test("B.pas");
+        assert_graphs_charged_within_a_fifth(&workspace);
+    }
+
+    /// l4d-10: a nested interface the store holds is charged once, by its
+    /// own entry; charging it to every importer too made the share churn
+    /// (SFClient2's index extraction ran ten times slower).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_nested_interface_the_store_holds_is_charged_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = nested_provider_workspace(temp.path());
+        assert_graphs_charged_within_a_fifth(&workspace);
+    }
+
+    /// `Main{n}` uses `A{n}`, whose interface reads `B{n}`'s: `units`
+    /// such pairs, each B about 1.6 MB of interface. Returns the workspace
+    /// and each Main's URI, source and context.
+    #[cfg(target_os = "linux")]
+    fn importer_pairs(
+        root: &std::path::Path,
+        units: usize,
+    ) -> (Workspace, Vec<(Url, String, ContextKey)>) {
+        let declarations = (0..2_000)
+            .map(|n| format!("C{n} = {n};\n"))
+            .collect::<String>();
+        for n in 0..units {
+            std::fs::write(
+                root.join(format!("B{n}.pas")),
+                format!("unit B{n}; interface const\n{declarations}Flag = 8; implementation end."),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join(format!("A{n}.pas")),
+                format!("unit A{n}; interface uses B{n}; const {{$IF B{n}.Flag = 8}} Flag = 8; {{$ELSE}} Flag = 0; {{$IFEND}} implementation end."),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join(format!("Main{n}.pas")),
+                format!("unit Main{n}; interface uses A{n}; {{$IF A{n}.Flag = 8}} const Eight = 8; {{$IFEND}} implementation end."),
+            )
+            .unwrap();
+        }
+        pascal_project::backdate_tree_for_test(root);
+        let mut workspace = Workspace::with_override_session(
+            vec![root.into()],
+            Default::default(),
+            OverrideSession::new(None),
+        );
+        let mains = (0..units)
+            .map(|n| {
+                let path = root.join(format!("Main{n}.pas"));
+                let source = std::fs::read_to_string(&path).unwrap();
+                let uri = Url::from_file_path(path).unwrap();
+                let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+                (uri, source, key)
+            })
+            .collect();
+        (workspace, mains)
+    }
+
+    /// l4d-10 fix round 1 (M9): a kept interface stops being charged once
+    /// its last importer is gone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_kept_interface_is_released_when_its_last_importer_drops() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = nested_provider_workspace(temp.path());
+        workspace
+            .project_cache
+            .evict_provider_graphs_for_test("B.pas");
+        assert!(workspace.project_cache.kept_provider_graph_bytes_for_test() > 1_000_000);
+        workspace
+            .project_cache
+            .evict_provider_graphs_for_test("A.pas");
+        assert_eq!(
+            workspace.project_cache.kept_provider_graph_bytes_for_test(),
+            0
+        );
+        assert_eq!(workspace.project_cache.provider_graph_bytes(), 0);
+    }
+
+    /// l4d-10 fix round 1 (I1, l4d-4nbs I2): provider interfaces, kept
+    /// states included, give way to every request: a reservation evicts the
+    /// importer that keeps a state.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_request_evicts_the_importer_that_keeps_an_interface() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = nested_provider_workspace(temp.path());
+        workspace
+            .project_cache
+            .evict_provider_graphs_for_test("B.pas");
+        let kept = workspace.project_cache.kept_provider_graph_bytes_for_test();
+        assert!(kept > 1_000_000, "{kept}");
+        let cache = &workspace.project_cache;
+        cache.set_max_bytes(2 * kept);
+        let wanted = 3 * kept / 2;
+        let reservation = cache.reserve(crate::project_cache::ReservationKind::Scratch, wanted);
+        assert!(
+            reservation.is_some(),
+            "a {wanted}-byte reservation beside {kept} kept bytes an importer holds"
+        );
+        assert_eq!(cache.provider_graph_count(), 0, "A gave way");
+        assert_eq!(cache.kept_provider_graph_bytes_for_test(), 0);
+    }
+
+    /// l4d-10 fix round 1 (I2): interfaces and the states only importers
+    /// keep stay within the provider share, however many are compiled.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interfaces_and_kept_states_stay_within_the_provider_share() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, mains) = importer_pairs(temp.path(), 8);
+        let cache = &workspace.project_cache;
+        // A share of about three pairs.
+        let share = 5 << 20;
+        cache.set_max_bytes(4 * share);
+        for (uri, source, key) in &mains {
+            drop(expand_main(&workspace, uri, source, key));
+            let charged = cache.provider_graph_bytes();
+            assert!(
+                charged <= share,
+                "{charged} bytes against a {share}-byte share"
+            );
+        }
+        assert!(cache.provider_graph_count() > 0);
+    }
+
+    /// l4d-10 fix round 1 (I2): a member that needs an interface the store
+    /// evicted while an importer still keeps it takes that one back instead
+    /// of compiling a second copy.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_member_needing_a_kept_interface_adopts_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        // Written first: a later file would change the listing B's
+        // interface proved, and B would be compiled again for that.
+        let source = "unit Other; interface uses B; {$IF B.Flag = 8} const Eight = 8; {$IFEND} implementation end.";
+        std::fs::write(root.join("Other.pas"), source).unwrap();
+        let mut workspace = nested_provider_workspace(root);
+        workspace
+            .project_cache
+            .evict_provider_graphs_for_test("B.pas");
+        assert!(workspace.project_cache.kept_provider_graph_bytes_for_test() > 0);
+        let puts = workspace.project_cache.provider_graph_puts_for_test();
+        let uri = Url::from_file_path(root.join("Other.pas")).unwrap();
+        let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+        drop(expand_main(&workspace, &uri, source, &key));
+        assert_eq!(
+            workspace.project_cache.provider_graph_puts_for_test(),
+            puts,
+            "B was not compiled again"
+        );
+        assert_eq!(workspace.project_cache.provider_graph_count(), 2);
+        assert_eq!(
+            workspace.project_cache.kept_provider_graph_bytes_for_test(),
+            0
+        );
+    }
+
+    /// l4d-10 fix round 1 (I3): the store sizes each state once, at its put,
+    /// outside its lock: evicting walks no state, and an importer of a
+    /// stored interface walks only its own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_store_sizes_each_interface_state_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source = "unit Other; interface uses A2; {$IF A2.Flag = 8} const Eight = 8; {$IFEND} implementation end.";
+        std::fs::write(
+            root.join("A2.pas"),
+            "unit A2; interface uses B; const {$IF B.Flag = 8} Flag = 8; {$ELSE} Flag = 0; {$IFEND} implementation end.",
+        )
+        .unwrap();
+        std::fs::write(root.join("Other.pas"), source).unwrap();
+        let mut workspace = nested_provider_workspace(root);
+        let walks = pascal_core::compile_time::interface_state_walks;
+        let before = walks();
+        workspace
+            .project_cache
+            .evict_provider_graphs_for_test("B.pas");
+        workspace
+            .project_cache
+            .evict_provider_graphs_for_test("A.pas");
+        assert_eq!(walks(), before, "evictions walk no state");
+        // Another importer of B, with B stored again: only its own state.
+        nested_provider_workspace_again(&mut workspace, root);
+        let uri = Url::from_file_path(root.join("Other.pas")).unwrap();
+        let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+        let before = walks();
+        drop(expand_main(&workspace, &uri, source, &key));
+        assert_eq!(
+            walks() - before,
+            0,
+            "B's state is charged already: not walked again"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn nested_provider_workspace_again(workspace: &mut Workspace, root: &std::path::Path) {
+        let source = "unit Main; interface uses A; {$IF A.Flag = 8} const Eight = 8; {$IFEND} implementation end.";
+        let uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+        let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+        drop(expand_main(workspace, &uri, source, &key));
+        assert_eq!(workspace.project_cache.provider_graph_count(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_graphs_charged_within_a_fifth(workspace: &Workspace) {
+        assert!(workspace.project_cache.provider_graph_count() > 0);
+        let charged = workspace.project_cache.provider_graph_bytes();
+        let (freed, holders) = workspace.project_cache.drop_provider_graphs_for_test();
+        assert!(
+            holders.iter().all(|holders| *holders == 0),
+            "only the store holds the interfaces: {holders:?}"
+        );
+        let error = charged.abs_diff(freed as usize) as f64 / freed as f64;
+        assert!(
+            error <= 0.2,
+            "charged {charged} bytes for interfaces that kept {freed} ({:.0}% off)",
+            error * 100.0
         );
     }
 

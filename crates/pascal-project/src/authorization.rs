@@ -75,7 +75,8 @@ impl ProjectPathEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct AuthorizedReadRoot {
     path: PathBuf,
-    pattern_exclusion_bases: Vec<PathBuf>,
+    /// The same bases for every root of a policy, shared.
+    pattern_exclusion_bases: Arc<[PathBuf]>,
 }
 
 /// Immutable, requester-scoped authorization for project metadata and source
@@ -83,13 +84,17 @@ struct AuthorizedReadRoot {
 /// from mapping provenance: a mapped entry may only use its selected mapping
 /// root, while a configured native entry may use one of the requester's
 /// workspace, source-path, or effective mapping destinations.
+///
+/// Every disk revision of a loaded source carries its policy, so a clone
+/// shares the storage instead of copying it (l4d-10: with 60 roots a copy
+/// held 240 KB, since each root lists every exclusion base).
 #[derive(Debug, Clone, Default)]
 pub struct ReadPolicy {
-    configured_roots: Vec<AuthorizedReadRoot>,
-    mapped_roots: Vec<AuthorizedReadRoot>,
+    configured_roots: Arc<[AuthorizedReadRoot]>,
+    mapped_roots: Arc<[AuthorizedReadRoot]>,
     authorized_files: Arc<Vec<PathBuf>>,
-    pub(super) exclusions: Vec<String>,
-    exclusion_bases: Vec<PathBuf>,
+    pub(super) exclusions: Arc<[String]>,
+    exclusion_bases: Arc<[PathBuf]>,
     compiled_exclusions: Arc<Option<CompiledExclusions>>,
 }
 
@@ -230,7 +235,7 @@ impl ReadPolicy {
                     .ok_or_else(overflow)?,
             ),
         )?;
-        for root in self.configured_roots.iter().chain(&self.mapped_roots) {
+        for root in self.configured_roots.iter().chain(self.mapped_roots.iter()) {
             visit(root.pattern_exclusion_bases.len(), None)?;
             visit(0, Some(root.path.as_os_str().len()))?;
             visit(
@@ -242,7 +247,7 @@ impl ReadPolicy {
                         .ok_or_else(overflow)?,
                 ),
             )?;
-            for base in &root.pattern_exclusion_bases {
+            for base in root.pattern_exclusion_bases.iter() {
                 visit(0, Some(base.as_os_str().len()))?;
             }
         }
@@ -255,7 +260,7 @@ impl ReadPolicy {
                     .ok_or_else(overflow)?,
             ),
         )?;
-        for pattern in &self.exclusions {
+        for pattern in self.exclusions.iter() {
             visit(0, Some(pattern.len()))?;
         }
         visit(
@@ -267,7 +272,7 @@ impl ReadPolicy {
                     .ok_or_else(overflow)?,
             ),
         )?;
-        for base in &self.exclusion_bases {
+        for base in self.exclusion_bases.iter() {
             visit(0, Some(base.as_os_str().len()))?;
         }
         Ok(())
@@ -277,19 +282,19 @@ impl ReadPolicy {
         &self,
         visit: &mut dyn FnMut(usize) -> Result<(), String>,
     ) -> Result<(), String> {
-        for root in self.configured_roots.iter().chain(&self.mapped_roots) {
+        for root in self.configured_roots.iter().chain(self.mapped_roots.iter()) {
             visit(root.path.as_os_str().len())?;
-            for base in &root.pattern_exclusion_bases {
+            for base in root.pattern_exclusion_bases.iter() {
                 visit(base.as_os_str().len())?;
             }
         }
         for path in self.authorized_files.iter() {
             visit(path.as_os_str().len())?;
         }
-        for pattern in &self.exclusions {
+        for pattern in self.exclusions.iter() {
             visit(pattern.len())?;
         }
-        for base in &self.exclusion_bases {
+        for base in self.exclusion_bases.iter() {
             visit(base.as_os_str().len())?;
         }
         // globset does not expose compiled trie/DFA storage. Refuse recovery
@@ -368,6 +373,7 @@ impl ReadPolicy {
         for base in exclusion_bases {
             add_unique_path(&mut unique_exclusion_bases, base);
         }
+        let unique_exclusion_bases = Arc::<[PathBuf]>::from(unique_exclusion_bases);
         let configured_roots = configured_roots
             .into_iter()
             .map(|path| AuthorizedReadRoot {
@@ -387,7 +393,7 @@ impl ReadPolicy {
             configured_roots,
             mapped_roots,
             authorized_files: Arc::new(Vec::new()),
-            exclusions: exclusions.to_vec(),
+            exclusions: exclusions.into(),
             exclusion_bases: unique_exclusion_bases,
             compiled_exclusions: Arc::new(CompiledExclusions::new(exclusions)),
         }
@@ -441,17 +447,27 @@ impl ReadPolicy {
         }
 
         fn root_bytes(root: &AuthorizedReadRoot) -> usize {
-            std::mem::size_of::<AuthorizedReadRoot>()
-                .saturating_add(path_bytes(&root.path))
-                .saturating_add(
-                    root.pattern_exclusion_bases
-                        .iter()
-                        .map(path_bytes)
-                        .sum::<usize>(),
-                )
+            std::mem::size_of::<AuthorizedReadRoot>().saturating_add(path_bytes(&root.path))
         }
 
-        let configured = self.configured_roots.iter().map(root_bytes).sum::<usize>();
+        // Every root shares one list of exclusion bases.
+        let shared_bases = self
+            .configured_roots
+            .iter()
+            .chain(self.mapped_roots.iter())
+            .next()
+            .map_or(0, |root| {
+                root.pattern_exclusion_bases
+                    .iter()
+                    .map(path_bytes)
+                    .sum::<usize>()
+            });
+        let configured = self
+            .configured_roots
+            .iter()
+            .map(root_bytes)
+            .sum::<usize>()
+            .saturating_add(shared_bases);
         let mapped = self.mapped_roots.iter().map(root_bytes).sum::<usize>();
         let authorized_files = self.authorized_files.iter().map(path_bytes).sum::<usize>();
         let exclusions = self
@@ -1665,6 +1681,39 @@ mod tests {
 #[cfg(test)]
 mod view_tests {
     use super::*;
+
+    /// l4d-10: each disk revision of a loaded source clones its policy, and
+    /// every root lists every exclusion base, so copies grew with the square
+    /// of the roots (240 KB each at 60 roots).
+    #[test]
+    fn a_cloned_policy_shares_its_roots_and_exclusion_bases() {
+        let roots = (0..60)
+            .map(|root| PathBuf::from(format!("/ws/Source{root:02}")))
+            .collect::<Vec<_>>();
+        let policy = ReadPolicy::new(
+            &roots,
+            &[],
+            &["*.bak".to_string()],
+            &EffectiveOverrides::default(),
+        );
+        let clone = policy.clone();
+        let (original, copy) = (policy.view(), clone.view());
+        assert_eq!(original, copy);
+        assert!(std::ptr::eq(
+            original.exclusion_bases.as_ptr(),
+            copy.exclusion_bases.as_ptr()
+        ));
+        assert!(std::ptr::eq(
+            original.configured_roots[0]
+                .pattern_exclusion_bases
+                .as_ptr(),
+            copy.configured_roots[59].pattern_exclusion_bases.as_ptr()
+        ));
+        assert!(std::ptr::eq(
+            original.exclusions.as_ptr(),
+            copy.exclusions.as_ptr()
+        ));
+    }
 
     #[test]
     fn read_policy_view_follows_policy_equality() {

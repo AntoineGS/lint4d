@@ -13979,6 +13979,21 @@ pub(in crate::workspace) mod tests {
         fn crawl(session: &Workspace, cache: &PersistentCache, open: &Url) -> Workspace {
             let mut crawl = crawl_view(session, cache, true);
             crawl
+                .crawl_with_cancel(open, &AtomicBool::new(false))
+                .expect("crawl");
+            crawl
+        }
+
+        /// `crawl`, keeping what it walked indexed in the crawl's view (the
+        /// warmer's crawl releases it, l4d-10), for tests that inspect its
+        /// analysis.
+        fn crawl_keeping_its_index(
+            session: &Workspace,
+            cache: &PersistentCache,
+            open: &Url,
+        ) -> Workspace {
+            let mut crawl = crawl_view(session, cache, true);
+            crawl
                 .warm_with_cancel(open, &AtomicBool::new(false))
                 .expect("crawl");
             crawl
@@ -14196,7 +14211,7 @@ pub(in crate::workspace) mod tests {
             assert_eq!(cache.settle(Duration::from_secs(5)), CacheState::Enabled);
             let mut crawled = crawl_view(&session, &cache, false);
             crawled
-                .warm_with_cancel(&open, &AtomicBool::new(false))
+                .crawl_with_cancel(&open, &AtomicBool::new(false))
                 .expect("crawl");
             assert!(
                 session
@@ -14258,7 +14273,7 @@ pub(in crate::workspace) mod tests {
                 .unwrap();
             let cache = start(&session, store.path(), true);
             assert_eq!(cache.settle(Duration::from_secs(5)), CacheState::Enabled);
-            let crawled = crawl(&session, &cache, &open);
+            let crawled = crawl_keeping_its_index(&session, &cache, &open);
             for path in [&main, &shapes, &other] {
                 let uri = Url::from_file_path(path).unwrap();
                 assert!(
@@ -14408,7 +14423,7 @@ pub(in crate::workspace) mod tests {
             let (session, open) = configured_main_source(root);
             let cache = start(&session, store.path(), true);
             assert_eq!(cache.settle(Duration::from_secs(5)), CacheState::Enabled);
-            let crawled = crawl(&session, &cache, &open);
+            let crawled = crawl_keeping_its_index(&session, &cache, &open);
             assert_eq!(
                 sorted(session.project_cache.published_by_crawl_for_test()),
                 units(root, ROOT_UNITS)
@@ -14506,7 +14521,7 @@ pub(in crate::workspace) mod tests {
             }));
             assert!(
                 paused
-                    .warm_with_cancel(&open, &AtomicBool::new(false))
+                    .crawl_with_cancel(&open, &AtomicBool::new(false))
                     .is_err()
             );
             assert_eq!(session.project_cache.published_by_crawl_for_test().len(), 3);
@@ -14672,7 +14687,7 @@ pub(in crate::workspace) mod tests {
                 .unwrap();
             let cache = start(&session, store.path(), true);
             assert_eq!(cache.settle(Duration::from_secs(5)), CacheState::Enabled);
-            let crawled = crawl(&session, &cache, &open);
+            let crawled = crawl_keeping_its_index(&session, &cache, &open);
             for name in ["X", "Main"] {
                 let uri = Url::from_file_path(root.join(format!("lib/{name}.pas"))).unwrap();
                 assert!(crawled.index.parsed_document(&uri).is_some(), "{name}");
@@ -14744,7 +14759,7 @@ pub(in crate::workspace) mod tests {
             }));
             assert!(
                 crawled
-                    .warm_with_cancel(&open, &AtomicBool::new(false))
+                    .crawl_with_cancel(&open, &AtomicBool::new(false))
                     .is_err()
             );
             let published = sorted(session.project_cache.published_by_crawl_for_test());

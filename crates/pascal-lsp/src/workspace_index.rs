@@ -2092,6 +2092,66 @@ mod tests {
         assert!(name_matches("anything", ""));
     }
 
+    /// l4d-10: a generated business object unit declares a field, a getter,
+    /// a setter and a property per table column; its member is charged
+    /// within a fifth of what the index keeps for it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dense_members_charge_is_within_a_fifth_of_its_heap() {
+        let names = (0..300)
+            .flat_map(|column| {
+                [
+                    format!("FColumn{column:03}"),
+                    format!("GetColumn{column:03}"),
+                    format!("SetColumn{column:03}"),
+                    format!("Column{column:03}"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let decls = names
+            .iter()
+            .map(|name| {
+                (
+                    name.as_str(),
+                    DeclarationKind::Field,
+                    DeclarationShape::Field,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let postings = names.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut index = ContextIndex::new();
+        let units = (0..20)
+            .map(|unit| PathBuf::from(format!("/w/Common/BOBase/BaseTABLE{unit:04}.pas")))
+            .collect::<Vec<_>>();
+        index.set_members(units.clone());
+        let all = units
+            .iter()
+            .map(|path| {
+                let unit = path.file_stem().unwrap().to_string_lossy().to_lowercase();
+                facts(&unit, &["bobase", "classes", "sysutils"], &postings, &decls)
+            })
+            .collect::<Vec<_>>();
+        let before = crate::test_alloc::live_bytes();
+        let charged_before = index.bytes();
+        for (path, facts) in units.iter().zip(&all) {
+            let stamps = vec![MemberStamp {
+                path: path.clone(),
+                stamp: None,
+            }];
+            let facts = MemberFacts::from_facts(path, facts, vec![Some(path.clone())]);
+            index.insert(path, facts, stamps, 1);
+        }
+        let measured = usize::try_from(crate::test_alloc::live_bytes() - before).unwrap();
+        let charged = index.bytes() - charged_before;
+        let error = charged.abs_diff(measured) as f64 / measured as f64;
+        assert!(
+            error <= 0.2,
+            "charged {charged} bytes for members that keep {measured} ({:.0}% off)",
+            error * 100.0
+        );
+    }
+
     #[test]
     fn charge_for_matches_the_stored_charge() {
         let mut index = ContextIndex::new();

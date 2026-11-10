@@ -23,10 +23,11 @@ use crate::workspace_index::{
 /// Default for the `maxCacheBytes` limit.
 pub(crate) const DEFAULT_MAX_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
-/// Retained heap bytes per indexed source byte, measured by
-/// `measure_retained_bytes_per_source_byte` on RAD Studio 7.0 RTL/VCL units.
-#[allow(dead_code)]
-pub(crate) const RETAINED_BYTES_PER_SOURCE_BYTE: usize = 48; // measured 2026-09-29: 46, 45, 45 on RAD Studio 7.0 RTL/VCL
+/// Retained heap bytes per source byte, for charging a source before it is
+/// parsed (`workspace::hydration`). Measured 2026-09-29 on RAD Studio 7.0
+/// RTL/VCL units (46, 45, 45); a parse already in memory is charged by its
+/// shape instead (`ParsedDocument::retained_bytes`, l4d-10).
+pub(crate) const RETAINED_BYTES_PER_SOURCE_BYTE: usize = 48;
 
 /// Shared directory catalogues (l4d-20) may hold at most this fraction of
 /// `maxCacheBytes`. Like a reservation, they may evict unpinned entries to
@@ -158,12 +159,8 @@ pub(crate) fn overlay_content_hash(text: &str) -> u64 {
     pascal_project::content_hash_bytes(text.as_bytes())
 }
 
-pub(crate) fn unit_value_bytes(indexed_len: usize) -> usize {
-    indexed_len.saturating_mul(RETAINED_BYTES_PER_SOURCE_BYTE)
-}
-
 pub(crate) fn import_value_bytes(resolved: &pascal_core::ResolvedImports) -> usize {
-    resolved.dependencies.iter().fold(4096usize, |total, unit| {
+    let dependencies = resolved.dependencies.iter().fold(4096usize, |total, unit| {
         total
             .saturating_add(unit.source.bytes.len())
             .saturating_add(
@@ -172,7 +169,25 @@ pub(crate) fn import_value_bytes(resolved: &pascal_core::ResolvedImports) -> usi
                     .as_deref()
                     .map_or(0, |text| text.len()),
             )
-    })
+            .saturating_add(unit.requested_name.len())
+            .saturating_add(unit.declared_name.len())
+            .saturating_add(unit.source.id.as_str().len())
+            .saturating_add(path_bytes(&unit.source.path))
+            .saturating_add(revision_bytes(&unit.source.revision))
+    });
+    resolved
+        .bindings
+        .iter()
+        .fold(dependencies, |total, binding| {
+            total
+                .saturating_add(binding.importer_source_id.as_str().len())
+                .saturating_add(binding.site.requested_name.len())
+                .saturating_add(strings_bytes(&binding.authorized_qualifiers))
+                .saturating_add(match &binding.target {
+                    pascal_core::ResolutionTarget::Found(id) => id.as_str().len(),
+                    _ => 0,
+                })
+        })
 }
 
 fn path_bytes(path: &Path) -> usize {
@@ -203,17 +218,29 @@ fn report_bytes(report: &pascal_core::ResolutionReport) -> usize {
     let observations = report.observations.iter().fold(
         std::mem::size_of_val(report.observations.as_slice()),
         |total, observation| {
-            let path = match observation {
-                O::Directory { path, .. }
-                | O::Candidate { path, .. }
-                | O::Payload { path, .. }
-                | O::Metadata(
-                    pascal_project::MetadataObservation::Stat { path }
-                    | pascal_project::MetadataObservation::Payload { path, .. },
-                ) => path,
-                O::ProjectRead(read) => &read.path,
+            let owned = match observation {
+                O::Directory { path, entry, .. } => {
+                    path_bytes(path).saturating_add(path_bytes(&entry.path))
+                }
+                O::Candidate { path, entry, .. } => path_bytes(path)
+                    .saturating_add(entry.as_ref().map_or(0, |entry| path_bytes(&entry.path))),
+                O::Payload {
+                    source_id,
+                    path,
+                    revision,
+                } => path_bytes(path)
+                    .saturating_add(source_id.as_str().len())
+                    .saturating_add(revision_bytes(revision)),
+                O::Metadata(pascal_project::MetadataObservation::Stat { path }) => path_bytes(path),
+                O::Metadata(pascal_project::MetadataObservation::Payload {
+                    path,
+                    path_entry,
+                    ..
+                }) => path_bytes(path).saturating_add(path_bytes(&path_entry.path)),
+                O::ProjectRead(read) => path_bytes(&read.path)
+                    .saturating_add(read.content_bytes.as_ref().map_or(0, Vec::len)),
             };
-            total.saturating_add(path_bytes(path))
+            total.saturating_add(owned)
         },
     );
     observations
@@ -348,8 +375,10 @@ pub(crate) fn observation_probes(
 /// `probes` with each exact duplicate dropped, in first-seen order: a hit
 /// checks every probe (`probes_hold`), and the resolver observes a
 /// directory once per lookup that consults it (rootcause A4,
-/// l4d-zf1b.8). Probes of one path that differ are all kept.
-pub(crate) fn dedup_probes(probes: Vec<Probe>) -> Vec<Probe> {
+/// l4d-zf1b.8). Probes of one path that differ are all kept. The result
+/// has no spare capacity: entries keep it, and a collect in place would keep
+/// the room of every duplicate (l4d-10: 7.4 MB for 0.15 MB of probes).
+pub(crate) fn dedup_probes(mut probes: Vec<Probe>) -> Vec<Probe> {
     let mut seen: HashMap<&Path, Vec<usize>> = HashMap::new();
     let mut kept = Vec::with_capacity(probes.len());
     for (at, probe) in probes.iter().enumerate() {
@@ -365,10 +394,11 @@ pub(crate) fn dedup_probes(probes: Vec<Probe>) -> Vec<Probe> {
         kept.push(at);
     }
     if kept.len() == probes.len() {
+        probes.shrink_to_fit();
         return probes;
     }
     let mut keep = kept.into_iter().peekable();
-    probes
+    let mut kept = probes
         .into_iter()
         .enumerate()
         .filter_map(|(at, probe)| {
@@ -377,7 +407,9 @@ pub(crate) fn dedup_probes(probes: Vec<Probe>) -> Vec<Probe> {
                 probe
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    kept.shrink_to_fit();
+    kept
 }
 
 /// Every include candidate observed while resolving an expansion, plus the
@@ -475,55 +507,249 @@ pub(crate) fn probes_hold(probes: &[Probe], overlays: &HashMap<Url, OverlayInput
     held
 }
 
-#[cfg(test)]
-mod tests {
-    fn resident_bytes() -> usize {
-        let statm = std::fs::read_to_string("/proc/self/statm").expect("statm");
-        let pages: usize = statm
-            .split_whitespace()
-            .nth(1)
-            .and_then(|value| value.parse().ok())
-            .expect("resident pages");
-        pages * 4096
+/// `retained_bytes()` against the heap a value really keeps (l4d-10),
+/// counted by the test allocator, tree-sitter's C allocations included.
+#[cfg(all(test, target_os = "linux"))]
+mod retained_tests {
+    use super::*;
+    use crate::test_alloc::live_bytes;
+
+    /// The Lazarus code tool manager: 228 KB of RTL-style Object Pascal.
+    const LARGE_UNIT: &str = include_str!("../../tree-sitter-pascal/examples/codetoolmanager.pas");
+
+    fn kept_by<T>(build: impl FnOnce() -> T) -> (T, usize) {
+        let before = live_bytes();
+        let value = build();
+        let after = live_bytes();
+        (
+            value,
+            usize::try_from(after - before).expect("net allocation"),
+        )
     }
 
-    /// Run manually:
-    /// `PASCAL_RTL=~/.local/share/Headless-Delphi/files/RAD\ Studio/7.0/source/Win32 \
-    ///  cargo test -p pascal-lsp --release --lib -- --ignored measure_retained --nocapture`
-    #[test]
-    #[ignore = "manual measurement against local Delphi sources"]
-    fn measure_retained_bytes_per_source_byte() {
-        let root = std::path::PathBuf::from(std::env::var("PASCAL_RTL").expect("PASCAL_RTL"));
-        let files = [
-            "rtl/win/Windows.pas",
-            "rtl/sys/SysUtils.pas",
-            "rtl/common/Classes.pas",
-            "vcl/Controls.pas",
-            "vcl/Forms.pas",
-            "db/DB.pas",
-        ];
+    fn parse(name: &str, text: &str) -> Arc<ParsedDocument> {
         let mut index = crate::navigation::NavigationIndex::new();
-        let context = pascal_core::conditional::ConditionalContext::default();
-        let cancel = std::sync::atomic::AtomicBool::new(false);
-        let before = resident_bytes();
-        let mut source_bytes = 0usize;
-        for file in files {
-            let path = root.join(file);
-            let bytes = std::fs::read(&path).expect("source");
-            let text = crate::workspace::resolver::decode_source_bytes(&bytes);
-            source_bytes += text.len();
-            let uri = lsp_types::Url::from_file_path(&path).expect("uri");
-            index
-                .update_with_context_and_cached_with_cancel(uri, text, &context, None, &cancel)
-                .expect("index");
-        }
-        let after = resident_bytes();
-        let factor = (after.saturating_sub(before)) / source_bytes.max(1);
-        println!(
-            "source={source_bytes} retained={} factor={factor}",
-            after - before
+        let uri = Url::from_file_path(Path::new("/ws").join(name)).unwrap();
+        index
+            .update_with_context_and_cached_with_cancel(
+                uri.clone(),
+                text.to_string(),
+                &pascal_core::conditional::ConditionalContext::default(),
+                None,
+                &AtomicBool::new(false),
+            )
+            .expect("index");
+        index.parsed_document(&uri).expect("parsed")
+    }
+
+    fn assert_within_a_fifth(what: &str, estimate: usize, measured: usize) {
+        let error = estimate.abs_diff(measured) as f64 / measured as f64;
+        assert!(
+            error <= 0.2,
+            "{what}: retained_bytes {estimate} vs measured {measured} ({:.0}% off)",
+            error * 100.0
         );
-        std::hint::black_box(&index);
+    }
+
+    #[test]
+    fn a_large_units_parse_is_estimated_within_a_fifth_of_its_heap() {
+        let (unit, measured) = kept_by(|| UnitValue {
+            parsed: parse("CodeToolManager.pas", LARGE_UNIT),
+            expansion: None,
+            probes: Vec::new(),
+            disk: None,
+        });
+        assert_within_a_fifth("unit", unit.retained_bytes(), measured);
+    }
+
+    /// Generated declarations: many syntax nodes and symbols per byte, so
+    /// a per-source-byte factor under-counts them (48x estimated, 120x kept).
+    fn dense_unit() -> String {
+        let mut text = String::from("unit Dense;\ninterface\ntype\n  TDense = class\n  public\n");
+        for member in 0..400 {
+            text.push_str(&format!(
+                "    procedure Member{member}(Value: Integer; const Name: string);\n"
+            ));
+        }
+        text.push_str("  end;\nimplementation\n");
+        for member in 0..400 {
+            text.push_str(&format!(
+                "procedure TDense.Member{member}(Value: Integer; const Name: string);\nbegin\nend;\n"
+            ));
+        }
+        text.push_str("end.\n");
+        text
+    }
+
+    /// Mostly comments: few nodes per byte, so a per-byte factor over-counts.
+    fn sparse_unit() -> String {
+        let mut text = String::from("unit Sparse;\ninterface\n");
+        for line in 0..4_000 {
+            text.push_str(&format!(
+                "// Line {line} of the licence and change history kept at the top of the unit.\n"
+            ));
+        }
+        text.push_str("procedure Run;\nimplementation\nprocedure Run;\nbegin\nend;\nend.\n");
+        text
+    }
+
+    /// A project read policy with as many roots as a large Delphi project's
+    /// search path: every disk revision carries its own copy.
+    fn wide_policy() -> pascal_project::ReadPolicy {
+        let roots = (0..60)
+            .map(|root| PathBuf::from(format!("/ws/Projects/Library/Components/Source{root:02}")))
+            .collect::<Vec<_>>();
+        pascal_project::ReadPolicy::new(
+            &roots,
+            &[],
+            &["*.bak".to_string(), "__history".to_string()],
+            &pascal_project::delphi_overrides::EffectiveOverrides::default(),
+        )
+    }
+
+    fn disk_revision(
+        policy: &pascal_project::ReadPolicy,
+        path: &Path,
+    ) -> pascal_core::SourceRevision {
+        pascal_core::SourceRevision::Disk {
+            stamp: ProjectReadStamp {
+                bytes: 20_000,
+                modified: Some(std::time::SystemTime::UNIX_EPOCH),
+                is_dir: false,
+                is_symlink: false,
+                change: None,
+                settled: true,
+            },
+            content_hash: 7,
+            read_policy: policy.clone(),
+            path_entry: pascal_project::ProjectPathEntry {
+                path: path.parent().unwrap().to_path_buf(),
+                provenance: pascal_project::ProjectPathProvenance::LegacyNative,
+            },
+        }
+    }
+
+    fn unit_path(index: usize) -> PathBuf {
+        PathBuf::from(format!(
+            "/ws/Projects/Library/Components/Source00/BusinessUnit{index:04}.pas"
+        ))
+    }
+
+    fn import_value_like_a_vcl_unit(policy: &pascal_project::ReadPolicy) -> ImportValue {
+        use pascal_core::{
+            ImportSection, ImportSite, LoadedSource, ResolutionObservation as O, ResolutionTarget,
+            ResolvedImport, ResolvedUnit, SourceId,
+        };
+        let dependencies = (0..30)
+            .map(|index| {
+                let path = unit_path(index);
+                let text = "x".repeat(20_000);
+                ResolvedUnit {
+                    requested_name: format!("BusinessUnit{index:04}"),
+                    declared_name: format!("BusinessUnit{index:04}"),
+                    source: LoadedSource {
+                        id: SourceId::new(path.display().to_string()),
+                        bytes: Arc::from(text.as_bytes()),
+                        decoded_text: Some(Arc::from(text.as_str())),
+                        revision: disk_revision(policy, &path),
+                        path,
+                        compile_time_backing: None,
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        let bindings = (0..30)
+            .map(|index| ResolvedImport {
+                importer_source_id: SourceId::new("/ws/Projects/App/Main.pas"),
+                site: ImportSite {
+                    byte_range: index * 20..index * 20 + 16,
+                    requested_name: format!("BusinessUnit{index:04}"),
+                    section: ImportSection::Interface,
+                },
+                target: ResolutionTarget::Found(SourceId::new(
+                    unit_path(index).display().to_string(),
+                )),
+                authorized_qualifiers: vec!["Vcl".to_string(), "System".to_string()],
+            })
+            .collect();
+        let observations = (0..200)
+            .map(|index| O::Candidate {
+                path: unit_path(index),
+                entry: Some(pascal_project::ProjectPathEntry {
+                    path: unit_path(index).parent().unwrap().to_path_buf(),
+                    provenance: pascal_project::ProjectPathProvenance::LegacyNative,
+                }),
+                stamp: None,
+                present: index < 30,
+            })
+            .collect();
+        ImportValue {
+            resolved: Arc::new(pascal_core::ResolvedImports {
+                bindings,
+                dependencies,
+                complete: true,
+                settled: true,
+            }),
+            report: Arc::new(pascal_core::ResolutionReport {
+                observations,
+                warnings: vec!["a warning about one of the imports".to_string()],
+                complete: true,
+                incomplete_reasons: vec![],
+            }),
+            probes: (0..30)
+                .map(|index| Probe::Content {
+                    path: unit_path(index),
+                    stamp: None,
+                    content_hash: 7,
+                })
+                .collect(),
+            watch_dirs: (0..10)
+                .map(|index| {
+                    unit_path(index)
+                        .parent()
+                        .unwrap()
+                        .join(format!("Dir{index}"))
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn an_import_entry_is_estimated_within_a_fifth_of_its_heap() {
+        let policy = wide_policy();
+        let (value, measured) = kept_by(|| import_value_like_a_vcl_unit(&policy));
+        assert_within_a_fifth("imports", value.retained_bytes(), measured);
+    }
+
+    #[test]
+    fn an_interface_entry_is_estimated_within_a_fifth_of_its_heap() {
+        let policy = wide_policy();
+        let (value, measured) = kept_by(|| InterfaceImportsValue {
+            bindings: (0..100)
+                .map(|index| InterfaceBinding {
+                    name: format!("BusinessUnit{index:04}"),
+                    uri: Url::from_file_path(unit_path(index)).unwrap(),
+                    revision: disk_revision(&policy, &unit_path(index)),
+                })
+                .collect(),
+            complete: true,
+            probes: (0..100)
+                .map(|index| Probe::Content {
+                    path: unit_path(index),
+                    stamp: None,
+                    content_hash: 7,
+                })
+                .collect(),
+        });
+        assert_within_a_fifth("interface", value.retained_bytes(), measured);
+    }
+
+    #[test]
+    fn dense_and_sparse_parses_are_estimated_within_a_fifth_of_their_heap() {
+        for (name, text) in [("Dense.pas", dense_unit()), ("Sparse.pas", sparse_unit())] {
+            let (parsed, measured) = kept_by(|| parse(name, &text));
+            assert_within_a_fifth(name, parsed.retained_bytes(), measured);
+        }
     }
 }
 
@@ -760,6 +986,14 @@ mod probe_tests {
 
 #[cfg(test)]
 mod cache_tests {
+    /// A cache charging exactly the bytes these tests store, without its own
+    /// index copies (`index_bytes`): they check LRU, pins and reservations
+    /// in small abstract sizes.
+    fn abstract_cache(max_bytes: usize) -> ProjectCache {
+        let cache = ProjectCache::new(max_bytes);
+        lock(&cache.inner).charge_indexes = false;
+        cache
+    }
     use super::*;
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::AtomicBool;
@@ -838,7 +1072,7 @@ mod cache_tests {
 
     #[test]
     fn closure_crawl_requests_are_deduplicated_and_drained() {
-        let cache = ProjectCache::new(usize::MAX);
+        let cache = abstract_cache(usize::MAX);
         cache.request_closure_crawl(&uri("Main.pas"));
         cache.request_closure_crawl(&uri("Main.pas"));
         cache.request_closure_crawl(&uri("Other.pas"));
@@ -851,7 +1085,7 @@ mod cache_tests {
 
     #[test]
     fn closure_misses_request_a_crawl_only_when_a_new_unit_misses() {
-        let cache = ProjectCache::new(usize::MAX);
+        let cache = abstract_cache(usize::MAX);
         let main = uri("Main.pas");
         let misses = |names: &[&str]| names.iter().map(|name| uri(name)).collect::<HashSet<_>>();
 
@@ -882,7 +1116,7 @@ mod cache_tests {
 
     #[test]
     fn an_overflow_forgets_closure_misses() {
-        let cache = ProjectCache::new(usize::MAX);
+        let cache = abstract_cache(usize::MAX);
         let main = uri("Main.pas");
         let misses = || HashSet::from([uri("Sync.pas")]);
         cache.report_closure_misses(&main, misses());
@@ -958,7 +1192,7 @@ mod cache_tests {
 
     #[test]
     fn peek_unit_returns_verified_entries_for_the_same_project_and_content() {
-        let cache = ProjectCache::new(usize::MAX);
+        let cache = abstract_cache(usize::MAX);
         let ctx = context("A.dproj");
         fill_unit(&cache, "Base.pas", &ctx, 7, vec![]);
 
@@ -981,7 +1215,7 @@ mod cache_tests {
 
     #[test]
     fn entries_are_not_shared_by_contexts_that_differ_in_analysis_inputs() {
-        let cache = ProjectCache::new(usize::MAX);
+        let cache = abstract_cache(usize::MAX);
         let ctx = context("A.dproj");
         fill_unit(&cache, "Base.pas", &ctx, 7, vec![]);
         // Include paths are not part of the fingerprint, so only the
@@ -1009,7 +1243,7 @@ mod cache_tests {
         let temp = tempfile::tempdir().unwrap();
         let include = temp.path().join("Defs.inc");
         std::fs::write(&include, "{$DEFINE A}").unwrap();
-        let cache = ProjectCache::new(usize::MAX);
+        let cache = abstract_cache(usize::MAX);
         let ctx = context("A.dproj");
         fill_unit(
             &cache,
@@ -1038,7 +1272,7 @@ mod cache_tests {
 
     #[test]
     fn peek_never_claims_or_waits() {
-        let cache = ProjectCache::new(usize::MAX);
+        let cache = abstract_cache(usize::MAX);
         let ctx = context("A.dproj");
         assert!(
             cache
@@ -1065,7 +1299,7 @@ mod cache_tests {
 
     #[test]
     fn interface_entries_report_whether_they_are_new_or_changed() {
-        let cache = ProjectCache::new(usize::MAX);
+        let cache = abstract_cache(usize::MAX);
         let ctx = context("A.dproj");
         let derived = uri("Derived.pas");
 
@@ -1116,7 +1350,7 @@ mod cache_tests {
 
     #[test]
     fn interface_entries_from_before_an_invalidation_are_dropped() {
-        let cache = ProjectCache::new(usize::MAX);
+        let cache = abstract_cache(usize::MAX);
         let epoch = cache.invalidation_epoch();
         cache.invalidate_path(&ws_path("Other.pas"));
         assert!(!cache.put_interface_imports(
@@ -1143,7 +1377,7 @@ mod cache_tests {
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().join("Base.pas");
         std::fs::write(&base, "unit Base;").unwrap();
-        let cache = ProjectCache::new(usize::MAX);
+        let cache = abstract_cache(usize::MAX);
         let ctx = context("A.dproj");
         let mut value = interface_value(&[], true);
         value.probes = vec![Probe::Content {
@@ -1190,7 +1424,10 @@ mod cache_tests {
             import_value_bytes(&resolved),
             4096usize
                 .saturating_add(raw.len())
-                .saturating_add(decoded.len()),
+                .saturating_add(decoded.len())
+                .saturating_add("Provider".len() * 2)
+                .saturating_add("Provider.pas".len())
+                .saturating_add("/ws/Provider.pas".len()),
             "the estimate includes both retained source payloads and entry metadata"
         );
     }
@@ -1206,7 +1443,7 @@ mod cache_tests {
 
     #[test]
     fn stored_entry_is_a_hit_for_same_context_and_hash() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         fill(&cache, "Main.pas", &ctx, 7, 10);
         assert!(matches!(
@@ -1217,7 +1454,7 @@ mod cache_tests {
 
     #[test]
     fn different_hash_or_context_is_a_miss() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         fill(&cache, "Main.pas", &ctx, 7, 10);
         assert!(matches!(
@@ -1240,7 +1477,7 @@ mod cache_tests {
     fn failed_probe_is_a_miss() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("Gone.pas");
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let Lookup::Compute(claim) =
             cache.imports(&uri("Main.pas"), &ctx, 1, &HashMap::new(), &no_cancel())
@@ -1265,7 +1502,7 @@ mod cache_tests {
 
     #[test]
     fn dropped_claim_lets_the_next_caller_compute() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let Lookup::Compute(claim) =
             cache.imports(&uri("Main.pas"), &ctx, 1, &HashMap::new(), &no_cancel())
@@ -1281,7 +1518,7 @@ mod cache_tests {
 
     #[test]
     fn cancelled_owner_result_is_not_cached() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let Lookup::Compute(claim) =
             cache.imports(&uri("Main.pas"), &ctx, 1, &HashMap::new(), &no_cancel())
@@ -1299,7 +1536,7 @@ mod cache_tests {
 
     #[test]
     fn poisoned_cache_discards_entries_and_recovers() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         fill(&cache, "Main.pas", &ctx, 1, 1);
         cache.poison_state();
@@ -1318,7 +1555,7 @@ mod cache_tests {
 
     #[test]
     fn waiter_receives_the_in_flight_result() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let Lookup::Compute(claim) =
             cache.imports(&uri("Main.pas"), &ctx, 1, &HashMap::new(), &no_cancel())
@@ -1351,7 +1588,7 @@ mod cache_tests {
 
     #[test]
     fn waiter_takes_over_when_the_computation_is_abandoned() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let Lookup::Compute(claim) =
             cache.imports(&uri("Main.pas"), &ctx, 1, &HashMap::new(), &no_cancel())
@@ -1381,7 +1618,7 @@ mod cache_tests {
 
     #[test]
     fn a_claim_for_other_input_is_not_waited_on() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let main = uri("Main.pas");
         let Lookup::Compute(older) = cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel())
@@ -1490,7 +1727,7 @@ mod cache_tests {
 
     #[test]
     fn interactive_lookup_waits_for_a_unit_claim_instead_of_parsing_it_again() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let main = uri("Main.pas");
         let owner_cancel = Arc::new(AtomicBool::new(false));
@@ -1525,7 +1762,7 @@ mod cache_tests {
 
     #[test]
     fn cancelled_interactive_waiter_returns_while_the_claim_is_held() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let main = uri("Main.pas");
         let (finish, owner) = spawn_owner(
@@ -1562,7 +1799,7 @@ mod cache_tests {
 
     #[test]
     fn a_failed_owner_lets_the_waiter_compute() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let main = uri("Main.pas");
         let (finish, owner) = spawn_owner(
@@ -1598,7 +1835,7 @@ mod cache_tests {
 
     #[test]
     fn a_cancelled_owners_claim_is_taken_over() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let main = uri("Main.pas");
         let owner_cancel = Arc::new(AtomicBool::new(false));
@@ -1632,7 +1869,7 @@ mod cache_tests {
 
     #[test]
     fn interactive_lookup_takes_over_a_yielding_claim() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let main = uri("Main.pas");
         let (finish, owner) = spawn_owner(
@@ -1666,7 +1903,7 @@ mod cache_tests {
     /// interactive work does, and still reuses what the warmer stored.
     #[test]
     fn client_request_lookup_takes_over_a_yielding_claim() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let main = uri("Main.pas");
         let (finish, owner) = spawn_owner(
@@ -1701,7 +1938,7 @@ mod cache_tests {
     /// l4d-ig6b: what the warmer finished is reused, not computed again.
     #[test]
     fn client_request_lookup_reuses_a_unit_the_warmer_stored() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let main = uri("Main.pas");
         let (finish, owner) = spawn_owner(
@@ -1727,7 +1964,7 @@ mod cache_tests {
 
     #[test]
     fn interactive_unit_waits_on_a_roleless_owner_are_bounded() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let main = uri("Main.pas");
         let (finish, owner) = spawn_owner(&cache, &main, &ctx, ClaimRole::default());
@@ -1749,7 +1986,7 @@ mod cache_tests {
 
     #[test]
     fn interactive_lookup_waits_for_a_jobs_import_claim() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let main = uri("Main.pas");
         let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
@@ -1815,7 +2052,7 @@ mod cache_tests {
 
     #[test]
     fn interactive_import_waits_are_bounded_and_leave_the_claim() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let main = uri("Main.pas");
         let Lookup::Compute(claim) = cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel())
@@ -1863,7 +2100,7 @@ mod cache_tests {
 
     #[test]
     fn a_wait_that_would_close_a_cycle_computes_detached() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let first = uri("First.pas");
         let second = uri("Second.pas");
@@ -1916,7 +2153,7 @@ mod cache_tests {
 
     #[test]
     fn waiter_recovers_poisoned_state_when_condvar_reacquires() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let main = uri("Main.pas");
         let Lookup::Compute(claim) = cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel())
@@ -1964,7 +2201,7 @@ mod cache_tests {
 
     #[test]
     fn cancelled_waiter_returns_cancelled() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let Lookup::Compute(_claim) =
             cache.imports(&uri("Main.pas"), &ctx, 1, &HashMap::new(), &no_cancel())
@@ -1980,7 +2217,7 @@ mod cache_tests {
 
     #[test]
     fn lru_eviction_respects_budget_and_pins() {
-        let cache = ProjectCache::new(25);
+        let cache = abstract_cache(25);
         let ctx = context("A.dproj");
         fill(&cache, "A.pas", &ctx, 1, 10);
         fill(&cache, "B.pas", &ctx, 1, 10);
@@ -2022,7 +2259,7 @@ mod cache_tests {
 
     #[test]
     fn eviction_follows_last_use_across_hits_and_peeks() {
-        let cache = ProjectCache::new(30);
+        let cache = abstract_cache(30);
         let ctx = context("A.dproj");
         fill(&cache, "A.pas", &ctx, 1, 10);
         fill(&cache, "B.pas", &ctx, 1, 10);
@@ -2049,7 +2286,7 @@ mod cache_tests {
 
     #[test]
     fn a_pin_protects_every_layer_of_its_unit_until_the_last_owner_unpins() {
-        let cache = ProjectCache::new(20);
+        let cache = abstract_cache(20);
         let ctx = context("A.dproj");
         // Pinned once ready: an entry stored after its pin is held to the
         // pin cap (half the budget), which A's two layers exceed.
@@ -2080,7 +2317,7 @@ mod cache_tests {
 
     #[test]
     fn repinning_an_owner_replaces_its_previous_pins() {
-        let cache = ProjectCache::new(20);
+        let cache = abstract_cache(20);
         let ctx = context("A.dproj");
         pin_names(&cache, "Open.pas", &["A.pas"], &ctx);
         fill(&cache, "A.pas", &ctx, 1, 10);
@@ -2093,7 +2330,7 @@ mod cache_tests {
 
     #[test]
     fn pins_only_cover_their_own_project_fingerprint() {
-        let cache = ProjectCache::new(10);
+        let cache = abstract_cache(10);
         let a = context("A.dproj");
         let b = context("B.dproj");
         pin_names(&cache, "Open.pas", &["Main.pas"], &b);
@@ -2122,7 +2359,7 @@ mod cache_tests {
     /// entries, never the entries a request stored or used.
     #[test]
     fn a_crawl_store_evicts_only_its_own_entries_no_request_used() {
-        let cache = ProjectCache::new(100);
+        let cache = abstract_cache(100);
         let ctx = context("A.dproj");
         as_role(request_role(), || fill(&cache, "Used.pas", &ctx, 1, 40));
         as_role(crawl_role(), || {
@@ -2172,7 +2409,7 @@ mod cache_tests {
 
     #[test]
     fn a_crawl_interface_put_never_evicts_a_requests_entry() {
-        let cache = ProjectCache::new(100);
+        let cache = abstract_cache(100);
         let ctx = context("A.dproj");
         as_role(request_role(), || fill(&cache, "Used.pas", &ctx, 1, 90));
         as_role(crawl_role(), || {
@@ -2189,7 +2426,7 @@ mod cache_tests {
     /// D51: a request's store still evicts the crawl's entries first by age.
     #[test]
     fn a_request_store_may_evict_the_crawls_entries() {
-        let cache = ProjectCache::new(100);
+        let cache = abstract_cache(100);
         let ctx = context("A.dproj");
         as_role(crawl_role(), || fill(&cache, "C1.pas", &ctx, 1, 60));
         as_role(request_role(), || fill(&cache, "Used.pas", &ctx, 1, 60));
@@ -2201,7 +2438,7 @@ mod cache_tests {
     /// publications past their pool) is under its admission.
     #[test]
     fn a_crawl_reservation_never_evicts_a_requests_entry() {
-        let cache = ProjectCache::new(100);
+        let cache = abstract_cache(100);
         let ctx = context("A.dproj");
         as_role(request_role(), || fill(&cache, "Used.pas", &ctx, 1, 60));
         as_role(crawl_role(), || {
@@ -2220,7 +2457,7 @@ mod cache_tests {
     /// does not make it the crawl's to evict again.
     #[test]
     fn a_crawl_refresh_keeps_a_requests_interface_protected() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let value = || interface_value(&[("Base.pas", 1)], true);
         as_role(request_role(), || {
@@ -2241,7 +2478,7 @@ mod cache_tests {
     /// everything and stays pending.
     #[test]
     fn a_sweep_with_no_known_current_fingerprint_is_deferred() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         fill(&cache, "Main.pas", &ctx, 1, 10);
         cache.begin_fingerprint_sweep();
@@ -2256,7 +2493,7 @@ mod cache_tests {
     /// older ones.
     #[test]
     fn room_for_a_request_is_taken_from_the_crawls_entries_first() {
-        let cache = ProjectCache::new(100);
+        let cache = abstract_cache(100);
         let ctx = context("A.dproj");
         as_role(request_role(), || fill(&cache, "Used.pas", &ctx, 1, 40));
         as_role(crawl_role(), || fill(&cache, "C1.pas", &ctx, 1, 50));
@@ -2273,7 +2510,7 @@ mod cache_tests {
     /// current project's, which the sweep keeps.
     #[test]
     fn fingerprints_used_since_a_sweep_began_are_recorded() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let old = context("Old.dproj");
         let current = context("A.dproj");
         fill(&cache, "Old.pas", &old, 1, 10);
@@ -2288,7 +2525,7 @@ mod cache_tests {
 
     #[test]
     fn pinning_a_ready_entry_counts_it_as_pinned_until_unpinned() {
-        let cache = ProjectCache::new(10);
+        let cache = abstract_cache(10);
         let ctx = context("A.dproj");
         fill(&cache, "A.pas", &ctx, 1, 10);
         assert!(cache.has_room());
@@ -2303,7 +2540,7 @@ mod cache_tests {
 
     #[test]
     fn invalidating_one_path_among_ten_thousand_entries_examines_one() {
-        let cache = ProjectCache::new(usize::MAX);
+        let cache = abstract_cache(usize::MAX);
         let ctx = context("A.dproj");
         for index in 0..10_000 {
             let name = format!("Main{index}.pas");
@@ -2330,7 +2567,7 @@ mod cache_tests {
 
     #[test]
     fn evicting_one_entry_among_ten_thousand_examines_one() {
-        let cache = ProjectCache::new(10_000);
+        let cache = abstract_cache(10_000);
         let ctx = context("A.dproj");
         for index in 0..10_000 {
             fill(&cache, &format!("Main{index}.pas"), &ctx, 1, 1);
@@ -2386,7 +2623,7 @@ mod cache_tests {
 
     #[test]
     fn watcher_calls_run_without_the_cache_lock() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let calls = recording_watcher(&cache);
         let ctx = context("A.dproj");
         let dir = PathBuf::from("/ws/includes");
@@ -2403,7 +2640,7 @@ mod cache_tests {
 
     #[test]
     fn poison_recovery_releases_watches_without_the_cache_lock() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let calls = recording_watcher(&cache);
         let ctx = context("A.dproj");
         let dir = PathBuf::from("/ws/includes");
@@ -2420,7 +2657,7 @@ mod cache_tests {
     fn a_published_catalogue_watches_its_directories_with_the_cache_unlocked() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("sub")).unwrap();
-        let cache = ProjectCache::new(1 << 30);
+        let cache = abstract_cache(1 << 30);
         let calls = recording_watcher(&cache);
         let (key, catalogue) = super::listed_catalogue(temp.path());
         cache
@@ -2448,7 +2685,7 @@ mod cache_tests {
     fn a_catalogue_beyond_the_watch_budget_is_not_watched() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("sub")).unwrap();
-        let cache = ProjectCache::new(1 << 30);
+        let cache = abstract_cache(1 << 30);
         let calls = recording_watcher(&cache);
         cache.set_catalogue_watch_budget_for_test(1);
         let (key, catalogue) = super::listed_catalogue(temp.path());
@@ -2462,7 +2699,7 @@ mod cache_tests {
     #[test]
     fn replacing_the_watcher_forgets_every_watched_catalogue() {
         let temp = tempfile::tempdir().unwrap();
-        let cache = ProjectCache::new(1 << 30);
+        let cache = abstract_cache(1 << 30);
         recording_watcher(&cache);
         let (key, catalogue) = super::listed_catalogue(temp.path());
         let generation = cache
@@ -2480,7 +2717,7 @@ mod cache_tests {
         let temp = tempfile::tempdir().unwrap();
         let shared_directory = temp.path().join("sub");
         std::fs::create_dir_all(&shared_directory).unwrap();
-        let cache = ProjectCache::new(1 << 30);
+        let cache = abstract_cache(1 << 30);
         let calls = recording_watcher(&cache);
         cache.set_catalogue_watch_budget_for_test(2);
         let (old_key, old) = super::listed_catalogue(temp.path());
@@ -2518,7 +2755,7 @@ mod cache_tests {
             fn unwatch(&mut self, _: &Path) {}
         }
         let temp = tempfile::tempdir().unwrap();
-        let cache = ProjectCache::new(1 << 30);
+        let cache = abstract_cache(1 << 30);
         cache.set_watcher(Box::new(Refuse));
         let (key, catalogue) = super::listed_catalogue(temp.path());
         let generation = cache
@@ -2536,14 +2773,61 @@ mod cache_tests {
         }
     }
 
+    /// l4d-10: an entry's charge covers what the cache keeps for it, its
+    /// path indexes included. Generated business units each probe the same
+    /// candidate paths over a long search path (SFClient2: the last index
+    /// batches kept ~1.3 GiB that nothing charged).
+    #[cfg(target_os = "linux")]
     #[test]
-    /// `retained_bytes` takes the parse at the measured factor; that factor
-    /// is calibrated by RSS in `measure_retained_bytes_per_source_byte`, since
-    /// tree-sitter's trees live in C allocations no in-process count sees.
-    /// This checks only what the estimate adds on top of it.
+    fn unit_entries_with_many_shared_probes_are_charged_within_a_fifth_of_their_heap() {
+        let paths = (0..60)
+            .flat_map(|directory| {
+                (0..30).map(move |unit| {
+                    PathBuf::from(format!(
+                        "/ws/Projects/Library/Components/Source{directory:02}/BusinessUnit{unit:04}.pas"
+                    ))
+                })
+            })
+            .collect::<Vec<_>>();
+        let cache = ProjectCache::new(1 << 30);
+        let ctx = context("A.dproj");
+        let before = crate::test_alloc::live_bytes();
+        for unit in 0..20 {
+            let probes = paths
+                .iter()
+                .map(|path| Probe::Stamp {
+                    path: path.clone(),
+                    expected: None,
+                })
+                .collect();
+            let name = format!("BusinessUnit{unit:04}.pas");
+            let value = UnitValue {
+                parsed: parsed_unit(&name),
+                expansion: None,
+                probes,
+                disk: None,
+            };
+            let bytes = value.retained_bytes();
+            match cache.unit(&uri(&name), &ctx, 1, &HashMap::new(), &no_cancel()) {
+                Lookup::Compute(claim) => cache.store_unit(claim, value, bytes, &no_cancel()),
+                _ => panic!("expected a miss for {name}"),
+            }
+        }
+        let measured = usize::try_from(crate::test_alloc::live_bytes() - before).unwrap();
+        let charged = cache.stats().bytes;
+        let error = charged.abs_diff(measured) as f64 / measured as f64;
+        assert!(
+            error <= 0.2,
+            "charged {charged} bytes for entries that keep {measured} ({:.0}% off)",
+            error * 100.0
+        );
+    }
+
+    #[test]
+    /// The parse's own estimate is checked against measured allocations in
+    /// `retained_tests`; this checks what the unit estimate adds to it.
     fn unit_retained_bytes_add_probes_and_unshared_text_to_the_parse_estimate() {
         let parsed = parsed_unit("Base.pas");
-        let source_len = parsed.source_text().len();
         let unit = |probes, disk| UnitValue {
             parsed: parsed.clone(),
             expansion: None,
@@ -2553,7 +2837,7 @@ mod cache_tests {
         let bare = unit(vec![], None).retained_bytes();
         assert_eq!(
             bare,
-            unit_value_bytes(source_len) + std::mem::size_of::<UnitValue>()
+            parsed.retained_bytes() + std::mem::size_of::<UnitValue>()
         );
         assert!(unit(vec![long_probe("A.inc")], None).retained_bytes() >= bare + 256);
 
@@ -2618,7 +2902,7 @@ mod cache_tests {
 
     #[test]
     fn interface_entries_charge_their_probes() {
-        let cache = ProjectCache::new(usize::MAX);
+        let cache = abstract_cache(usize::MAX);
         let ctx = context("A.dproj");
         cache.put_interface_imports(&uri("Bare.pas"), &ctx, 1, interface_value(&[], true), None);
         let bare = cache.stats().bytes;
@@ -2633,7 +2917,7 @@ mod cache_tests {
 
     #[test]
     fn entries_of_one_project_share_its_context() {
-        let cache = ProjectCache::new(usize::MAX);
+        let cache = abstract_cache(usize::MAX);
         fill(&cache, "A.pas", &context("A.dproj"), 1, 1);
         fill(&cache, "B.pas", &context("A.dproj"), 1, 1);
         fill_unit(&cache, "C.pas", &context("A.dproj"), 1, vec![]);
@@ -2671,7 +2955,7 @@ mod cache_tests {
 
     #[test]
     fn a_leased_parse_stays_charged_after_eviction_until_the_lease_drops() {
-        let cache = ProjectCache::new(10);
+        let cache = abstract_cache(10);
         let ctx = context("A.dproj");
         store_unit_bytes(&cache, "A.pas", &ctx, 10);
         let unit = cache
@@ -2706,7 +2990,7 @@ mod cache_tests {
 
     #[test]
     fn a_leased_parse_nothing_keeps_is_not_charged() {
-        let cache = ProjectCache::new(usize::MAX);
+        let cache = abstract_cache(usize::MAX);
         let ctx = context("A.dproj");
         store_unit_bytes(&cache, "A.pas", &ctx, 10);
         let unit = cache
@@ -2726,7 +3010,7 @@ mod cache_tests {
 
     #[test]
     fn leasing_a_parse_evicted_after_its_hit_keeps_the_budget() {
-        let cache = ProjectCache::new(10_000);
+        let cache = abstract_cache(10_000);
         let ctx = context("A.dproj");
         store_unit_bytes(&cache, "A.pas", &ctx, 10);
         let unit = cache
@@ -2745,7 +3029,7 @@ mod cache_tests {
 
     #[test]
     fn transient_hits_are_not_charged_after_eviction() {
-        let cache = ProjectCache::new(usize::MAX);
+        let cache = abstract_cache(usize::MAX);
         let ctx = context("A.dproj");
         store_unit_bytes(&cache, "A.pas", &ctx, 10);
         let unit = cache
@@ -2758,7 +3042,7 @@ mod cache_tests {
 
     #[test]
     fn a_re_cached_parse_is_charged_by_its_entry_again() {
-        let cache = ProjectCache::new(usize::MAX);
+        let cache = abstract_cache(usize::MAX);
         let ctx = context("A.dproj");
         store_unit_bytes(&cache, "A.pas", &ctx, 10);
         let unit = cache
@@ -2787,7 +3071,7 @@ mod cache_tests {
 
     #[test]
     fn unpinned_entries_at_budget_still_allow_room_for_warming() {
-        let cache = ProjectCache::new(10);
+        let cache = abstract_cache(10);
         let ctx = context("A.dproj");
         fill(&cache, "A.pas", &ctx, 1, 10);
 
@@ -2798,7 +3082,7 @@ mod cache_tests {
 
     #[test]
     fn pinned_entries_at_budget_report_no_room() {
-        let cache = ProjectCache::new(10);
+        let cache = abstract_cache(10);
         let ctx = context("A.dproj");
         fill(&cache, "A.pas", &ctx, 1, 10);
         cache.pin(
@@ -2813,7 +3097,7 @@ mod cache_tests {
 
     #[test]
     fn capped_pins_stay_within_half_the_budget_unpinning_the_oldest_owner_first() {
-        let cache = ProjectCache::new(40);
+        let cache = abstract_cache(40);
         let ctx = context("A.dproj");
         let fingerprint = project_context_fingerprint(&ctx);
         for name in ["A.pas", "B.pas", "C.pas", "D.pas", "E.pas"] {
@@ -2861,7 +3145,7 @@ mod cache_tests {
 
     #[test]
     fn pinned_entries_stored_after_their_pin_stay_within_the_cap() {
-        let cache = ProjectCache::new(40);
+        let cache = abstract_cache(40);
         let ctx = context("A.dproj");
         let fingerprint = project_context_fingerprint(&ctx);
         let names = ["A.pas", "B.pas", "C.pas", "D.pas"];
@@ -2901,7 +3185,7 @@ mod cache_tests {
 
     #[test]
     fn pinned_entries_over_budget_report_no_room() {
-        let cache = ProjectCache::new(10);
+        let cache = abstract_cache(10);
         let ctx = context("A.dproj");
         fill(&cache, "A.pas", &ctx, 1, 10);
         cache.pin(
@@ -2919,7 +3203,7 @@ mod cache_tests {
 
     #[test]
     fn project_switch_sweep_drops_other_fingerprints_and_stale_claims() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let a = context("A.dproj");
         let b = context("B.dproj");
         fill(&cache, "Main.pas", &a, 1, 1);
@@ -2952,7 +3236,7 @@ mod cache_tests {
     fn invalidate_path_evicts_entries_that_observed_it() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().to_path_buf();
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let Lookup::Compute(claim) =
             cache.imports(&uri("Main.pas"), &ctx, 1, &HashMap::new(), &no_cancel())
@@ -3003,7 +3287,7 @@ mod cache_tests {
         for name in ["Unit1.o", "build.lock", "settings.ini"] {
             std::fs::write(dir.join(name), "x").unwrap();
         }
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         store_directory_observer(&cache, &dir);
         let epoch = cache.invalidation_epoch();
 
@@ -3032,7 +3316,7 @@ mod cache_tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join(".opencode/work/ws");
         std::fs::create_dir_all(&root).unwrap();
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         cache.set_artifact_roots(vec![root.clone()]);
         store_directory_observer(&cache, &root);
 
@@ -3052,7 +3336,7 @@ mod cache_tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("ws");
         std::fs::create_dir_all(root.join(".opencode/db")).unwrap();
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         cache.set_artifact_roots(vec![root.clone()]);
         let epoch = cache.invalidation_epoch();
 
@@ -3067,7 +3351,7 @@ mod cache_tests {
 
     #[test]
     fn a_crowded_invalidation_counts_as_touching_every_unit() {
-        let cache = ProjectCache::new(1 << 30);
+        let cache = abstract_cache(1 << 30);
         let shared = PathBuf::from("/w/Shared.inc");
         let ctx = context("A.dproj");
         for index in 0..(MAX_AFFECTED_PER_RECORD + 5) {
@@ -3103,7 +3387,7 @@ mod cache_tests {
 
     #[test]
     fn a_dispatch_at_the_dropped_epoch_is_still_covered_by_the_log() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let units = HashSet::from([uri("Sync.pas")]);
         for index in 0..=MAX_INVALIDATION_LOG {
             cache.invalidate_file_contents(Path::new(&format!("/w/Other{index}.pas")));
@@ -3118,7 +3402,7 @@ mod cache_tests {
     fn a_source_created_in_an_observed_directory_still_stales_the_cache() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().to_path_buf();
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         store_directory_observer(&cache, &dir);
         let epoch = cache.invalidation_epoch();
 
@@ -3131,7 +3415,7 @@ mod cache_tests {
 
     #[test]
     fn compiled_unit_and_unknown_kinds_still_stale_the_cache() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         for name in [
             "/w/Unit1.dcu",
             "/w/Pack.dcp",
@@ -3150,7 +3434,7 @@ mod cache_tests {
         let temp = tempfile::tempdir().unwrap();
         let object = temp.path().join("Unit1.o");
         std::fs::write(&object, "x").unwrap();
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         store_directory_observer(&cache, &object);
         let epoch = cache.invalidation_epoch();
 
@@ -3163,7 +3447,7 @@ mod cache_tests {
 
     #[test]
     fn units_invalidated_since_sees_only_the_units_it_is_asked_about() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let sync = uri("Sync.pas");
         let units = HashSet::from([sync.clone()]);
         let before = cache.invalidation_epoch();
@@ -3184,7 +3468,7 @@ mod cache_tests {
     #[test]
     fn invalidation_after_claim_prevents_store() {
         let temp = tempfile::tempdir().unwrap();
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let main = uri("Main.pas");
         let Lookup::Compute(claim) = cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel())
@@ -3204,7 +3488,7 @@ mod cache_tests {
 
     #[test]
     fn overflow_drops_imports_releases_watches_and_keeps_pins() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let main = uri("Main.pas");
         let watch_dir = PathBuf::from("/ws/includes");
@@ -3240,7 +3524,7 @@ mod cache_tests {
 
     #[test]
     fn overflow_prevents_a_prior_import_claim_from_storing() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let main = uri("Main.pas");
         let snapshot_epoch = cache.invalidation_epoch();
@@ -3271,7 +3555,7 @@ mod cache_tests {
         let path = temp.path().join("Observed.pas");
         std::fs::write(&path, "unit Observed;").unwrap();
         let expected = pascal_project::path_stamp_result(&path).unwrap().unwrap();
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let Lookup::Compute(claim) =
             cache.imports(&uri("Main.pas"), &ctx, 1, &HashMap::new(), &no_cancel())
@@ -3303,7 +3587,7 @@ mod cache_tests {
 
     #[test]
     fn a_reservation_evicts_unpinned_entries_least_recently_used_first() {
-        let cache = ProjectCache::new(30);
+        let cache = abstract_cache(30);
         let ctx = context("A.dproj");
         fill(&cache, "A.pas", &ctx, 1, 10);
         fill(&cache, "B.pas", &ctx, 1, 10);
@@ -3321,7 +3605,7 @@ mod cache_tests {
 
     #[test]
     fn a_reservation_that_pinned_entries_leave_no_room_for_is_refused_without_evicting() {
-        let cache = ProjectCache::new(20);
+        let cache = abstract_cache(20);
         let ctx = context("A.dproj");
         pin_names(&cache, "Open.pas", &["A.pas"], &ctx);
         fill(&cache, "A.pas", &ctx, 1, 10);
@@ -3339,7 +3623,7 @@ mod cache_tests {
 
     #[test]
     fn reservations_shrink_release_on_drop_and_are_totalled_per_kind() {
-        let cache = ProjectCache::new(100);
+        let cache = abstract_cache(100);
         let mut facts = cache.reserve(ReservationKind::Facts, 10).unwrap();
         let scratch = cache.reserve(ReservationKind::Scratch, 3).unwrap();
         let pages = cache.reserve(ReservationKind::Pages, 2).unwrap();
@@ -3396,7 +3680,7 @@ mod cache_tests {
     /// each compiles it with its own reads instead.
     #[test]
     fn a_provider_interface_with_overflowed_reads_is_not_kept() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let overflowed = crate::workspace::capture::CapturedReads {
             overflowed: true,
             ..Default::default()
@@ -3426,7 +3710,7 @@ mod cache_tests {
     /// share; reuse refreshes an entry.
     #[test]
     fn provider_interfaces_are_evicted_least_recently_used_first() {
-        let cache = ProjectCache::new(4 * 3_000);
+        let cache = abstract_cache(4 * 3_000);
         let overlays = HashMap::new();
         for name in ["A", "B"] {
             assert!(cache.put_provider_graph(
@@ -3483,7 +3767,7 @@ mod cache_tests {
     /// by recency with unit entries; their share is a cap, not a guarantee.
     #[test]
     fn provider_interfaces_give_way_to_every_charge() {
-        let cache = ProjectCache::new(24_000);
+        let cache = abstract_cache(24_000);
         let overlays = HashMap::new();
         assert!(cache.put_provider_graph(
             7,
@@ -3506,7 +3790,7 @@ mod cache_tests {
         cache.release_catalogues(vec![]);
         drop(held);
 
-        let cache = ProjectCache::new(24_000);
+        let cache = abstract_cache(24_000);
         let held = cache.reserve(ReservationKind::Scratch, 18_000).unwrap();
         assert!(cache.put_provider_graph(
             7,
@@ -3519,7 +3803,7 @@ mod cache_tests {
         assert_eq!(cache.provider_graph_count(), 0);
         drop(held);
 
-        let cache = ProjectCache::new(24_000);
+        let cache = abstract_cache(24_000);
         let ctx = context("A.dproj");
         assert!(cache.put_provider_graph(
             7,
@@ -3543,7 +3827,7 @@ mod cache_tests {
     /// (`charge_index`, l4d-4nbs review I2).
     #[test]
     fn an_index_batch_dispatches_past_evictable_provider_interfaces() {
-        let cache = ProjectCache::new(24_000);
+        let cache = abstract_cache(24_000);
         assert!(cache.put_provider_graph(
             7,
             provider_key("A"),
@@ -3568,7 +3852,7 @@ mod cache_tests {
     #[test]
     fn evictable_provider_interfaces_never_refuse_a_small_request() {
         let max = 24_000;
-        let cache = ProjectCache::new(max);
+        let cache = abstract_cache(max);
         assert!(cache.put_provider_graph(
             7,
             provider_key("A"),
@@ -3601,7 +3885,7 @@ mod cache_tests {
     #[test]
     fn pooled_publication_bytes_are_outside_the_budget() {
         let max = 24_000;
-        let cache = ProjectCache::new(max);
+        let cache = abstract_cache(max);
         let ctx = context("A.dproj");
         assert!(cache.put_provider_graph(
             7,
@@ -3648,7 +3932,7 @@ mod cache_tests {
     #[test]
     fn publication_transients_draw_on_their_own_pool() {
         let max = 160_000;
-        let cache = ProjectCache::new(max);
+        let cache = abstract_cache(max);
         let pool = cache.publication_pool_bytes();
         assert_eq!(pool, max / PUBLICATION_POOL_SHARE);
         let full = cache.reserve(ReservationKind::Facts, max).unwrap();
@@ -3678,7 +3962,7 @@ mod cache_tests {
     #[test]
     fn evictable_provider_interfaces_leave_the_crawl_room() {
         let max = 24_000;
-        let cache = ProjectCache::new(max);
+        let cache = abstract_cache(max);
         let ctx = context("A.dproj");
         let fingerprint = project_context_fingerprint(&ctx);
         for name in ["A.pas", "B.pas"] {
@@ -3722,7 +4006,7 @@ mod cache_tests {
 
     #[test]
     fn reserved_bytes_count_in_eviction_and_room() {
-        let cache = ProjectCache::new(20);
+        let cache = abstract_cache(20);
         let ctx = context("A.dproj");
         let reservation = cache.reserve(ReservationKind::Scratch, 15).unwrap();
         fill(&cache, "A.pas", &ctx, 1, 10);
@@ -3739,7 +4023,7 @@ mod cache_tests {
 
     #[test]
     fn reserving_several_kinds_is_all_or_nothing_and_evicts_only_when_all_fit() {
-        let cache = ProjectCache::new(20);
+        let cache = abstract_cache(20);
         let ctx = context("A.dproj");
         fill(&cache, "A.pas", &ctx, 1, 5);
         assert!(
@@ -3771,7 +4055,7 @@ mod cache_tests {
 
     #[test]
     fn a_lower_budget_keeps_held_reservations_and_refuses_new_ones() {
-        let cache = ProjectCache::new(100);
+        let cache = abstract_cache(100);
         let held = cache.reserve(ReservationKind::Facts, 60).unwrap();
         cache.set_max_bytes(50);
         assert_eq!(
@@ -3786,7 +4070,7 @@ mod cache_tests {
 
     #[test]
     fn leased_parses_evicted_for_a_reservation_stay_outstanding_and_refuse_it() {
-        let cache = ProjectCache::new(15);
+        let cache = abstract_cache(15);
         let ctx = context("A.dproj");
         store_unit_bytes(&cache, "A.pas", &ctx, 10);
         let unit = cache
@@ -3806,7 +4090,7 @@ mod cache_tests {
 
     #[test]
     fn poison_recovery_keeps_held_reservations_charged_until_they_drop() {
-        let cache = ProjectCache::new(20);
+        let cache = abstract_cache(20);
         let mut held = cache.reserve(ReservationKind::Pages, 12).unwrap();
         let other = cache.reserve(ReservationKind::Scratch, 3).unwrap();
         cache.poison_state();
@@ -3834,7 +4118,7 @@ mod cache_tests {
     #[test]
     fn reservations_racing_stores_never_exceed_the_budget() {
         const MAX: usize = 32;
-        let cache = ProjectCache::new(MAX);
+        let cache = abstract_cache(MAX);
         let ctx = context("A.dproj");
         pin_names(&cache, "Open.pas", &["P.pas"], &ctx);
         fill(&cache, "P.pas", &ctx, 1, 8);
@@ -4016,16 +4300,17 @@ impl Probed for InterfaceImportsValue {
 }
 
 impl UnitValue {
-    /// Estimated heap retained by the entry: the parse at the measured
-    /// factor, its include expansion, probes, and file text it does not
-    /// share with the parse.
+    /// Estimated heap retained by the entry: the parse
+    /// (`ParsedDocument::retained_bytes`), its include expansion, probes, and
+    /// file text it does not share with the parse.
     pub(crate) fn retained_bytes(&self) -> usize {
         let unshared_text = self
             .disk
             .as_ref()
             .filter(|disk| !Arc::ptr_eq(&disk.text, self.parsed.source_text()))
             .map_or(0, |disk| disk.text.len());
-        unit_value_bytes(self.parsed.source_text().len())
+        self.parsed
+            .retained_bytes()
             .saturating_add(std::mem::size_of::<Self>())
             .saturating_add(self.expansion.as_deref().map_or(0, expansion_bytes))
             .saturating_add(probes_bytes(&self.probes))
@@ -4055,13 +4340,26 @@ impl InterfaceImportsValue {
     }
 }
 
+/// Heap a source revision owns. Its read policy shares the context's
+/// storage (`ReadPolicy` clones are shallow), so only the path entry counts.
+fn revision_bytes(revision: &pascal_core::SourceRevision) -> usize {
+    match revision {
+        pascal_core::SourceRevision::Disk { path_entry, .. } => path_bytes(&path_entry.path),
+        pascal_core::SourceRevision::Overlay { .. } => 0,
+    }
+}
+
 fn interface_value_bytes(value: &InterfaceImportsValue) -> usize {
-    value.bindings.iter().fold(256usize, |total, binding| {
-        total
-            .saturating_add(128)
-            .saturating_add(binding.name.len())
-            .saturating_add(binding.uri.as_str().len())
-    })
+    value.bindings.iter().fold(
+        std::mem::size_of::<InterfaceImportsValue>()
+            .saturating_add(std::mem::size_of_val(value.bindings.as_slice())),
+        |total, binding| {
+            total
+                .saturating_add(binding.name.len())
+                .saturating_add(binding.uri.as_str().len())
+                .saturating_add(revision_bytes(&binding.revision))
+        },
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -4230,11 +4528,11 @@ struct State {
     provider_graphs: ProviderGraphStore,
     /// Ready entries with a stamp or content probe on the path. A change to
     /// the path, or to a child for a directory probe, invalidates them.
-    observed: HashMap<PathBuf, HashSet<Key>>,
+    observed: HashMap<PathBuf, HashSet<Arc<Key>>>,
     /// Ready entries for the source at the path or with an overlay probe on
     /// it. Only a change to the path itself invalidates them.
-    exact: HashMap<PathBuf, HashSet<Key>>,
-    by_uri: HashMap<Url, HashSet<Key>>,
+    exact: HashMap<PathBuf, HashSet<Arc<Key>>>,
+    by_uri: HashMap<Url, HashSet<Arc<Key>>>,
     /// One shared copy of each project context, by fingerprint, so entries
     /// do not each hold their own.
     contexts: HashMap<u64, Arc<ProjectContext>>,
@@ -4277,6 +4575,9 @@ struct State {
     /// Ready entries looked at by eviction and invalidation.
     #[cfg(test)]
     examined: std::cell::Cell<usize>,
+    /// Whether entries are charged for the cache's index copies
+    /// (`index_bytes`); off only in tests of abstract sizes.
+    charge_indexes: bool,
 }
 
 impl Default for State {
@@ -4317,6 +4618,7 @@ impl Default for State {
             waiting: HashMap::new(),
             #[cfg(test)]
             examined: std::cell::Cell::new(0),
+            charge_indexes: true,
         }
     }
 }
@@ -4365,6 +4667,9 @@ struct Inner {
     /// Provider interfaces handed out by `provider_graph` (tests only).
     #[cfg(test)]
     provider_graph_hits: AtomicU64,
+    /// Provider interfaces `put_provider_graph` stored (tests only).
+    #[cfg(test)]
+    provider_graph_puts: AtomicU64,
     #[cfg(test)]
     validation_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
@@ -4584,6 +4889,7 @@ pub(crate) struct CacheStats {
     pub reserved_provider_graph_bytes: usize,
     pub reserved_publication_bytes: usize,
     pub reserved_query_trees_bytes: usize,
+    pub reserved_crawl_source_bytes: usize,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -4597,6 +4903,7 @@ impl CacheStats {
             .saturating_add(self.reserved_provider_graph_bytes)
             .saturating_add(self.reserved_publication_bytes)
             .saturating_add(self.reserved_query_trees_bytes)
+            .saturating_add(self.reserved_crawl_source_bytes)
     }
 }
 
@@ -4626,10 +4933,13 @@ pub(crate) enum ReservationKind {
     /// Candidate trees an indexed query parses that no cache lease charges
     /// (`workspace::hydration`, R9-8).
     QueryTrees,
+    /// Source texts a warm crawl holds for the dependencies it has not
+    /// walked yet (l4d-10).
+    CrawlSources,
 }
 
 impl ReservationKind {
-    const COUNT: usize = 8;
+    const COUNT: usize = 9;
 
     fn index(self) -> usize {
         match self {
@@ -4641,6 +4951,7 @@ impl ReservationKind {
             Self::ProviderGraphs => 5,
             Self::Publication => 6,
             Self::QueryTrees => 7,
+            Self::CrawlSources => 8,
         }
     }
 }
@@ -4734,10 +5045,16 @@ fn fits(state: &State, retained: usize, request: usize) -> bool {
 /// bytes, less the shared provider interfaces, a cache that gives way to
 /// every request (l4d-4nbs review I2).
 fn committed_bytes(state: &State) -> usize {
+    // Kept states give way too: evicting the importers that keep them
+    // releases them (fix round 1, I1).
+    let graphs = state
+        .provider_graphs
+        .bytes
+        .saturating_add(state.provider_graphs.kept_bytes);
     state
         .pinned_bytes
         .saturating_add(state.outstanding_bytes)
-        .saturating_add(budgeted_reserved_bytes(state).saturating_sub(state.provider_graphs.bytes))
+        .saturating_add(budgeted_reserved_bytes(state).saturating_sub(graphs))
 }
 
 /// Whether `request` fits beside what no eviction frees.
@@ -4845,12 +5162,7 @@ fn evict_oldest(state: &mut State) -> bool {
 }
 
 fn evict_oldest_graph(state: &mut State) -> bool {
-    let Some(id) = state
-        .provider_graphs
-        .lru
-        .first_key_value()
-        .map(|(_, id)| id.clone())
-    else {
+    let Some(id) = state.provider_graphs.victim() else {
         return false;
     };
     let freed = state.provider_graphs.remove(&id);
@@ -4858,9 +5170,16 @@ fn evict_oldest_graph(state: &mut State) -> bool {
     true
 }
 
-fn release_graph_bytes(state: &mut State, freed: usize) {
+/// The provider interfaces' reservation: their entries, and the states
+/// only other interfaces keep (l4d-10). `freed` is what the caller just
+/// removed from the entries.
+fn release_graph_bytes(state: &mut State, _freed: usize) {
+    state.provider_graphs.prune_kept();
     let index = ReservationKind::ProviderGraphs.index();
-    state.reserved[index] = state.reserved[index].saturating_sub(freed);
+    state.reserved[index] = state
+        .provider_graphs
+        .bytes
+        .saturating_add(state.provider_graphs.kept_bytes);
 }
 
 fn recover_poisoned_state<'a>(
@@ -5390,7 +5709,9 @@ impl ProjectCache {
                 && old.bindings == value.bindings
                 && old.complete == value.complete
         );
-        let bytes = value.retained_bytes();
+        let retained = value.retained_bytes();
+        let value = Value::Interface(Arc::new(value));
+        let bytes = entry_charge(&state, &key, &value, retained);
         let crawl = crawl_admission_on_this_thread();
         // A refresh keeps a request's use of the entry it replaces.
         let replaces_requested = matches!(
@@ -5414,7 +5735,7 @@ impl ProjectCache {
         }
         state.clock += 1;
         let entry = Entry {
-            value: Value::Interface(Arc::new(value)),
+            value,
             context: intern_context(&mut state, key.fingerprint, context),
             input_hash: content_hash,
             bytes,
@@ -5973,11 +6294,15 @@ fn value_probes(value: &Value) -> &[Probe] {
 /// The paths whose change invalidates the entry: `true` marks a stamp or
 /// content probe, which a change to a child also invalidates.
 fn indexed_paths(key: &Key, entry: &Entry) -> Vec<(bool, PathBuf)> {
+    value_paths(key, &entry.value)
+}
+
+fn value_paths(key: &Key, value: &Value) -> Vec<(bool, PathBuf)> {
     let mut paths = Vec::new();
     if let Ok(own) = key.uri.to_file_path() {
         paths.push((false, own));
     }
-    for probe in value_probes(&entry.value) {
+    for probe in value_probes(value) {
         match probe {
             Probe::Stamp { path, .. } | Probe::Content { path, .. } => {
                 paths.push((true, path.clone()));
@@ -5992,11 +6317,60 @@ fn indexed_paths(key: &Key, entry: &Entry) -> Vec<(bool, PathBuf)> {
     paths
 }
 
-fn index_insert<K: std::hash::Hash + Eq>(map: &mut HashMap<K, HashSet<Key>>, at: K, key: &Key) {
+/// `bytes` a caller estimates for `value`, plus what the cache's indexes
+/// keep for it (`index_bytes`): the entry's charge, which admission and
+/// eviction count.
+fn entry_charge(state: &State, key: &Key, value: &Value, bytes: usize) -> usize {
+    if !state.charge_indexes {
+        return bytes;
+    }
+    bytes.saturating_add(index_bytes(state, key, &value_paths(key, value)))
+}
+
+/// What the cache's own indexes keep for an entry under `key` probing
+/// `paths` (l4d-10): its shared key, the LRU order's copy, a slot in the set
+/// of each path, and each path the indexes do not hold yet. A unit of
+/// generated code can probe thousands of candidate paths over a long search
+/// path; caller estimates (`UnitValue::retained_bytes`) cannot see these.
+fn index_bytes(state: &State, key: &Key, paths: &[(bool, PathBuf)]) -> usize {
+    // A hash set slot with its control byte, at hashbrown's mean load.
+    fn slot<T>() -> usize {
+        (std::mem::size_of::<T>() + 1) * 3 / 2
+    }
+    // The shared key and the LRU order's copy.
+    let key_copy = (std::mem::size_of::<Key>() + 16).saturating_add(key.uri.as_str().len());
+    paths
+        .iter()
+        .fold(key_copy.saturating_mul(2), |total, (observed, path)| {
+            let map = if *observed {
+                &state.observed
+            } else {
+                &state.exact
+            };
+            let new_path = if map.contains_key(path) {
+                0
+            } else {
+                slot::<(PathBuf, HashSet<Key>)>().saturating_add(path_bytes(path))
+            };
+            total
+                .saturating_add(slot::<Arc<Key>>())
+                .saturating_add(new_path)
+        })
+}
+
+fn index_insert<K: std::hash::Hash + Eq>(
+    map: &mut HashMap<K, HashSet<Arc<Key>>>,
+    at: K,
+    key: &Arc<Key>,
+) {
     map.entry(at).or_default().insert(key.clone());
 }
 
-fn index_remove<K: std::hash::Hash + Eq>(map: &mut HashMap<K, HashSet<Key>>, at: &K, key: &Key) {
+fn index_remove<K: std::hash::Hash + Eq>(
+    map: &mut HashMap<K, HashSet<Arc<Key>>>,
+    at: &K,
+    key: &Key,
+) {
     if let Some(keys) = map.get_mut(at) {
         keys.remove(key);
         if keys.is_empty() {
@@ -6009,10 +6383,11 @@ fn index_remove<K: std::hash::Hash + Eq>(map: &mut HashMap<K, HashSet<Key>>, at:
 /// every index in step with it.
 fn insert_ready(state: &mut State, key: Key, entry: Entry) {
     remove_ready(state, &key);
-    state.bytes = state.bytes.saturating_add(entry.bytes);
     if let Some(address) = parse_address(&entry.value) {
         hold_parse(state, address, entry.bytes);
     }
+    let paths = indexed_paths(&key, &entry);
+    state.bytes = state.bytes.saturating_add(entry.bytes);
     // A pinned key whose entry arrives after its pin keeps the pins within
     // their cap (l4d-axsn): over it, the key is unpinned for every owner.
     if is_pinned(state, &key)
@@ -6029,15 +6404,17 @@ fn insert_ready(state: &mut State, key: Key, entry: Entry) {
             state.background_bytes = state.background_bytes.saturating_add(entry.bytes);
         }
     }
-    for (observed, path) in indexed_paths(&key, &entry) {
+    // One copy of the key, shared by every index (l4d-10).
+    let shared = Arc::new(key.clone());
+    for (observed, path) in paths {
         let map = if observed {
             &mut state.observed
         } else {
             &mut state.exact
         };
-        index_insert(map, path, &key);
+        index_insert(map, path, &shared);
     }
-    index_insert(&mut state.by_uri, key.uri.clone(), &key);
+    index_insert(&mut state.by_uri, key.uri.clone(), &shared);
     if let Value::Import(imports) = &entry.value {
         for directory in &imports.watch_dirs {
             acquire_watch(state, directory);
@@ -6299,6 +6676,7 @@ fn prune_dead_leases(state: &mut State) {
         alive
     });
     state.outstanding_bytes = state.outstanding_bytes.saturating_sub(released);
+    release_graph_bytes(state, 0);
 }
 
 fn retain_fingerprints_locked(state: &mut State, keep: &HashSet<u64>) {
@@ -6391,7 +6769,8 @@ impl ProjectCache {
                     && claim.generation == state.generation
                     && *id == claim.claim);
         let crawl = crawl_admission_on_this_thread();
-        let refused = current && crawl && !make_room_for_crawl(&mut state, bytes, None, 0);
+        let charged = entry_charge(&state, &claim.key, &value, bytes);
+        let refused = current && crawl && !make_room_for_crawl(&mut state, charged, None, 0);
         if refused {
             refuse_crawl_on_this_thread();
         }
@@ -6420,7 +6799,7 @@ impl ProjectCache {
                 value,
                 context: claim.context.clone(),
                 input_hash: claim.input_hash,
-                bytes,
+                bytes: charged,
                 last_used: state.clock,
                 background: crawl,
             };
@@ -6698,7 +7077,7 @@ impl ProjectCache {
             #[cfg(test)]
             note_examined(&state);
             if remove_ready(&mut state, &key) && seen.insert(key.uri.clone()) {
-                affected.push(key.uri);
+                affected.push(key.uri.clone());
             }
         }
         if relevant {
@@ -6974,6 +7353,7 @@ impl ProjectCache {
             reserved_provider_graph_bytes: state.reserved[ReservationKind::ProviderGraphs.index()],
             reserved_publication_bytes: state.reserved[ReservationKind::Publication.index()],
             reserved_query_trees_bytes: state.reserved[ReservationKind::QueryTrees.index()],
+            reserved_crawl_source_bytes: state.reserved[ReservationKind::CrawlSources.index()],
         }
     }
 
@@ -7339,7 +7719,17 @@ impl ProjectCache {
     ) -> Option<SharedProviderGraphHit> {
         let full = (configuration, key.clone());
         let hit = {
-            let state = lock(&self.inner);
+            let mut state = lock(&self.inner);
+            // An entry evicted while an importer kept its interface is
+            // taken back rather than compiled again (fix round 1, I2).
+            if !state.provider_graphs.entries.contains_key(&full) {
+                state.clock += 1;
+                let tick = state.clock;
+                if !state.provider_graphs.adopt(&full, tick) {
+                    return None;
+                }
+                release_graph_bytes(&mut state, 0);
+            }
             let entry = state.provider_graphs.entries.get(&full)?;
             SharedProviderGraphHit {
                 graph: Arc::clone(&entry.graph),
@@ -7359,8 +7749,8 @@ impl ProjectCache {
             return None;
         }
         if !held {
-            let freed = state.provider_graphs.remove(&full);
-            release_graph_bytes(&mut state, freed);
+            state.provider_graphs.discard(&full);
+            release_graph_bytes(&mut state, 0);
             self.release(state);
             return None;
         }
@@ -7379,6 +7769,20 @@ impl ProjectCache {
     #[cfg(test)]
     pub(crate) fn provider_graph_hits_for_test(&self) -> u64 {
         self.inner.provider_graph_hits.load(Ordering::Relaxed)
+    }
+
+    /// How many provider interfaces `put_provider_graph` stored.
+    #[cfg(test)]
+    pub(crate) fn provider_graph_puts_for_test(&self) -> u64 {
+        self.inner.provider_graph_puts.load(Ordering::Relaxed)
+    }
+
+    /// Bytes of the interface states only other interfaces keep.
+    #[cfg(test)]
+    pub(crate) fn kept_provider_graph_bytes_for_test(&self) -> usize {
+        let mut state = lock(&self.inner);
+        release_graph_bytes(&mut state, 0);
+        state.provider_graphs.kept_bytes
     }
 
     /// Keep a compiled provider interface, charged to `maxCacheBytes` within
@@ -7412,22 +7816,40 @@ impl ProjectCache {
             return false;
         }
         let full = (configuration, key);
+        // Sized outside the lock, and only the states nothing charges yet:
+        // a state can bind through many, of 100 MB and more (fix round 1,
+        // I3).
+        let known = {
+            let state = lock(&self.inner);
+            state
+                .provider_graphs
+                .by_state
+                .keys()
+                .chain(state.provider_graphs.kept.keys())
+                .copied()
+                .collect::<HashSet<_>>()
+        };
+        let nested = graph.nested_interfaces(&|identity| known.contains(&identity));
         let mut state = lock(&self.inner);
         let share = state.max_bytes / PROVIDER_GRAPH_BUDGET_SHARE;
-        if bytes > share {
+        // The entry replaced is stale: it never comes back.
+        state.provider_graphs.discard(&full);
+        release_graph_bytes(&mut state, 0);
+        let kept = state.provider_graphs.new_kept_bytes(&nested);
+        let needed = bytes.saturating_add(kept);
+        if needed > share {
             self.release(state);
             return false;
         }
         prune_dead_leases(&mut state);
-        let freed = state.provider_graphs.remove(&full);
-        release_graph_bytes(&mut state, freed);
-        let freed = state.provider_graphs.evict_until(share - bytes);
-        release_graph_bytes(&mut state, freed);
-        if !make_room(&mut state, bytes) {
+        // Entries and kept states share the provider budget (I2).
+        state.provider_graphs.evict_until(share - needed);
+        release_graph_bytes(&mut state, 0);
+        // Room for what the put charges, kept states included (M1).
+        if !make_room(&mut state, needed) {
             self.release(state);
             return false;
         }
-        state.reserved[ReservationKind::ProviderGraphs.index()] += bytes;
         state.clock += 1;
         let tick = state.clock;
         state.provider_graphs.insert(
@@ -7439,14 +7861,71 @@ impl ProjectCache {
                 bytes,
             },
             tick,
+            nested,
         );
+        release_graph_bytes(&mut state, 0);
         self.release(state);
+        #[cfg(test)]
+        self.inner
+            .provider_graph_puts
+            .fetch_add(1, Ordering::Relaxed);
         true
     }
 
     #[cfg(test)]
     pub(crate) fn provider_graph_count(&self) -> usize {
         lock(&self.inner).provider_graphs.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider_graphs_for_test(
+        &self,
+    ) -> Vec<Arc<pascal_core::compile_time::SharedProviderGraph>> {
+        lock(&self.inner)
+            .provider_graphs
+            .entries
+            .values()
+            .map(|entry| Arc::clone(&entry.graph))
+            .collect()
+    }
+
+    /// Removes the provider interfaces whose source path ends with
+    /// `suffix`, as an eviction would, without measuring.
+    #[cfg(test)]
+    pub(crate) fn evict_provider_graphs_for_test(&self, suffix: &str) {
+        let mut state = lock(&self.inner);
+        let doomed = state
+            .provider_graphs
+            .entries
+            .keys()
+            .filter(|key| key.1.source.as_str().ends_with(suffix))
+            .cloned()
+            .collect::<Vec<_>>();
+        for id in doomed {
+            state.provider_graphs.remove(&id);
+        }
+        release_graph_bytes(&mut state, 0);
+    }
+
+    /// Removes every provider interface and returns the bytes the test
+    /// allocator saw this thread free, with how many other holders each
+    /// graph still had.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn drop_provider_graphs_for_test(&self) -> (isize, Vec<usize>) {
+        let entries = {
+            let mut state = lock(&self.inner);
+            let entries = std::mem::take(&mut state.provider_graphs.entries);
+            state.provider_graphs = ProviderGraphStore::default();
+            state.reserved[ReservationKind::ProviderGraphs.index()] = 0;
+            entries
+        };
+        let holders = entries
+            .values()
+            .map(|entry| Arc::strong_count(&entry.graph) - 1)
+            .collect();
+        let before = crate::test_alloc::live_bytes();
+        drop(entries);
+        (before - crate::test_alloc::live_bytes(), holders)
     }
 
     /// What the shared provider interfaces are charged.
@@ -7473,6 +7952,22 @@ struct ProviderGraphEntry {
     bytes: usize,
 }
 
+/// A provider interface's state that no entry holds but another interface
+/// does (l4d-10): charged until the last holder drops it. The weak handle is
+/// never upgraded; it keeps the allocation's identity from being reused
+/// while kept.
+struct KeptInterface {
+    alive: std::sync::Weak<dyn std::any::Any + Send + Sync>,
+    bytes: usize,
+}
+
+/// Whether anything besides `entry` keeps its interface: a session holding
+/// the shared interface, or another interface binding through its state.
+/// Evicting such an entry frees only its bookkeeping.
+fn graph_entry_held(entry: &ProviderGraphEntry) -> bool {
+    Arc::strong_count(&entry.graph) > 1 || entry.graph.state_holders() > 1
+}
+
 /// Compiled provider interfaces by resolver configuration and provider key,
 /// least recently used first in `lru`.
 #[derive(Default)]
@@ -7482,6 +7977,18 @@ struct ProviderGraphStore {
     /// By the cache's clock, which unit entries share.
     lru: BTreeMap<u64, ProviderGraphId>,
     bytes: usize,
+    /// Entries and kept entries by the identity of their interface's state.
+    by_state: HashMap<usize, ProviderGraphId>,
+    /// Entries evicted while something else still keeps their interface
+    /// (l4d-10): still charged, taken back by a lookup (`adopt`) instead of
+    /// compiled again, and dropped once nothing else keeps them.
+    kept_entries: HashMap<ProviderGraphId, ProviderGraphEntry>,
+    /// States other interfaces bind through that no entry ever held, charged
+    /// until their last holder drops them. Each state is charged once: by
+    /// its entry, its kept entry, or here.
+    kept: HashMap<usize, KeptInterface>,
+    /// Bytes of `kept_entries` and `kept`.
+    kept_bytes: usize,
 }
 
 impl ProviderGraphStore {
@@ -7492,70 +7999,251 @@ impl ProviderGraphStore {
         self.lru.insert(tick, id.clone());
     }
 
-    /// The caller released whatever `id` held before.
-    fn insert(&mut self, id: ProviderGraphId, entry: ProviderGraphEntry, tick: u64) {
+    /// Whether a state is charged here already.
+    fn charges(&self, identity: usize) -> bool {
+        self.by_state.contains_key(&identity) || self.kept.contains_key(&identity)
+    }
+
+    /// What `nested` would add as kept: the states nothing charges yet.
+    fn new_kept_bytes(&self, nested: &[pascal_core::compile_time::NestedInterface]) -> usize {
+        nested
+            .iter()
+            .filter(|interface| !self.charges(interface.identity))
+            .fold(0usize, |total, interface| {
+                total.saturating_add(interface.bytes)
+            })
+    }
+
+    /// The caller released whatever `id` held before. `nested` are the
+    /// interfaces its state binds through that were not charged when it was
+    /// sized: those still uncharged are charged as kept.
+    fn insert(
+        &mut self,
+        id: ProviderGraphId,
+        entry: ProviderGraphEntry,
+        tick: u64,
+        nested: Vec<pascal_core::compile_time::NestedInterface>,
+    ) {
+        for interface in nested {
+            if self.charges(interface.identity) {
+                continue;
+            }
+            self.kept_bytes = self.kept_bytes.saturating_add(interface.bytes);
+            self.kept.insert(
+                interface.identity,
+                KeptInterface {
+                    alive: interface.alive,
+                    bytes: interface.bytes,
+                },
+            );
+        }
+        if let Some(identity) = entry.graph.state_identity() {
+            // Its own entry charges it now.
+            if let Some(kept) = self.kept.remove(&identity) {
+                self.kept_bytes = self.kept_bytes.saturating_sub(kept.bytes);
+            }
+            debug_assert!(
+                self.by_state
+                    .get(&identity)
+                    .is_none_or(|other| *other == id),
+                "one state under two keys"
+            );
+            self.by_state.insert(identity, id.clone());
+        }
         self.bytes = self.bytes.saturating_add(entry.bytes);
         self.entries.insert(id.clone(), entry);
         self.touch(&id, tick);
     }
 
-    fn remove(&mut self, id: &ProviderGraphId) -> usize {
-        if let Some(tick) = self.ticks.remove(id) {
-            self.lru.remove(&tick);
+    /// Takes back an entry kept since its eviction, as a lookup of `id`
+    /// finds it: no second copy of a state still in memory is compiled.
+    fn adopt(&mut self, id: &ProviderGraphId, tick: u64) -> bool {
+        let Some(entry) = self.kept_entries.remove(id) else {
+            return false;
+        };
+        self.kept_bytes = self.kept_bytes.saturating_sub(entry.bytes);
+        self.bytes = self.bytes.saturating_add(entry.bytes);
+        self.entries.insert(id.clone(), entry);
+        self.touch(id, tick);
+        true
+    }
+
+    /// An entry evicted from `entries`: kept while something else keeps
+    /// its interface, else dropped. Walks no state (fix round 1, I3).
+    fn evicted(&mut self, id: &ProviderGraphId, entry: ProviderGraphEntry) -> usize {
+        self.bytes = self.bytes.saturating_sub(entry.bytes);
+        let freed = entry.bytes;
+        if graph_entry_held(&entry) {
+            self.kept_bytes = self.kept_bytes.saturating_add(entry.bytes);
+            self.kept_entries.insert(id.clone(), entry);
+        } else {
+            self.unmap(id, &entry);
         }
-        let freed = self.entries.remove(id).map_or(0, |entry| entry.bytes);
-        self.bytes = self.bytes.saturating_sub(freed);
         freed
     }
 
-    /// Evicts least recently used entries until at most `limit` bytes remain.
+    /// An entry no lookup may take back (invalidated, or the store
+    /// cleared): a state something else keeps stays charged as kept.
+    fn forget(&mut self, id: &ProviderGraphId, entry: ProviderGraphEntry) {
+        self.unmap(id, &entry);
+        let held = graph_entry_held(&entry);
+        let (identity, alive, bytes) = (
+            entry.graph.state_identity(),
+            entry.graph.state_alive(),
+            entry.bytes,
+        );
+        drop(entry);
+        if let (true, Some(identity), Some(alive)) = (held, identity, alive)
+            && alive.strong_count() > 0
+            && !self.charges(identity)
+        {
+            self.kept_bytes = self.kept_bytes.saturating_add(bytes);
+            self.kept.insert(identity, KeptInterface { alive, bytes });
+        }
+    }
+
+    fn unmap(&mut self, id: &ProviderGraphId, entry: &ProviderGraphEntry) {
+        if let Some(identity) = entry.graph.state_identity()
+            && self.by_state.get(&identity) == Some(id)
+        {
+            self.by_state.remove(&identity);
+        }
+    }
+
+    /// Stops charging the kept entries and states nothing else keeps any
+    /// more. Dropping a kept entry may release what it bound through, so it
+    /// runs until nothing changes.
+    fn prune_kept(&mut self) {
+        loop {
+            let released = self
+                .kept_entries
+                .iter()
+                .filter(|(_, entry)| !graph_entry_held(entry))
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            for id in &released {
+                if let Some(entry) = self.kept_entries.remove(id) {
+                    self.kept_bytes = self.kept_bytes.saturating_sub(entry.bytes);
+                    self.unmap(id, &entry);
+                }
+            }
+            let mut dead = 0usize;
+            self.kept.retain(|_, kept| {
+                let alive = kept.alive.strong_count() > 0;
+                if !alive {
+                    dead = dead.saturating_add(kept.bytes);
+                }
+                alive
+            });
+            self.kept_bytes = self.kept_bytes.saturating_sub(dead);
+            if released.is_empty() {
+                break;
+            }
+        }
+    }
+
+    /// The entry to evict first: the least recently used one nothing else
+    /// keeps, since evicting a kept one frees only its bookkeeping and
+    /// loses its reuse; else the least recently used.
+    fn victim(&self) -> Option<ProviderGraphId> {
+        self.lru
+            .values()
+            .find(|id| {
+                self.entries
+                    .get(*id)
+                    .is_some_and(|entry| !graph_entry_held(entry))
+            })
+            .or_else(|| self.lru.values().next())
+            .cloned()
+    }
+
+    fn take(&mut self, id: &ProviderGraphId) -> Option<ProviderGraphEntry> {
+        if let Some(tick) = self.ticks.remove(id) {
+            self.lru.remove(&tick);
+        }
+        let entry = self.entries.remove(id)?;
+        self.bytes = self.bytes.saturating_sub(entry.bytes);
+        Some(entry)
+    }
+
+    /// Evicts `id`, keeping it while something else keeps its interface.
+    fn remove(&mut self, id: &ProviderGraphId) -> usize {
+        match self.take(id) {
+            Some(entry) => {
+                self.bytes = self.bytes.saturating_add(entry.bytes);
+                self.evicted(id, entry)
+            }
+            None => 0,
+        }
+    }
+
+    /// Drops `id` for good, kept or not.
+    fn discard(&mut self, id: &ProviderGraphId) {
+        if let Some(entry) = self.take(id) {
+            self.forget(id, entry);
+        }
+        if let Some(entry) = self.kept_entries.remove(id) {
+            self.kept_bytes = self.kept_bytes.saturating_sub(entry.bytes);
+            self.forget(id, entry);
+        }
+    }
+
+    /// Evicts until entries and kept states fit `limit`, nothing else
+    /// keeps first; stops when no entry is left.
     fn evict_until(&mut self, limit: usize) -> usize {
         let mut freed = 0usize;
-        while self.bytes > limit {
-            let Some((_, id)) = self.lru.pop_first() else {
+        self.prune_kept();
+        while self.bytes.saturating_add(self.kept_bytes) > limit {
+            let Some(id) = self.victim() else {
                 break;
             };
-            self.ticks.remove(&id);
-            if let Some(entry) = self.entries.remove(&id) {
-                self.bytes = self.bytes.saturating_sub(entry.bytes);
-                freed = freed.saturating_add(entry.bytes);
-            }
+            freed = freed.saturating_add(self.remove(&id));
+            self.prune_kept();
         }
         freed
     }
 
     /// Drops every entry a probe of which names `path` or lies under it, or
-    /// (`include_parent`) names its parent directory.
+    /// (`include_parent`) names its parent directory, kept ones included.
     fn invalidate(&mut self, path: &Path, include_parent: bool) -> usize {
         let parent = path.parent().filter(|_| include_parent);
+        let touched = |entry: &ProviderGraphEntry| {
+            entry.probes.iter().any(|probe| {
+                let probed = match probe {
+                    Probe::Stamp { path, .. } | Probe::Content { path, .. } => path.clone(),
+                    Probe::Overlay { uri, .. } => match uri.to_file_path() {
+                        Ok(path) => path,
+                        Err(()) => return false,
+                    },
+                };
+                probed.starts_with(path) || parent.is_some_and(|parent| probed == parent)
+            })
+        };
         let doomed = self
             .entries
             .iter()
-            .filter(|(_, entry)| {
-                entry.probes.iter().any(|probe| {
-                    let probed = match probe {
-                        Probe::Stamp { path, .. } | Probe::Content { path, .. } => path.clone(),
-                        Probe::Overlay { uri, .. } => match uri.to_file_path() {
-                            Ok(path) => path,
-                            Err(()) => return false,
-                        },
-                    };
-                    probed.starts_with(path) || parent.is_some_and(|parent| probed == parent)
-                })
-            })
+            .chain(self.kept_entries.iter())
+            .filter(|(_, entry)| touched(entry))
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
-        doomed
-            .iter()
-            .fold(0usize, |freed, id| freed.saturating_add(self.remove(id)))
+        let before = self.bytes;
+        for id in &doomed {
+            self.discard(id);
+        }
+        before.saturating_sub(self.bytes)
     }
 
     fn clear(&mut self) -> usize {
         let freed = self.bytes;
-        self.entries.clear();
-        self.ticks.clear();
-        self.lru.clear();
-        self.bytes = 0;
+        let ids = self
+            .entries
+            .keys()
+            .chain(self.kept_entries.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+        for id in &ids {
+            self.discard(id);
+        }
         freed
     }
 }

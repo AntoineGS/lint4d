@@ -11,6 +11,8 @@
 //! cost in extraction throughput (l4d-zf1b.8, root-cause pass 3).
 
 use std::ffi::OsString;
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 /// The arena count the server sets when the user did not choose one.
 pub const ARENA_MAX: i32 = 2;
@@ -52,6 +54,37 @@ pub fn limit_malloc_arenas() {
         }
     }
     crate::trace::trace!("{}", arena_decision(limit));
+}
+
+/// Gives the allocator's free pages back to the system, at most every ten
+/// seconds. glibc keeps what threads free in its arenas and returns only
+/// the top of each: on SFClient2 a 1.2 GiB live heap held 5.4 GiB of arena
+/// after the open-file crawl, 4.1 GiB of it free (l4d-10). Called by the
+/// warmer between units and batch members, while no interactive request
+/// runs: a trim holds each arena's lock for 15 ms typically, 150 ms at most.
+pub(crate) fn release_free_memory() {
+    const MIN_INTERVAL: Duration = Duration::from_secs(10);
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap_or_else(PoisonError::into_inner);
+        if last.is_some_and(|last| last.elapsed() < MIN_INTERVAL) {
+            return;
+        }
+        *last = Some(Instant::now());
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        let started = Instant::now();
+        // SAFETY: malloc_trim only returns free allocator pages to the
+        // system; it takes each arena's own lock.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+        crate::trace::trace!(
+            "malloc_trim elapsed_ms={:.1}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
 }
 
 /// The startup trace line for an [`arena_limit`] outcome.

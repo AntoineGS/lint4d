@@ -1004,6 +1004,7 @@ impl Warmer {
                 lower_thread_priority();
                 for job in job_receiver {
                     run_job(job, worker_gate.clone(), &event_sender);
+                    crate::allocator::release_free_memory();
                 }
             })
             .expect("spawn warmer thread");
@@ -1840,9 +1841,11 @@ fn run_index_job(
         }
         if quantum {
             if gate.index_quantum_may_run(&job.cancel) {
+                crate::allocator::release_free_memory();
                 return Ok(());
             }
         } else if gate.index_may_run(&job.cancel) {
+            crate::allocator::release_free_memory();
             return Ok(());
         } else {
             gate.note_index_held();
@@ -2044,6 +2047,7 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
             });
         }
         crate::trace::trace!("  warm unit {done}/{total} {}", unit_name(unit));
+        crate::allocator::release_free_memory();
         // Only past the last yield, so every dispatch analyses new units.
         let boundary = persists && done > resume_after && done < total;
         // A reuse pass the crawl went ahead of while Bulk work held it back
@@ -2078,7 +2082,7 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
             Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string())
         }
     }));
-    let result = workspace.warm_with_cancel(&uri, &job.cancel);
+    let result = workspace.crawl_with_cancel(&uri, &job.cancel);
     // Entries stored before a pause or error are already in the shared cache,
     // and a retry will not store them again, so report them now.
     if workspace.interface_entries_stored() > 0 {

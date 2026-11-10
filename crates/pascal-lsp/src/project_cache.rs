@@ -375,8 +375,10 @@ pub(crate) fn observation_probes(
 /// `probes` with each exact duplicate dropped, in first-seen order: a hit
 /// checks every probe (`probes_hold`), and the resolver observes a
 /// directory once per lookup that consults it (rootcause A4,
-/// l4d-zf1b.8). Probes of one path that differ are all kept.
-pub(crate) fn dedup_probes(probes: Vec<Probe>) -> Vec<Probe> {
+/// l4d-zf1b.8). Probes of one path that differ are all kept. The result
+/// has no spare capacity: entries keep it, and a collect in place would keep
+/// the room of every duplicate (l4d-10: 7.4 MB for 0.15 MB of probes).
+pub(crate) fn dedup_probes(mut probes: Vec<Probe>) -> Vec<Probe> {
     let mut seen: HashMap<&Path, Vec<usize>> = HashMap::new();
     let mut kept = Vec::with_capacity(probes.len());
     for (at, probe) in probes.iter().enumerate() {
@@ -392,10 +394,11 @@ pub(crate) fn dedup_probes(probes: Vec<Probe>) -> Vec<Probe> {
         kept.push(at);
     }
     if kept.len() == probes.len() {
+        probes.shrink_to_fit();
         return probes;
     }
     let mut keep = kept.into_iter().peekable();
-    probes
+    let mut kept = probes
         .into_iter()
         .enumerate()
         .filter_map(|(at, probe)| {
@@ -404,7 +407,9 @@ pub(crate) fn dedup_probes(probes: Vec<Probe>) -> Vec<Probe> {
                 probe
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    kept.shrink_to_fit();
+    kept
 }
 
 /// Every include candidate observed while resolving an expansion, plus the
@@ -2353,7 +2358,7 @@ mod cache_tests {
     /// entries, never the entries a request stored or used.
     #[test]
     fn a_crawl_store_evicts_only_its_own_entries_no_request_used() {
-        let cache = ProjectCache::new(100);
+        let cache = abstract_cache(100);
         let ctx = context("A.dproj");
         as_role(request_role(), || fill(&cache, "Used.pas", &ctx, 1, 40));
         as_role(crawl_role(), || {
@@ -2403,7 +2408,7 @@ mod cache_tests {
 
     #[test]
     fn a_crawl_interface_put_never_evicts_a_requests_entry() {
-        let cache = ProjectCache::new(100);
+        let cache = abstract_cache(100);
         let ctx = context("A.dproj");
         as_role(request_role(), || fill(&cache, "Used.pas", &ctx, 1, 90));
         as_role(crawl_role(), || {
@@ -2420,7 +2425,7 @@ mod cache_tests {
     /// D51: a request's store still evicts the crawl's entries first by age.
     #[test]
     fn a_request_store_may_evict_the_crawls_entries() {
-        let cache = ProjectCache::new(100);
+        let cache = abstract_cache(100);
         let ctx = context("A.dproj");
         as_role(crawl_role(), || fill(&cache, "C1.pas", &ctx, 1, 60));
         as_role(request_role(), || fill(&cache, "Used.pas", &ctx, 1, 60));
@@ -2432,7 +2437,7 @@ mod cache_tests {
     /// publications past their pool) is under its admission.
     #[test]
     fn a_crawl_reservation_never_evicts_a_requests_entry() {
-        let cache = ProjectCache::new(100);
+        let cache = abstract_cache(100);
         let ctx = context("A.dproj");
         as_role(request_role(), || fill(&cache, "Used.pas", &ctx, 1, 60));
         as_role(crawl_role(), || {
@@ -2451,7 +2456,7 @@ mod cache_tests {
     /// does not make it the crawl's to evict again.
     #[test]
     fn a_crawl_refresh_keeps_a_requests_interface_protected() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         let value = || interface_value(&[("Base.pas", 1)], true);
         as_role(request_role(), || {
@@ -2472,7 +2477,7 @@ mod cache_tests {
     /// everything and stays pending.
     #[test]
     fn a_sweep_with_no_known_current_fingerprint_is_deferred() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let ctx = context("A.dproj");
         fill(&cache, "Main.pas", &ctx, 1, 10);
         cache.begin_fingerprint_sweep();
@@ -2487,7 +2492,7 @@ mod cache_tests {
     /// older ones.
     #[test]
     fn room_for_a_request_is_taken_from_the_crawls_entries_first() {
-        let cache = ProjectCache::new(100);
+        let cache = abstract_cache(100);
         let ctx = context("A.dproj");
         as_role(request_role(), || fill(&cache, "Used.pas", &ctx, 1, 40));
         as_role(crawl_role(), || fill(&cache, "C1.pas", &ctx, 1, 50));
@@ -2504,7 +2509,7 @@ mod cache_tests {
     /// current project's, which the sweep keeps.
     #[test]
     fn fingerprints_used_since_a_sweep_began_are_recorded() {
-        let cache = ProjectCache::new(1 << 20);
+        let cache = abstract_cache(1 << 20);
         let old = context("Old.dproj");
         let current = context("A.dproj");
         fill(&cache, "Old.pas", &old, 1, 10);
@@ -5692,7 +5697,9 @@ impl ProjectCache {
                 && old.bindings == value.bindings
                 && old.complete == value.complete
         );
-        let bytes = value.retained_bytes();
+        let retained = value.retained_bytes();
+        let value = Value::Interface(Arc::new(value));
+        let bytes = entry_charge(&state, &key, &value, retained);
         let crawl = crawl_admission_on_this_thread();
         // A refresh keeps a request's use of the entry it replaces.
         let replaces_requested = matches!(
@@ -5716,7 +5723,7 @@ impl ProjectCache {
         }
         state.clock += 1;
         let entry = Entry {
-            value: Value::Interface(Arc::new(value)),
+            value,
             context: intern_context(&mut state, key.fingerprint, context),
             input_hash: content_hash,
             bytes,
@@ -6275,11 +6282,15 @@ fn value_probes(value: &Value) -> &[Probe] {
 /// The paths whose change invalidates the entry: `true` marks a stamp or
 /// content probe, which a change to a child also invalidates.
 fn indexed_paths(key: &Key, entry: &Entry) -> Vec<(bool, PathBuf)> {
+    value_paths(key, &entry.value)
+}
+
+fn value_paths(key: &Key, value: &Value) -> Vec<(bool, PathBuf)> {
     let mut paths = Vec::new();
     if let Ok(own) = key.uri.to_file_path() {
         paths.push((false, own));
     }
-    for probe in value_probes(&entry.value) {
+    for probe in value_probes(value) {
         match probe {
             Probe::Stamp { path, .. } | Probe::Content { path, .. } => {
                 paths.push((true, path.clone()));
@@ -6292,6 +6303,16 @@ fn indexed_paths(key: &Key, entry: &Entry) -> Vec<(bool, PathBuf)> {
         }
     }
     paths
+}
+
+/// `bytes` a caller estimates for `value`, plus what the cache's indexes
+/// keep for it (`index_bytes`): the entry's charge, which admission and
+/// eviction count.
+fn entry_charge(state: &State, key: &Key, value: &Value, bytes: usize) -> usize {
+    if !state.charge_indexes {
+        return bytes;
+    }
+    bytes.saturating_add(index_bytes(state, key, &value_paths(key, value)))
 }
 
 /// What the cache's own indexes keep for an entry under `key` probing
@@ -6348,15 +6369,12 @@ fn index_remove<K: std::hash::Hash + Eq>(
 
 /// Stores a ready entry, replacing any ready entry under the key, and keeps
 /// every index in step with it.
-fn insert_ready(state: &mut State, key: Key, mut entry: Entry) {
+fn insert_ready(state: &mut State, key: Key, entry: Entry) {
     remove_ready(state, &key);
     if let Some(address) = parse_address(&entry.value) {
         hold_parse(state, address, entry.bytes);
     }
     let paths = indexed_paths(&key, &entry);
-    if state.charge_indexes {
-        entry.bytes = entry.bytes.saturating_add(index_bytes(state, &key, &paths));
-    }
     state.bytes = state.bytes.saturating_add(entry.bytes);
     // A pinned key whose entry arrives after its pin keeps the pins within
     // their cap (l4d-axsn): over it, the key is unpinned for every owner.
@@ -6738,7 +6756,8 @@ impl ProjectCache {
                     && claim.generation == state.generation
                     && *id == claim.claim);
         let crawl = crawl_admission_on_this_thread();
-        let refused = current && crawl && !make_room_for_crawl(&mut state, bytes, None, 0);
+        let charged = entry_charge(&state, &claim.key, &value, bytes);
+        let refused = current && crawl && !make_room_for_crawl(&mut state, charged, None, 0);
         if refused {
             refuse_crawl_on_this_thread();
         }
@@ -6767,7 +6786,7 @@ impl ProjectCache {
                 value,
                 context: claim.context.clone(),
                 input_hash: claim.input_hash,
-                bytes,
+                bytes: charged,
                 last_used: state.clock,
                 background: crawl,
             };
@@ -7795,6 +7814,18 @@ impl ProjectCache {
     #[cfg(test)]
     pub(crate) fn provider_graph_count(&self) -> usize {
         lock(&self.inner).provider_graphs.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider_graphs_for_test(
+        &self,
+    ) -> Vec<Arc<pascal_core::compile_time::SharedProviderGraph>> {
+        lock(&self.inner)
+            .provider_graphs
+            .entries
+            .values()
+            .map(|entry| Arc::clone(&entry.graph))
+            .collect()
     }
 
     /// Removes every provider interface and returns the bytes the test

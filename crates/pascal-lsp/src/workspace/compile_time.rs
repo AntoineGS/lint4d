@@ -1621,6 +1621,131 @@ mod tests {
         assert!(graphs.get(&key).is_some());
     }
 
+    /// l4d-10: SFClient2's business object interfaces probe the same
+    /// candidate paths in their observations, their trace and their nested
+    /// providers' lookups; the deduplicated probes kept the capacity of all
+    /// of them (BaseREPAIRHEADER: 7.4 MB kept, 0.15 MB charged). The store
+    /// charges what it keeps for an interface's probes and reads.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_shared_interface_with_repeated_probes_is_charged_within_a_fifth_of_its_heap() {
+        use pascal_core::SourceId;
+        use pascal_core::compile_time::{ProviderGraphKey, SharedProviderGraph};
+        use pascal_core::resolver::ResolutionObservation;
+        let candidate = |n: usize| ResolutionObservation::Candidate {
+            path: format!("/w/Common/BOBase/Source{:02}/BaseTABLE{n:04}.pas", n % 30).into(),
+            entry: None,
+            stamp: None,
+            present: false,
+        };
+        // 40 lookups seen 200 times each.
+        let observations = Arc::new((0..8_000).map(|n| candidate(n % 40)).collect::<Vec<_>>());
+        let graph = Arc::new(SharedProviderGraph {
+            occurrence: OccurrenceId(1),
+            graph: None,
+            // Kept alive by the test: only what the store adds is measured.
+            observations: Arc::clone(&observations),
+            warnings: Default::default(),
+            dependencies: Default::default(),
+            scanned: Default::default(),
+            children: Default::default(),
+            trace: Arc::clone(&observations),
+            revision: pascal_core::SourceRevision::Overlay {
+                version: 1,
+                content_hash: 1,
+            },
+            lookup: (0, 0),
+            names: None,
+            // What the graph's own estimate counts for its struct.
+            retained_bytes: std::mem::size_of::<SharedProviderGraph>(),
+        });
+        let key = ProviderGraphKey {
+            source: SourceId::new("/w/Common/BOBase/BaseREPAIRHEADER.pas"),
+            content_hash: 1,
+            disk_stamp: None,
+            overlay_version: Some(1),
+            context: Default::default(),
+            qualifiers: vec![],
+        };
+        let cache = crate::project_cache::ProjectCache::new(1 << 30);
+        let graphs = CachedProviderGraphs {
+            cache: cache.clone(),
+            configuration: 3,
+            overlays: Default::default(),
+            capture: Arc::new(crate::workspace::capture::ReadCapture::default()),
+        };
+        use pascal_core::compile_time::SharedProviderGraphs;
+        graphs.put(key, graph);
+        assert_eq!(cache.provider_graph_count(), 1);
+        let charged = cache.provider_graph_bytes();
+        let (freed, holders) = cache.drop_provider_graphs_for_test();
+        assert_eq!(holders, vec![0]);
+        let error = charged.abs_diff(freed as usize) as f64 / freed as f64;
+        assert!(
+            error <= 0.2,
+            "charged {charged} bytes for an interface that kept {freed} ({:.0}% off)",
+            error * 100.0
+        );
+    }
+
+    /// l4d-10: an interface compiled through nested providers collects each
+    /// provider it read once per nesting; deduplicated, the list kept the
+    /// room of every repeat (BaseREPAIRHEADER: 5.3 MB of dependencies).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_interfaces_keep_no_room_for_repeated_dependencies() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source = "unit Main; interface uses A; {$IF A.Flag = 8} const Eight = 8; {$IFEND} implementation end.";
+        std::fs::write(root.join("Main.pas"), source).unwrap();
+        std::fs::write(
+            root.join("C.pas"),
+            "unit C; interface const F = 1; implementation end.",
+        )
+        .unwrap();
+        let middles = (0..12).map(|n| format!("B{n}")).collect::<Vec<_>>();
+        for name in &middles {
+            std::fs::write(
+                root.join(format!("{name}.pas")),
+                format!("unit {name}; interface uses C; const {{$IF C.F = 1}} F = 1; {{$ELSE}} F = 0; {{$IFEND}} implementation end."),
+            )
+            .unwrap();
+        }
+        let checks = middles
+            .iter()
+            .map(|name| format!("{{$IF {name}.F = 1}} {name}Ok = 1; {{$IFEND}}"))
+            .collect::<String>();
+        std::fs::write(
+            root.join("A.pas"),
+            format!(
+                "unit A; interface uses C, {}; const {checks} Flag = 8; implementation end.",
+                middles.join(", ")
+            ),
+        )
+        .unwrap();
+        pascal_project::backdate_tree_for_test(root);
+        let mut workspace = Workspace::with_override_session(
+            vec![root.into()],
+            Default::default(),
+            OverrideSession::new(None),
+        );
+        let uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+        let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+        drop(expand_main(&workspace, &uri, source, &key));
+        let graphs = workspace.project_cache.provider_graphs_for_test();
+        assert!(graphs.len() > 2, "{} shared interfaces", graphs.len());
+        for graph in graphs {
+            assert_eq!(
+                graph.dependencies.capacity(),
+                graph.dependencies.len(),
+                "{} keeps room for {} dependencies, holds {}",
+                graph.occurrence.0,
+                graph.dependencies.capacity(),
+                graph.dependencies.len()
+            );
+        }
+    }
+
     fn provider_workspace(root: &std::path::Path) -> (Workspace, Url, String, ContextKey) {
         let source = "unit Main; interface uses A; {$IF A.Flag = 8} const Eight = 8; {$ELSE} const Other = 0; {$ENDIF} implementation end.";
         std::fs::write(root.join("Main.pas"), source).unwrap();
@@ -2190,6 +2315,75 @@ mod tests {
         let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
         drop(expand_main(&workspace, &uri, source, &key));
         assert_graphs_charged_within_a_fifth(&workspace);
+    }
+
+    /// l4d-10: the shared interfaces of real providers, compiled under the
+    /// production limits, are charged within a fifth of the heap they keep.
+    /// Needs RAD Studio 7.0's sources (read only), and multidev's business
+    /// objects when `MULTIDEV` is set:
+    /// `PASCAL_RTL=~/.local/share/Headless-Delphi/files/RAD\ Studio/7.0/source/Win32
+    ///  MULTIDEV=~/gits/multidev cargo test -p pascal-lsp --lib real_providers -- --ignored`
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs RAD Studio 7.0 sources"]
+    fn real_providers_are_charged_within_a_fifth_of_their_heap() {
+        let rtl = std::path::PathBuf::from(std::env::var("PASCAL_RTL").expect("PASCAL_RTL"));
+        let mut paths = ["rtl/sys", "rtl/common", "rtl/win", "vcl", "db"]
+            .iter()
+            .map(|dir| rtl.join(dir))
+            .collect::<Vec<_>>();
+        let mut uses = vec!["SysConst", "Variants", "Types"];
+        if let Some(multidev) = std::env::var_os("MULTIDEV").map(std::path::PathBuf::from) {
+            for dir in ["Common", "Common/BO", "Common/BOBase", "Common/BORules"] {
+                paths.push(multidev.join(dir));
+            }
+            uses.extend([
+                "BusinessObject",
+                "BOFields",
+                "BOConnection",
+                "BaseREPAIRHEADER",
+            ]);
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let source = format!(
+            "unit Main; interface uses {}; {{$IF Declared(TObject)}} const Eight = 8; {{$IFEND}} implementation end.",
+            uses.join(", ")
+        );
+        std::fs::write(temp.path().join("Main.pas"), &source).unwrap();
+        let options = crate::workspace::WorkspaceOptions {
+            source_paths: paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            ..crate::workspace::WorkspaceOptions::default()
+        };
+        let mut workspace = Workspace::with_override_session(
+            vec![temp.path().into()],
+            options,
+            OverrideSession::new(None),
+        );
+        let uri = Url::from_file_path(temp.path().join("Main.pas")).unwrap();
+        let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+        // A session past max_work still shares what it compiled before.
+        drop(expand(
+            &workspace,
+            &uri,
+            &source,
+            &key,
+            workspace.include_expansion_limits(),
+            &AtomicBool::new(false),
+            None,
+        ));
+        assert!(workspace.project_cache.provider_graph_count() > 0);
+        let charged = workspace.project_cache.provider_graph_bytes();
+        let (freed, holders) = workspace.project_cache.drop_provider_graphs_for_test();
+        assert!(holders.iter().all(|holders| *holders == 0), "{holders:?}");
+        let error = charged.abs_diff(freed as usize) as f64 / freed as f64;
+        assert!(
+            error <= 0.2,
+            "charged {charged} bytes for interfaces that kept {freed} ({:.0}% off)",
+            error * 100.0
+        );
     }
 
     #[cfg(target_os = "linux")]

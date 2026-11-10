@@ -3062,6 +3062,10 @@ impl ProviderEngine<'_, '_> {
             (a.source.as_str(), a.content_hash).cmp(&(b.source.as_str(), b.content_hash))
         });
         dependencies.dedup();
+        // Shared with the interface: nested providers push each source they
+        // read, so the deduplicated list would keep room for every repeat
+        // (l4d-10).
+        dependencies.shrink_to_fit();
         let dependencies = Arc::new(dependencies);
         self.note_dependencies(&dependencies)?;
         let mut analysis = result?;
@@ -3114,6 +3118,7 @@ impl ProviderEngine<'_, '_> {
                     (a.source.as_str(), a.content_hash).cmp(&(b.source.as_str(), b.content_hash))
                 });
                 all.dedup();
+                all.shrink_to_fit();
                 Arc::new(all)
             }
             _ => dependencies,
@@ -3699,6 +3704,7 @@ impl ProviderEngine<'_, '_> {
                 (a.source.as_str(), a.content_hash).cmp(&(b.source.as_str(), b.content_hash))
             });
             dependencies.dedup();
+            dependencies.shrink_to_fit();
             entry.dependencies = Arc::new(dependencies);
         }
         let (Some(origin), Some(store)) =

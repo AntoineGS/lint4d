@@ -350,18 +350,24 @@ fn held_answer(
     }
 }
 
-/// What a Delphi build writes beside the sources: compiled units (in both
-/// cases), the executable, a package, resources, a map.
+/// What a Delphi build writes beside the sources: compiled units beside
+/// their units (`Other<round>.pas` and `Importer<round>.pas` exist in
+/// `lib`; in the root there is no unit, so none), the executable, a
+/// package, resources, a map, a version resource.
 fn write_build_products(directory: &Path, round: usize) {
-    for name in [
-        format!("Other{round}.dcu"),
-        format!("Shared{round}.DCU"),
+    let mut names = vec![
         format!("App{round}.exe"),
         format!("Pkg{round}.dcp"),
         format!("App{round}.res"),
         format!("App{round}.map"),
         format!("App{round}.drc"),
-    ] {
+        format!("App{round}.vrc"),
+    ];
+    if directory.ends_with("lib") {
+        names.push(format!("Other{round}.dcu"));
+        names.push(format!("importer{round}.DCU"));
+    }
+    for name in names {
         fs::write(directory.join(name), b"built").unwrap();
     }
 }
@@ -417,6 +423,29 @@ fn build_products_written_during_a_request_refuse_nothing() {
     server.shutdown();
 }
 
+/// l4d-qk5t round 1: a compiled unit with no source of its stem appears in
+/// the search directory while references are computed: the compiled-unit
+/// fallback can bind an import to it, so the request is refused.
+#[test]
+fn a_lone_compiled_unit_written_during_a_request_refuses_it() {
+    let environment = tempfile::tempdir().unwrap();
+    let root = query_fixture(environment.path(), &SPEC);
+    let (barrier, spec) = validation_barrier(environment.path());
+    let mut server = held_server(environment.path(), &root, &spec);
+    let lib = root.join("lib");
+    let created = held_answer(
+        &mut server,
+        &barrier,
+        "references-lone-dcu",
+        "textDocument/references",
+        references_to_shared(&root),
+        || fs::write(lib.join("Vendor.dcu"), b"built").unwrap(),
+    );
+    let error = created.expect_err("a lone compiled unit refuses the request in flight");
+    assert!(error.starts_with("-32803 "), "{error}");
+    server.shutdown();
+}
+
 /// l4d-qk5t: a new unit (a source the resolver can select; its extension
 /// in another case) created in the search directory while references are
 /// computed can change the answer: the request is refused, and the retry
@@ -461,6 +490,9 @@ fn build_products_written_between_sessions_keep_persisted_members() {
     let done = index_after_a_build(|root| {
         write_build_products(&root.join("lib"), 0);
         write_build_products(root, 0);
+        // Bindings are found again on every refresh: a lone compiled unit
+        // does not stale a stored listing either.
+        fs::write(root.join("lib/Vendor.dcu"), b"built").unwrap();
     });
     assert_eq!(done["extracted"], 0, "{done}");
     assert_eq!(done["reused"], done["members"], "{done}");

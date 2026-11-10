@@ -3924,3 +3924,71 @@ fn distinct_header_candidates_are_bounded_by_their_distinct_bytes() {
     let usage = resolver.compile_time_usage();
     assert!(usage.work <= 10_000 + credited, "{usage:?}");
 }
+
+/// l4d-qk5t round 1: an include whose requested name has a build-product
+/// extension may select a file the resolvable fingerprint leaves out, so
+/// the directory listings its search reads hold only by their stamp
+/// (`EXACT_LISTING`); an ordinary include's listing keeps its fingerprint.
+#[test]
+fn an_include_of_a_build_product_name_records_exact_listings() {
+    let directory = tempdir().expect("include root");
+    let root = directory.path();
+    fs::write(
+        root.join("Main.pas"),
+        "unit Main; interface implementation end.",
+    )
+    .unwrap();
+    let listings = |requested: &str| {
+        let mut context = configured_disk_context(root);
+        edit_context(&mut context, |p| {
+            p.include_path_entries = vec![ProjectPathEntry::configured(root.to_path_buf())]
+        });
+        let mut resolver = UnitResolver::new(
+            context,
+            vec![root.to_path_buf()],
+            FilesystemSourceStore::new(),
+            Default::default(),
+        );
+        let outcome = resolver.resolve_include(
+            pascal_core::IncludeResolveRequest {
+                including_path: &root.join("Main.pas"),
+                byte_range: 0..1,
+                requested_name: requested,
+                legacy_route: None,
+            },
+            &NoCancellation,
+        );
+        assert!(
+            !matches!(outcome.result, Resolution::Found(_)),
+            "{requested}"
+        );
+        resolver
+            .finish()
+            .observations
+            .into_iter()
+            .filter_map(|observation| match observation {
+                ResolutionObservation::Directory {
+                    listed: true,
+                    resolvable,
+                    ..
+                } => Some(resolvable),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let exact = listings("Settings.RES");
+    assert!(!exact.is_empty(), "the fallback listed the directory");
+    assert!(
+        exact
+            .iter()
+            .all(|resolvable| *resolvable == Some(pascal_core::resolver::EXACT_LISTING)),
+        "{exact:?}"
+    );
+    let ordinary = listings("Missing.inc");
+    assert!(!ordinary.is_empty());
+    assert!(
+        ordinary.iter().all(|resolvable| resolvable
+            .is_some_and(|fingerprint| fingerprint != pascal_core::resolver::EXACT_LISTING)),
+        "{ordinary:?}"
+    );
+}

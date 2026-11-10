@@ -1958,6 +1958,15 @@ impl Workspace {
     pub(crate) fn revalidate_records(&self, records: &[SourceRecord]) -> Result<(), String> {
         let cancel = AtomicBool::new(false);
         let deleted_paths = deleted_override_paths(&self.deleted_overrides);
+        let open_documents = || {
+            open_paths(
+                self.open_documents
+                    .iter()
+                    .filter(|(_, document)| document.text.is_some())
+                    .map(|(uri, _)| uri),
+            )
+        };
+        let relist = Relisting::new(&open_documents);
         for record in records {
             if let Some(path) = &record.path {
                 if record.missing_provider_candidate {
@@ -1981,14 +1990,7 @@ impl Workspace {
                         ));
                     }
                 }
-                revalidate_path_record(path, record, &cancel, true, &deleted_paths, &|| {
-                    open_paths(
-                        self.open_documents
-                            .iter()
-                            .filter(|(_, document)| document.text.is_some())
-                            .map(|(uri, _)| uri),
-                    )
-                })?;
+                revalidate_path_record(path, record, &cancel, true, &deleted_paths, &relist)?;
                 continue;
             }
             if record.open {
@@ -2141,6 +2143,8 @@ fn revalidate_records(
     cancel: &AtomicBool,
     validate_transport_observations: bool,
 ) -> Result<(), String> {
+    let open_buffers = || open_paths(overlays.keys());
+    let relist = Relisting::new(&open_buffers);
     for record in records {
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
@@ -2158,7 +2162,7 @@ fn revalidate_records(
                 cancel,
                 validate_transport_observations,
                 deleted_paths,
-                &|| open_paths(overlays.keys()),
+                &relist,
             )?;
             // A retained path-backed record can become superseded by a newly
             // admitted overlay.  Effective owner validation must compare the
@@ -2261,7 +2265,7 @@ fn revalidate_path_record(
     cancel: &AtomicBool,
     validate_transport_observations: bool,
     deleted_paths: &[PathBuf],
-    open_paths: &dyn Fn() -> Vec<PathBuf>,
+    relist: &Relisting<'_>,
 ) -> Result<(), String> {
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
@@ -2344,7 +2348,7 @@ fn revalidate_path_record(
                     path,
                     record,
                     &actual_path_stamp,
-                    open_paths,
+                    relist,
                     deleted_paths,
                     cancel,
                 )?);
@@ -2412,21 +2416,52 @@ fn open_paths<'a>(uris: impl Iterator<Item = &'a Url>) -> Vec<PathBuf> {
     uris.filter_map(|uri| uri.to_file_path().ok()).collect()
 }
 
-/// The most entries `directory_resolves_alike` lists before it gives up and
-/// the stamp check refuses.
+/// The most entries `directory_resolves_alike` lists in one directory, and
+/// in all the directories of one revalidation, before it gives up and the
+/// stamp check refuses.
 const MAX_REVALIDATED_LISTING_ENTRIES: usize = 65_536;
+const MAX_REVALIDATED_LISTING_TOTAL: usize = 262_144;
+
+/// One revalidation's listings of directories whose stamps changed: the
+/// open buffers they join and the entries they have read so far.
+pub(crate) struct Relisting<'a> {
+    open_paths: &'a dyn Fn() -> Vec<PathBuf>,
+    listed: std::cell::Cell<usize>,
+}
+
+impl<'a> Relisting<'a> {
+    pub(crate) fn new(open_paths: &'a dyn Fn() -> Vec<PathBuf>) -> Self {
+        Self {
+            open_paths,
+            listed: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Counts one more listed entry; false past the bound.
+    fn admit(&self) -> bool {
+        let listed = self.listed.get().saturating_add(1);
+        self.listed.set(listed);
+        listed <= MAX_REVALIDATED_LISTING_TOTAL
+    }
+}
 
 /// Whether the directory `path` of a directory observation whose stamp
 /// changed still holds the resolvable entries the computation saw
 /// (`DirectoryListingWitness::Resolvable`): only entries no lookup selects
-/// (build products) were created or removed, so every lookup there resolves
-/// as it did (l4d-qk5t). The listing joins the open buffers and leaves out
-/// the files deleted in the editor, as the computation's source store did.
+/// (build products beside their sources) were created or removed, so every
+/// lookup there resolves as it did (l4d-qk5t).
+///
+/// The listing approximates the computation's source store rather than
+/// copying it: it joins every open buffer in the directory (the store joins
+/// only authorized ones), leaves out the files deleted in the editor (the
+/// store keeps them) and keeps the cache directory (the store drops it).
+/// Each difference, like any read error or a bound, can only make the
+/// fingerprints differ, which refuses; none can hold a changed directory.
 fn directory_resolves_alike(
     path: &Path,
     record: &SourceRecord,
     actual: &Option<PathStamp>,
-    open_paths: &dyn Fn() -> Vec<PathBuf>,
+    relist: &Relisting<'_>,
     deleted_paths: &[PathBuf],
     cancel: &AtomicBool,
 ) -> Result<bool, String> {
@@ -2457,7 +2492,7 @@ fn directory_resolves_alike(
             if count % 256 == 0 && is_cancelled(cancel) {
                 return Err(CANCELLATION_MESSAGE.to_string());
             }
-            if count >= MAX_REVALIDATED_LISTING_ENTRIES {
+            if count >= MAX_REVALIDATED_LISTING_ENTRIES || !relist.admit() {
                 return Ok(false);
             }
             let Ok(entry) = entry else {
@@ -2478,7 +2513,7 @@ fn directory_resolves_alike(
             .iter()
             .any(|deleted| shared_resolver::path_equivalent(deleted, file))
     });
-    for open in open_paths() {
+    for open in (relist.open_paths)() {
         if open
             .parent()
             .is_some_and(|parent| shared_resolver::path_equivalent(parent, path))
@@ -12121,8 +12156,15 @@ mod tests {
         assert!(record.read_policy.is_some());
         assert!(record.path_entry.is_some());
         let cancel = AtomicBool::new(false);
-        super::revalidate_path_record(&candidate, &record, &cancel, true, &[], &Vec::new)
-            .expect("unchanged discarded candidate must revalidate");
+        super::revalidate_path_record(
+            &candidate,
+            &record,
+            &cancel,
+            true,
+            &[],
+            &super::Relisting::new(&Vec::new),
+        )
+        .expect("unchanged discarded candidate must revalidate");
 
         let original_mtime = fs::metadata(&candidate)
             .expect("candidate metadata")
@@ -12136,9 +12178,15 @@ mod tests {
             .set_times(FileTimes::new().set_modified(original_mtime))
             .expect("restore candidate mtime");
 
-        let error =
-            super::revalidate_path_record(&candidate, &record, &cancel, true, &[], &Vec::new)
-                .expect_err("same-stamp discarded candidate mutation must stale");
+        let error = super::revalidate_path_record(
+            &candidate,
+            &record,
+            &cancel,
+            true,
+            &[],
+            &super::Relisting::new(&Vec::new),
+        )
+        .expect_err("same-stamp discarded candidate mutation must stale");
         assert!(
             error.contains("changed") || error.contains("metadata"),
             "unexpected discarded candidate revalidation error: {error}"
@@ -14753,7 +14801,7 @@ mod tests {
             &AtomicBool::new(false),
             true,
             &[],
-            &Vec::new,
+            &super::Relisting::new(&Vec::new),
         )
     }
 
@@ -14779,7 +14827,14 @@ mod tests {
         };
         revalidate_directory(&record).expect("unchanged");
 
-        for product in ["Shared.dcu", "Other.DCU", "App.exe", "Pkg.dcp", "App.res"] {
+        for product in [
+            "Shared.dcu",
+            "shared.DCU",
+            "App.exe",
+            "Pkg.dcp",
+            "App.res",
+            "App.vrc",
+        ] {
             fs::write(lib.join(product), b"built").unwrap();
         }
         revalidate_directory(&record).expect("build products resolve nothing");
@@ -14787,6 +14842,11 @@ mod tests {
         assert!(error.contains("retry the request"), "{error}");
         fs::remove_file(lib.join("App.exe")).unwrap();
         revalidate_directory(&record).expect("a removed build product");
+
+        fs::write(lib.join("Vendor.dcu"), b"built").unwrap();
+        let error = revalidate_directory(&record).expect_err("a lone compiled unit");
+        assert!(error.contains("retry the request"), "{error}");
+        fs::remove_file(lib.join("Vendor.dcu")).unwrap();
 
         fs::write(
             lib.join("Late.Pas"),

@@ -1310,6 +1310,7 @@ enum TestBarrier {
     CompletionResolution,
     WorkspaceSymbols,
     References,
+    #[cfg(feature = "test-support")]
     ReferencesValidation,
     PartialValidation,
     ProjectOperation,
@@ -6852,6 +6853,7 @@ impl AnalysisJobs {
                 ) {
                     invalidate_analysis_result(&mut result, error);
                 }
+                #[cfg(feature = "test-support")]
                 if matches!(
                     result.value,
                     AnalysisResultValue::References(Ok(_))

@@ -1680,6 +1680,28 @@ fn hppemit_bodies_end_at_the_first_closer() {
     assert_eq!(activity(&analysis, "DEFINE AFTER"), Truth::True);
 }
 
+/// l4d-eg7s: `REGION`/`ENDREGION` text is an IDE folding caption DCC never
+/// reads, so the directive ends at the first closer whatever quotes it holds.
+/// multidev's PosMainForm compiles with
+/// `{$REGION 'Écriture … l''état 'R' y monte en prévision d'y appeler …'}`,
+/// an odd number of quotes.
+#[test]
+fn region_bodies_end_at_the_first_closer() {
+    let source = "unit T; interface\n\
+         {$REGION 'pour que l''état 'R' y monte en prévision d'y appeler'}\n\
+         (*$REGION 'we don't '*)\n\
+         {$ENDREGION 'it's done'}\n\
+         {$REGION'caption's quote follows the keyword'}\n\
+         {$ENDREGION'}\n\
+         {$ENDREGION}\n\
+         {$DEFINE AFTER}{$IFDEF AFTER}const A = 1;{$ENDIF}\n\
+         implementation end.";
+    let mut fixture = Fixture::new(source, context(LayoutPlatform::Win32));
+    let analysis = fixture.analyze().unwrap();
+    assert!(analysis.root.complete, "{:?}", analysis.reasons);
+    assert_eq!(activity(&analysis, "DEFINE AFTER"), Truth::True);
+}
+
 /// l4d-ztip: the short code-generation switches `B`, `J`, `V`, `I+`/`I-`,
 /// `STRINGCHECKS` and the numeric list members `Z1`/`A4` are harmless, and
 /// the tracked `$IFOPT` options keep their state.

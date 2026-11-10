@@ -8346,45 +8346,18 @@ impl NavigationIndex {
         }
         let span = Span::from_node(identifier);
         let key = canonical_name(&node_text(identifier, &document.source));
-        let routine_keys = document
-            .symbols
-            .iter()
-            .filter(|symbol| {
-                #[cfg(test)]
-                test_record_materialization(&TEST_SEMANTIC_GENERIC_SYMBOL_VISITS);
-                symbol.kind == SymbolKind::Routine
-                    && !symbol.generic_parameters.is_empty()
-                    && symbol.declaration_span.contains(span)
-                    && symbol
-                        .generic_parameters
-                        .iter()
-                        .any(|parameter| parameter.name == key)
-            })
-            .filter_map(|symbol| symbol.routine_key.as_ref())
-            .collect::<HashSet<_>>();
-        if routine_keys.is_empty() {
-            return None;
-        }
-        let candidates = document
-            .symbols
-            .iter()
-            .enumerate()
-            .filter(|(_, symbol)| {
-                #[cfg(test)]
-                test_record_materialization(&TEST_SEMANTIC_GENERIC_SYMBOL_VISITS);
-                symbol.kind == SymbolKind::Type
-                    && symbol.generic_parameter.as_deref() == Some(key.as_str())
-                    && symbol
-                        .routine_key
-                        .as_ref()
-                        .is_some_and(|routine_key| routine_keys.contains(routine_key))
-            })
-            .map(|(index, _)| Candidate {
-                uri: uri.clone(),
-                index,
-            })
-            .collect::<Vec<_>>();
-        (!candidates.is_empty()).then_some(candidates)
+        let indices = document
+            .generic_parameter_symbol_indices(span, &key, &mut |_| Ok::<(), ()>(()))
+            .ok()?;
+        (!indices.is_empty()).then(|| {
+            indices
+                .into_iter()
+                .map(|index| Candidate {
+                    uri: uri.clone(),
+                    index,
+                })
+                .collect()
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8406,50 +8379,20 @@ impl NavigationIndex {
             cancel,
             budget,
         )?);
-        let mut routine_keys = HashSet::new();
-        for symbol in &document.symbols {
+        let indices = document.generic_parameter_symbol_indices(span, &key, &mut |symbol| {
             check_navigation_cancel(cancel)?;
             budget.require_work(1, cancel)?;
-            budget.require_bytes(symbol.key.len().saturating_add(symbol.name.len()), cancel)?;
-            #[cfg(test)]
-            test_record_materialization(&TEST_SEMANTIC_GENERIC_SYMBOL_VISITS);
-            if symbol.kind == SymbolKind::Routine
-                && !symbol.generic_parameters.is_empty()
-                && symbol.declaration_span.contains(span)
-                && symbol
-                    .generic_parameters
-                    .iter()
-                    .any(|parameter| parameter.name == key)
-                && let Some(routine_key) = symbol.routine_key.as_ref()
-            {
-                routine_keys.insert(routine_key.clone());
-            }
-        }
-        if routine_keys.is_empty() {
-            return Ok(None);
-        }
-
-        let mut candidates = Vec::new();
-        for (index, symbol) in document.symbols.iter().enumerate() {
-            check_navigation_cancel(cancel)?;
-            budget.require_work(1, cancel)?;
-            budget.require_bytes(symbol.key.len().saturating_add(symbol.name.len()), cancel)?;
-            #[cfg(test)]
-            test_record_materialization(&TEST_SEMANTIC_GENERIC_SYMBOL_VISITS);
-            if symbol.kind == SymbolKind::Type
-                && symbol.generic_parameter.as_deref() == Some(key.as_str())
-                && symbol
-                    .routine_key
-                    .as_ref()
-                    .is_some_and(|routine_key| routine_keys.contains(routine_key))
-            {
-                candidates.push(Candidate {
+            budget.require_bytes(symbol.key.len().saturating_add(symbol.name.len()), cancel)
+        })?;
+        Ok((!indices.is_empty()).then(|| {
+            indices
+                .into_iter()
+                .map(|index| Candidate {
                     uri: uri.clone(),
                     index,
-                });
-            }
-        }
-        Ok((!candidates.is_empty()).then_some(candidates))
+                })
+                .collect()
+        }))
     }
 
     fn with_lookup_for_name(
@@ -16243,6 +16186,10 @@ pub(crate) struct ParsedDocument {
     direct_symbol_indices: HashMap<Span, Vec<usize>>,
     routine_symbol_indices: HashMap<String, Vec<usize>>,
     routine_symbol_indices_by_body_scope: HashMap<usize, Vec<usize>>,
+    /// Routines declaring a generic parameter, by the parameter's key.
+    generic_routine_indices_by_parameter: HashMap<String, Vec<usize>>,
+    /// Generic parameter type symbols, by (routine key, parameter key).
+    generic_parameter_type_indices: HashMap<(String, String), Vec<usize>>,
     exported_symbol_indices: Vec<usize>,
     interface_member_routine_keys: HashMap<String, HashSet<String>>,
     method_resolutions: Vec<MethodResolution>,
@@ -17063,8 +17010,29 @@ impl Document {
         let mut direct_symbol_indices = HashMap::new();
         let mut routine_symbol_indices = HashMap::new();
         let mut routine_symbol_indices_by_body_scope = HashMap::new();
+        let mut generic_routine_indices_by_parameter = HashMap::<String, Vec<usize>>::new();
+        let mut generic_parameter_type_indices = HashMap::<(String, String), Vec<usize>>::new();
         let mut interface_member_routine_keys = HashMap::<String, HashSet<String>>::new();
         for (index, symbol) in symbols.iter().enumerate() {
+            if symbol.kind == SymbolKind::Routine {
+                for parameter in &symbol.generic_parameters {
+                    let indices = generic_routine_indices_by_parameter
+                        .entry(parameter.name.clone())
+                        .or_default();
+                    if indices.last() != Some(&index) {
+                        indices.push(index);
+                    }
+                }
+            }
+            if symbol.kind == SymbolKind::Type
+                && let (Some(parameter), Some(routine_key)) =
+                    (&symbol.generic_parameter, &symbol.routine_key)
+            {
+                generic_parameter_type_indices
+                    .entry((routine_key.clone(), parameter.clone()))
+                    .or_default()
+                    .push(index);
+            }
             symbol_indices_by_scope_key
                 .entry((symbol.scope, symbol.key.clone()))
                 .or_insert_with(Vec::new)
@@ -17174,6 +17142,8 @@ impl Document {
             direct_symbol_indices,
             routine_symbol_indices,
             routine_symbol_indices_by_body_scope,
+            generic_routine_indices_by_parameter,
+            generic_parameter_type_indices,
             exported_symbol_indices,
             interface_member_routine_keys,
             method_resolutions,
@@ -17189,6 +17159,53 @@ impl Document {
             import_binding_fingerprint: None,
             unbound: None,
         })
+    }
+
+    /// The type symbols of the generic parameter `key` declared by a routine
+    /// whose declaration contains `span`, in symbol order. `visit` is called
+    /// for each symbol examined, so a caller can charge the lookup to its
+    /// budget; it costs the routines declaring a parameter named `key`, not
+    /// the whole document (l4d-3ia4).
+    fn generic_parameter_symbol_indices<E>(
+        &self,
+        span: Span,
+        key: &str,
+        visit: &mut dyn FnMut(&Symbol) -> Result<(), E>,
+    ) -> Result<Vec<usize>, E> {
+        let Some(routines) = self.generic_routine_indices_by_parameter.get(key) else {
+            return Ok(Vec::new());
+        };
+        let mut routine_keys = Vec::<&String>::new();
+        for index in routines {
+            let symbol = &self.symbols[*index];
+            #[cfg(test)]
+            test_record_materialization(&TEST_SEMANTIC_GENERIC_SYMBOL_VISITS);
+            visit(symbol)?;
+            if symbol.declaration_span.contains(span)
+                && let Some(routine_key) = symbol.routine_key.as_ref()
+                && !routine_keys.contains(&routine_key)
+            {
+                routine_keys.push(routine_key);
+            }
+        }
+        let mut candidates = Vec::new();
+        for routine_key in routine_keys {
+            let Some(indices) = self
+                .generic_parameter_type_indices
+                .get(&(routine_key.clone(), key.to_owned()))
+            else {
+                continue;
+            };
+            for index in indices {
+                #[cfg(test)]
+                test_record_materialization(&TEST_SEMANTIC_GENERIC_SYMBOL_VISITS);
+                visit(&self.symbols[*index])?;
+                candidates.push(*index);
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        Ok(candidates)
     }
 
     fn region_at(&self, offset: usize) -> Region {
@@ -27431,9 +27448,11 @@ mod tests {
             Url::parse("file:///tmp/semantic-correction-r7-provider.pas").expect("provider URI");
         let consumer_uri =
             Url::parse("file:///tmp/semantic-correction-r7-consumer.pas").expect("consumer URI");
-        let mut provider = String::from("unit Provider;\ninterface\nconst\n  C0 = 0;\n");
+        // Generic parameter lookups are indexed by parameter name (l4d-3ia4):
+        // routines with a `TBase` parameter keep the parent lookup expensive.
+        let mut provider = String::from("unit Provider;\ninterface\n");
         for index in 1..=3_000 {
-            writeln!(&mut provider, "  C{index} = {index};").expect("write provider symbol");
+            writeln!(&mut provider, "procedure G{index}<TBase>;").expect("write provider symbol");
         }
         provider
             .push_str("type TBase = class end; TChild = class(TBase) end;\nimplementation\nend.\n");
@@ -28054,15 +28073,87 @@ mod tests {
         );
     }
 
+    /// The whole-document scan the generic parameter index replaced.
+    fn generic_parameter_symbol_indices_by_scan(
+        document: &Document,
+        span: Span,
+        key: &str,
+    ) -> Vec<usize> {
+        let routine_keys = document
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.kind == SymbolKind::Routine
+                    && symbol.declaration_span.contains(span)
+                    && symbol
+                        .generic_parameters
+                        .iter()
+                        .any(|parameter| parameter.name == key)
+            })
+            .filter_map(|symbol| symbol.routine_key.as_ref())
+            .collect::<HashSet<_>>();
+        document
+            .symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, symbol)| {
+                symbol.kind == SymbolKind::Type
+                    && symbol.generic_parameter.as_deref() == Some(key)
+                    && symbol
+                        .routine_key
+                        .as_ref()
+                        .is_some_and(|routine_key| routine_keys.contains(routine_key))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    #[test]
+    fn generic_parameter_index_matches_the_whole_document_scan() {
+        let sources = [
+            "unit G1;\ninterface\ntype\n  TBox<T> = class\n    function Map<T, U>(const Value: T): U;\n    procedure Run<V>(A: V; B: T);\n  end;\nfunction Free<T>(X: T): T; overload;\nfunction Free<T, W>(X: T; Y: W): W; overload;\nimplementation\nfunction TBox<T>.Map<T, U>(const Value: T): U;\nvar Local: U;\nbegin\n  Result := Local;\nend;\nprocedure TBox<T>.Run<V>(A: V; B: T);\nbegin\nend;\nfunction Free<T>(X: T): T;\nbegin\n  Result := X;\nend;\nfunction Free<T, W>(X: T; Y: W): W;\n  function Inner<T>(Z: T): T;\n  begin\n    Result := Z;\n  end;\nbegin\n  Result := Y;\nend;\nend.\n",
+            "program G2;\nprocedure Swap<T>(var A, B: T);\nvar Tmp: T;\nbegin\n  Tmp := A; A := B; B := Tmp;\nend;\nprocedure Twice<T, T>(A: T);\nbegin\nend;\nvar I, J: Integer;\nbegin\n  Swap<Integer>(I, J);\nend.\n",
+        ];
+        for (number, source) in sources.into_iter().enumerate() {
+            let uri = Url::parse(&format!("file:///GenericIndex{number}.pas")).expect("test URI");
+            let mut index = NavigationIndex::new();
+            index
+                .update(uri.clone(), source.to_owned())
+                .expect("generic fixture parses");
+            let document = index.documents.get(&uri).expect("indexed document");
+            let mut identifiers = Vec::new();
+            collect_nodes(document.tree.root_node(), &mut |node| {
+                if node.kind() == "identifier" {
+                    identifiers.push(node);
+                }
+            });
+            let mut matched = 0;
+            for identifier in identifiers {
+                let span = Span::from_node(identifier);
+                let key = canonical_name(&node_text(identifier, &document.source));
+                let expected = generic_parameter_symbol_indices_by_scan(document, span, &key);
+                let actual = document
+                    .generic_parameter_symbol_indices(span, &key, &mut |_| Ok::<(), ()>(()))
+                    .expect("unbounded lookup");
+                assert_eq!(actual, expected, "{key} at {span:?} in fixture {number}");
+                matched += usize::from(!expected.is_empty());
+            }
+            assert!(matched > 0, "fixture {number} exercises generic parameters");
+        }
+    }
+
     #[test]
     fn semantic_diagnostics_charge_provider_generic_symbol_scans() {
         let provider_uri =
             Url::parse("file:///tmp/semantic-budget-provider.pas").expect("provider URI");
         let consumer_uri =
             Url::parse("file:///tmp/semantic-budget-consumer.pas").expect("consumer URI");
-        let mut provider = String::from("unit Provider;\ninterface\nconst\n  C0 = 0;\n");
+        // Generic parameter lookups are indexed by parameter name (l4d-3ia4),
+        // so the provider declares many routines with a `Value` parameter to
+        // keep each lookup expensive.
+        let mut provider = String::from("unit Provider;\ninterface\n");
         for index in 1..=3_000 {
-            writeln!(&mut provider, "  C{index} = {index};").expect("write provider symbol");
+            writeln!(&mut provider, "procedure G{index}<Value>;").expect("write provider symbol");
         }
         provider.push_str(
             "type\n  TRec = record\n    Value: Integer;\n  end;\nvar Box: TRec;\nimplementation\nend.\n",
@@ -28106,9 +28197,11 @@ mod tests {
             Url::parse("file:///tmp/semantic-budget-early-provider.pas").expect("provider URI");
         let consumer_uri =
             Url::parse("file:///tmp/semantic-budget-early-consumer.pas").expect("consumer URI");
-        let mut provider = String::from("unit Provider;\ninterface\nconst\n  C0 = 0;\n");
+        // Generic parameter lookups are indexed by parameter name (l4d-3ia4),
+        // so many routines with a `Value` parameter keep each lookup expensive.
+        let mut provider = String::from("unit Provider;\ninterface\n");
         for index in 1..=3_000 {
-            writeln!(&mut provider, "  C{index} = {index};").expect("write provider symbol");
+            writeln!(&mut provider, "procedure G{index}<Value>;").expect("write provider symbol");
         }
         provider.push_str(
             "type\n  TRec = record\n    Value: Integer;\n  end;\nvar Box: TRec;\nimplementation\nend.\n",

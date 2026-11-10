@@ -206,7 +206,7 @@ fn stamps_bytes(stamps: &[MemberStamp]) -> usize {
 
 /// Last dotted segment after `canonical_name`, or `None` when the name is
 /// not ASCII or the segment is empty: postings prove nothing then (A2).
-fn posting_key(name: &str) -> Option<String> {
+pub(crate) fn posting_key(name: &str) -> Option<String> {
     let name = canonical_name(name);
     let key = name.rsplit('.').next().unwrap_or_default();
     if !name.is_ascii() || key.is_empty() {
@@ -697,6 +697,22 @@ impl ContextIndex {
         self.pending_members()
             .filter(|member| !member.reuse_tried)
             .take(limit)
+            .map(|member| member.path.clone())
+            .collect()
+    }
+
+    /// Members never indexed by this index and not asked of the store yet,
+    /// nor deferred, in path order: what the reuse pass has still to
+    /// validate from the stored facts (l4d-c8l2). Whether one changed since
+    /// the process started is the project cache's record
+    /// (`ProjectCache::changed_since_start`), which survives an eviction.
+    pub(crate) fn awaiting_first_reuse(&self) -> Vec<PathBuf> {
+        self.pending_members()
+            .filter(|member| {
+                matches!(member.state(), MemberState::Unindexed)
+                    && !member.reuse_tried
+                    && member.deferred == 0
+            })
             .map(|member| member.path.clone())
             .collect()
     }

@@ -895,7 +895,19 @@ fn interface_identity(graph: &AdmittedInterfaceGraph) -> usize {
     Arc::as_ptr(graph).cast::<()>() as usize
 }
 
+thread_local! {
+    static INTERFACE_STATE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread walked a shared interface's whole state to
+/// size it (l4d-10): a store must size each state once.
+#[doc(hidden)]
+pub fn interface_state_walks() -> usize {
+    INTERFACE_STATE_WALKS.with(std::cell::Cell::get)
+}
+
 fn interface_own_bytes(state: &CompileTimeState) -> usize {
+    INTERFACE_STATE_WALKS.with(|walks| walks.set(walks.get() + 1));
     let mut total = state.retained_source_bytes();
     let _ = state.visit_snapshot_payload(&mut |n| {
         total = total.saturating_add(n);
@@ -906,6 +918,7 @@ fn interface_own_bytes(state: &CompileTimeState) -> usize {
 
 fn collect_nested(
     state: &CompileTimeState,
+    known: &dyn Fn(usize) -> bool,
     seen: &mut std::collections::HashSet<usize>,
     out: &mut Vec<NestedInterface>,
 ) {
@@ -913,7 +926,9 @@ fn collect_nested(
         let Some(graph) = &interface.graph else {
             continue;
         };
-        if !seen.insert(interface_identity(graph)) {
+        let identity = interface_identity(graph);
+        // A known state is charged already, with what it binds through.
+        if known(identity) || !seen.insert(identity) {
             continue;
         }
         let alive: Arc<dyn std::any::Any + Send + Sync> = graph.clone();
@@ -922,7 +937,7 @@ fn collect_nested(
             bytes: interface_own_bytes(graph),
             alive: Arc::downgrade(&alive),
         });
-        collect_nested(graph, seen, out);
+        collect_nested(graph, known, seen, out);
     }
 }
 
@@ -933,13 +948,10 @@ impl SharedProviderGraph {
         self.graph.as_ref().map(interface_identity)
     }
 
-    /// What this interface's own state keeps (declaration state and source
-    /// bytes), without its nested interfaces: its charge once only an
-    /// importer keeps it.
-    pub fn state_bytes(&self) -> usize {
-        self.graph
-            .as_ref()
-            .map_or(0, |graph| interface_own_bytes(graph))
+    /// How many holders this interface's state has, this one included;
+    /// 0 when it could not be completed.
+    pub fn state_holders(&self) -> usize {
+        self.graph.as_ref().map_or(0, Arc::strong_count)
     }
 
     /// A handle alive while anything keeps this interface's state.
@@ -951,13 +963,16 @@ impl SharedProviderGraph {
     }
 
     /// The provider interfaces this one's state binds through, recursively,
-    /// each once. `retained_bytes` leaves them out: a store charges each
-    /// once, by its own entry while it holds one, else as kept by others.
-    pub fn nested_interfaces(&self) -> Vec<NestedInterface> {
+    /// each once, except those `known` names (with what they bind through):
+    /// each is sized by walking its state, so a store passes the states it
+    /// charges already. `retained_bytes` leaves them out: a store charges
+    /// each once, by its own entry while it holds one, else as kept by
+    /// others.
+    pub fn nested_interfaces(&self, known: &dyn Fn(usize) -> bool) -> Vec<NestedInterface> {
         let mut out = Vec::new();
         if let Some(graph) = &self.graph {
             let mut seen = std::collections::HashSet::from([interface_identity(graph)]);
-            collect_nested(graph, &mut seen, &mut out);
+            collect_nested(graph, known, &mut seen, &mut out);
         }
         out
     }

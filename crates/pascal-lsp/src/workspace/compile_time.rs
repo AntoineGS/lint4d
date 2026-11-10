@@ -2318,16 +2318,20 @@ mod tests {
         assert_graphs_charged_within_a_fifth(&workspace);
     }
 
-    /// l4d-10: the shared interfaces of real providers, compiled under the
-    /// production limits, are charged within a fifth of the heap they keep.
-    /// Needs RAD Studio 7.0's sources (read only), and multidev's business
-    /// objects when `MULTIDEV` is set:
+    /// l4d-10 smoke probe, not a regression test (fix round 1, M7): it
+    /// passed before and after the interface fixes, since `max_work` stops a
+    /// single session before the large interfaces production builds over
+    /// many member sessions; the evidence for those is the in-process
+    /// SFClient2 measurement (report m14/m17). It checks that real providers'
+    /// shared interfaces, compiled under the production limits, are charged
+    /// within a fifth of the heap they keep. Needs RAD Studio 7.0's sources
+    /// (read only), and multidev's business objects when `MULTIDEV` is set:
     /// `PASCAL_RTL=~/.local/share/Headless-Delphi/files/RAD\ Studio/7.0/source/Win32
-    ///  MULTIDEV=~/gits/multidev cargo test -p pascal-lsp --lib real_providers -- --ignored`
+    ///  MULTIDEV=~/gits/multidev cargo test -p pascal-lsp --lib real_providers_smoke -- --ignored`
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "needs RAD Studio 7.0 sources"]
-    fn real_providers_are_charged_within_a_fifth_of_their_heap() {
+    fn real_providers_smoke_probe() {
         let rtl = std::path::PathBuf::from(std::env::var("PASCAL_RTL").expect("PASCAL_RTL"));
         let mut paths = ["rtl/sys", "rtl/common", "rtl/win", "vcl", "db"]
             .iter()
@@ -2444,6 +2448,200 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let workspace = nested_provider_workspace(temp.path());
         assert_graphs_charged_within_a_fifth(&workspace);
+    }
+
+    /// `Main{n}` uses `A{n}`, whose interface reads `B{n}`'s: `units`
+    /// such pairs, each B about 1.6 MB of interface. Returns the workspace
+    /// and each Main's URI, source and context.
+    #[cfg(target_os = "linux")]
+    fn importer_pairs(
+        root: &std::path::Path,
+        units: usize,
+    ) -> (Workspace, Vec<(Url, String, ContextKey)>) {
+        let declarations = (0..2_000)
+            .map(|n| format!("C{n} = {n};\n"))
+            .collect::<String>();
+        for n in 0..units {
+            std::fs::write(
+                root.join(format!("B{n}.pas")),
+                format!("unit B{n}; interface const\n{declarations}Flag = 8; implementation end."),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join(format!("A{n}.pas")),
+                format!("unit A{n}; interface uses B{n}; const {{$IF B{n}.Flag = 8}} Flag = 8; {{$ELSE}} Flag = 0; {{$IFEND}} implementation end."),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join(format!("Main{n}.pas")),
+                format!("unit Main{n}; interface uses A{n}; {{$IF A{n}.Flag = 8}} const Eight = 8; {{$IFEND}} implementation end."),
+            )
+            .unwrap();
+        }
+        pascal_project::backdate_tree_for_test(root);
+        let mut workspace = Workspace::with_override_session(
+            vec![root.into()],
+            Default::default(),
+            OverrideSession::new(None),
+        );
+        let mains = (0..units)
+            .map(|n| {
+                let path = root.join(format!("Main{n}.pas"));
+                let source = std::fs::read_to_string(&path).unwrap();
+                let uri = Url::from_file_path(path).unwrap();
+                let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+                (uri, source, key)
+            })
+            .collect();
+        (workspace, mains)
+    }
+
+    /// l4d-10 fix round 1 (M9): a kept interface stops being charged once
+    /// its last importer is gone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_kept_interface_is_released_when_its_last_importer_drops() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = nested_provider_workspace(temp.path());
+        workspace
+            .project_cache
+            .evict_provider_graphs_for_test("B.pas");
+        assert!(workspace.project_cache.kept_provider_graph_bytes_for_test() > 1_000_000);
+        workspace
+            .project_cache
+            .evict_provider_graphs_for_test("A.pas");
+        assert_eq!(
+            workspace.project_cache.kept_provider_graph_bytes_for_test(),
+            0
+        );
+        assert_eq!(workspace.project_cache.provider_graph_bytes(), 0);
+    }
+
+    /// l4d-10 fix round 1 (I1, l4d-4nbs I2): provider interfaces, kept
+    /// states included, give way to every request: a reservation evicts the
+    /// importer that keeps a state.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_request_evicts_the_importer_that_keeps_an_interface() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = nested_provider_workspace(temp.path());
+        workspace
+            .project_cache
+            .evict_provider_graphs_for_test("B.pas");
+        let kept = workspace.project_cache.kept_provider_graph_bytes_for_test();
+        assert!(kept > 1_000_000, "{kept}");
+        let cache = &workspace.project_cache;
+        cache.set_max_bytes(2 * kept);
+        let wanted = 3 * kept / 2;
+        let reservation = cache.reserve(crate::project_cache::ReservationKind::Scratch, wanted);
+        assert!(
+            reservation.is_some(),
+            "a {wanted}-byte reservation beside {kept} kept bytes an importer holds"
+        );
+        assert_eq!(cache.provider_graph_count(), 0, "A gave way");
+        assert_eq!(cache.kept_provider_graph_bytes_for_test(), 0);
+    }
+
+    /// l4d-10 fix round 1 (I2): interfaces and the states only importers
+    /// keep stay within the provider share, however many are compiled.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interfaces_and_kept_states_stay_within_the_provider_share() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, mains) = importer_pairs(temp.path(), 8);
+        let cache = &workspace.project_cache;
+        // A share of about three pairs.
+        let share = 5 << 20;
+        cache.set_max_bytes(4 * share);
+        for (uri, source, key) in &mains {
+            drop(expand_main(&workspace, uri, source, key));
+            let charged = cache.provider_graph_bytes();
+            assert!(
+                charged <= share,
+                "{charged} bytes against a {share}-byte share"
+            );
+        }
+        assert!(cache.provider_graph_count() > 0);
+    }
+
+    /// l4d-10 fix round 1 (I2): a member that needs an interface the store
+    /// evicted while an importer still keeps it takes that one back instead
+    /// of compiling a second copy.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_member_needing_a_kept_interface_adopts_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        // Written first: a later file would change the listing B's
+        // interface proved, and B would be compiled again for that.
+        let source = "unit Other; interface uses B; {$IF B.Flag = 8} const Eight = 8; {$IFEND} implementation end.";
+        std::fs::write(root.join("Other.pas"), source).unwrap();
+        let mut workspace = nested_provider_workspace(root);
+        workspace
+            .project_cache
+            .evict_provider_graphs_for_test("B.pas");
+        assert!(workspace.project_cache.kept_provider_graph_bytes_for_test() > 0);
+        let puts = workspace.project_cache.provider_graph_puts_for_test();
+        let uri = Url::from_file_path(root.join("Other.pas")).unwrap();
+        let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+        drop(expand_main(&workspace, &uri, source, &key));
+        assert_eq!(
+            workspace.project_cache.provider_graph_puts_for_test(),
+            puts,
+            "B was not compiled again"
+        );
+        assert_eq!(workspace.project_cache.provider_graph_count(), 2);
+        assert_eq!(
+            workspace.project_cache.kept_provider_graph_bytes_for_test(),
+            0
+        );
+    }
+
+    /// l4d-10 fix round 1 (I3): the store sizes each state once, at its put,
+    /// outside its lock: evicting walks no state, and an importer of a
+    /// stored interface walks only its own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_store_sizes_each_interface_state_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source = "unit Other; interface uses A2; {$IF A2.Flag = 8} const Eight = 8; {$IFEND} implementation end.";
+        std::fs::write(
+            root.join("A2.pas"),
+            "unit A2; interface uses B; const {$IF B.Flag = 8} Flag = 8; {$ELSE} Flag = 0; {$IFEND} implementation end.",
+        )
+        .unwrap();
+        std::fs::write(root.join("Other.pas"), source).unwrap();
+        let mut workspace = nested_provider_workspace(root);
+        let walks = pascal_core::compile_time::interface_state_walks;
+        let before = walks();
+        workspace
+            .project_cache
+            .evict_provider_graphs_for_test("B.pas");
+        workspace
+            .project_cache
+            .evict_provider_graphs_for_test("A.pas");
+        assert_eq!(walks(), before, "evictions walk no state");
+        // Another importer of B, with B stored again: only its own state.
+        nested_provider_workspace_again(&mut workspace, root);
+        let uri = Url::from_file_path(root.join("Other.pas")).unwrap();
+        let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+        let before = walks();
+        drop(expand_main(&workspace, &uri, source, &key));
+        assert_eq!(
+            walks() - before,
+            0,
+            "B's state is charged already: not walked again"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn nested_provider_workspace_again(workspace: &mut Workspace, root: &std::path::Path) {
+        let source = "unit Main; interface uses A; {$IF A.Flag = 8} const Eight = 8; {$IFEND} implementation end.";
+        let uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+        let key = workspace.context_for_uri_with_cancel(&uri, None).unwrap();
+        drop(expand_main(workspace, &uri, source, &key));
+        assert_eq!(workspace.project_cache.provider_graph_count(), 2);
     }
 
     #[cfg(target_os = "linux")]

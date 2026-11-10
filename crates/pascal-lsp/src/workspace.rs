@@ -3403,8 +3403,11 @@ impl CrawlRelease {
 enum CrawlUnit {
     /// Indexed, stored, published and dropped; walked from its text.
     Released(DeferredSource),
-    /// Walked and dropped.
-    Walked,
+    /// Walked and dropped: what it was walked under and from.
+    Walked {
+        context_key: Arc<ContextKey>,
+        content_hash: u64,
+    },
 }
 
 /// A dependency the warm crawl released, with what its import load indexed
@@ -3415,7 +3418,9 @@ struct DeferredSource {
     raw_content_hash: Option<u64>,
     context_key: Arc<ContextKey>,
     /// Charges `text` to the cache budget while the crawl holds it. Absent
-    /// when the budget had no room; the crawl keeps the text regardless.
+    /// when the budget had no room; that refusal also stops the crawl at
+    /// its next unit (D51: BudgetStopped), so it keeps the text only that
+    /// long.
     _charge: Option<crate::project_cache::Reservation>,
 }
 
@@ -8169,11 +8174,13 @@ impl Workspace {
                         .is_some_and(|source| source == dependency_text);
                 // A warm crawl indexed and released it already: its entries
                 // are stored and it was published (l4d-10).
+                // Under the same context and text, as for an indexed one.
                 let released = !already_indexed
-                    && self
-                        .crawl_deferred
-                        .as_ref()
-                        .is_some_and(|release| release.units.contains_key(&dependency_uri));
+                    && self.crawl_released(
+                        &dependency_uri,
+                        &effective_context_key,
+                        &dependency_text,
+                    );
                 // A crawl keeps the text of a unit it releases, to index it
                 // again when its walk reaches it.
                 let release_text = (!already_indexed && !released && self.crawl_deferred.is_some())
@@ -8516,9 +8523,31 @@ impl Workspace {
             }
             done += 1;
             let indexed = self.index_released_unit(&unit, context_key, pinned, cancel)?;
-            // A walked unit is never walked again: drop its text.
+            // A walked unit is never walked again: drop its text, keep what
+            // it was indexed under and from.
+            let walked = self.index.source_text(&unit).and_then(|text| {
+                let key = self.document_contexts.get(&unit)?;
+                Some((
+                    key.clone(),
+                    pascal_project::content_hash_bytes(text.as_bytes()),
+                ))
+            });
             if let Some(release) = self.crawl_deferred.as_mut() {
-                release.units.insert(unit.clone(), CrawlUnit::Walked);
+                match walked {
+                    Some((key, content_hash)) => {
+                        let context_key = release.key(&key);
+                        release.units.insert(
+                            unit.clone(),
+                            CrawlUnit::Walked {
+                                context_key,
+                                content_hash,
+                            },
+                        );
+                    }
+                    None => {
+                        release.units.remove(&unit);
+                    }
+                }
             }
             if !indexed {
                 continue;
@@ -8555,6 +8584,29 @@ impl Workspace {
             }
         }
         Ok(closure)
+    }
+
+    /// Whether the crawl released `uri` already (l4d-10) as `context_key`
+    /// indexes `text`: it counts as indexed then, as `already_indexed` checks
+    /// for an indexed one; under another context or text it is indexed again.
+    fn crawl_released(&self, uri: &Url, context_key: &ContextKey, text: &str) -> bool {
+        match self
+            .crawl_deferred
+            .as_ref()
+            .and_then(|release| release.units.get(uri))
+        {
+            Some(CrawlUnit::Released(source)) => {
+                *source.context_key == *context_key && source.text == text
+            }
+            Some(CrawlUnit::Walked {
+                context_key: walked,
+                content_hash,
+            }) => {
+                **walked == *context_key
+                    && *content_hash == pascal_project::content_hash_bytes(text.as_bytes())
+            }
+            None => false,
+        }
     }
 
     /// Indexes again, for its walk, a unit the crawl released (l4d-10).
@@ -20173,6 +20225,46 @@ mod tests {
         .unwrap();
         let workspace = test_workspace(vec![root], Default::default());
         (temp, workspace, Url::from_file_path(main).unwrap(), chain)
+    }
+
+    /// l4d-10 fix round 1 (M4): a unit the crawl released counts as
+    /// indexed only for the context and text it was released with, as
+    /// `already_indexed` checks for an indexed one.
+    #[test]
+    fn a_released_unit_counts_as_indexed_only_for_its_context_and_text() {
+        let (_temp, mut workspace, main, chain) = chain_fixture(2);
+        let key = workspace.context_for_uri_with_cancel(&main, None).unwrap();
+        let other = ContextKey {
+            config: Some("Other".to_owned()),
+            ..key.clone()
+        };
+        let mut release = super::CrawlRelease::default();
+        let shared = release.key(&key);
+        release.units.insert(
+            chain[0].clone(),
+            super::CrawlUnit::Released(super::DeferredSource {
+                text: "unit U00;".to_owned(),
+                disk_size: None,
+                raw_content_hash: None,
+                context_key: shared.clone(),
+                _charge: None,
+            }),
+        );
+        release.units.insert(
+            chain[1].clone(),
+            super::CrawlUnit::Walked {
+                context_key: shared,
+                content_hash: pascal_project::content_hash_bytes(b"unit U01;"),
+            },
+        );
+        workspace.crawl_deferred = Some(release);
+        assert!(workspace.crawl_released(&chain[0], &key, "unit U00;"));
+        assert!(!workspace.crawl_released(&chain[0], &other, "unit U00;"));
+        assert!(!workspace.crawl_released(&chain[0], &key, "unit U00; changed"));
+        assert!(workspace.crawl_released(&chain[1], &key, "unit U01;"));
+        assert!(!workspace.crawl_released(&chain[1], &other, "unit U01;"));
+        assert!(!workspace.crawl_released(&chain[1], &key, "unit U01; changed"));
+        assert!(!workspace.crawl_released(&main, &key, "unit Main;"));
     }
 
     /// l4d-10: a warm crawl keeps the parses of the closure it walked in its

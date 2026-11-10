@@ -42,9 +42,11 @@ pub const MAX_SNAPSHOT_CANDIDATES: usize = 8;
 /// `SQLITE_LIMIT_LENGTH`: SQLite refuses to materialize a longer value, so
 /// a planted oversized blob fails before it is copied.
 pub const SQLITE_LENGTH_LIMIT: i32 = 2 * 1024 * 1024;
-/// Live namespaces a store keeps by default: the opening build's and the two
-/// most recently used others (l4d-1ypi).
-pub const DEFAULT_MAX_NAMESPACES: usize = 3;
+/// Live namespaces a store keeps by default: the opening build's and the
+/// most recently used other (l4d-1ypi, l4d-i2tj: a SFClient2-size project
+/// takes about 0.9 GB per namespace, so each kept older build is dead weight
+/// after an upgrade).
+pub const DEFAULT_MAX_NAMESPACES: usize = 2;
 /// The most `StoreLimits::max_namespaces` may be.
 pub const MAX_NAMESPACES: usize = 16;
 

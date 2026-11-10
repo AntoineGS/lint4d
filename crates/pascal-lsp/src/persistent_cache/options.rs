@@ -378,7 +378,7 @@ mod tests {
             (16 << 20, 16 << 20)
         );
         assert_eq!(options.wait, std::time::Duration::from_millis(25));
-        assert_eq!(options.max_namespaces, 3);
+        assert_eq!(options.max_namespaces, 2);
     }
 
     #[test]

@@ -31,8 +31,10 @@ fn keeping(max_namespaces: usize) -> StoreLimits {
     }
 }
 
+/// The retention scenarios below keep three namespaces, one more than the
+/// default (l4d-i2tj), so that retirement order shows.
 fn open(directory: &Path, byte: u8) -> Store {
-    Store::open(directory, &namespace(byte), StoreLimits::default()).unwrap()
+    Store::open(directory, &namespace(byte), keeping(3)).unwrap()
 }
 
 fn raw(directory: &Path) -> Connection {
@@ -130,6 +132,27 @@ fn two_builds_alternating_on_one_store_keep_each_others_facts() {
         1,
         "build 1's facts are still there"
     );
+}
+
+/// l4d-i2tj: by default the store keeps the opening build's namespace and
+/// the most recently used other only.
+#[test]
+fn the_default_keeps_the_current_and_the_previous_build() {
+    let root = private_tempdir();
+    let dir = root.path();
+    let default_session = |byte: u8, at: u64| {
+        drop(Store::open(dir, &namespace(byte), StoreLimits::default()).unwrap());
+        used_at(dir, byte, at);
+    };
+    default_session(1, 1);
+    default_session(2, 2);
+    assert!(
+        live(dir, 1) && live(dir, 2),
+        "current and previous are kept"
+    );
+    default_session(3, 3);
+    assert_eq!(state(dir, 1), Some((0, 2)), "the oldest build is retired");
+    assert!(live(dir, 2) && live(dir, 3));
 }
 
 #[test]
@@ -777,7 +800,7 @@ fn a_held_namespace_is_never_retired() {
 
 #[test]
 fn the_namespace_count_is_validated() {
-    assert_eq!(StoreLimits::default().max_namespaces, 3);
+    assert_eq!(StoreLimits::default().max_namespaces, 2);
     assert_eq!(keeping(0).validate(), Err(LimitsError::MaxNamespaces));
     assert_eq!(
         keeping(MAX_NAMESPACES + 1).validate(),

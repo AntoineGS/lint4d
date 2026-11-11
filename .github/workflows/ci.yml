@@ -195,3 +195,43 @@ jobs:
           files: ./lcov.info
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
+
+  vscode-extension:
+    name: VS Code extension (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npm run test:grammar
+      - run: npm run package
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: pascal-lsp-vsix
+          path: editors/vscode/*.vsix
+      - uses: dtolnay/rust-toolchain@1.99.0
+        if: runner.os == 'Linux'
+      - uses: Swatinem/rust-cache@v2
+        if: runner.os == 'Linux'
+      - name: Build pascal-lsp
+        if: runner.os == 'Linux'
+        working-directory: .
+        run: cargo build --locked -p pascal-lsp
+      - name: Integration smoke test
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm run test:integration

@@ -1,0 +1,6 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem Probe.pas
+Probe.pas(23) E2037 Declaration of 'Renamed' differs from previous declaration
+Probe.pas(12) E2065 Unsatisfied forward or external declaration: 'TFoo.Missing'
+Probe.pas(8) H2219 Private symbol 'FUnused' declared but never used
+Probe.pas(9) H2219 Private symbol 'UnusedPrivate' declared but never used

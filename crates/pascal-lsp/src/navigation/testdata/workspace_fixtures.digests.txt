@@ -168,6 +168,8 @@ crates/lint4d/tests/fixtures/use_after_free/good_nil_after_free.pas 552e45fc17a3
 crates/lint4d/tests/fixtures/use_after_free/good_nil_checks_after_freeandnil.pas afa785cd91023c98 5
 crates/lint4d/tests/fixtures/use_after_free/good_no_use_after_free.pas 7497a79be61135b1 3
 crates/lint4d/tests/fixtures/use_after_free/good_reassign_after_free.pas dd590620d68318af 3
+crates/pascal-lsp/tests/dcc_oracle/clean_unit/Clean.pas 7e1642b25d165d46 10
+crates/pascal-lsp/tests/dcc_oracle/probe_basic/Probe.pas 2113e1869ee2f337 14
 crates/tree-sitter-pascal/examples/anon.pas a85fc4aa96646bff 8
 crates/tree-sitter-pascal/examples/codetoolmanager.pas a63aae1503886bc1 2737
 crates/tree-sitter-pascal/examples/foo.pas 8f519c2c3175c5be 90

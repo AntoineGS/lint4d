@@ -82,6 +82,8 @@ fn map_verified_header_location(uri: &Url, range: Range) -> Location {
 mod assistance;
 mod call_hierarchy;
 pub mod compiled_dcu;
+#[cfg(test)]
+mod dcc_oracle_tests;
 mod documentation;
 mod facts;
 mod folding;

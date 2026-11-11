@@ -179,6 +179,63 @@ impl ConditionalAnalysis {
     }
 }
 
+impl ConditionalAnalysis {
+    /// The conditionals whose unknown value puts Pascal code under unknown
+    /// activity, the reason `unknown_activity_requires_fail_closed` holds:
+    /// for each such span opened by a conditional that is itself active,
+    /// that conditional, and for an `ELSE`/`ELSEIF` arm also the `IF` that
+    /// starts its frame.
+    pub fn unknown_code_conditions(&self) -> Vec<&ConditionalDirective> {
+        let mut frames: Vec<usize> = Vec::new();
+        let mut frame_start = vec![None; self.directives.len()];
+        for (index, directive) in self.directives.iter().enumerate() {
+            match directive.kind {
+                DirectiveKind::ConditionalStart => {
+                    frames.push(index);
+                    frame_start[index] = Some(index);
+                }
+                DirectiveKind::ConditionalMiddle => frame_start[index] = frames.last().copied(),
+                DirectiveKind::ConditionalEnd => {
+                    frames.pop();
+                }
+                _ => {}
+            }
+        }
+        let mut conditions: Vec<&ConditionalDirective> = Vec::new();
+        for span in &self.unknown_spans {
+            if !self
+                .projected_source
+                .get(span.clone())
+                .is_some_and(contains_pascal_tokens)
+            {
+                continue;
+            }
+            let Some(index) = self.directives.iter().position(|directive| {
+                directive.end == span.start
+                    && directive.activity == Truth::True
+                    && matches!(
+                        directive.kind,
+                        DirectiveKind::ConditionalStart | DirectiveKind::ConditionalMiddle
+                    )
+            }) else {
+                continue;
+            };
+            let start = frame_start[index].filter(|start| *start != index);
+            let own = (!is_else_directive(&self.directives[index].body)).then_some(index);
+            for found in start.into_iter().chain(own) {
+                let directive = &self.directives[found];
+                if !conditions
+                    .iter()
+                    .any(|known| known.start == directive.start)
+                {
+                    conditions.push(directive);
+                }
+            }
+        }
+        conditions
+    }
+}
+
 fn contains_pascal_tokens(source: &str) -> bool {
     let bytes = source.as_bytes();
     let mut index = 0;
@@ -4062,6 +4119,120 @@ fn evaluate_condition(
             Truth::Unknown
         }
     }
+}
+
+/// The defines whose values a path learns when it takes a conditional's
+/// branch (`holds`) or skips it (`!holds`), under `environment`.
+///
+/// Only conditions built from define tests are read: `IFDEF X`, `IFNDEF X`,
+/// and an `IF`/`ELSEIF` that is one `[not] Defined(X)` or a chain of them
+/// joined by only `or` or only `and`. A chain decides every test when
+/// `and` holds or `or` fails; otherwise it decides the one test that the
+/// environment leaves undecided, if the others are all known not to decide
+/// it. Anything else teaches nothing.
+pub(crate) fn condition_define_assumptions(
+    body: &str,
+    holds: bool,
+    environment: &ConditionalEnvironment,
+) -> Vec<(String, bool)> {
+    let Some(tests) = condition_define_tests(body) else {
+        return Vec::new();
+    };
+    let (tests, conjunction) = tests;
+    // A test `(symbol, negated)` takes `value` when the symbol's definedness
+    // differs from `negated` exactly when `value` holds.
+    let assign =
+        |(symbol, negated): &(String, bool), value: bool| (symbol.clone(), value != *negated);
+    // `and` holds / `or` fails: every test takes the condition's value.
+    if conjunction == holds || tests.len() == 1 {
+        return tests.iter().map(|test| assign(test, holds)).collect();
+    }
+    // `or` holds / `and` fails: some test takes `holds`; the condition pins
+    // it only when every other test is known to take the opposite.
+    let mut undecided = None;
+    for test in &tests {
+        match environment_value(environment, &test.0) {
+            Truth::Unknown if undecided.is_none() => undecided = Some(test),
+            Truth::Unknown => return Vec::new(),
+            value if ((value == Truth::True) != test.1) == holds => return Vec::new(),
+            _ => {}
+        }
+    }
+    let wanted = holds;
+    undecided
+        .map(|test| vec![assign(test, wanted)])
+        .unwrap_or_default()
+}
+
+/// The defines a conditional made only of define tests tests (`IFDEF X`,
+/// `IFNDEF X`, `IF Defined(X) or not Defined(Y)`), canonical (upper case);
+/// `None` for any other conditional.
+pub fn tested_defines(body: &str) -> Option<Vec<String>> {
+    let (tests, _) = condition_define_tests(body)?;
+    Some(tests.into_iter().map(|(symbol, _)| symbol).collect())
+}
+
+/// A conditional made only of define tests: each `(symbol, negated)` and
+/// whether they are joined by `and` (`true`) or `or` (`false`).
+fn condition_define_tests(body: &str) -> Option<(Vec<(String, bool)>, bool)> {
+    let keyword = directive_keyword(body)?.to_ascii_lowercase();
+    match keyword.as_str() {
+        "ifdef" => return directive_symbol(body).map(|symbol| (vec![(symbol, false)], true)),
+        "ifndef" => return directive_symbol(body).map(|symbol| (vec![(symbol, true)], true)),
+        "if" | "elseif" | "elif" => {}
+        _ => return None,
+    }
+    let mut rest = directive_arguments(body).trim();
+    let mut tests = Vec::new();
+    let mut conjunction = None;
+    loop {
+        let (test, after) = define_test(rest)?;
+        tests.push(test);
+        let after = after.trim_start();
+        if after.is_empty() {
+            break;
+        }
+        let (is_and, next) = if let Some(next) = strip_keyword_ci(after, "and") {
+            (true, next)
+        } else {
+            (false, strip_keyword_ci(after, "or")?)
+        };
+        if *conjunction.get_or_insert(is_and) != is_and {
+            return None;
+        }
+        rest = next;
+    }
+    Some((tests, conjunction.unwrap_or(true)))
+}
+
+/// One leading `[not] Defined(X)` and the text after it.
+fn define_test(text: &str) -> Option<((String, bool), &str)> {
+    let (negated, text) = match strip_keyword_ci(text, "not") {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let call = strip_keyword_ci(text, "defined")?.strip_prefix('(')?;
+    let close = call.find(')')?;
+    let inner = call[..close].trim();
+    let symbol = inner.strip_prefix('&').unwrap_or(inner);
+    if symbol.is_empty() || !symbol.bytes().all(is_identifier_byte) {
+        return None;
+    }
+    Some(((canonical_symbol(symbol)?, negated), &call[close + 1..]))
+}
+
+/// `text` after a leading `keyword` (ASCII case-insensitive) that is not
+/// the start of a longer identifier, with the whitespace after it removed.
+fn strip_keyword_ci<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+    let head = text.get(..keyword.len())?;
+    if !head.eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    let rest = &text[keyword.len()..];
+    if rest.bytes().next().is_some_and(is_identifier_byte) {
+        return None;
+    }
+    Some(rest.trim_start())
 }
 
 pub(crate) fn condition_expression(body: &str) -> Option<&str> {

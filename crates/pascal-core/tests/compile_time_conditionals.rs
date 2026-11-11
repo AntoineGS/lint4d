@@ -794,6 +794,60 @@ fn phase_b_sequential_splits_are_capped_not_only_nested_depth() {
     }
 }
 
+/// SysUtils.pas (Delphi 2010) tests an unknown define such as `MACOSX` many
+/// times. A branch taken under an unknown define fixes that define's value
+/// for the rest of the path, so retesting it must not fork the path again
+/// (sysutils-expansion).
+#[test]
+fn retesting_an_unknown_define_does_not_fork_its_paths_again() {
+    let mut incomplete = Vec::new();
+    for test in [
+        "{$IFDEF Mystery}type R{i}=Byte;{$ENDIF}",
+        "{$IFNDEF Mystery}type R{i}=Byte;{$ENDIF}",
+        "{$IF Defined(Mystery)}type R{i}=Byte;{$IFEND}",
+        "{$IF not defined( Mystery )}type R{i}=Byte;{$ELSE}type R{i}=Word;{$IFEND}",
+        "{$IFDEF Other}{$ELSEIF Defined(Mystery)}type R{i}=Byte;{$ENDIF}",
+        // SysUtils: `{$IF defined(LINUX) or defined(MACOSX)}` on Win32.
+        "{$IF Defined(Off) or Defined(Mystery)}type R{i}=Byte;{$IFEND}",
+        "{$IF Defined(Mystery) and not Defined(Off)}type R{i}=Byte;{$IFEND}",
+        "{$IF Defined(Other) or Defined(Mystery)}type R{i}=Byte;{$IFEND}",
+    ] {
+        let mut source = String::from("unit T; interface {$UNDEF Off}");
+        for i in 0..8 {
+            source.push_str(&test.replace("{i}", &i.to_string()));
+        }
+        source.push_str(" implementation end.");
+        let a = Fixture::new(&source, context(LayoutPlatform::Win32))
+            .analyze()
+            .unwrap();
+        if !a.root.complete {
+            incomplete.push(format!("{test}: {:?}", a.reasons));
+        }
+    }
+    assert!(incomplete.is_empty(), "{incomplete:#?}");
+}
+
+/// The branch taken under an unknown define decides that define for the
+/// rest of the path: no path defines both A and B (dcc32 21.0 and dcc64 37.0
+/// with and without `-DMystery`).
+#[test]
+fn an_unknown_define_keeps_the_value_its_branch_assumed() {
+    let source = "unit T; interface {$UNDEF A}{$UNDEF B}{$IFDEF Mystery}{$DEFINE A}{$ENDIF}\
+        {$IFNDEF Mystery}{$DEFINE B}{$ENDIF}\
+        {$IF Defined(A) and Defined(B)}{$DEFINE BOTH}{$IFEND}\
+        {$IF Defined(A) or Defined(B)}{$DEFINE EITHER}{$IFEND}\
+        {$IFDEF Mystery}{$UNDEF Mystery}{$ENDIF}{$IFDEF Mystery}{$DEFINE STILL}{$ENDIF}\
+        implementation end.";
+    let a = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(a.root.complete, "{:?}", a.reasons);
+    assert_eq!(activity(&a, "DEFINE BOTH"), Truth::False);
+    assert_eq!(activity(&a, "DEFINE EITHER"), Truth::True);
+    assert_eq!(activity(&a, "DEFINE A"), Truth::Unknown);
+    assert_eq!(activity(&a, "DEFINE STILL"), Truth::False);
+}
+
 #[test]
 fn phase_b_caller_branch_budget_is_shared_with_sequential_forks() {
     let mut f = Fixture::new(

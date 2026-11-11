@@ -979,3 +979,65 @@ end.
 ",
     );
 }
+
+/// In a conditional block, the grammar keeps a `var` section's
+/// declarations in the section only when there is one: from two on (as
+/// after expanding `A, B: T`) they become items of the block, which were
+/// laid out unindented, so formatting the output again changed it.
+#[test]
+fn declarations_after_a_section_keyword_in_a_conditional_block_stay_indented() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+implementation
+procedure P;
+{$IFDEF X}
+var
+  CertFile, KeyFile: String;
+{$ENDIF}
+begin
+end;
+procedure Q;
+{$IFDEF X}
+var
+  A: String;
+
+  B: String;
+{$ENDIF}
+begin
+end;
+end.
+",
+        "\
+unit T;
+
+interface
+
+implementation
+
+procedure P;
+
+{$IFDEF X}
+var
+  CertFile: String;
+  KeyFile: String;
+{$ENDIF}
+begin
+end;
+
+procedure Q;
+
+{$IFDEF X}
+var
+  A: String;
+
+  B: String;
+{$ENDIF}
+begin
+end;
+
+end.
+",
+    );
+}

@@ -1040,6 +1040,10 @@ impl<'a> DocBuilder<'a> {
     fn build_pp_block(&self, node: Node<'a>) -> Doc {
         let mut parts = Vec::new();
         let mut prev_end_row: Option<usize> = None;
+        // The kind of declaration a section opened in this block holds: the
+        // grammar leaves the declarations after the first outside the
+        // section, as items of the block, and they stay indented under it.
+        let mut open_section: Option<&'static str> = None;
 
         for child in node.children(&mut node.walk()) {
             if child.is_extra() {
@@ -1047,6 +1051,7 @@ impl<'a> DocBuilder<'a> {
             }
             match child.kind() {
                 K::PP_IF | K::PP_ELSE | K::PP_END_IF => {
+                    open_section = None;
                     if let Some(prev) = prev_end_row
                         && self.has_blank_line_between(prev, child.start_position().row)
                     {
@@ -1063,11 +1068,23 @@ impl<'a> DocBuilder<'a> {
                     {
                         parts.push(Doc::BlankLine);
                     }
-                    let child_doc = self.doc_for_node(child);
+                    let mut child_doc = self.doc_for_node(child);
+                    let item_of_section = open_section == Some(child.kind());
+                    open_section = match child.kind() {
+                        K::DECL_VARS => Some(K::DECL_VAR),
+                        K::DECL_CONSTS => Some(K::DECL_CONST),
+                        K::DECL_TYPES => Some(K::DECL_TYPE),
+                        kind if item_of_section => Some(kind),
+                        _ => None,
+                    };
                     if !starts_with_hardline(&child_doc) {
-                        parts.push(Doc::Hardline);
+                        child_doc = doc::concat(vec![Doc::Hardline, child_doc]);
                     }
-                    parts.push(child_doc);
+                    parts.push(if item_of_section {
+                        doc::indent(child_doc)
+                    } else {
+                        child_doc
+                    });
                     prev_end_row = Some(child.end_position().row);
                 }
             }

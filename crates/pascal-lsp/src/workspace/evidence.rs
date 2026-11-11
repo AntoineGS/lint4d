@@ -192,7 +192,9 @@ impl Evidence {
 /// consulted (`Directory { listed: false }`). After an exact hit the resolver
 /// consults nothing else in that directory, so the hit's payload evidence,
 /// reread and authorized at validation, proves what the session learned
-/// there. Every directory where the exact name missed was listed by the
+/// there. A hit whose name leaves the search directory (`Include\x.inc`,
+/// `..\x.inc`) marks the directory the hit is in, not the search directory
+/// (l4d-kcwv). Every directory where the exact name missed was listed by the
 /// case-insensitive fallback; that listing is its own observation and is
 /// proven by its capture.
 struct SearchedDirectories {

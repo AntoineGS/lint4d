@@ -12667,6 +12667,183 @@ pub(in crate::workspace) mod tests {
             cache.shutdown();
         }
 
+        /// l4d-kcwv: includes found through a search directory under a
+        /// name that leaves it, into a subdirectory (`Include\x.inc`,
+        /// OverbyteICS) or up a level (`..\up.inc`, mORMot2), are proven by
+        /// their hits: the members are persisted, and a restart reuses them
+        /// without extracting anything.
+        #[test]
+        fn members_whose_includes_name_another_directory_are_persisted_and_reused() {
+            const COUNT: usize = 4;
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let root = temp.path();
+            let (workspace, key, anchor) =
+                indexed_project(root, COUNT, WorkspaceOptions::default());
+            write(&root.join("lib/Include/x.inc"), "const FromSub = 1;\n");
+            write(&root.join("up.inc"), "const FromUp = 1;\n");
+            write(
+                &root.join("lib/U0.pas"),
+                "unit U0;\ninterface\n{$I Include\\x.inc}\nimplementation\nend.\n",
+            );
+            write(
+                &root.join("lib/U1.pas"),
+                "unit U1;\ninterface\n{$I ..\\up.inc}\nimplementation\nend.\n",
+            );
+            pascal_project::backdate_tree_for_test(root);
+            let (mut view, cache) = persisting_view(&workspace, store.path());
+            let first = until_settled(&mut view, &anchor, IndexBound::all(), 10);
+            assert!(first.complete, "{first:?}");
+            let status = view.project_cache.index_status(&|_| false);
+            assert_eq!(status[0].counts.unprovable, 0, "{:?}", status[0]);
+            assert_eq!(status[0].counts.persisted, COUNT, "{:?}", status[0]);
+            assert_eq!(
+                selected(&view, &key, "FromSub"),
+                vec![root.join("lib/U0.pas")]
+            );
+            assert_eq!(
+                selected(&view, &key, "FromUp"),
+                vec![root.join("lib/U1.pas")]
+            );
+            cache.shutdown();
+            drop(view);
+
+            let (mut second, cache) = restarted_view(root, store.path());
+            let loaded = record_loads();
+            crate::navigation::test_reset_document_parse_count();
+            let progress = advance(
+                &mut second,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            set_after_load_hook(None);
+            assert_eq!(progress.reused, COUNT, "{progress:?}");
+            assert!(
+                loaded.borrow().is_empty(),
+                "extracted: {:?}",
+                loaded.borrow()
+            );
+            assert_eq!(crate::navigation::test_document_parse_count(), 0);
+            assert_eq!(
+                selected(&second, &key, "FromSub"),
+                vec![root.join("lib/U0.pas")]
+            );
+            cache.shutdown();
+        }
+
+        /// l4d-kcwv: a member whose include was found in the second
+        /// directory of the include path is reused while nothing changes,
+        /// and is extracted again, reading the new file, once a file of that
+        /// name appears earlier in the path.
+        #[test]
+        fn an_include_appearing_earlier_in_the_search_path_invalidates_the_member() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let root = temp.path();
+            let member = root.join("lib/U0.pas");
+            write(&root.join("first/Other.txt"), "x\n");
+            write(&root.join("second/sub/y.inc"), "const FromSecond = 1;\n");
+            write(
+                &member,
+                "unit U0;\ninterface\n{$I sub\\y.inc}\nimplementation\nend.\n",
+            );
+            let properties = "<DCC_UnitSearchPath>lib</DCC_UnitSearchPath><DCC_IncludePath>first;second</DCC_IncludePath>";
+            let (workspace, key) =
+                project_workspace(root, properties, "", WorkspaceOptions::default());
+            let anchor = IndexAnchor::Project(root.join("App.dproj"));
+            let (mut view, cache) = persisting_view(&workspace, store.path());
+            let first = until_settled(&mut view, &anchor, IndexBound::all(), 10);
+            assert!(first.complete, "{first:?}");
+            let status = view.project_cache.index_status(&|_| false);
+            assert_eq!(status[0].counts.unprovable, 0, "{:?}", status[0]);
+            assert_eq!(selected(&view, &key, "FromSecond"), vec![member.clone()]);
+            cache.shutdown();
+            drop(view);
+
+            // Unchanged: reused.
+            let (mut second, cache) = restarted_view(root, store.path());
+            let loaded = record_loads();
+            let reused = advance(
+                &mut second,
+                &anchor,
+                IndexBound::all().with_mode(IndexMode::Reuse),
+            );
+            set_after_load_hook(None);
+            assert_eq!(reused.reused, 2, "{reused:?}");
+            assert!(
+                loaded.borrow().is_empty(),
+                "extracted: {:?}",
+                loaded.borrow()
+            );
+            cache.shutdown();
+            drop(second);
+
+            write(&root.join("first/sub/y.inc"), "const FromFirst = 1;\n");
+            pascal_project::backdate_tree_for_test(root);
+            let (mut third, cache) = restarted_view(root, store.path());
+            let loaded = record_loads();
+            let progress = until_settled(&mut third, &anchor, IndexBound::all(), 10);
+            set_after_load_hook(None);
+            assert!(progress.complete, "{progress:?}");
+            assert_eq!(
+                *loaded.borrow(),
+                vec![member.clone()],
+                "only U0 is extracted"
+            );
+            assert_eq!(selected(&third, &key, "FromFirst"), vec![member.clone()]);
+            assert!(selected(&third, &key, "FromSecond").is_empty());
+            cache.shutdown();
+        }
+
+        /// l4d-kcwv: a name that leaves the search directory (`..\cfg\z.inc`)
+        /// and misses there is looked up without a listing when no
+        /// directory above is a search location. The miss is still
+        /// evidence, even when the directory's marker is proven by another
+        /// include found there: creating the file it missed invalidates the
+        /// member.
+        #[test]
+        fn a_miss_outside_the_search_directory_invalidates_the_member_once_the_file_appears() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = private_dir();
+            let root = temp.path();
+            let member = root.join("lib/U0.pas");
+            write(&root.join("lib/a.inc"), "const FromA = 1;\n");
+            write(&root.join("deep/cfg/z.inc"), "const FromDeep = 1;\n");
+            write(&root.join("deep/x/Other.txt"), "x\n");
+            write(
+                &member,
+                "unit U0;\ninterface\n{$I a.inc}\n{$I ..\\cfg\\z.inc}\nimplementation\nend.\n",
+            );
+            let properties = "<DCC_UnitSearchPath>lib</DCC_UnitSearchPath><DCC_IncludePath>deep/x</DCC_IncludePath>";
+            let (workspace, key) =
+                project_workspace(root, properties, "", WorkspaceOptions::default());
+            let anchor = IndexAnchor::Project(root.join("App.dproj"));
+            let (mut view, cache) = persisting_view(&workspace, store.path());
+            let first = until_settled(&mut view, &anchor, IndexBound::all(), 10);
+            assert!(first.complete, "{first:?}");
+            assert_eq!(selected(&view, &key, "FromDeep"), vec![member.clone()]);
+            let status = view.project_cache.index_status(&|_| false);
+            assert_eq!(status[0].counts.persisted, 2, "{:?}", status[0]);
+            cache.shutdown();
+            drop(view);
+
+            write(&root.join("cfg/z.inc"), "const FromRoot = 1;\n");
+            pascal_project::backdate_tree_for_test(root);
+            let (mut second, cache) = restarted_view(root, store.path());
+            let loaded = record_loads();
+            let progress = until_settled(&mut second, &anchor, IndexBound::all(), 10);
+            set_after_load_hook(None);
+            assert!(progress.complete, "{progress:?}");
+            assert_eq!(
+                *loaded.borrow(),
+                vec![member.clone()],
+                "U0 is extracted again"
+            );
+            assert_eq!(selected(&second, &key, "FromRoot"), vec![member.clone()]);
+            assert!(selected(&second, &key, "FromDeep").is_empty());
+            cache.shutdown();
+        }
+
         /// 13b-5 (A4) measurement, not a gate: per-member extraction cost
         /// on a multidev-shaped project (`DIRS` search-path directories,
         /// `L4D_MEASURE_UNITS` (600) units whose interfaces use lower units

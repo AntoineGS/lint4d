@@ -562,7 +562,9 @@ pub enum ResolutionObservation {
         complete: bool,
         /// The directory was listed. An include search marks each directory
         /// it consults with a stat-only observation (`false`) and lists it
-        /// only when the exact name misses there.
+        /// only when the exact name misses there. An exact hit marks the
+        /// directory it was found in instead, when the name leads out of the
+        /// search directory.
         listed: bool,
         /// `resolvable_listing_fingerprint` of the listing the lookup read,
         /// when it read one: what in the directory can take part in
@@ -7017,7 +7019,6 @@ impl<S: SourceStore> UnitResolver<S> {
         let mut saw_unauthorized = false;
         for entry in entries {
             self.check_cancel(cancel)?;
-            self.record_include_search_directory(&entry, cancel)?;
             let resolved = match self
                 .context
                 .overrides()
@@ -7025,6 +7026,7 @@ impl<S: SourceStore> UnitResolver<S> {
             {
                 Ok(resolved) => resolved,
                 Err(error) => {
+                    self.record_include_search_directory(&entry, cancel)?;
                     self.warning_args(
                         cancel,
                         64 + request.requested_name.len() + error.len(),
@@ -7058,8 +7060,33 @@ impl<S: SourceStore> UnitResolver<S> {
                 &candidate_entry,
                 request.legacy_route,
             );
-            match self.load_include_candidate(&path, &candidate_entry, request.legacy_route, cancel)
-            {
+            // An exact hit consults nothing in the search directory: the name
+            // is opened as a path. Its marker names the directory the hit is
+            // in, which its payload proves, also when the name leads into a
+            // subdirectory (`Include\x.inc`) or out of the search directory
+            // (`..\x.inc`). Anything else marks the search directory itself
+            // (l4d-kcwv).
+            let elsewhere = path
+                .parent()
+                .filter(|parent| !path_equivalent(parent, &entry.path))
+                .map(|parent| ProjectPathEntry {
+                    path: parent.to_path_buf(),
+                    provenance: candidate_entry.provenance.clone(),
+                });
+            if elsewhere.is_none() {
+                self.record_include_search_directory(&entry, cancel)?;
+            }
+            let loaded =
+                self.load_include_candidate(&path, &candidate_entry, request.legacy_route, cancel);
+            if let Some(hit_directory) = &elsewhere {
+                let marked = if loaded.is_ok() {
+                    hit_directory
+                } else {
+                    &entry
+                };
+                self.record_include_search_directory(marked, cancel)?;
+            }
+            match loaded {
                 // First authorized success always wins. Transfer this inline
                 // source directly; no temporary heap collection or invoice.
                 Ok(source) => return Ok(Resolution::Found(source)),

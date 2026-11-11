@@ -590,6 +590,10 @@ pub struct WorkspaceOptions {
     /// source analysis. Unknown values remain unknown.
     pub conditional_context: ConditionalContext,
     pub limits: ResourceLimits,
+    /// D57 (b): publish lint findings for sources inside an installation's
+    /// own BDS tree (vendor code). Off by default; parse errors and semantic
+    /// diagnostics are published either way.
+    pub lint_installation_sources: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -614,6 +618,7 @@ pub(crate) struct RuntimeOptionsUpdate {
     pub(crate) max_total_bytes: RuntimeOption<usize>,
     pub(crate) max_cache_bytes: RuntimeOption<usize>,
     pub(crate) max_workspace_units: RuntimeOption<usize>,
+    pub(crate) lint_installation_sources: RuntimeOption<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -629,6 +634,7 @@ pub(crate) struct RuntimeOptionsOverride {
     max_total_bytes: Option<usize>,
     max_cache_bytes: Option<usize>,
     max_workspace_units: Option<usize>,
+    lint_installation_sources: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -743,6 +749,7 @@ impl RuntimeOptionsUpdate {
             max_total_bytes: RuntimeOption::Reset,
             max_cache_bytes: RuntimeOption::Reset,
             max_workspace_units: RuntimeOption::Reset,
+            lint_installation_sources: RuntimeOption::Reset,
         }
     }
 }
@@ -782,6 +789,9 @@ impl RuntimeOptionsOverride {
                     .max_workspace_units
                     .unwrap_or(base.limits.max_workspace_units),
             },
+            lint_installation_sources: self
+                .lint_installation_sources
+                .unwrap_or(base.lint_installation_sources),
         }
     }
 
@@ -842,6 +852,12 @@ impl RuntimeOptionsOverride {
             &mut self.max_workspace_units,
             update.max_workspace_units,
             "maxWorkspaceUnits",
+            &mut warnings,
+        );
+        apply_runtime_field(
+            &mut self.lint_installation_sources,
+            update.lint_installation_sources,
+            "lintInstallationSources",
             &mut warnings,
         );
         warnings
@@ -921,7 +937,20 @@ pub(crate) fn parse_runtime_options(
             "maxWorkspaceUnits",
             DEFAULT_MAX_WORKSPACE_UNITS,
         ),
+        lint_installation_sources: parse_runtime_bool(object, "lintInstallationSources"),
     })
+}
+
+fn parse_runtime_bool(
+    object: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> RuntimeOption<bool> {
+    match object.get(name) {
+        None => RuntimeOption::Absent,
+        Some(serde_json::Value::Null) => RuntimeOption::Reset,
+        Some(serde_json::Value::Bool(value)) => RuntimeOption::Value(*value),
+        Some(_) => RuntimeOption::Invalid("must be a boolean or null".to_string()),
+    }
 }
 
 fn parse_runtime_compiler_version(
@@ -1199,6 +1228,8 @@ struct RawWorkspaceOptions {
     max_total_bytes: Option<usize>,
     max_cache_bytes: Option<usize>,
     max_workspace_units: Option<usize>,
+    #[serde(default)]
+    lint_installation_sources: bool,
 }
 
 fn parse_conditional_context_values(
@@ -1405,6 +1436,7 @@ impl WorkspaceOptions {
                 raw.conditional_constants.as_ref(),
             )?,
             limits,
+            lint_installation_sources: raw.lint_installation_sources,
         })
     }
 }
@@ -6967,11 +6999,12 @@ impl Workspace {
     ) -> (Option<queries::DiagnosticPublication>, bool) {
         let mut has_current_owner = false;
         let mut has_incomplete_owner = false;
-        let mut diagnostics = Vec::new();
+        let mut diagnostics: Vec<(LspDiagnostic, usize)> = Vec::new();
         let mut seen_diagnostics = HashSet::new();
         let mut diagnostics_bytes = 0usize;
         let mut visits = 0usize;
-        for root in &self.diagnostic_publication_root_order {
+        let mut visit_capped = false;
+        'roots: for root in &self.diagnostic_publication_root_order {
             let Some(contribution) = self
                 .diagnostic_publications
                 .get(root)
@@ -6987,28 +7020,50 @@ impl Workspace {
             for diagnostic in contribution {
                 visits = visits.saturating_add(1);
                 if visits > MAX_DIAGNOSTIC_PUBLICATION_AGGREGATE_VISITS {
-                    return (None, true);
+                    visit_capped = true;
+                    break 'roots;
                 }
                 let Ok(encoded) = serde_json::to_vec(diagnostic) else {
                     return (None, true);
                 };
                 if seen_diagnostics.insert(encoded.clone()) {
-                    diagnostics_bytes = diagnostics_bytes.saturating_add(encoded.len());
-                    if diagnostics.len() >= 10_000 || diagnostics_bytes > 64 * 1024 {
-                        return (None, true);
-                    }
-                    diagnostics.push(diagnostic.clone());
+                    // One more byte for the separating comma.
+                    let size = encoded.len() + 1;
+                    diagnostics_bytes = diagnostics_bytes.saturating_add(size);
+                    diagnostics.push((diagnostic.clone(), size));
                 }
             }
         }
         if !has_current_owner && has_incomplete_owner {
             return (None, true);
         }
+        let oversized = visit_capped
+            || diagnostics.len() > MAX_PUBLISHED_DIAGNOSTICS
+            || diagnostics_bytes > MAX_PUBLISHED_DIAGNOSTIC_BYTES;
+        if !oversized {
+            return (
+                Some(queries::DiagnosticPublication {
+                    version: self.document_version(uri),
+                    uri: uri.clone(),
+                    diagnostics: diagnostics
+                        .into_iter()
+                        .map(|(diagnostic, _)| diagnostic)
+                        .collect(),
+                }),
+                has_incomplete_owner,
+            );
+        }
+        // D57: an open document gets its report truncated, with a note. A
+        // document that is not open keeps the all-or-nothing rule (review
+        // minor 4).
+        if !self.open_documents.contains_key(uri) {
+            return (None, true);
+        }
         (
             Some(queries::DiagnosticPublication {
                 version: self.document_version(uri),
                 uri: uri.clone(),
-                diagnostics,
+                diagnostics: truncated_report(diagnostics, visit_capped),
             }),
             has_incomplete_owner,
         )
@@ -16063,6 +16118,9 @@ impl Workspace {
             self.include_expansion_limits().max_work,
         );
         let mut mapped = HashMap::<Url, Vec<LspDiagnostic>>::new();
+        // D57 (b): lint findings in vendor sources (an installation's own BDS
+        // tree) are not published unless asked for; parse errors are.
+        let mut vendor_sources = HashMap::<Url, bool>::new();
         for diagnostic in lint_result.diagnostics {
             check_workspace_cancel(Some(cancel))?;
             let Some(normalized_range) = line_index.byte_range(
@@ -16102,6 +16160,21 @@ impl Workspace {
                 crate::include_expansion::VirtualMapping::Many(_)
                 | crate::include_expansion::VirtualMapping::Unmapped => continue,
             };
+            if !self.options.lint_installation_sources
+                && !matches!(diagnostic.rule_id.as_str(), "parse-error" | "lint4d-error")
+                && *vendor_sources.entry(span.uri.clone()).or_insert_with(|| {
+                    span.uri.to_file_path().is_ok_and(|path| {
+                        pascal_project::installation_source(
+                            &absolute_path(path),
+                            &roots,
+                            &self.overrides,
+                        )
+                        .is_some()
+                    })
+                })
+            {
+                continue;
+            }
             let Some(source) = expansion.source_texts.get(&span.uri) else {
                 continue;
             };
@@ -17223,9 +17296,104 @@ fn metadata_payload_is_current_in_pass(
     )
 }
 
+/// The diagnostic replacing a document report that cannot be published at
+/// all, even truncated: its notification would still exceed the wire bound.
+pub(crate) fn withheld_report_diagnostic() -> LspDiagnostic {
+    server_diagnostic(
+        "this document's diagnostics exceed the publication limit (64 KiB); they were withheld",
+        DiagnosticSeverity::WARNING,
+    )
+}
+
+/// Diagnostics one document's publication may carry.
+const MAX_PUBLISHED_DIAGNOSTICS: usize = 10_000;
+/// Encoded bytes of the diagnostics one document's publication may carry.
+const MAX_PUBLISHED_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+/// Room kept below `MAX_PUBLISHED_DIAGNOSTIC_BYTES` for the note and the
+/// notification around the list, so a truncated report fits the wire bound.
+const TRUNCATED_REPORT_RESERVE_BYTES: usize = 4 * 1024;
+
+/// D57: a report over the per-document bounds, truncated. Errors come first,
+/// then warnings, information and hints, each by position, while they fit;
+/// a warning at line 1 counts the rest and names the limit that stopped it.
+fn truncated_report(
+    mut diagnostics: Vec<(LspDiagnostic, usize)>,
+    visit_capped: bool,
+) -> Vec<LspDiagnostic> {
+    let rank = |diagnostic: &LspDiagnostic| match diagnostic.severity {
+        Some(DiagnosticSeverity::ERROR) | None => 0,
+        Some(DiagnosticSeverity::WARNING) => 1,
+        Some(DiagnosticSeverity::INFORMATION) => 2,
+        _ => 3,
+    };
+    diagnostics.sort_by(|(left, _), (right, _)| {
+        (
+            rank(left),
+            left.range.start.line,
+            left.range.start.character,
+        )
+            .cmp(&(
+                rank(right),
+                right.range.start.line,
+                right.range.start.character,
+            ))
+    });
+    let total = diagnostics.len();
+    let mut shown = Vec::new();
+    let mut bytes = 0usize;
+    let mut stopped_by_bytes = false;
+    for (diagnostic, size) in diagnostics {
+        if shown.len() + 1 >= MAX_PUBLISHED_DIAGNOSTICS {
+            break;
+        }
+        if bytes + size > MAX_PUBLISHED_DIAGNOSTIC_BYTES - TRUNCATED_REPORT_RESERVE_BYTES {
+            stopped_by_bytes = true;
+            break;
+        }
+        bytes += size;
+        shown.push(diagnostic);
+    }
+    let omitted = total - shown.len();
+    let merged = group_thousands(MAX_DIAGNOSTIC_PUBLICATION_AGGREGATE_VISITS);
+    let note = match (omitted, visit_capped) {
+        (0, _) => format!(
+            "other diagnostics may not have been shown (per-document limit: {merged} diagnostics merged)"
+        ),
+        (_, true) => format!(
+            "{omitted} more diagnostics, and possibly others, were not shown (per-document \
+             limit: {merged} diagnostics merged)"
+        ),
+        (_, false) => format!(
+            "{omitted} more diagnostics were not shown (per-document limit: {})",
+            if stopped_by_bytes {
+                "64 KiB"
+            } else {
+                "10,000 diagnostics"
+            }
+        ),
+    };
+    let mut report = Vec::with_capacity(shown.len() + 1);
+    report.push(server_diagnostic(&note, DiagnosticSeverity::WARNING));
+    report.extend(shown);
+    report
+}
+
+fn group_thousands(value: usize) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
 /// Why lint was withheld for an incomplete expansion, from the expansion's
-/// errors and its conditional projection. An unresolved include comes
-/// first; then a compile-time analysis that stopped early; then code whose
+/// errors and its conditional projection. A compile-time analysis stopped
+/// by a limit comes first, named by its own reason; then an unresolved
+/// include; then an analysis stopped for another reason; then code whose
 /// activity the context leaves unknown, naming the defines `context` does
 /// not know (or the conditional, when it is not made of define tests).
 fn withheld_lint_message(
@@ -17234,6 +17402,17 @@ fn withheld_lint_message(
     context: &pascal_project::ConditionalContext,
 ) -> String {
     const WITHHELD: &str = "lint diagnostics were withheld";
+    // The analysis's own recorded reason, if it stopped and recorded one.
+    let recorded = errors
+        .iter()
+        .find_map(|error| error.strip_prefix(compile_time::ANALYSIS_STOPPED))
+        .filter(|_| !conditional.complete);
+    // An analysis stopped by a limit comes first: the includes after where
+    // it stopped were never walked, so they are not unresolved. Otherwise a
+    // missing include is the cause the analysis stopped on.
+    if let Some(reason) = recorded.filter(|reason| reason.ends_with(" was reached")) {
+        return format!("conditional compilation analysis stopped: {reason}; {WITHHELD}");
+    }
     if errors
         .iter()
         .any(|error| error.starts_with(compile_time::UNRESOLVED_INCLUDE))
@@ -17241,11 +17420,7 @@ fn withheld_lint_message(
         return format!("include expansion was incomplete; {WITHHELD}");
     }
     if !conditional.complete {
-        let reason = errors
-            .iter()
-            .find(|error| error.ends_with(" was reached"))
-            .or_else(|| errors.first())
-            .map_or("its safety limits were reached", String::as_str);
+        let reason = recorded.unwrap_or("no reason was recorded");
         return format!("conditional compilation analysis stopped: {reason}; {WITHHELD}");
     }
     if conditional.unknown_activity_requires_fail_closed() {
@@ -18266,6 +18441,72 @@ fn is_immutable_override_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Review M1/M2 (l4d-zgyw): a stopped analysis is named by its own
+    /// reason, not by a resolver warning listed before it, and an include
+    /// the stopped analysis never walked is not blamed as unresolved.
+    #[test]
+    fn withheld_lint_names_the_stopped_analysis_reason() {
+        let stopped = pascal_core::conditional::ConditionalAnalysis {
+            projected_source: String::new(),
+            inactive_spans: vec![],
+            unknown_spans: vec![],
+            directives: vec![],
+            complete: false,
+        };
+        let errors = vec![
+            "include candidate could not be loaded: Unauthorized { reason: \"was reached\" }"
+                .to_string(),
+            format!(
+                "{}the max_branch_states limit (64) was reached",
+                super::compile_time::ANALYSIS_STOPPED
+            ),
+            "shared compile-time analysis is incomplete".to_string(),
+            format!(
+                "{} {{$I Later.inc}}",
+                super::compile_time::UNRESOLVED_INCLUDE
+            ),
+        ];
+        assert_eq!(
+            super::withheld_lint_message(
+                &errors,
+                &stopped,
+                &pascal_project::ConditionalContext::default()
+            ),
+            "conditional compilation analysis stopped: the max_branch_states limit (64) was \
+             reached; lint diagnostics were withheld"
+        );
+    }
+
+    /// Round-2 review minor 3: with no recorded reason, the fallback wording
+    /// is not a limit, so an unresolved include still names the cause.
+    #[test]
+    fn withheld_lint_without_a_recorded_reason_still_blames_an_unresolved_include() {
+        let stopped = pascal_core::conditional::ConditionalAnalysis {
+            projected_source: String::new(),
+            inactive_spans: vec![],
+            unknown_spans: vec![],
+            directives: vec![],
+            complete: false,
+        };
+        let context = pascal_project::ConditionalContext::default();
+        assert_eq!(
+            super::withheld_lint_message(
+                &[format!(
+                    "{} {{$I Missing.inc}}",
+                    super::compile_time::UNRESOLVED_INCLUDE
+                )],
+                &stopped,
+                &context
+            ),
+            "include expansion was incomplete; lint diagnostics were withheld"
+        );
+        assert_eq!(
+            super::withheld_lint_message(&[], &stopped, &context),
+            "conditional compilation analysis stopped: no reason was recorded; lint diagnostics \
+             were withheld"
+        );
+    }
+
     #[test]
     fn context_states_differing_only_in_observations_are_not_equal() {
         let state = |warnings: Vec<String>| ContextState {
@@ -18566,11 +18807,27 @@ mod tests {
         let root = resolver
             .load_source(&dense, None, pascal_core::SourceKind::Unit, &cancel)
             .unwrap();
-        let refusal = resolver.analyze_compile_time(&root, &cancel).unwrap_err();
-        assert!(
-            refusal.to_string().contains("max_byte_work"),
-            "genuine fixed-cap body refusal: {refusal:?}"
-        );
+        // The cap is crossed either by a session-level charge (an error) or
+        // inside a path (an incomplete analysis recording the limit); which
+        // charge crosses it first depends on the context's size.
+        match resolver.analyze_compile_time(&root, &cancel) {
+            Err(refusal) => assert!(
+                refusal.to_string().contains("max_byte_work"),
+                "genuine fixed-cap body refusal: {refusal:?}"
+            ),
+            Ok(analysis) => assert!(
+                !analysis.root.complete
+                    && analysis.reasons.iter().any(|reason| matches!(
+                        reason,
+                        pascal_core::compile_time::IncompleteReason::Limit {
+                            name: "max_byte_work",
+                            ..
+                        }
+                    )),
+                "genuine fixed-cap body refusal: {:?}",
+                analysis.reasons
+            ),
+        }
         super::compile_time::take_body_analyses();
         let locations = workspace.navigate(
             &uri,
@@ -27321,6 +27578,38 @@ BDS = '/fake/37'
             parse(0).unwrap_err(),
             "initializationOptions.maxWorkspaceUnits must be at least 1"
         );
+    }
+
+    #[test]
+    fn lint_installation_sources_option_parses_at_initialization_and_runtime() {
+        assert!(
+            !WorkspaceOptions::parse(None)
+                .unwrap()
+                .lint_installation_sources
+        );
+        assert!(
+            WorkspaceOptions::parse(Some(&json!({"lintInstallationSources": true})))
+                .unwrap()
+                .lint_installation_sources
+        );
+        let base = WorkspaceOptions::default();
+        let mut runtime = super::RuntimeOptionsOverride::default();
+        runtime.apply(
+            super::parse_runtime_options(&json!({"lintInstallationSources": true})).unwrap(),
+        );
+        assert!(runtime.effective(&base).lint_installation_sources);
+        let warnings = runtime.apply(
+            super::parse_runtime_options(&json!({"lintInstallationSources": "yes"})).unwrap(),
+        );
+        assert_eq!(
+            warnings,
+            ["ignoring runtime lintInstallationSources: must be a boolean or null"]
+        );
+        assert!(runtime.effective(&base).lint_installation_sources);
+        runtime.apply(
+            super::parse_runtime_options(&json!({"lintInstallationSources": null})).unwrap(),
+        );
+        assert!(!runtime.effective(&base).lint_installation_sources);
     }
 
     #[test]

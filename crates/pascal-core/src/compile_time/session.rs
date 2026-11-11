@@ -5003,9 +5003,12 @@ fn assume_defines(
     conditional: &ConditionalDirective,
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<(), IncompleteReason> {
-    budget.charge(1, conditional.body.len(), 0)?;
     let assumptions =
         conditional::condition_define_assumptions(&conditional.body, holds, &path.environment);
+    if assumptions.is_empty() {
+        return Ok(());
+    }
+    budget.charge(1, conditional.body.len(), 0)?;
     for (symbol, defined) in assumptions {
         let (kind, keyword) = if defined {
             (DirectiveKind::Define, "DEFINE")

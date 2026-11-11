@@ -226,6 +226,37 @@ impl SwitchFacts {
     }
 }
 
+/// D56: dcc compiling a source with no project, as the installation builds
+/// its own RTL: each switch takes the installation's value, else dcc's
+/// default, where that compiler and platform's defaults were observed.
+/// Caller-supplied options win.
+pub(crate) fn apply_installation_defaults(
+    context: &mut ConditionalContext,
+    installation: &BTreeMap<String, String>,
+    platform: Option<&TargetPlatform>,
+) {
+    if !defaults_known(None, false, platform, false, context.compiler_version) {
+        return;
+    }
+    let facts = SWITCHES
+        .iter()
+        .map(|switch| {
+            let installed = installation
+                .iter()
+                .find(|(name, value)| {
+                    name.eq_ignore_ascii_case(switch.property) && !value.trim().is_empty()
+                })
+                .map(|(_, value)| parse(switch.values, value));
+            let value = installed.unwrap_or(switch.default);
+            (
+                switch.option,
+                (value != ConditionalFact::Unknown).then_some(value),
+            )
+        })
+        .collect::<Vec<_>>();
+    apply(context, &facts);
+}
+
 fn apply(context: &mut ConditionalContext, facts: &[(&'static str, Option<ConditionalFact>)]) {
     for (option, fact) in facts {
         if let Some(fact) = fact

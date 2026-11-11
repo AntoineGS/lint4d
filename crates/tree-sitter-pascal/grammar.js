@@ -559,6 +559,9 @@ module.exports = grammar({
 		// exprBinary as the only survivor. Declaring the _ref/_typeref
 		// conflict is needed because both accept ppFragmentExpr.
 		[$._ref, $._typeref],
+		// `AnsiString(CP)` is a code-page string type unless `..` follows,
+		// which makes `Low(Word)`-style calls subrange bounds.
+		[$.exprArgs, $.declStringCodePage],
 		[$.defProc, $.ppBlock],
 		// A directive after a routine header may wrap the routine body or only
 		// its first local declarations, where a body-like block is a statement.
@@ -873,6 +876,7 @@ module.exports = grammar({
 			$.declArray,
 			$.declFile,
 			$.declString,
+			$.declStringCodePage,
 			$.declProcRef,
 			$.declSubRange,
 			// Anonymous record types only; named declarations retain declClass.
@@ -1198,6 +1202,10 @@ module.exports = grammar({
 			optional(seq('[', choice($._expr), ']')),
 			...enable_if(delphi, optional(prec.right(seq($.kDeprecated, optional($._expr))))),
 		)),
+
+		// Delphi code-page string type: `type AnsiString($ffff)`,
+		// `AnsiString(CP_UTF8)`.
+		declStringCodePage: $ => seq($.identifier, '(', $._expr, ')'),
 
 		declProcRef:     $ => prec.right(1,seq(
 			optional(seq($.kReference, $.kTo)),

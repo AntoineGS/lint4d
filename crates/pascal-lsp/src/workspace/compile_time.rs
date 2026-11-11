@@ -1319,9 +1319,12 @@ pub(crate) fn mapped(
 /// resolve.
 pub(crate) const UNRESOLVED_INCLUDE: &str = "unresolved include";
 
+/// Prefix of an expansion error giving a reason the analysis stopped.
+pub(crate) const ANALYSIS_STOPPED: &str = "compile-time analysis stopped: ";
+
 fn describe_incomplete_reason(reason: &pascal_core::compile_time::IncompleteReason) -> String {
     use pascal_core::compile_time::IncompleteReason;
-    match reason {
+    let reason = match reason {
         IncompleteReason::Limit { name, maximum } => {
             format!("the {name} limit ({maximum}) was reached")
         }
@@ -1330,7 +1333,8 @@ fn describe_incomplete_reason(reason: &pascal_core::compile_time::IncompleteReas
         }
         IncompleteReason::MalformedSource => "a directive could not be analysed".into(),
         IncompleteReason::Cancelled => "the analysis was cancelled".into(),
-    }
+    };
+    format!("{ANALYSIS_STOPPED}{reason}")
 }
 
 struct Mapping<'a> {

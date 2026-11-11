@@ -1379,6 +1379,98 @@ fn standalone_source_under_an_installation_uses_its_compiler_and_platform() {
     assert_eq!(conditionals.define("PIC"), ConditionalFact::False);
 }
 
+/// D56 (l4d-zgyw): a source in an installation's own BDS tree that no
+/// project claims is compiled as dcc compiles the RTL, with no project:
+/// its predefined defines and nothing else, and dcc's default switches.
+/// dcc32 21.0 compiling such a unit with `--no-config` and no `-D` leaves
+/// MACOSX, DEBUG_MREWS, PUREPASCAL, DEBUG, CONSOLE and CLR undefined, and
+/// `{$IFOPT R-}` holds.
+#[test]
+fn standalone_installation_source_has_dcc_closed_define_set_and_default_switches() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let bds = temp.path().join("RAD Studio/7.0");
+    let sources = [
+        bds.join("source/Win32/rtl/sys/SysUtils.pas"),
+        bds.join("source/Win32/rtl/common/StrUtils.pas"),
+        bds.join("source/Win32/rtl/win/Windows.pas"),
+    ];
+    write(
+        &workspace.join("App.pas"),
+        "unit App; interface implementation end.",
+    );
+    for source in &sources {
+        write(source, "unit U; interface implementation end.");
+    }
+    let configuration = temp.path().join("config.toml");
+    write(
+        &configuration,
+        &format!(
+            "[installations.\"7.0\".properties]\nBDS = '{}'\nPlatform = 'Win32'\n",
+            bds.display(),
+        ),
+    );
+    for source in &sources {
+        let context = ProjectContext::discover_with_overrides(
+            source,
+            std::slice::from_ref(&workspace),
+            &ProjectOptions::default(),
+            &OverrideSession::new(Some(configuration.clone())),
+        )
+        .unwrap()
+        .context;
+        let conditionals = context.conditional_context_for(source);
+        for undefined in [
+            "MACOSX",
+            "DEBUG_MREWS",
+            "PUREPASCAL",
+            "DEBUG",
+            "CONSOLE",
+            "CLR",
+        ] {
+            assert_eq!(
+                conditionals.define(undefined),
+                ConditionalFact::False,
+                "{undefined} in {}",
+                source.display()
+            );
+        }
+        assert_eq!(conditionals.define("MSWINDOWS"), ConditionalFact::True);
+        assert_eq!(conditionals.define("NATIVECODE"), ConditionalFact::True);
+        assert_eq!(conditionals.option("R"), ConditionalFact::False);
+        assert_eq!(conditionals.option("H"), ConditionalFact::True);
+    }
+}
+
+/// A source outside every installation's BDS tree keeps its open define set.
+#[test]
+fn standalone_source_outside_installations_keeps_an_open_define_set() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let unit = workspace.join("Loose.pas");
+    write(&unit, "unit Loose; interface implementation end.");
+    let configuration = temp.path().join("config.toml");
+    write(
+        &configuration,
+        &format!(
+            "[installations.\"7.0\".properties]\nBDS = '{}'\nPlatform = 'Win32'\n",
+            temp.path().join("RAD Studio/7.0").display(),
+        ),
+    );
+    let context = ProjectContext::discover_with_overrides(
+        &unit,
+        &[workspace],
+        &ProjectOptions::default(),
+        &OverrideSession::new(Some(configuration)),
+    )
+    .unwrap()
+    .context;
+    assert_eq!(
+        context.conditional_context_for(&unit).define("MACOSX"),
+        ConditionalFact::Unknown
+    );
+}
+
 /// Delphi 2010 ships sample programs next to its VCL and DB sources
 /// (`source/Win32/vcl/HTTPSrvr.dpr`, `source/Win32/db/ScktSrvr.dpr`), and
 /// discovery makes such a program the owner of `Controls.pas` or `DB.pas`.

@@ -39,9 +39,11 @@ pub(super) fn build_standalone_context_with_overrides(
         }
     };
     let mut options = options.clone();
+    let mut installation_properties = None;
     if override_error.is_none()
         && let Some(installation) = containing_installation(file, roots, session)
     {
+        installation_properties = Some(installation.overrides.properties.clone());
         effective_overrides = merge_effective_overrides(
             installation.overrides,
             &effective_overrides,
@@ -63,10 +65,21 @@ pub(super) fn build_standalone_context_with_overrides(
         metadata_files,
         metadata_observations,
         exclusions,
+        installation_properties.as_ref(),
         None,
     )?;
     Arc::make_mut(&mut project.context).override_error = override_error;
     Ok(project)
+}
+
+/// The configured installation whose own `BDS` tree contains `file`, if
+/// exactly one does: the file is vendor source (D56/D57).
+pub fn installation_source(
+    file: &Path,
+    roots: &[PathBuf],
+    session: &OverrideSession,
+) -> Option<String> {
+    containing_installation(file, roots, session).map(|installation| installation.id)
 }
 
 /// A source inside exactly one configured installation's `BDS` tree (its RTL
@@ -1081,6 +1094,7 @@ fn build_standalone_context(
     metadata_files: Vec<PathBuf>,
     metadata_observations: Vec<MetadataObservation>,
     exclusions: &[String],
+    installation: Option<&BTreeMap<String, String>>,
     cancel: Option<&AtomicBool>,
 ) -> Result<DiscoveredProject, String> {
     check_project_scan_cancel(cancel)?;
@@ -1114,9 +1128,18 @@ fn build_standalone_context(
     let project_source_roots = paths_from_entries(&search_path_entries);
     let config = selected_standalone_property(&overrides, options.build_config.as_ref(), "config");
     let platform = selected_standalone_property(&overrides, options.platform.as_ref(), "platform");
-    // A standalone source is not necessarily a program's main source, so it
-    // cannot establish the project-level CONSOLE target.
-    let console_target = ConditionalFact::Unknown;
+    // D56: a source in an installation's own BDS tree that no project claims
+    // is compiled as dcc compiles the RTL: no project, so no defines beyond
+    // the predefined ones (not CONSOLE either: no -CC) and dcc's default
+    // switches. Any other standalone source is not necessarily a program's
+    // main source, so it cannot establish the project-level CONSOLE target,
+    // and its define set stays open.
+    let closed = installation.is_some() && options.conditional_context.compiler_version.is_some();
+    let console_target = if closed {
+        ConditionalFact::False
+    } else {
+        ConditionalFact::Unknown
+    };
     let mut conditional_context = options.conditional_context.clone();
     let target_platform = platform.as_deref().and_then(TargetPlatform::parse);
     conditional_context.layout = selected_layout(
@@ -1141,20 +1164,31 @@ fn build_standalone_context(
     conditional_closure::merge_predefined_facts(&mut conditional_context, &predefined);
     conditional_closure::merge_rtl_constants(&mut conditional_context, rtl_constants.as_deref());
     conditional_context.absent_define = ConditionalFact::Unknown;
+    if closed && let Some(installation) = installation {
+        crate::switches::apply_installation_defaults(
+            &mut conditional_context,
+            installation,
+            target_platform.as_ref(),
+        );
+    }
     let library_conditional_context = conditional_context.clone();
     let config_selection = BuildSelection::default();
     let platform_selection = BuildSelection::default();
-    let open_reasons = conditional_closure::open_reasons(
-        false,
-        discovery_complete,
-        conditional_context.compiler_version.is_some(),
-        config.as_deref(),
-        platform.as_deref(),
-        &config_selection,
-        &platform_selection,
-    );
+    let open_reasons = if closed {
+        Vec::new()
+    } else {
+        conditional_closure::open_reasons(
+            false,
+            discovery_complete,
+            conditional_context.compiler_version.is_some(),
+            config.as_deref(),
+            platform.as_deref(),
+            &config_selection,
+            &platform_selection,
+        )
+    };
     let conditional_closure = ConditionalClosure {
-        closed: false,
+        closed,
         open_reasons,
         rtl_source,
         rtl_constants,

@@ -128,7 +128,9 @@ pub use selection::{
     selected_project_is_current_with_cancel, selected_project_is_current_with_work_budget,
 };
 mod selection;
-pub use assembly::{add_metadata_observation, system_pas_candidate_in_directory};
+pub use assembly::{
+    add_metadata_observation, installation_source, system_pas_candidate_in_directory,
+};
 mod assembly;
 pub use packages::{
     PackageMetadata, PackageMetadataRead, read_package_metadata,

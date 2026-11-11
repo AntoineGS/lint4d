@@ -733,7 +733,14 @@ impl ProjectContext {
     /// closed.
     pub fn conditional_context_for(&self, path: &Path) -> ConditionalContext {
         if self.project_file.is_none() {
-            return self.effective_conditional_context();
+            // D56: only a source in an installation's own BDS tree has a
+            // closed standalone define set.
+            return if self.conditional_closure.closed {
+                self.effective_conditional_context()
+                    .with_absent_define(ConditionalFact::False)
+            } else {
+                self.effective_conditional_context()
+            };
         }
         match self.source_origin(path) {
             SourceOrigin::ProjectCompiled if self.conditional_closure.closed => self

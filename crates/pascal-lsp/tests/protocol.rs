@@ -73,6 +73,71 @@ fn diagnostics_suppress_unqualified_global_absence_without_a_system_catalogue() 
     server.shutdown();
 }
 
+/// Lint withheld because conditional compilation is unresolved names that
+/// cause; it is not an include failure (sysutils-expansion: Delphi 2010's
+/// SysUtils.pas has no include and reported "include expansion").
+#[test]
+fn withheld_lint_names_its_conditional_cause_not_include_expansion() {
+    let mut forks = String::new();
+    for i in 0..7 {
+        forks.push_str(&format!(
+            "{{$IFDEF M{i}}}{{$DEFINE X{i}}}{{$ELSE}}{{$UNDEF X{i}}}{{$ENDIF}}\n"
+        ));
+    }
+    let cases = [
+        (
+            "Unknown.pas",
+            "unit Unknown;\ninterface\n{$IFDEF Mystery}\nvar X: Integer;\n{$ENDIF}\n\
+             {$IFNDEF Other}\nvar Y: Integer;\n{$ENDIF}\n\
+             {$IF Defined(Third) or Defined(Mystery)}\nvar Z: Integer;\n{$IFEND}\n\
+             implementation\nend.\n"
+                .to_string(),
+            "conditional compilation is unresolved in this context \
+             (unknown: MYSTERY, OTHER, THIRD); lint diagnostics were withheld",
+        ),
+        (
+            "Forks.pas",
+            format!("unit Forks;\ninterface\n{forks}implementation\nend.\n"),
+            "conditional compilation analysis stopped: the max_branch_states limit (64) \
+             was reached; lint diagnostics were withheld",
+        ),
+    ];
+    let root = tempfile::tempdir().expect("workspace");
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+    let mut messages = Vec::new();
+    for (name, source, _) in &cases {
+        let path = root.path().join(name);
+        write_file(&path, source);
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(&path),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": source,
+                }
+            }),
+        );
+        let publication = diagnostics_for_uri(&mut server, &uri(&path));
+        messages.push(
+            publication["diagnostics"]
+                .as_array()
+                .expect("diagnostics")
+                .iter()
+                .map(|diagnostic| diagnostic["message"].as_str().unwrap_or("").to_string())
+                .collect::<Vec<_>>(),
+        );
+    }
+    server.shutdown();
+    let expected = cases
+        .iter()
+        .map(|(_, _, message)| vec![message.to_string()])
+        .collect::<Vec<_>>();
+    assert_eq!(messages, expected);
+}
+
 #[test]
 fn compiled_dcu_source_navigation_serves_read_only_virtual_type() {
     let temp = tempfile::tempdir().expect("isolated workspace");
@@ -3207,8 +3272,9 @@ fn diagnostics_suppress_shared_include_claims_for_incomplete_competing_roots_and
                 .as_array()
                 .expect("complete A diagnostics")
                 .iter()
-                .all(|diagnostic| diagnostic["message"]
-                    != "include expansion was incomplete; lint diagnostics were withheld")
+                .all(|diagnostic| !diagnostic["message"]
+                    .as_str()
+                    .is_some_and(|message| message.ends_with("lint diagnostics were withheld")))
         );
         let _ = diagnostics_for_uri(&mut server, &uri(&b));
         assert!(
@@ -3270,8 +3336,9 @@ fn diagnostics_suppress_shared_include_claims_for_incomplete_competing_roots_and
                 .as_array()
                 .expect("complete A diagnostics after removing Missing.inc")
                 .iter()
-                .all(|diagnostic| diagnostic["message"]
-                    != "include expansion was incomplete; lint diagnostics were withheld")
+                .all(|diagnostic| !diagnostic["message"]
+                    .as_str()
+                    .is_some_and(|message| message.ends_with("lint diagnostics were withheld")))
         );
         if let Some(publication) =
             diagnostics_for_uri_until(&mut server, &uri(&shared), Duration::from_secs(1), |_| true)

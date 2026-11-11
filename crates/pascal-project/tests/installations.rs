@@ -1379,6 +1379,61 @@ fn standalone_source_under_an_installation_uses_its_compiler_and_platform() {
     assert_eq!(conditionals.define("PIC"), ConditionalFact::False);
 }
 
+/// Delphi 2010 ships sample programs next to its VCL and DB sources
+/// (`source/Win32/vcl/HTTPSrvr.dpr`, `source/Win32/db/ScktSrvr.dpr`), and
+/// discovery makes such a program the owner of `Controls.pas` or `DB.pas`.
+/// The program lies in the installation's BDS tree, so that installation
+/// compiles it (sysutils-expansion).
+#[test]
+fn project_under_an_installation_is_compiled_by_that_installation() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let bds = temp.path().join("RAD Studio/7.0");
+    let vcl = bds.join("source/Win32/vcl");
+    let controls = vcl.join("Controls.pas");
+    write(
+        &workspace.join("App.pas"),
+        "unit App; interface implementation end.",
+    );
+    write(&controls, "unit Controls; interface implementation end.");
+    write(
+        &vcl.join("HTTPSrvr.dpr"),
+        "program HTTPSrvr; uses Controls; begin end.",
+    );
+    let configuration = temp.path().join("config.toml");
+    write(
+        &configuration,
+        &format!(
+            "[installations.\"7.0\".properties]\nBDS = '{}'\nPlatform = 'Win32'\n\
+             [installations.\"10.0\".properties]\nBDS = '{}'\n",
+            bds.display(),
+            temp.path().join("RAD Studio/10.0").display()
+        ),
+    );
+
+    let context = ProjectContext::discover_with_overrides(
+        &controls,
+        &[workspace],
+        &ProjectOptions::default(),
+        &OverrideSession::new(Some(configuration)),
+    )
+    .unwrap()
+    .context;
+    assert_eq!(
+        context.project_file(),
+        Some(vcl.join("HTTPSrvr.dpr").as_path())
+    );
+    let conditionals = context.conditional_context_for(&controls);
+
+    assert_eq!(
+        conditionals.compiler_version,
+        Some(pascal_project::CompilerVersion::new(21, 0))
+    );
+    assert_eq!(conditionals.define("VER210"), ConditionalFact::True);
+    assert_eq!(conditionals.define("MSWINDOWS"), ConditionalFact::True);
+    assert_eq!(conditionals.define("LINUX"), ConditionalFact::False);
+}
+
 #[test]
 fn standalone_source_under_an_installation_without_platform_keeps_platform_unknown() {
     let temp = tempfile::tempdir().unwrap();

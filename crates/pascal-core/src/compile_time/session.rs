@@ -4298,6 +4298,14 @@ impl RootSession<'_, '_> {
                 None
             });
         }
+        // A fork on define tests decides those defines for its continuations,
+        // so retesting them never forks the continuations again.
+        for (path, clone) in self.current.iter_mut().zip(clones.iter_mut()) {
+            if let Some(clone) = clone {
+                assume_defines(path, true, directive, self.budget)?;
+                assume_defines(clone, false, directive, self.budget)?;
+            }
+        }
         for ((path, condition), clone) in std::mem::take(&mut self.current)
             .into_iter()
             .zip(decisions)
@@ -4986,6 +4994,43 @@ impl SourceOrder for RootSession<'_, '_> {
     }
 }
 
+/// Record on `path` the defines that taking (`holds`) or skipping the
+/// branch of `conditional` implies, each as the `$DEFINE` or `$UNDEF` at the
+/// conditional that would set it.
+fn assume_defines(
+    path: &mut AdmittedOwned<ReachablePath>,
+    holds: bool,
+    conditional: &ConditionalDirective,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<(), IncompleteReason> {
+    budget.charge(1, conditional.body.len(), 0)?;
+    let assumptions =
+        conditional::condition_define_assumptions(&conditional.body, holds, &path.environment);
+    for (symbol, defined) in assumptions {
+        let (kind, keyword) = if defined {
+            (DirectiveKind::Define, "DEFINE")
+        } else {
+            (DirectiveKind::Undef, "UNDEF")
+        };
+        let bytes = keyword.len() + symbol.len() + 1;
+        budget.charge(1, symbol.len(), bytes)?;
+        let assumption = ConditionalDirective {
+            kind,
+            body: format!("{keyword} {symbol}"),
+            start: conditional.start,
+            end: conditional.end,
+            activity: Truth::True,
+            condition: None,
+        };
+        let result = path.with_budget_mut(budget, |path, budget| {
+            apply_path_directive(path, &assumption, budget)
+        });
+        budget.release(bytes);
+        result??;
+    }
+    Ok(())
+}
+
 fn apply_path_directive(
     path: &mut ReachablePath,
     directive: &ConditionalDirective,
@@ -5484,7 +5529,7 @@ mod tests {
     }
 
     #[test]
-    fn required_firedac_style_prefix_proves_common_header_at_144_states() {
+    fn required_firedac_style_prefix_proves_common_header_at_96_states() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("FireDAC.Phys.IB.pas");
         let prefix = "{$I FireDAC.inc}\n{$IFDEF IOS}{$HPPEMIT 'mobile'}{$ELSE}{$IFDEF WIN32}{$HPPEMIT 'win'}{$ENDIF}{$ENDIF}\n";
@@ -5542,7 +5587,7 @@ mod tests {
         let proof = prove(limits).unwrap();
         assert!(
             matches!(proof, Fact::Known(ref h) if h.name == "FireDAC.Phys.IB"),
-            "144-state required prefix: {proof:?}"
+            "96-state required prefix: {proof:?}"
         );
         let tight = prove(CompileTimeLimits {
             max_branch_states: 64,
@@ -5578,20 +5623,32 @@ mod tests {
             "outer candidate must use header purpose: {:?}",
             selected.result
         );
-        let at128 = prove(CompileTimeLimits {
-            max_branch_states: 128,
+        // The nested `{$IFDEF WIN32}` retests a define FireDAC.inc already
+        // forked on, so it no longer forks (sysutils-expansion): 96 states,
+        // not 144.
+        let at95 = prove(CompileTimeLimits {
+            max_branch_states: 95,
             ..limits
         })
         .unwrap();
         assert!(
             matches!(
-                at128,
+                at95,
                 Fact::Incomplete(IncompleteReason::Limit {
                     name: "max_branch_states",
-                    maximum: 128
+                    maximum: 95
                 })
             ),
-            "nested HPPEMIT requires the final 144 states: {at128:?}"
+            "nested HPPEMIT requires the final 96 states: {at95:?}"
+        );
+        let at96 = prove(CompileTimeLimits {
+            max_branch_states: 96,
+            ..limits
+        })
+        .unwrap();
+        assert!(
+            matches!(at96, Fact::Known(ref h) if h.name == "FireDAC.Phys.IB"),
+            "96 states suffice: {at96:?}"
         );
         for tighter in [
             CompileTimeLimits {

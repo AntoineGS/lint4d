@@ -16013,17 +16013,20 @@ impl Workspace {
             .conditionals
             .clone()
             .ok_or("diagnostics lost the shared compile-time session")?;
-        let expansion_complete = expansion.complete;
+        let withheld = (!expansion.complete).then(|| {
+            withheld_lint_message(
+                &expansion.errors,
+                &conditional,
+                &context.conditional_context_for(&path),
+            )
+        });
         self.store_expansion(uri, &context_key, source.clone(), expansion);
         self.record_expansion_analysis_sources(uri, &context, cancel)?;
-        if !expansion_complete {
+        if let Some(message) = withheld {
             return Ok(single_diagnostic_publication(
                 uri,
                 version,
-                vec![server_diagnostic(
-                    "include expansion was incomplete; lint diagnostics were withheld",
-                    DiagnosticSeverity::ERROR,
-                )],
+                vec![server_diagnostic(&message, DiagnosticSeverity::ERROR)],
             ));
         }
         self.ensure_open_root_expansions_for_semantic_context(cancel)?;
@@ -17218,6 +17221,64 @@ fn metadata_payload_is_current_in_pass(
         read_limit,
         budget.map(|budget| budget as &dyn ProjectWorkBudget),
     )
+}
+
+/// Why lint was withheld for an incomplete expansion, from the expansion's
+/// errors and its conditional projection. An unresolved include comes
+/// first; then a compile-time analysis that stopped early; then code whose
+/// activity the context leaves unknown, naming the defines `context` does
+/// not know (or the conditional, when it is not made of define tests).
+fn withheld_lint_message(
+    errors: &[String],
+    conditional: &pascal_core::conditional::ConditionalAnalysis,
+    context: &pascal_project::ConditionalContext,
+) -> String {
+    const WITHHELD: &str = "lint diagnostics were withheld";
+    if errors
+        .iter()
+        .any(|error| error.starts_with(compile_time::UNRESOLVED_INCLUDE))
+    {
+        return format!("include expansion was incomplete; {WITHHELD}");
+    }
+    if !conditional.complete {
+        let reason = errors
+            .iter()
+            .find(|error| error.ends_with(" was reached"))
+            .or_else(|| errors.first())
+            .map_or("its safety limits were reached", String::as_str);
+        return format!("conditional compilation analysis stopped: {reason}; {WITHHELD}");
+    }
+    if conditional.unknown_activity_requires_fail_closed() {
+        const NAMED: usize = 4;
+        let mut unknown: Vec<String> = Vec::new();
+        for directive in conditional.unknown_code_conditions() {
+            let items = match pascal_core::conditional::tested_defines(&directive.body) {
+                Some(defines) => defines
+                    .into_iter()
+                    .filter(|define| {
+                        context.define(define) == pascal_core::conditional::Truth::Unknown
+                    })
+                    .collect(),
+                None => vec![format!("{{${}}}", directive.body.trim())],
+            };
+            for item in items {
+                if !unknown.contains(&item) {
+                    unknown.push(item);
+                }
+            }
+        }
+        if unknown.is_empty() {
+            return format!("conditional compilation is unresolved in this context; {WITHHELD}");
+        }
+        let more = if unknown.len() > NAMED { ", …" } else { "" };
+        unknown.truncate(NAMED);
+        return format!(
+            "conditional compilation is unresolved in this context (unknown: {}{more}); \
+             {WITHHELD}",
+            unknown.join(", ")
+        );
+    }
+    format!("include expansion was incomplete; {WITHHELD}")
 }
 
 pub(crate) fn server_diagnostic(message: &str, severity: DiagnosticSeverity) -> LspDiagnostic {

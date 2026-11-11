@@ -18067,7 +18067,10 @@ mod tests {
     }
 
     #[test]
-    fn oversized_aggregate_is_replaced_by_a_withheld_notice_and_warning_not_a_partial_report() {
+    fn oversized_aggregate_of_an_unopened_document_is_omitted_with_operational_warning() {
+        // Review minor 4 (l4d-zgyw): only an open document gets a truncated
+        // report; a related document that is not open keeps the
+        // all-or-nothing rule and the operational warning.
         let temp = tempfile::tempdir().expect("workspace");
         let mut workspace = test_workspace(
             vec![temp.path().to_path_buf()],
@@ -18099,25 +18102,7 @@ mod tests {
         }
 
         pump_pending_diagnostic_publications(&server, &mut workspace)
-            .expect("oversized report is replaced, not sent partially");
-        // The document learns that its report was withheld (l4d-zgyw):
-        // without a publication the client keeps showing the previous one.
-        let Message::Notification(replacement) = client
-            .receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("withheld-report publication")
-        else {
-            panic!("expected publishDiagnostics");
-        };
-        assert_eq!(replacement.method, "textDocument/publishDiagnostics");
-        assert_eq!(replacement.params["uri"], target.as_str());
-        let diagnostics = replacement.params["diagnostics"].as_array().unwrap();
-        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert_eq!(
-            diagnostics[0]["message"],
-            "this document's diagnostics exceed the publication limit (10,000 diagnostics or \
-             64 KiB); they were withheld"
-        );
+            .expect("oversized report is skipped, not sent partially");
         let Message::Notification(warning) = client
             .receiver
             .recv_timeout(Duration::from_secs(1))
@@ -18126,14 +18111,187 @@ mod tests {
             panic!("expected operational warning");
         };
         assert_eq!(warning.method, "window/showMessage");
-        assert!(
-            warning.params["message"]
-                .as_str()
-                .unwrap()
-                .contains("incomplete")
-        );
         assert!(client.receiver.try_recv().is_err());
         assert_eq!(workspace.pending_diagnostic_publication_count(), 0);
+    }
+
+    /// Stage `diagnostics` for the open document `Main.pas` from one owner
+    /// per entry of `owners` (each owner contributes the same list), pump,
+    /// and return the published diagnostics and whether anything else was
+    /// sent.
+    fn publish_for_open_document(
+        owners: usize,
+        diagnostics: Vec<Diagnostic>,
+    ) -> (Vec<Diagnostic>, Vec<Message>) {
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace = test_workspace(
+            vec![temp.path().to_path_buf()],
+            crate::workspace::WorkspaceOptions::default(),
+        );
+        let target = Url::from_file_path(temp.path().join("Main.pas")).expect("target URI");
+        workspace
+            .open_document(
+                target.clone(),
+                "unit Main; interface implementation end.".into(),
+                1,
+            )
+            .expect("open target");
+        let (server, client) = Connection::memory();
+        for owner_index in 0..owners {
+            let root = if owner_index == 0 {
+                target.clone()
+            } else {
+                Url::from_file_path(temp.path().join(format!("Owner{owner_index}.pas")))
+                    .expect("root URI")
+            };
+            super::send_diagnostic_publications(
+                &server,
+                &mut workspace,
+                &root,
+                vec![DiagnosticPublication {
+                    uri: target.clone(),
+                    version: Some(1),
+                    diagnostics: diagnostics.clone(),
+                }],
+            )
+            .expect("stage owner contribution");
+        }
+        while client.receiver.try_recv().is_ok() {}
+        pump_pending_diagnostic_publications(&server, &mut workspace).expect("pump");
+        let mut published = None;
+        let mut others = Vec::new();
+        while let Ok(message) = client.receiver.try_recv() {
+            match &message {
+                Message::Notification(notification)
+                    if notification.method == "textDocument/publishDiagnostics"
+                        && notification.params["uri"] == target.as_str() =>
+                {
+                    let encoded = serde_json::to_vec(&message).unwrap();
+                    assert!(
+                        encoded.len() + super::LSP_FRAME_HEADER_RESERVE_BYTES
+                            <= super::MAX_PUSH_DIAGNOSTIC_NOTIFICATION_BYTES
+                    );
+                    published = Some(
+                        serde_json::from_value::<Vec<Diagnostic>>(
+                            notification.params["diagnostics"].clone(),
+                        )
+                        .unwrap(),
+                    );
+                }
+                _ => others.push(message),
+            }
+        }
+        (
+            published.expect("a publication for the open document"),
+            others,
+        )
+    }
+
+    fn at(line: u32, severity: DiagnosticSeverity, message: String) -> Diagnostic {
+        Diagnostic {
+            range: Range::new(Position::new(line, 0), Position::new(line, 1)),
+            severity: Some(severity),
+            message,
+            ..Diagnostic::default()
+        }
+    }
+
+    /// D57 (l4d-zgyw): an open document whose report is over 64 KiB gets
+    /// the report truncated, errors first, then warnings, information and
+    /// hints, each by position, and one warning at line 1 counting the rest
+    /// and naming the limit.
+    #[test]
+    fn oversized_report_of_an_open_document_is_truncated_errors_first_with_a_note() {
+        let mut diagnostics = Vec::new();
+        for line in 0..400 {
+            diagnostics.push(at(
+                line,
+                DiagnosticSeverity::HINT,
+                format!("hint {line} {}", "h".repeat(100)),
+            ));
+            diagnostics.push(at(
+                line,
+                DiagnosticSeverity::WARNING,
+                format!("warning {line} {}", "w".repeat(100)),
+            ));
+        }
+        for line in (0..5).rev() {
+            diagnostics.push(at(
+                1000 + line,
+                DiagnosticSeverity::ERROR,
+                format!("error {line}"),
+            ));
+        }
+        let total = diagnostics.len();
+        let (published, others) = publish_for_open_document(1, diagnostics);
+        let note = published
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("were not shown"))
+            .expect("a truncation note");
+        assert_eq!(note.severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(note.range.start, Position::new(0, 0));
+        let shown = published
+            .iter()
+            .filter(|diagnostic| !diagnostic.message.contains("were not shown"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            note.message,
+            format!(
+                "{} more diagnostics were not shown (per-document limit: 64 KiB)",
+                total - shown.len()
+            )
+        );
+        assert!(shown.len() > 5 && shown.len() < total);
+        let errors = shown
+            .iter()
+            .take(5)
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            errors,
+            ["error 0", "error 1", "error 2", "error 3", "error 4"]
+        );
+        let rank = |diagnostic: &&Diagnostic| match diagnostic.severity {
+            Some(DiagnosticSeverity::ERROR) | None => 0,
+            Some(DiagnosticSeverity::WARNING) => 1,
+            Some(DiagnosticSeverity::INFORMATION) => 2,
+            _ => 3,
+        };
+        assert!(shown.windows(2).all(|pair| {
+            (rank(&pair[0]), pair[0].range.start.line) <= (rank(&pair[1]), pair[1].range.start.line)
+        }));
+        // 400 warnings do not fit 64 KiB with the errors: no hint is shown.
+        assert!(
+            shown
+                .iter()
+                .all(|diagnostic| diagnostic.severity != Some(DiagnosticSeverity::HINT))
+        );
+        assert!(
+            others.is_empty(),
+            "the note replaces the operational warning: {others:?}"
+        );
+    }
+
+    /// Review minor 4: a report cut short by the merge visit cap says that
+    /// other diagnostics may be missing and names that cap.
+    #[test]
+    fn report_cut_by_the_merge_visit_cap_names_that_cap() {
+        let diagnostics = (0..7_000)
+            .map(|index| at(index % 50, DiagnosticSeverity::WARNING, "same".into()))
+            .collect::<Vec<_>>();
+        let (published, _) = publish_for_open_document(3, diagnostics);
+        let note = published
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.severity == Some(DiagnosticSeverity::WARNING)
+                    && diagnostic.message.contains("per-document limit")
+            })
+            .expect("a truncation note");
+        assert_eq!(
+            note.message,
+            "other diagnostics may not have been shown (per-document limit: 20,000 diagnostics merged)"
+        );
+        assert_eq!(published.len(), 51, "50 distinct findings and the note");
     }
 
     #[test]

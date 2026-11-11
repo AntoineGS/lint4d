@@ -6961,29 +6961,18 @@ impl Workspace {
         }
     }
 
-    /// The publication standing for a document's report when that report
-    /// exceeds the publication bounds: one diagnostic saying it was
-    /// withheld, never a partial report, and never nothing, which would
-    /// leave the client showing a previous report.
-    fn withheld_diagnostic_publication(&self, uri: &Url) -> queries::DiagnosticPublication {
-        queries::DiagnosticPublication {
-            version: self.document_version(uri),
-            uri: uri.clone(),
-            diagnostics: vec![withheld_report_diagnostic()],
-        }
-    }
-
     fn aggregate_diagnostic_publication(
         &self,
         uri: &Url,
     ) -> (Option<queries::DiagnosticPublication>, bool) {
         let mut has_current_owner = false;
         let mut has_incomplete_owner = false;
-        let mut diagnostics = Vec::new();
+        let mut diagnostics: Vec<(LspDiagnostic, usize)> = Vec::new();
         let mut seen_diagnostics = HashSet::new();
         let mut diagnostics_bytes = 0usize;
         let mut visits = 0usize;
-        for root in &self.diagnostic_publication_root_order {
+        let mut visit_capped = false;
+        'roots: for root in &self.diagnostic_publication_root_order {
             let Some(contribution) = self
                 .diagnostic_publications
                 .get(root)
@@ -6999,28 +6988,50 @@ impl Workspace {
             for diagnostic in contribution {
                 visits = visits.saturating_add(1);
                 if visits > MAX_DIAGNOSTIC_PUBLICATION_AGGREGATE_VISITS {
-                    return (Some(self.withheld_diagnostic_publication(uri)), true);
+                    visit_capped = true;
+                    break 'roots;
                 }
                 let Ok(encoded) = serde_json::to_vec(diagnostic) else {
                     return (None, true);
                 };
                 if seen_diagnostics.insert(encoded.clone()) {
-                    diagnostics_bytes = diagnostics_bytes.saturating_add(encoded.len());
-                    if diagnostics.len() >= 10_000 || diagnostics_bytes > 64 * 1024 {
-                        return (Some(self.withheld_diagnostic_publication(uri)), true);
-                    }
-                    diagnostics.push(diagnostic.clone());
+                    // One more byte for the separating comma.
+                    let size = encoded.len() + 1;
+                    diagnostics_bytes = diagnostics_bytes.saturating_add(size);
+                    diagnostics.push((diagnostic.clone(), size));
                 }
             }
         }
         if !has_current_owner && has_incomplete_owner {
             return (None, true);
         }
+        let oversized = visit_capped
+            || diagnostics.len() > MAX_PUBLISHED_DIAGNOSTICS
+            || diagnostics_bytes > MAX_PUBLISHED_DIAGNOSTIC_BYTES;
+        if !oversized {
+            return (
+                Some(queries::DiagnosticPublication {
+                    version: self.document_version(uri),
+                    uri: uri.clone(),
+                    diagnostics: diagnostics
+                        .into_iter()
+                        .map(|(diagnostic, _)| diagnostic)
+                        .collect(),
+                }),
+                has_incomplete_owner,
+            );
+        }
+        // D57: an open document gets its report truncated, with a note. A
+        // document that is not open keeps the all-or-nothing rule (review
+        // minor 4).
+        if !self.open_documents.contains_key(uri) {
+            return (None, true);
+        }
         (
             Some(queries::DiagnosticPublication {
                 version: self.document_version(uri),
                 uri: uri.clone(),
-                diagnostics,
+                diagnostics: truncated_report(diagnostics, visit_capped),
             }),
             has_incomplete_owner,
         )
@@ -17235,13 +17246,98 @@ fn metadata_payload_is_current_in_pass(
     )
 }
 
-/// The diagnostic replacing a document report too large to publish.
+/// The diagnostic replacing a document report that cannot be published at
+/// all, even truncated: its notification would still exceed the wire bound.
 pub(crate) fn withheld_report_diagnostic() -> LspDiagnostic {
     server_diagnostic(
-        "this document's diagnostics exceed the publication limit (10,000 diagnostics or \
-         64 KiB); they were withheld",
+        "this document's diagnostics exceed the publication limit (64 KiB); they were withheld",
         DiagnosticSeverity::WARNING,
     )
+}
+
+/// Diagnostics one document's publication may carry.
+const MAX_PUBLISHED_DIAGNOSTICS: usize = 10_000;
+/// Encoded bytes of the diagnostics one document's publication may carry.
+const MAX_PUBLISHED_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+/// Room kept below `MAX_PUBLISHED_DIAGNOSTIC_BYTES` for the note and the
+/// notification around the list, so a truncated report fits the wire bound.
+const TRUNCATED_REPORT_RESERVE_BYTES: usize = 4 * 1024;
+
+/// D57: a report over the per-document bounds, truncated. Errors come first,
+/// then warnings, information and hints, each by position, while they fit;
+/// a warning at line 1 counts the rest and names the limit that stopped it.
+fn truncated_report(
+    mut diagnostics: Vec<(LspDiagnostic, usize)>,
+    visit_capped: bool,
+) -> Vec<LspDiagnostic> {
+    let rank = |diagnostic: &LspDiagnostic| match diagnostic.severity {
+        Some(DiagnosticSeverity::ERROR) | None => 0,
+        Some(DiagnosticSeverity::WARNING) => 1,
+        Some(DiagnosticSeverity::INFORMATION) => 2,
+        _ => 3,
+    };
+    diagnostics.sort_by(|(left, _), (right, _)| {
+        (
+            rank(left),
+            left.range.start.line,
+            left.range.start.character,
+        )
+            .cmp(&(
+                rank(right),
+                right.range.start.line,
+                right.range.start.character,
+            ))
+    });
+    let total = diagnostics.len();
+    let mut shown = Vec::new();
+    let mut bytes = 0usize;
+    let mut stopped_by_bytes = false;
+    for (diagnostic, size) in diagnostics {
+        if shown.len() + 1 >= MAX_PUBLISHED_DIAGNOSTICS {
+            break;
+        }
+        if bytes + size > MAX_PUBLISHED_DIAGNOSTIC_BYTES - TRUNCATED_REPORT_RESERVE_BYTES {
+            stopped_by_bytes = true;
+            break;
+        }
+        bytes += size;
+        shown.push(diagnostic);
+    }
+    let omitted = total - shown.len();
+    let merged = group_thousands(MAX_DIAGNOSTIC_PUBLICATION_AGGREGATE_VISITS);
+    let note = match (omitted, visit_capped) {
+        (0, _) => format!(
+            "other diagnostics may not have been shown (per-document limit: {merged} diagnostics merged)"
+        ),
+        (_, true) => format!(
+            "{omitted} more diagnostics, and possibly others, were not shown (per-document \
+             limit: {merged} diagnostics merged)"
+        ),
+        (_, false) => format!(
+            "{omitted} more diagnostics were not shown (per-document limit: {})",
+            if stopped_by_bytes {
+                "64 KiB"
+            } else {
+                "10,000 diagnostics"
+            }
+        ),
+    };
+    let mut report = Vec::with_capacity(shown.len() + 1);
+    report.push(server_diagnostic(&note, DiagnosticSeverity::WARNING));
+    report.extend(shown);
+    report
+}
+
+fn group_thousands(value: usize) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
 }
 
 /// Why lint was withheld for an incomplete expansion, from the expansion's
@@ -17256,16 +17352,15 @@ fn withheld_lint_message(
     context: &pascal_project::ConditionalContext,
 ) -> String {
     const WITHHELD: &str = "lint diagnostics were withheld";
-    let stopped = (!conditional.complete).then(|| {
-        errors
-            .iter()
-            .find_map(|error| error.strip_prefix(compile_time::ANALYSIS_STOPPED))
-            .unwrap_or("its safety limits were reached")
-    });
+    // The analysis's own recorded reason, if it stopped and recorded one.
+    let recorded = errors
+        .iter()
+        .find_map(|error| error.strip_prefix(compile_time::ANALYSIS_STOPPED))
+        .filter(|_| !conditional.complete);
     // An analysis stopped by a limit comes first: the includes after where
     // it stopped were never walked, so they are not unresolved. Otherwise a
     // missing include is the cause the analysis stopped on.
-    if let Some(reason) = stopped.filter(|reason| reason.ends_with(" was reached")) {
+    if let Some(reason) = recorded.filter(|reason| reason.ends_with(" was reached")) {
         return format!("conditional compilation analysis stopped: {reason}; {WITHHELD}");
     }
     if errors
@@ -17274,7 +17369,8 @@ fn withheld_lint_message(
     {
         return format!("include expansion was incomplete; {WITHHELD}");
     }
-    if let Some(reason) = stopped {
+    if !conditional.complete {
+        let reason = recorded.unwrap_or("no reason was recorded");
         return format!("conditional compilation analysis stopped: {reason}; {WITHHELD}");
     }
     if conditional.unknown_activity_requires_fail_closed() {
@@ -18328,6 +18424,36 @@ mod tests {
             ),
             "conditional compilation analysis stopped: the max_branch_states limit (64) was \
              reached; lint diagnostics were withheld"
+        );
+    }
+
+    /// Round-2 review minor 3: with no recorded reason, the fallback wording
+    /// is not a limit, so an unresolved include still names the cause.
+    #[test]
+    fn withheld_lint_without_a_recorded_reason_still_blames_an_unresolved_include() {
+        let stopped = pascal_core::conditional::ConditionalAnalysis {
+            projected_source: String::new(),
+            inactive_spans: vec![],
+            unknown_spans: vec![],
+            directives: vec![],
+            complete: false,
+        };
+        let context = pascal_project::ConditionalContext::default();
+        assert_eq!(
+            super::withheld_lint_message(
+                &[format!(
+                    "{} {{$I Missing.inc}}",
+                    super::compile_time::UNRESOLVED_INCLUDE
+                )],
+                &stopped,
+                &context
+            ),
+            "include expansion was incomplete; lint diagnostics were withheld"
+        );
+        assert_eq!(
+            super::withheld_lint_message(&[], &stopped, &context),
+            "conditional compilation analysis stopped: no reason was recorded; lint diagnostics \
+             were withheld"
         );
     }
 

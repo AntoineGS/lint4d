@@ -140,9 +140,10 @@ fn withheld_lint_names_its_conditional_cause_not_include_expansion() {
 
 /// Windows.pas (Delphi 2010) has more lint findings than one publication may
 /// carry. The report was dropped and nothing was published, so the client
-/// showed no diagnostics, or kept a previous report (l4d-zgyw).
+/// showed no diagnostics, or kept a previous report (l4d-zgyw). D57: the
+/// report is truncated, with a note counting what was not shown.
 #[test]
-fn an_oversized_report_still_publishes_that_it_was_withheld() {
+fn an_oversized_report_is_published_truncated_with_a_note() {
     let mut source = String::from("unit Big;\ninterface\nconst\n");
     for i in 0..1500 {
         source.push_str(&format!("  lowerCaseConstant{i} = {i};\n"));
@@ -174,13 +175,17 @@ fn an_oversized_report_still_publishes_that_it_was_withheld() {
         .map(|diagnostic| diagnostic["message"].as_str().unwrap_or("").to_string())
         .collect::<Vec<_>>();
     server.shutdown();
-    assert_eq!(
-        messages,
-        vec![
-            "this document's diagnostics exceed the publication limit (10,000 diagnostics or \
-             64 KiB); they were withheld"
-                .to_string()
-        ]
+    let note = format!(
+        "{} more diagnostics were not shown (per-document limit: 64 KiB)",
+        1500 - (messages.len() - 1)
+    );
+    assert_eq!(messages[0], note, "{messages:?}");
+    assert!(messages.len() > 100, "{} shown", messages.len());
+    assert!(
+        messages[1..]
+            .iter()
+            .all(|message| message.starts_with("Constant 'lowerCaseConstant")),
+        "{messages:?}"
     );
 }
 

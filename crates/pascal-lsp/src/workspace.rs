@@ -18566,11 +18566,27 @@ mod tests {
         let root = resolver
             .load_source(&dense, None, pascal_core::SourceKind::Unit, &cancel)
             .unwrap();
-        let refusal = resolver.analyze_compile_time(&root, &cancel).unwrap_err();
-        assert!(
-            refusal.to_string().contains("max_byte_work"),
-            "genuine fixed-cap body refusal: {refusal:?}"
-        );
+        // The cap is crossed either by a session-level charge (an error) or
+        // inside a path (an incomplete analysis recording the limit); which
+        // charge crosses it first depends on the context's size.
+        match resolver.analyze_compile_time(&root, &cancel) {
+            Err(refusal) => assert!(
+                refusal.to_string().contains("max_byte_work"),
+                "genuine fixed-cap body refusal: {refusal:?}"
+            ),
+            Ok(analysis) => assert!(
+                !analysis.root.complete
+                    && analysis.reasons.iter().any(|reason| matches!(
+                        reason,
+                        pascal_core::compile_time::IncompleteReason::Limit {
+                            name: "max_byte_work",
+                            ..
+                        }
+                    )),
+                "genuine fixed-cap body refusal: {:?}",
+                analysis.reasons
+            ),
+        }
         super::compile_time::take_body_analyses();
         let locations = workspace.navigate(
             &uri,

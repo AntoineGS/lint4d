@@ -86,8 +86,8 @@ impl<'a> DocBuilder<'a> {
 
             for child in &body_children {
                 let kind = child.kind();
-                let single_line = child.start_position().row == child.end_position().row;
-                let child_doc = self.doc_for_node(*child);
+                let (child_doc, several_lines) = self.doc_for_node_and_extent(*child);
+                let single_line = !several_lines;
                 let source_blank = !prev_child_kind.is_empty()
                     && prev_end_row.is_some_and(|prev_end| {
                         self.has_blank_line_between(prev_end, child.start_position().row)

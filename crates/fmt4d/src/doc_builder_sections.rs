@@ -81,8 +81,8 @@ impl DocBuilder<'_> {
             }
             _ => {
                 let kind = child.kind();
-                let single_line = child.start_position().row == child.end_position().row;
-                let child_doc = self.doc_for_node(child);
+                let (child_doc, several_lines) = self.doc_for_node_and_extent(child);
+                let single_line = !several_lines;
                 if after_header {
                     parts.push(Doc::Hardline);
                     after_header = false;
@@ -127,8 +127,8 @@ impl DocBuilder<'_> {
             }
             _ => {
                 let kind = child.kind();
-                let single_line = child.start_position().row == child.end_position().row;
-                let child_doc = self.doc_for_node(child);
+                let (child_doc, several_lines) = self.doc_for_node_and_extent(child);
+                let single_line = !several_lines;
                 if after_header {
                     parts.push(Doc::Hardline);
                     after_header = false;

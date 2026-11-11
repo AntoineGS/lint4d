@@ -678,3 +678,59 @@ end.
 ",
     );
 }
+
+/// Whether declarations get a blank line between them depended on whether
+/// they spanned one line in the source, which formatting changes: a
+/// signature joined onto one line, or broken because it is too long, got a
+/// blank line on one run and lost it (or gained it) on the next. It now
+/// depends on whether the declaration's layout forces line breaks.
+#[test]
+fn blank_lines_between_declarations_are_stable() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+type
+  TA = (a,
+    b);
+  TB = Integer;
+  TC = class
+  end;
+  TD = Byte;
+function F(
+  A: Integer): Integer;
+function G: Integer;
+procedure ThisIsAVeryLongProcedureName(const FirstArgument: Integer; const SecondArgument: string; const Third: Boolean);
+procedure H;
+implementation
+end.
+",
+        "\
+unit T;
+
+interface
+
+type
+  TA = (a, b);
+  TB = Integer;
+
+  TC = class
+  end;
+
+  TD = Byte;
+
+function F(A: Integer): Integer;
+function G: Integer;
+procedure ThisIsAVeryLongProcedureName(
+  const FirstArgument: Integer;
+  const SecondArgument: string;
+  const Third: Boolean
+);
+procedure H;
+
+implementation
+
+end.
+",
+    );
+}

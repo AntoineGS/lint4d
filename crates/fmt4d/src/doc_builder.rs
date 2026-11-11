@@ -379,6 +379,23 @@ impl<'a> DocBuilder<'a> {
         doc::concat(vec![leading, body, trailing])
     }
 
+    /// [`Self::doc_for_node`], and whether the layout of `node` itself,
+    /// without its leading and trailing comments and directives, always
+    /// spans several lines (see [`doc::has_forced_break`]). Unlike the
+    /// node's source rows, this does not change when the output is
+    /// formatted again.
+    pub(crate) fn doc_for_node_and_extent(&self, node: Node<'a>) -> (Doc, bool) {
+        if self.is_in_format_off_region(node) {
+            let several = node.start_position().row != node.end_position().row;
+            return (self.format_off_doc(node, true, true), several);
+        }
+        let leading = self.leading_trivia_doc(node);
+        let body = self.build_doc(node);
+        let several = doc::has_forced_break(&body);
+        let trailing = self.trailing_trivia_doc(node);
+        (doc::concat(vec![leading, body, trailing]), several)
+    }
+
     /// Like `doc_for_node` but omits leading comments and directives.
     ///
     /// Used by alignment decompose functions so that leading comments and

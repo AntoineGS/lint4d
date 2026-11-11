@@ -14434,3 +14434,78 @@ fn metrics_test_endpoint_is_rejected_after_shutdown() {
     );
     drop(temp);
 }
+
+/// l4d-czw7: diagnostics held inside a unit (where they never reach a point
+/// to pause at) fill both general slots; client requests the user waits on
+/// still run beside them instead of waiting for a diagnostic to pause.
+#[cfg(feature = "test-support")]
+#[test]
+fn client_requests_run_beside_diagnostics_held_inside_a_unit() {
+    let (_workspace, main, provider, main_source, provider_source) = standard_workspace();
+    let root = main.parent().expect("workspace root").to_path_buf();
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(environment);
+    server.initialize(&root, Value::Null);
+    for (path, text) in [(&main, &main_source), (&provider, &provider_source)] {
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument": {
+                "uri": uri(path), "languageId": "pascal", "version": 1, "text": text}}),
+        );
+    }
+    barrier.wait_for_entries(2);
+
+    let references_id = RequestId::from("references-beside-held-diagnostics".to_string());
+    server.send_request(
+        references_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(&main_source, "PublicRoutine", 0),
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let symbols_id = RequestId::from("symbols-beside-held-diagnostics".to_string());
+    server.send_request(
+        symbols_id.clone(),
+        "workspace/symbol",
+        json!({"query": "PublicRoutine"}),
+    );
+    let hover_id = RequestId::from("hover-beside-held-diagnostics".to_string());
+    server.send_request(
+        hover_id.clone(),
+        "textDocument/hover",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(&main_source, "PublicRoutine", 0)
+        }),
+    );
+    let declaration_id = RequestId::from("declaration-beside-held-diagnostics".to_string());
+    server.send_request(
+        declaration_id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(&main_source, "PublicRoutine", 0)
+        }),
+    );
+    // The diagnostics stay held until every request answered.
+    let mut responses = Vec::new();
+    for id in [&references_id, &symbols_id, &hover_id, &declaration_id] {
+        let response = server
+            .response_with_timeout(id, Duration::from_secs(20))
+            .unwrap_or_else(|| panic!("{id:?} waited behind diagnostics held inside a unit"));
+        assert!(response.error.is_none(), "{response:?}");
+        responses.push(response);
+    }
+    assert!(!barrier.release.exists(), "the diagnostics were still held");
+    let references = result_locations(responses.swap_remove(0));
+    assert!(
+        references
+            .iter()
+            .any(|location| location["uri"] == uri(&provider).to_string()),
+        "{references:?}"
+    );
+    barrier.release();
+    server.shutdown();
+}

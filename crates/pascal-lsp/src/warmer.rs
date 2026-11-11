@@ -29,6 +29,43 @@ const MAX_ROOM_RETRIES: usize = 3;
 /// misses (a busy store, a refused decode reservation) before its pass ends.
 const MAX_REUSE_RETRIES: usize = 3;
 
+/// How long shutdown lets a seal in flight finish (l4d-cyrt), and how much
+/// longer it waits for the warmer thread past that. Without a seal in
+/// flight it waits at most `SHUTDOWN_JOIN_LIMIT`.
+const SHUTDOWN_SEAL_GRACE: Duration = Duration::from_secs(4);
+const SHUTDOWN_JOIN_SLACK: Duration = Duration::from_millis(500);
+const SHUTDOWN_JOIN_LIMIT: Duration = Duration::from_secs(2);
+
+/// Set by shutdown: until when a seal in flight may go on (l4d-cyrt). The
+/// index reports `complete` before its seal runs, so a client that stops
+/// the server at `complete` would otherwise interrupt it, and the next
+/// start would find no sealed snapshot.
+#[derive(Default)]
+struct SealGrace {
+    deadline: Mutex<Option<Instant>>,
+    /// A seal runs on the warmer thread.
+    sealing: AtomicBool,
+}
+
+impl SealGrace {
+    fn begin(&self, grace: Duration) {
+        *self.deadline.lock().unwrap_or_else(PoisonError::into_inner) =
+            Instant::now().checked_add(grace);
+    }
+
+    /// `None` while the server runs; else whether the seal may go on.
+    fn seal_may_go_on(&self) -> Option<bool> {
+        self.deadline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .map(|deadline| Instant::now() < deadline)
+    }
+
+    fn sealing(&self) -> bool {
+        self.sealing.load(Ordering::Relaxed)
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct InteractiveGate {
     busy: Mutex<usize>,
@@ -38,11 +75,9 @@ pub(crate) struct InteractiveGate {
     warm_busy: std::sync::atomic::AtomicUsize,
     idle: Condvar,
     /// Queued Interactive and Bulk client requests, which wait for a worker
-    /// and could take a lent slot (queued pull diagnostics are not counted).
+    /// (queued pull diagnostics are not counted).
     waiting_clients: std::sync::atomic::AtomicUsize,
-    /// Background jobs paused in `yield_to_interactive_work`. Their workers
-    /// use no CPU meanwhile, so the dispatcher lends their slots to client
-    /// requests.
+    /// Background jobs paused in `yield_to_interactive_work`.
     paused: std::sync::atomic::AtomicUsize,
     /// Running Bulk client requests; index batches wait for them (D33).
     running_bulk: std::sync::atomic::AtomicUsize,
@@ -85,6 +120,11 @@ pub(crate) struct InteractiveGate {
     /// `Busy`.
     #[cfg(test)]
     busy_store_before_seal: AtomicBool,
+    /// Test seam: the next seal after a complete batch reports that it
+    /// starts (`.0`) and waits for `.1` first.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    seal_barrier: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     #[cfg(test)]
     index_turn_waiters: std::sync::atomic::AtomicUsize,
     /// Test seam: `wait_index_turn` waits as if the gate did not pass.
@@ -219,7 +259,7 @@ impl InteractiveGate {
     }
 
     /// Records how many client requests wait for a worker. Background work
-    /// pauses for them as for interactive work, and lends them its slot.
+    /// pauses for them as for interactive work.
     pub(crate) fn set_waiting_clients(&self, waiting: usize) {
         self.waiting_clients.store(waiting, Ordering::Relaxed);
         if waiting == 0 {
@@ -446,16 +486,12 @@ impl InteractiveGate {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_paused_background_for_tests(&self, paused: usize) {
-        self.paused.store(paused, Ordering::Relaxed);
-    }
-
-    #[cfg(test)]
     pub(crate) fn waiting_clients_for_tests(&self) -> usize {
         self.waiting_clients.load(Ordering::Relaxed)
     }
 
     /// The number of background jobs paused for interactive work.
+    #[cfg(test)]
     pub(crate) fn paused_background(&self) -> usize {
         self.paused.load(Ordering::Relaxed)
     }
@@ -1023,6 +1059,9 @@ pub(crate) struct Warmer {
     /// at the stop: dispatched again on a trigger, or once it grew.
     budget_stopped: HashMap<Url, usize>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// How long shutdown lets a seal in flight finish.
+    shutdown_seal_grace: Duration,
+    seal_grace: Arc<SealGrace>,
 }
 
 impl Warmer {
@@ -1030,11 +1069,13 @@ impl Warmer {
         let (jobs, job_receiver) = crossbeam_channel::unbounded::<WarmJob>();
         let (event_sender, events) = crossbeam_channel::unbounded();
         let worker_gate = gate.clone();
+        let seal_grace = Arc::new(SealGrace::default());
+        let worker_grace = seal_grace.clone();
         let thread = crate::server::analysis_thread("PascalLspWarmer")
             .spawn(move || {
                 lower_thread_priority();
                 for job in job_receiver {
-                    run_job(job, worker_gate.clone(), &event_sender);
+                    run_job(job, worker_gate.clone(), &event_sender, &worker_grace);
                     crate::allocator::release_free_memory();
                 }
             })
@@ -1070,6 +1111,8 @@ impl Warmer {
             crawled_epochs: HashMap::new(),
             budget_stopped: HashMap::new(),
             thread: Some(thread),
+            shutdown_seal_grace: SHUTDOWN_SEAL_GRACE,
+            seal_grace,
         }
     }
 
@@ -1788,9 +1831,16 @@ impl Warmer {
         }
     }
 
-    /// Stops accepting work, cancels the active job, and joins within two seconds.
+    /// Stops accepting work, cancels the active job, and joins within
+    /// `SHUTDOWN_JOIN_LIMIT`, or within `shutdown_seal_grace` and
+    /// `SHUTDOWN_JOIN_SLACK` while a seal is in flight: it alone goes on,
+    /// past the cancellation and the interactive gate, until the grace ends
+    /// (l4d-cyrt); other work stops at its next check.
     /// Returns `true` when the worker thread was joined successfully.
     pub(crate) fn shutdown(&mut self) -> bool {
+        if self.thread.is_some() {
+            self.seal_grace.begin(self.shutdown_seal_grace);
+        }
         self.cancel.store(true, Ordering::Relaxed);
         drop(self.jobs.take());
         self.queue.clear();
@@ -1804,9 +1854,14 @@ impl Warmer {
         let Some(thread) = self.thread.take() else {
             return true;
         };
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let started = Instant::now();
+        let seal_limit = self.shutdown_seal_grace.saturating_add(SHUTDOWN_JOIN_SLACK);
+        let mut join_limit = SHUTDOWN_JOIN_LIMIT.min(seal_limit);
         while !thread.is_finished() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            if self.seal_grace.sealing() {
+                join_limit = seal_limit;
+            }
+            let remaining = join_limit.saturating_sub(started.elapsed());
             if remaining.is_zero() {
                 break;
             }
@@ -1821,7 +1876,7 @@ impl Warmer {
             }
         } else {
             eprintln!(
-                "pascal-lsp: warning: warmer thread did not stop within 2 seconds; detaching it"
+                "pascal-lsp: warning: warmer thread did not stop within {join_limit:?}; detaching it"
             );
             drop(thread);
             false
@@ -1842,6 +1897,7 @@ fn run_index_job(
     job: &WarmJob,
     gate: &InteractiveGate,
     events: &Sender<WarmEvent>,
+    seal_grace: &SealGrace,
 ) {
     let stopped = |paused| {
         let _ = events.send(WarmEvent::IndexStopped {
@@ -1980,7 +2036,28 @@ fn run_index_job(
                     {
                         job.store().fail_next_for_test(pascal_cache::Bypass::Busy);
                     }
-                    let outcome = workspace.seal_baseline_if_due(key, &mut before_io);
+                    seal_grace.sealing.store(true, Ordering::Relaxed);
+                    #[cfg(test)]
+                    if let Some((entered, release)) = gate
+                        .seal_barrier
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take()
+                    {
+                        let _ = entered.send(());
+                        let _ = release.recv();
+                    }
+                    // Once shutdown began, the seal goes on until its grace
+                    // ends, whatever the gate or the cancellation say.
+                    let mut seal_check = || match seal_grace.seal_may_go_on() {
+                        Some(true) => Ok(()),
+                        Some(false) => {
+                            Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string())
+                        }
+                        None => before_io(),
+                    };
+                    let outcome = workspace.seal_baseline_if_due(key, &mut seal_check);
+                    seal_grace.sealing.store(false, Ordering::Relaxed);
                     crate::trace::trace!("index seal {anchor:?}: {outcome:?}");
                     outcome
                 });
@@ -2011,7 +2088,12 @@ fn run_index_job(
     }
 }
 
-fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>) {
+fn run_job(
+    job: WarmJob,
+    gate: Arc<InteractiveGate>,
+    events: &Sender<WarmEvent>,
+    seal_grace: &SealGrace,
+) {
     let (uri, open_epoch, extraction_queued, reuse_due, resume_after) = match &job.kind {
         WarmJobKind::Crawl {
             uri,
@@ -2027,7 +2109,15 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
             *resume_after,
         ),
         WarmJobKind::Index(anchor, pending, mode) => {
-            return run_index_job(anchor.clone(), pending, *mode, &job, &gate, events);
+            return run_index_job(
+                anchor.clone(),
+                pending,
+                *mode,
+                &job,
+                &gate,
+                events,
+                seal_grace,
+            );
         }
     };
     let end = |fingerprint, pins| {
@@ -2821,7 +2911,7 @@ mod tests {
                 .send(yield_to_interactive_work(&AtomicBool::new(false)))
                 .unwrap();
         });
-        // The pause is reported to the dispatcher, which lends its slot.
+        // The pause is counted.
         let deadline = Instant::now() + Duration::from_secs(5);
         while gate.paused_background() == 0 {
             assert!(Instant::now() < deadline, "the work pauses");
@@ -5803,6 +5893,101 @@ mod tests {
                 .baseline_hint(&key)
                 .expect("sealed");
             assert!(hint.sealed() && hint.held());
+            workspace.persistent_cache().shutdown();
+        }
+
+        /// The seal of the first complete batch, held at the seal barrier:
+        /// returns its warmer once the seal waits there, and the release.
+        fn warmer_holding_its_seal(
+            gate: &Arc<InteractiveGate>,
+            workspace: &crate::workspace::Workspace,
+            main: Url,
+        ) -> (Warmer, std::sync::mpsc::Sender<()>) {
+            let (entered, seal_started) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            *gate.seal_barrier.lock().unwrap() = Some((entered, released));
+            let mut warmer = Warmer::start(gate.clone());
+            warmer.open(main);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while seal_started.try_recv().is_err() {
+                assert!(Instant::now() < deadline, "no seal started");
+                let _ = warmer.poll(workspace);
+                std::thread::yield_now();
+            }
+            (warmer, release)
+        }
+
+        fn seal_outcome(
+            warmer: &Warmer,
+            within: Duration,
+        ) -> Option<(SealOutcome, crate::workspace::ContextKey)> {
+            let deadline = Instant::now() + within;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match warmer.events.recv_timeout(remaining) {
+                    Ok(WarmEvent::IndexProgress {
+                        progress,
+                        seal: Some(seal),
+                        ..
+                    }) => return Some((seal, progress.key.clone()?)),
+                    Ok(_) => {}
+                    Err(_) => return None,
+                }
+            }
+        }
+
+        /// l4d-cyrt: the index reports `complete` before its seal ran, and a
+        /// client stopping the server right then (a probe, an editor closed
+        /// soon after indexing) interrupted the seal: the next start found
+        /// no sealed snapshot. Shutdown finishes a seal in flight.
+        #[test]
+        fn shutdown_right_after_complete_finishes_the_seal() {
+            let gate = Arc::new(InteractiveGate::default());
+            let (_temp, _store, workspace, main) = fixture_persisting(&gate);
+            let (mut warmer, release) = warmer_holding_its_seal(&gate, &workspace, main);
+            // Shutdown arrives while the seal is due: released once the
+            // warmer is cancelled.
+            let cancel = warmer.cancel.clone();
+            let releaser = std::thread::spawn(move || {
+                while !cancel.load(Ordering::Relaxed) {
+                    std::thread::yield_now();
+                }
+                let _ = release.send(());
+            });
+            assert!(warmer.shutdown(), "the warmer thread was joined");
+            releaser.join().unwrap();
+            let (outcome, key) =
+                seal_outcome(&warmer, Duration::ZERO).expect("the seal reported its outcome");
+            assert_eq!(outcome, SealOutcome::Sealed);
+            let hint = workspace
+                .project_cache()
+                .baseline_hint(&key)
+                .expect("sealed");
+            assert!(hint.sealed() && hint.held());
+            workspace.persistent_cache().shutdown();
+        }
+
+        /// l4d-cyrt: a seal that cannot finish within the shutdown bound
+        /// does not hold the exit: it stops at its next check.
+        #[test]
+        fn a_seal_past_the_shutdown_bound_does_not_hold_the_exit() {
+            let gate = Arc::new(InteractiveGate::default());
+            let (_temp, _store, workspace, main) = fixture_persisting(&gate);
+            let (mut warmer, release) = warmer_holding_its_seal(&gate, &workspace, main);
+            warmer.shutdown_seal_grace = Duration::from_millis(50);
+            let started = Instant::now();
+            // Held for good: the join gives up after the bound.
+            assert!(!warmer.shutdown(), "the warmer thread was detached");
+            assert!(
+                started.elapsed()
+                    < Duration::from_millis(50) + SHUTDOWN_JOIN_SLACK + Duration::from_secs(1),
+                "{:?}",
+                started.elapsed()
+            );
+            let _ = release.send(());
+            let (outcome, _) =
+                seal_outcome(&warmer, Duration::from_secs(20)).expect("the seal stopped");
+            assert_eq!(outcome, SealOutcome::Interrupted);
             workspace.persistent_cache().shutdown();
         }
 

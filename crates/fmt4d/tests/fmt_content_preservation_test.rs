@@ -586,3 +586,38 @@ end.
 ",
     );
 }
+
+/// A calling convention after the `;` of a procedural type keeps its space
+/// (`G: procedure; cdecl = nil;` became `procedure;cdecl`).
+#[test]
+fn procedural_type_directives_keep_their_space() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+var
+  G: procedure; cdecl = nil;
+  H: function(A: Integer): Integer; stdcall;
+type
+  TP = procedure(X: Integer) of object; cdecl;
+implementation
+end.
+",
+        "\
+unit T;
+
+interface
+
+var
+  G: procedure; cdecl = nil;
+  H: function(A: Integer): Integer; stdcall;
+
+type
+  TP = procedure(X: Integer) of object; cdecl;
+
+implementation
+
+end.
+",
+    );
+}

@@ -199,6 +199,11 @@ pub fn would_need_space(
     if prev_kind == K::K_DOT || prev_kind == K::DOT {
         return false;
     }
+    // `procedure; cdecl` in a procedural type: the calling convention
+    // follows the `;` on the same line.
+    if prev_kind == K::SEMICOLON && parent_kind == K::PROC_ATTRIBUTE {
+        return true;
+    }
     if space_before(kind) {
         return true;
     }

@@ -810,3 +810,52 @@ end.
 ",
     );
 }
+
+/// When a broken conditional elsewhere makes the parser mask conditional
+/// blocks, a masked block in a `uses` clause exists only as a virtual
+/// directive leading the next unit, which the uses layout ignored
+/// (RTL ExtActns.pas lost `{$IF DEFINED(CLR)} System.Runtime.InteropServices,
+/// {$IFEND}`).
+#[test]
+fn masked_conditional_blocks_in_uses_clauses_are_kept() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+uses
+{$IF DEFINED(CLR)}
+  System.Runtime.InteropServices,
+{$IFEND}
+  ActnList, StdActns;
+const
+  A = 1;
+{$IF NOT DEFINED(LINUX)}
+    B = 2,
+{$ENDIF}
+implementation
+end.
+",
+        "\
+unit T;
+
+interface
+
+uses
+  {$IF DEFINED(CLR)}
+  System.Runtime.InteropServices,
+{$IFEND}
+  ActnList,
+  StdActns;
+
+const
+  A = 1;
+
+{$IF NOT DEFINED(LINUX)}
+    B = 2,
+{$ENDIF}
+implementation
+
+end.
+",
+    );
+}

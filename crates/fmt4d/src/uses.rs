@@ -640,7 +640,31 @@ pub(crate) fn extract_uses_items(
     };
     let mut items = Vec::new();
     let mut commas = SourceCommas::default();
+    // Directives the parser masked (see `DirectivePatch`) inside the clause
+    // are not nodes: they only lead or trail a leaf in the directive map.
+    let real_directives: Vec<usize> = node
+        .children(&mut node.walk())
+        .filter(|c| c.kind() == K::PP_DIRECTIVE)
+        .map(|c| c.start_byte())
+        .collect();
+    let virtual_directives = |attached: &[crate::directive_map::AttachedDirective]| {
+        attached
+            .iter()
+            .filter(|d| {
+                (node.start_byte()..node.end_byte()).contains(&d.span.start)
+                    && !real_directives.contains(&d.span.start)
+            })
+            .map(|d| UsesItem::directive(d.text.clone()))
+            .collect::<Vec<_>>()
+    };
     for child in node.children(&mut node.walk()) {
+        if !child.is_extra() {
+            let masked = virtual_directives(directives.leading_directives(first_leaf(child).id()));
+            if !masked.is_empty() {
+                items.extend(masked);
+                commas.pushed(&items);
+            }
+        }
         commas.read(child.kind(), &mut items);
         match child.kind() {
             K::MODULE_NAME => {
@@ -683,6 +707,13 @@ pub(crate) fn extract_uses_items(
                 attach_after(&mut items, texts);
             }
             _ => {} // skip kUses keyword, comments, etc.
+        }
+        if !child.is_extra() && last_leaf(child).id() != end.id() {
+            let masked = virtual_directives(directives.trailing_directives(last_leaf(child).id()));
+            if !masked.is_empty() {
+                items.extend(masked);
+                commas.pushed(&items);
+            }
         }
     }
     UsesClause { items, after }

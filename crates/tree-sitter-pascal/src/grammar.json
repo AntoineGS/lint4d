@@ -11080,8 +11080,17 @@
                     "type": "FIELD",
                     "name": "getter",
                     "content": {
-                      "type": "SYMBOL",
-                      "name": "identifier"
+                      "type": "CHOICE",
+                      "members": [
+                        {
+                          "type": "SYMBOL",
+                          "name": "identifier"
+                        },
+                        {
+                          "type": "SYMBOL",
+                          "name": "exprDot"
+                        }
+                      ]
                     }
                   }
                 ]
@@ -11097,11 +11106,28 @@
                     "type": "FIELD",
                     "name": "setter",
                     "content": {
-                      "type": "SYMBOL",
-                      "name": "identifier"
+                      "type": "CHOICE",
+                      "members": [
+                        {
+                          "type": "SYMBOL",
+                          "name": "identifier"
+                        },
+                        {
+                          "type": "SYMBOL",
+                          "name": "exprDot"
+                        }
+                      ]
                     }
                   }
                 ]
+              },
+              {
+                "type": "SYMBOL",
+                "name": "kReadonly"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "kWriteonly"
               },
               {
                 "type": "SEQ",
@@ -14198,6 +14224,14 @@
     {
       "type": "SYMBOL",
       "name": "kContains"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kReadonly"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kWriteonly"
     }
   ],
   "inline": [],

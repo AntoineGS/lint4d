@@ -168,6 +168,8 @@ typedef enum {
     KPACKAGE,
     KREQUIRES,
     KCONTAINS,
+    KREADONLY,
+    KWRITEONLY,
 } TokenType;
 
 static inline bool is_ascii_letter(int32_t c) {
@@ -262,6 +264,8 @@ static const ContextualWord CONTEXTUAL_WORDS[] = {
     {"package", KPACKAGE},
     {"requires", KREQUIRES},
     {"contains", KCONTAINS},
+    {"readonly", KREADONLY},
+    {"writeonly", KWRITEONLY},
     {"true", KTRUE},
     {"false", KFALSE},
 };

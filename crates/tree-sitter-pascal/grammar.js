@@ -515,6 +515,8 @@ module.exports = grammar({
 		$.kPackage,
 		$.kRequires,
 		$.kContains,
+		$.kReadonly,
+		$.kWriteonly,
 	],
 
 	extras: $ => [$._space, $.comment, $.ppDirective],
@@ -1360,8 +1362,11 @@ module.exports = grammar({
 			repeat(choice(
 				seq($.kIndex, field('index', $._expr)),
 				...enable_if(delphi, seq($.kDispId, field('dispid', $._expr))),
-				seq($.kRead, field('getter', $.identifier)),
-				seq($.kWrite, field('setter', $.identifier)),
+				// A field of a record field: `read FState.Mode`.
+				seq($.kRead, field('getter', choice($.identifier, $.exprDot))),
+				seq($.kWrite, field('setter', choice($.identifier, $.exprDot))),
+				// Type-library dispinterface properties.
+				$.kReadonly, $.kWriteonly,
 				seq($.kImplements, field('implements', delimited($._expr))),
 				seq($.kDefault, field('defaultValue', $._expr)),
 				seq($.kStored, field('stored', $._expr)),

@@ -2623,6 +2623,10 @@
         "required": false,
         "types": [
           {
+            "type": "exprDot",
+            "named": true
+          },
+          {
             "type": "identifier",
             "named": true
           }
@@ -2811,6 +2815,10 @@
         "required": false,
         "types": [
           {
+            "type": "exprDot",
+            "named": true
+          },
+          {
             "type": "identifier",
             "named": true
           }
@@ -2946,11 +2954,19 @@
           "named": true
         },
         {
+          "type": "kReadonly",
+          "named": true
+        },
+        {
           "type": "kStored",
           "named": true
         },
         {
           "type": "kWrite",
+          "named": true
+        },
+        {
+          "type": "kWriteonly",
           "named": true
         },
         {
@@ -10736,6 +10752,10 @@
     "named": true
   },
   {
+    "type": "kReadonly",
+    "named": true
+  },
+  {
     "type": "kRecord",
     "named": true
   },
@@ -10901,6 +10921,10 @@
   },
   {
     "type": "kWrite",
+    "named": true
+  },
+  {
+    "type": "kWriteonly",
     "named": true
   },
   {

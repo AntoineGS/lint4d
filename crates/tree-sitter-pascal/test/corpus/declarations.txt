@@ -860,3 +860,37 @@ var
     (declVar
       (identifier)
       (type (declStringCodePage (identifier) (identifier))))))
+
+===
+Property accessors through record fields, readonly and writeonly dispids
+===
+
+type
+  TFoo = class
+    property Mode: Integer read FState.Mode write FState.Mode;
+    property X: Integer read FState.P.X;
+  end;
+  IDisp = dispinterface
+    property accParent: IDispatch readonly dispid -5000;
+    property Name: WideString writeonly dispid 1;
+  end;
+
+---
+
+(root
+  (declTypes (kType)
+    (declType (identifier) (kEq)
+      (declClass (kClass)
+        (declProp (kProperty) (identifier) (type (typeref (identifier)))
+          (kRead) (exprDot (identifier) (kDot) (identifier))
+          (kWrite) (exprDot (identifier) (kDot) (identifier)))
+        (declProp (kProperty) (identifier) (type (typeref (identifier)))
+          (kRead) (exprDot (exprDot (identifier) (kDot) (identifier)) (kDot) (identifier)))
+        (kEnd)))
+    (declType (identifier) (kEq)
+      (declIntf (kDispInterface)
+        (declProp (kProperty) (identifier) (type (typeref (identifier)))
+          (kReadonly) (kDispId) (literalNumber))
+        (declProp (kProperty) (identifier) (type (typeref (identifier)))
+          (kWriteonly) (kDispId) (literalNumber))
+        (kEnd)))))

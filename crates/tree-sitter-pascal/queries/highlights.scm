@@ -30,6 +30,8 @@
 	(kImplements)
 	(kDefault)
 	(kNodefault)
+	(kReadonly)
+	(kWriteonly)
 	(kStored)
 	(kIndex)
 	(kDispId)

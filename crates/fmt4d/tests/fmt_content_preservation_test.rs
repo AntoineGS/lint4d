@@ -734,3 +734,40 @@ end.
 ",
     );
 }
+
+/// The grammar reads `-B < C` as `-(B < C)`; the breaking expression
+/// builder laid out only the binary operand of that unary expression and
+/// dropped the `-` (FMTBcd.pas: `else if -DecPos < Length(Result)`).
+#[test]
+fn unary_operator_before_a_binary_expression_is_kept() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  if A then X
+  else if -B < C then Y;
+end;
+end.
+",
+        "\
+unit T;
+
+interface
+
+implementation
+
+procedure P;
+begin
+  if A then
+    X
+  else if - B < C then
+    Y;
+end;
+
+end.
+",
+    );
+}

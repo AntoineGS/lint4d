@@ -288,18 +288,12 @@ impl<'a> DocBuilder<'a> {
     }
 
     pub(crate) fn build_expression_breaking(&self, node: Node<'a>) -> Doc {
-        let binary_node = if node.kind() == K::EXPR_BINARY {
-            node
-        } else {
-            let mut cursor = node.walk();
-            let found = node
-                .children(&mut cursor)
-                .find(|c| c.kind() == K::EXPR_BINARY);
-            match found {
-                Some(bin) => bin,
-                None => return self.build_children(node),
-            }
-        };
+        // Another node with an operator child (`-(B < C)`, an exprUnary)
+        // is laid out child by child; its binary operand breaks on its own.
+        if node.kind() != K::EXPR_BINARY {
+            return self.build_children(node);
+        }
+        let binary_node = node;
 
         let segments = flatten_binary_chain(binary_node, None);
         if segments.len() <= 1 {

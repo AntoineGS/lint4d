@@ -217,7 +217,7 @@ impl<'a> DocBuilder<'a> {
         self.for_each_code_child(node, |child| match child.kind() {
             K::PP_IF => {
                 parts.push(Doc::Hardline);
-                parts.push(Doc::Raw(self.node_text(child)));
+                parts.push(self.pp_marker_doc(child, Doc::Raw));
             }
             K::K_STRICT => {
                 parts.push(Doc::Hardline);
@@ -238,7 +238,7 @@ impl<'a> DocBuilder<'a> {
             }
             K::PP_END_IF => {
                 parts.push(Doc::Hardline);
-                parts.push(Doc::Raw(self.node_text(child)));
+                parts.push(self.pp_marker_doc(child, Doc::Raw));
             }
             _ => {
                 body_children.push(child);

@@ -6,48 +6,6 @@ use pascal_core::FileInfo;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-/// Minimized from Spring4D `Spring.ValueConverters.pas`: the formatter drops
-/// `{$REGION}`/`{$ENDREGION}` directives (and their captions) around
-/// `{$IFNDEF}`-guarded type declarations.
-const REGION_AROUND_IFNDEF_TYPE: &str = "\
-unit T;
-
-interface
-
-type
-
-  {$REGION 'TA'}
-
-  TA = class
-  end;
-
-  {$ENDREGION}
-
-
-  {$REGION 'TB'}
-
-{$IFNDEF NO_B}
-  TB = class
-  end;
-{$ENDIF}
-
-  {$ENDREGION}
-
-
-  {$REGION 'TC'}
-
-{$IFNDEF NO_C}
-  TC = class
-  end;
-{$ENDIF}
-
-  {$ENDREGION}
-
-implementation
-
-end.
-";
-
 /// Minimized from `cashzNewPetty.pas`: the formatter drops a conditional
 /// inside a class ancestor list.
 const IFDEF_IN_CLASS_ANCESTORS: &str = "\
@@ -86,15 +44,6 @@ fn assert_refused(name: &str, source: &str, lost: &[&str]) {
             }
         }
     }
-}
-
-#[test]
-fn region_directives_around_ifndef_type_declarations_are_refused_not_dropped() {
-    assert_refused(
-        "region_around_ifndef_type",
-        REGION_AROUND_IFNDEF_TYPE,
-        &["`{$REGION 'TB'}` (line 15)", "`{$ENDREGION}` x2"],
-    );
 }
 
 #[test]

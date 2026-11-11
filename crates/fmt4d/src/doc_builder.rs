@@ -850,7 +850,7 @@ impl<'a> DocBuilder<'a> {
         let mut parts = Vec::new();
         parts.push(Doc::Hardline);
         let keyword = first_leaf(node);
-        parts.push(self.uses_leading_trivia_doc(keyword));
+        parts.push(self.leading_trivia_lines_doc(keyword));
         parts.push(doc::token("uses", K::K_USES, ""));
         parts.push(mark);
         parts.push(self.trailing_comments_doc(keyword));
@@ -878,10 +878,14 @@ impl<'a> DocBuilder<'a> {
         doc::concat(parts)
     }
 
-    /// Comments and directives leading the `uses` keyword, laid out as in
-    /// the source, then a line break. `build_uses` does not descend into
-    /// the clause, so nothing else emits them.
-    fn uses_leading_trivia_doc(&self, keyword: Node<'a>) -> Doc {
+    /// Comments and directives leading the leaf `keyword`, laid out as in
+    /// the source, then a line break. For leaves their builder emits as
+    /// text, such as the `uses` keyword (`build_uses` does not descend into
+    /// the clause) and conditional-block directives.
+    fn leading_trivia_lines_doc(&self, keyword: Node<'a>) -> Doc {
+        if self.trivia_suppressed.get() {
+            return Doc::Empty;
+        }
         let trivia = self.trivia_items(
             self.comments.leading_comments(keyword.id()),
             self.directives.leading_directives(keyword.id()),
@@ -897,6 +901,23 @@ impl<'a> DocBuilder<'a> {
             Doc::Hardline
         };
         doc::concat(vec![run, line_break])
+    }
+
+    /// A `{$IF…}` / `{$ELSE}` / `{$ENDIF}` leaf of a conditional block, laid
+    /// out by `marker` from its text, with the comments and directives
+    /// attached to it: the leading ones on the lines before it, as in the
+    /// source, and the trailing ones after it on its line. Expects to start
+    /// a line.
+    pub(crate) fn pp_marker_doc(
+        &self,
+        marker: Node<'a>,
+        layout: impl FnOnce(String) -> Doc,
+    ) -> Doc {
+        doc::concat(vec![
+            self.leading_trivia_lines_doc(marker),
+            layout(self.node_text(marker)),
+            self.trailing_trivia_doc(marker),
+        ])
     }
 
     fn build_pp_block(&self, node: Node<'a>) -> Doc {
@@ -915,7 +936,8 @@ impl<'a> DocBuilder<'a> {
                         parts.push(Doc::BlankLine);
                     }
                     parts.push(Doc::Hardline);
-                    parts.push(doc::token(self.node_text(child), child.kind(), ""));
+                    parts
+                        .push(self.pp_marker_doc(child, |text| doc::token(text, child.kind(), "")));
                     prev_end_row = Some(child.end_position().row);
                 }
                 _ => {

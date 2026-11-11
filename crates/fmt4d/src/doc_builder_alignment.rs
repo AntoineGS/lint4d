@@ -258,7 +258,7 @@ impl<'a> DocBuilder<'a> {
         let (bare_type_doc, bare_value_doc) = self.without_trivia(build_docs);
 
         let before_colon = &children[..colon_idx];
-        self.allow_var_list_expansion(
+        let mark = self.allow_var_list_expansion(
             node,
             before_colon,
             idents.len(),
@@ -274,6 +274,11 @@ impl<'a> DocBuilder<'a> {
         for (i, ident) in idents.iter().enumerate() {
             let is_last = i == idents.len() - 1;
             let (name_doc, trivia) = self.var_list_ident(before_colon, *ident, is_last, true);
+            let name_doc = if i == 0 {
+                doc::concat(vec![name_doc, mark.clone()])
+            } else {
+                name_doc
+            };
             let mut leading = Vec::new();
             if !carried.is_empty() {
                 let mut lines = Vec::new();

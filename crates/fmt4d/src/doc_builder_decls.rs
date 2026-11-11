@@ -409,7 +409,8 @@ impl<'a> DocBuilder<'a> {
             if !idents.is_empty() && !from_colon.is_empty() {
                 let suffix = self.suffix_doc(from_colon);
                 let bare_suffix = self.without_trivia(|| self.suffix_doc(from_colon));
-                self.allow_var_list_expansion(node, before_colon, idents.len(), &bare_suffix);
+                let mark =
+                    self.allow_var_list_expansion(node, before_colon, idents.len(), &bare_suffix);
 
                 let mut parts = Vec::new();
                 for (i, ident) in idents.iter().enumerate() {
@@ -420,6 +421,9 @@ impl<'a> DocBuilder<'a> {
                     let (ident_doc, moved) =
                         self.var_list_ident(before_colon, *ident, is_last, false);
                     parts.push(ident_doc);
+                    if i == 0 {
+                        parts.push(mark.clone());
+                    }
                     // The last identifier keeps its `//` comment, which
                     // would swallow the `:`.
                     if is_last && self.has_trailing_line_comment(*ident) {
@@ -516,13 +520,16 @@ impl<'a> DocBuilder<'a> {
     /// Record that expanding the `declVar` `node` of `count` identifiers
     /// drops the commas of `before_colon` and repeats `bare_suffix` (the
     /// `: Type = Value;` built without its comments) for all but the last.
+    /// Returns the mark to put in the expansion's doc (see
+    /// [`Self::allow_content_change`]).
+    #[must_use]
     pub(crate) fn allow_var_list_expansion(
         &self,
         node: Node<'a>,
         before_colon: &[Node<'a>],
         count: usize,
         bare_suffix: &Doc,
-    ) {
+    ) -> Doc {
         let commas = before_colon.iter().filter(|c| c.kind() == K::COMMA).count();
         let suffix = doc::text_of(bare_suffix);
         self.allow_content_change(
@@ -531,7 +538,7 @@ impl<'a> DocBuilder<'a> {
                 dropped: ",".repeat(commas),
                 added: suffix.repeat(count.saturating_sub(1)),
             },
-        );
+        )
     }
 
     /// The `: Type;` part of a `declVar` (children from the colon on).

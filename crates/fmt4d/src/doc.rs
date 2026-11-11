@@ -81,6 +81,11 @@ pub enum Doc {
 
     /// Identity element — produces no output.
     Empty,
+
+    /// Produces no output, like `Empty`: marks that the content-check
+    /// allowance recorded for the node of this id applies, because the doc
+    /// holding the mark is emitted.
+    ContentMark(usize),
 }
 
 /// A single cell in an alignment row.
@@ -168,12 +173,41 @@ pub fn text_of(doc: &Doc) -> String {
             | Doc::Line
             | Doc::Softline
             | Doc::PreservedLine
+            | Doc::ContentMark(_)
             | Doc::Empty => {}
         }
     }
     let mut out = String::new();
     collect(doc, &mut out);
     out
+}
+
+/// The ids of every [`Doc::ContentMark`] in `doc`.
+pub fn content_marks(doc: &Doc) -> std::collections::HashSet<usize> {
+    let mut marks = std::collections::HashSet::new();
+    let mut stack = vec![doc];
+    while let Some(doc) = stack.pop() {
+        match doc {
+            Doc::ContentMark(id) => {
+                marks.insert(*id);
+            }
+            Doc::Concat(docs) | Doc::Fill(docs) | Doc::AlignGroup(docs) => stack.extend(docs),
+            Doc::FillRest(rest) => stack.extend(rest.as_slice()),
+            Doc::Indent(inner) | Doc::Group(inner) => stack.push(inner),
+            Doc::IfBreak { broken, flat } => stack.extend([&**broken, &**flat]),
+            Doc::AlignRow(cells) => stack.extend(cells.iter().map(|c| &c.content)),
+            Doc::Token { .. }
+            | Doc::Raw(_)
+            | Doc::LineStart(_)
+            | Doc::Hardline
+            | Doc::BlankLine
+            | Doc::Line
+            | Doc::Softline
+            | Doc::PreservedLine
+            | Doc::Empty => {}
+        }
+    }
+    marks
 }
 
 /// Join docs with a separator between each pair.

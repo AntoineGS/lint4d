@@ -79,7 +79,8 @@ pub struct DocBuilder<'a> {
     /// are emitted with another copy (see [`Self::without_trivia`]).
     trivia_suppressed: Cell<bool>,
     /// Content each rewriting node knowingly drops or adds, by node id, for
-    /// the content-preservation check.
+    /// the content-preservation check. A record applies only if the
+    /// [`Doc::ContentMark`] of its node is in the emitted doc.
     content_allowances: RefCell<HashMap<usize, ContentAllowance>>,
 }
 
@@ -117,21 +118,29 @@ impl<'a> DocBuilder<'a> {
         doc::concat(vec![body, self.eof_trivia_doc(root)])
     }
 
-    /// Everything the built docs knowingly drop from or add to the source.
-    pub(crate) fn content_allowance(&self) -> ContentAllowance {
+    /// Everything `doc`, built by this builder, knowingly drops from or adds
+    /// to the source: the records whose [`Doc::ContentMark`] it emits.
+    pub(crate) fn content_allowance(&self, doc: &Doc) -> ContentAllowance {
+        let marks = doc::content_marks(doc);
         let mut total = ContentAllowance::default();
-        for allowance in self.content_allowances.borrow().values() {
-            total.extend(allowance);
+        for (id, allowance) in self.content_allowances.borrow().iter() {
+            if marks.contains(id) {
+                total.extend(allowance);
+            }
         }
         total
     }
 
-    /// Record what the doc of `node` drops from or adds to its source text.
-    /// A node built again replaces its earlier record.
-    pub(crate) fn allow_content_change(&self, node: Node<'a>, allowance: ContentAllowance) {
+    /// Record what the doc of `node` drops from or adds to its source text,
+    /// returning the mark the caller must put in that doc: the record
+    /// applies only if the doc is emitted. A node built again replaces its
+    /// earlier record.
+    #[must_use]
+    pub(crate) fn allow_content_change(&self, node: Node<'a>, allowance: ContentAllowance) -> Doc {
         self.content_allowances
             .borrow_mut()
             .insert(node.id(), allowance);
+        Doc::ContentMark(node.id())
     }
 
     /// Record the parent kind of every node under `root` in one walk.
@@ -836,13 +845,14 @@ impl<'a> DocBuilder<'a> {
             };
             target.extend(std::iter::repeat_n(c, source.abs_diff(laid_out)));
         }
-        self.allow_content_change(node, allowance);
+        let mark = self.allow_content_change(node, allowance);
 
         let mut parts = Vec::new();
         parts.push(Doc::Hardline);
         let keyword = first_leaf(node);
         parts.push(self.uses_leading_trivia_doc(keyword));
         parts.push(doc::token("uses", K::K_USES, ""));
+        parts.push(mark);
         parts.push(self.trailing_comments_doc(keyword));
         parts.push(Doc::Hardline);
         // Emit the laid-out uses body as Token+Hardline pairs so the renderer
@@ -1117,6 +1127,32 @@ mod tests {
         external_units: &'a HashSet<String>,
     ) -> DocBuilder<'a> {
         DocBuilder::new(source, config, comments, directives, vec![], external_units)
+    }
+
+    #[test]
+    fn content_allowance_applies_only_to_emitted_docs() {
+        let source = "unit T;\ninterface\nvar A, B: Integer;\nimplementation\nend.\n";
+        let (tree, bytes) = parse(source);
+        let config = FmtConfig::default();
+        let comments = CommentMap::build(tree.root_node(), &bytes);
+        let directives = DirectiveMap::build(tree.root_node(), &bytes);
+        let external_units = HashSet::new();
+        let builder = make_builder(&bytes, &config, &comments, &directives, &external_units);
+        let doc = builder.build(tree.root_node());
+        let emitted = builder.content_allowance(&doc);
+        assert_eq!(emitted.dropped.trim(), ",");
+        assert!(emitted.added.contains("Integer"));
+        // A record whose doc is discarded (never emitted) does not apply.
+        let discarded = builder.allow_content_change(
+            tree.root_node(),
+            crate::content_check::ContentAllowance {
+                dropped: ";".into(),
+                added: String::new(),
+            },
+        );
+        drop(discarded);
+        let after = builder.content_allowance(&doc);
+        assert_eq!(after.dropped.trim(), ",");
     }
 
     #[test]

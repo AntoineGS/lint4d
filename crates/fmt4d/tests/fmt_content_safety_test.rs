@@ -93,7 +93,7 @@ fn region_directives_around_ifndef_type_declarations_are_refused_not_dropped() {
     assert_refused(
         "region_around_ifndef_type",
         REGION_AROUND_IFNDEF_TYPE,
-        &["`REGION` x2 (first at line 7)", "`ENDREGION` x2"],
+        &["`{$REGION 'TB'}` (line 15)", "`{$ENDREGION}` x2"],
     );
 }
 
@@ -102,7 +102,7 @@ fn ifdef_inside_class_ancestor_list_is_refused_not_dropped() {
     assert_refused(
         "ifdef_in_class_ancestors",
         IFDEF_IN_CLASS_ANCESTORS,
-        &["`IFDEF` (line 4)", "`ENDIF` (line 4)"],
+        &["`{$IFDEF X}` (line 4)", "`{$ENDIF}` (line 4)"],
     );
 }
 
@@ -114,4 +114,46 @@ fn content_preserving_formatting_still_succeeds() {
     assert!(output.contains("uses"));
     assert!(output.contains("// units"));
     assert!(output.contains("{ done }"));
+}
+
+/// Code moved onto the end of a `//` comment line becomes part of the
+/// comment (review of l4d-um8g step 1): the output must be refused.
+fn assert_not_swallowed_into_line_comment(body: &str) {
+    let source =
+        format!("unit T;\ninterface\nimplementation\nprocedure P;\nbegin\n  {body}\nend;\nend.\n");
+    match format(&source) {
+        Ok(output) => {
+            // Accepted output must keep the comment as it was.
+            let comment = body.lines().find(|l| l.contains("//")).unwrap();
+            let comment = &comment[comment.find("//").unwrap()..];
+            assert!(
+                output.lines().any(|l| l.trim_end().ends_with(comment)),
+                "code was swallowed into `{comment}` and the output accepted:\n{output}"
+            );
+        }
+        Err(error) => assert!(
+            matches!(error, fmt4d::FmtError::ContentChanged { .. }),
+            "expected ContentChanged, got {error:?}"
+        ),
+    }
+}
+
+#[test]
+fn then_moved_into_a_line_comment_is_refused() {
+    assert_not_swallowed_into_line_comment("if A // c2\n  then B := 1;");
+}
+
+#[test]
+fn do_moved_into_a_line_comment_is_refused() {
+    assert_not_swallowed_into_line_comment("while A // c\n  do B := 1;");
+}
+
+#[test]
+fn to_moved_into_a_line_comment_is_refused() {
+    assert_not_swallowed_into_line_comment("for I := 1 // c\n  to 2 do ;");
+}
+
+#[test]
+fn semicolon_moved_into_a_line_comment_is_refused() {
+    assert_not_swallowed_into_line_comment("X := A // c\n  ;\n  Y := 2;");
 }

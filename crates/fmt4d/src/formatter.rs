@@ -74,7 +74,7 @@ pub fn format_source(
         external_units,
     );
     let doc = builder.build(root);
-    let allowance = builder.content_allowance();
+    let allowance = builder.content_allowance(&doc);
     // Source length is a good upper bound for output length (the
     // formatter mostly adds/removes whitespace). Slight overshoot
     // avoids the final realloc. Review PERF-H4.
@@ -90,17 +90,40 @@ pub fn format_source(
         final_output.insert(0, '\u{FEFF}');
     }
 
-    crate::content_check::check_content_preserved(
-        &pascal_core::decode_bytes(source),
-        &final_output,
-        &allowance,
-    )
-    .map_err(|summary| crate::error::FmtError::ContentChanged {
-        path: info.path.clone(),
-        summary,
-    })?;
+    verify_output(source, &final_output, info, &allowance)?;
 
     Ok(final_output)
+}
+
+/// Refuses `output`, the formatting of the parse-error-free `source`, unless
+/// it holds exactly the source's content (but for `allowance`, see
+/// [`crate::content_check`]) and parses without errors.
+fn verify_output(
+    source: &[u8],
+    output: &str,
+    info: &FileInfo,
+    allowance: &crate::content_check::ContentAllowance,
+) -> crate::error::Result<()> {
+    let refuse = |summary: String| crate::error::FmtError::ContentChanged {
+        path: info.path.clone(),
+        summary,
+    };
+    crate::content_check::check_content_preserved(
+        &pascal_core::decode_bytes(source),
+        output,
+        allowance,
+    )
+    .map_err(refuse)?;
+    match pascal_core::parser::parse_file_with_patches(info, output.as_bytes()) {
+        Ok((_, diagnostics, _)) if diagnostics.is_empty() => Ok(()),
+        Ok((_, diagnostics, _)) => Err(refuse(format!(
+            "would produce output that does not parse ({:?})",
+            diagnostics[0]
+        ))),
+        Err(error) => Err(refuse(format!(
+            "would produce output that does not parse ({error})"
+        ))),
+    }
 }
 
 /// Format Delphi/Object Pascal source code **preserving the on-disk encoding**.
@@ -166,5 +189,40 @@ mod tests {
 
         assert_eq!(formatted, expected);
         assert_eq!(leaf_index_build_count(), 1);
+    }
+
+    #[test]
+    fn output_that_does_not_parse_is_refused() {
+        let info = FileInfo::new(PathBuf::from("test.pas"));
+        let source = b"unit T;\ninterface\nimplementation\nend.\n";
+        // Same tokens, no directive moved: only the re-parse can tell.
+        let output = "T unit;\ninterface\nimplementation\nend.\n";
+        assert_eq!(
+            crate::content_check::check_content_preserved(
+                std::str::from_utf8(source).unwrap(),
+                output,
+                &crate::content_check::ContentAllowance::default(),
+            ),
+            Ok(())
+        );
+        let error = super::verify_output(
+            source,
+            output,
+            &info,
+            &crate::content_check::ContentAllowance::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, crate::error::FmtError::ContentChanged { summary, .. }
+                if summary.contains("does not parse")),
+            "{error:?}"
+        );
+        super::verify_output(
+            source,
+            "unit T;\n\ninterface\n\nimplementation\n\nend.\n",
+            &info,
+            &crate::content_check::ContentAllowance::default(),
+        )
+        .expect("a parsing, content-preserving output is accepted");
     }
 }

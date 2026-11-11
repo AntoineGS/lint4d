@@ -134,7 +134,7 @@ impl Renderer {
     fn drain_render_stack(&mut self, mut stack: Vec<(usize, Mode, Doc)>) {
         while let Some((indent, mode, doc)) = stack.pop() {
             match doc {
-                Doc::Empty => {}
+                Doc::Empty | Doc::ContentMark(_) => {}
 
                 Doc::Token {
                     text,
@@ -502,7 +502,7 @@ impl Renderer {
         last_parent: &mut &'static str,
     ) {
         match doc {
-            Doc::Empty => {}
+            Doc::Empty | Doc::ContentMark(_) => {}
             Doc::Token {
                 text,
                 kind,
@@ -664,7 +664,7 @@ impl Renderer {
         last_parent: &mut &'static str,
     ) -> bool {
         match doc {
-            Doc::Empty => true,
+            Doc::Empty | Doc::ContentMark(_) => true,
 
             Doc::Token {
                 text,
@@ -842,7 +842,7 @@ impl Renderer {
         last_parent: &mut &'static str,
     ) -> FitsResult {
         match doc {
-            Doc::Empty => FitsResult::Continue,
+            Doc::Empty | Doc::ContentMark(_) => FitsResult::Continue,
 
             Doc::Hardline | Doc::BlankLine | Doc::LineStart(_) => FitsResult::LineBreak,
 

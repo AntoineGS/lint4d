@@ -126,6 +126,54 @@ fn actual_findings(case: &Case) -> Vec<Finding> {
         .collect()
 }
 
+fn finding_differences(expected: &[Finding], actual: &[Finding]) -> (Vec<Finding>, Vec<Finding>) {
+    let mut expected = expected.to_vec();
+    let mut actual = actual.to_vec();
+    expected.sort();
+    actual.sort();
+    let (mut expected_index, mut actual_index) = (0, 0);
+    let (mut invented, mut missed) = (Vec::new(), Vec::new());
+    while expected_index < expected.len() && actual_index < actual.len() {
+        match actual[actual_index].cmp(&expected[expected_index]) {
+            std::cmp::Ordering::Less => {
+                invented.push(actual[actual_index].clone());
+                actual_index += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                missed.push(expected[expected_index].clone());
+                expected_index += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                actual_index += 1;
+                expected_index += 1;
+            }
+        }
+    }
+    invented.extend_from_slice(&actual[actual_index..]);
+    missed.extend_from_slice(&expected[expected_index..]);
+    (invented, missed)
+}
+
+#[test]
+fn finding_differences_compare_duplicate_occurrences() {
+    let finding = Finding {
+        file: "Probe.pas".to_owned(),
+        line: 12,
+        code: "E2065".to_owned(),
+        message: "Unsatisfied forward or external declaration: 'TFoo.Missing'".to_owned(),
+    };
+    let one = vec![finding.clone()];
+    let two = vec![finding.clone(), finding.clone()];
+
+    let (invented, missed) = finding_differences(&one, &two);
+    assert_eq!(invented, vec![finding.clone()]);
+    assert!(missed.is_empty());
+
+    let (invented, missed) = finding_differences(&two, &one);
+    assert!(invented.is_empty());
+    assert_eq!(missed, vec![finding]);
+}
+
 #[test]
 fn dcc_oracle_cases_match_recorded_dcc_output() {
     let rtl_available = std::env::var_os("PASCAL_RTL").is_some();
@@ -140,34 +188,23 @@ fn dcc_oracle_cases_match_recorded_dcc_output() {
     for dir in dirs {
         let case = load_case(&dir);
         let enabled = |finding: &Finding| ENABLED_CODES.contains(&finding.code.as_str());
-        let mut expected = parse_expected(&case)
+        let expected = parse_expected(&case)
             .into_iter()
             .filter(|finding| enabled(finding) && finding.file.eq_ignore_ascii_case(&case.unit))
             .collect::<Vec<_>>();
-        let mut actual = actual_findings(&case)
+        let actual = actual_findings(&case)
             .into_iter()
             .filter(enabled)
             .collect::<Vec<_>>();
-        expected.sort();
-        actual.sort();
-        let invented = actual
-            .iter()
-            .filter(|finding| !expected.contains(finding))
-            .collect::<Vec<_>>();
+        let (invented, missed) = finding_differences(&expected, &actual);
         if !invented.is_empty() {
             failures.push(format!("{}: not reported by dcc: {invented:?}", case.name));
         }
-        if !case.requires_rtl || rtl_available {
-            let missed = expected
-                .iter()
-                .filter(|finding| !actual.contains(finding))
-                .collect::<Vec<_>>();
-            if !missed.is_empty() {
-                failures.push(format!(
-                    "{}: dcc reported, we missed: {missed:?}",
-                    case.name
-                ));
-            }
+        if (!case.requires_rtl || rtl_available) && !missed.is_empty() {
+            failures.push(format!(
+                "{}: dcc reported, we missed: {missed:?}",
+                case.name
+            ));
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));

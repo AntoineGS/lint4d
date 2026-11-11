@@ -24,13 +24,39 @@ for name in "${cases[@]}"; do
   unit=$(sed -nE 's/^unit *= *"([^"]+)".*/\1/p' "$dir/case.toml")
   if [[ -z $unit ]]; then echo "$name: case.toml has no unit" >&2; status=1; continue; fi
   out=$(mktemp -d)
-  raw=$(cd "$dir" && WINEPREFIX="$prefix" WINEDEBUG=-all timeout 300 \
+  if raw=$(cd "$dir" && WINEPREFIX="$prefix" WINEDEBUG=-all timeout 300 \
     wine "$dcc" -B -H+ -W+ -Q -U"$lib" -NSSystem -N0"$(winpath "$out")" -E"$(winpath "$out")" "$unit" \
-    2>&1 | tr -d '\r') || true
+    2>&1 | tr -d '\r'); then
+    compiler_status=0
+  else
+    # With pipefail, command substitution preserves dcc's 0/1 exit status.
+    compiler_status=$?
+  fi
   rm -rf "$out"
+  case "$compiler_status" in
+    0|1) ;;
+    124|137)
+      echo "$name: dcc timed out (exit $compiler_status), nothing recorded:" >&2
+      printf '%s\n' "$raw" >&2
+      status=1
+      continue
+      ;;
+    *)
+      echo "$name: dcc invocation failed (exit $compiler_status), nothing recorded:" >&2
+      printf '%s\n' "$raw" >&2
+      status=1
+      continue
+      ;;
+  esac
   version=$(grep -m1 '^Embarcadero Delphi' <<<"$raw" || true)
   if [[ -z $version ]] || grep -qE '(Fatal|Error): F[0-9]{4}' <<<"$raw"; then
     echo "$name: dcc did not run cleanly, nothing recorded:" >&2
+    printf '%s\n' "$raw" >&2
+    status=1
+    continue
+  fi
+  if [[ $compiler_status -eq 1 ]] && ! grep -qE 'Error: E[0-9]{4} ' <<<"$raw"; then
+    echo "$name: dcc exited 1 without a compiler error, nothing recorded:" >&2
     printf '%s\n' "$raw" >&2
     status=1
     continue

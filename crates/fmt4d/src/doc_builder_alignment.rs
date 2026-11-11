@@ -216,8 +216,9 @@ impl<'a> DocBuilder<'a> {
     pub(crate) fn expand_comma_var_rows(&self, node: Node<'a>) -> Option<Vec<VarListRow>> {
         let children = self.code_children(node);
 
-        // Only expand when there are commas.
-        if !children.iter().any(|c| c.kind() == K::COMMA) {
+        // Only expand when there are commas, and no directive whose reach
+        // a copy of the type or initializer would leave.
+        if !children.iter().any(|c| c.kind() == K::COMMA) || self.holds_directive(node) {
             return None;
         }
 

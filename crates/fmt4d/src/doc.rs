@@ -158,12 +158,6 @@ pub fn text_of(doc: &Doc) -> String {
     text_joined(doc, ' ')
 }
 
-/// The text of `doc`'s tokens and raw pieces, one per line, so that a `//`
-/// comment in one piece does not run into the next.
-pub fn text_lines_of(doc: &Doc) -> String {
-    text_joined(doc, '\n')
-}
-
 fn text_joined(doc: &Doc, separator: char) -> String {
     fn collect(doc: &Doc, separator: char, out: &mut String) {
         match doc {

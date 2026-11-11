@@ -507,11 +507,12 @@ end.
     );
 }
 
-/// Two rewrites change the order of compiler directives by design and are
-/// recorded exactly: sorting a `uses` clause moves a conditional group with
-/// its unit, and expanding `A, B: T` repeats the directives of `T`.
+/// A uses clause or a var list holding directives is kept as written
+/// (round "directive regions"): sorting would move units across the
+/// directives, and expanding `ctx, ctx1: T` would repeat the directives of
+/// `T`.
 #[test]
-fn recorded_directive_rewrites_are_accepted() {
+fn uses_clauses_and_var_lists_with_directives_are_kept_as_written() {
     assert_formats_to(
         "\
 unit T;
@@ -532,22 +533,21 @@ unit T;
 interface
 
 uses
-  Beta,
+  Zeta,
+  {$IFDEF Y}
+  Yankee,
+  {$ENDIF}
   Mid,
   {$IFDEF X}
   Alpha,
   {$ENDIF}
-  {$IFDEF Y}
-  Yankee,
-  {$ENDIF}
-  Zeta;
+  Beta;
 
 implementation
 
 procedure P;
 var
-  ctx: {$IFNDEF FPC}TMD5_CTX{$ELSE}TMD5Context{$IFEND};
-  ctx1: {$IFNDEF FPC}TMD5_CTX{$ELSE}TMD5Context{$IFEND};
+  ctx, ctx1: {$IFNDEF FPC}TMD5_CTX{$ELSE}TMD5Context{$IFEND};
 begin
 end;
 
@@ -1072,6 +1072,180 @@ var
 asm
   mov eax, 1
 end;
+
+end.
+",
+    );
+}
+
+// ── Round: directive regions (review of de1f3c6) ─────────────────────────
+
+/// Sorting a `uses` clause pinned plain directives after the unit before
+/// them and reordered them: `{$DEFINE FOO}` ended after the clause and
+/// `P` joined the interface. A clause holding any directive keeps its
+/// source order.
+#[test]
+fn uses_clause_with_a_define_keeps_its_source_order() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+uses
+  Zed,
+  {$DEFINE FOO}
+  Alpha,
+  {$UNDEF FOO}
+  Mid;
+{$IFDEF FOO}
+procedure P;
+{$ENDIF}
+implementation
+end.
+",
+        "\
+unit T;
+
+interface
+
+uses
+  Zed,
+  {$DEFINE FOO}
+  Alpha,
+  {$UNDEF FOO}
+  Mid;
+
+{$IFDEF FOO}
+procedure P;
+
+{$ENDIF}
+
+implementation
+
+end.
+",
+    );
+}
+
+/// `{$WARN UNIT_PLATFORM OFF} FileCtrl {$WARN UNIT_PLATFORM ON}` must keep
+/// exactly `FileCtrl` between the two switches.
+#[test]
+fn uses_clause_with_warning_switches_keeps_its_source_order() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+uses Windows, {$WARN UNIT_PLATFORM OFF} FileCtrl, {$WARN UNIT_PLATFORM ON} Classes;
+implementation
+end.
+",
+        "\
+unit T;
+
+interface
+
+uses
+  Windows,
+  {$WARN UNIT_PLATFORM OFF}
+  FileCtrl,
+  {$WARN UNIT_PLATFORM ON}
+  Classes;
+
+implementation
+
+end.
+",
+    );
+}
+
+/// Shaped like Common/FingerPrint.pas: sorting moved `Forms` and others
+/// between `{$WARNINGS OFF}` and `{$WARNINGS ON}`.
+#[test]
+fn uses_clause_with_switches_around_one_unit_keeps_its_source_order() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+uses SysUtils, Forms, ActiveX, {$WARNINGS OFF}OleAuto{$WARNINGS ON}, mscorlib_tlb;
+implementation
+end.
+",
+        "\
+unit T;
+
+interface
+
+uses
+  SysUtils,
+  Forms,
+  ActiveX,
+  {$WARNINGS OFF}
+  OleAuto
+  {$WARNINGS ON},
+  mscorlib_tlb;
+
+implementation
+
+end.
+",
+    );
+}
+
+/// A uses clause whose only directives form a whole conditional group still
+/// formats (in source order).
+#[test]
+fn uses_clause_with_a_conditional_group_formats_in_source_order() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+uses Zed, {$IFDEF X} Alpha, {$ENDIF} Beta;
+implementation
+end.
+",
+        "\
+unit T;
+
+interface
+
+uses
+  Zed,
+  {$IFDEF X}
+  Alpha,
+  {$ENDIF}
+  Beta;
+
+implementation
+
+end.
+",
+    );
+}
+
+/// Expanding `A, B: Integer {$IFDEF Q} absolute X {$ENDIF};` repeated the
+/// guarded `absolute X` without its directives: `A` always aliased `X`.
+/// A declaration whose shared part holds a directive is kept as written.
+#[test]
+fn var_list_with_a_directive_in_its_type_is_not_expanded() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+var
+  A, B: Integer {$IFDEF Q} absolute X {$ENDIF};
+  C, D: Integer {$IFDEF Q} = 1 {$ENDIF};
+implementation
+end.
+",
+        "\
+unit T;
+
+interface
+
+var
+  A, B: Integer {$IFDEF Q} absolute X {$ENDIF};
+  C, D: Integer {$IFDEF Q} = 1 {$ENDIF};
+
+implementation
 
 end.
 ",

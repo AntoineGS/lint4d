@@ -2,7 +2,8 @@
 //!
 //! fmt4d re-lays-out source text: it changes whitespace, line breaks and
 //! indentation, normalises the `uses` keyword's case, reorders the units of
-//! a `uses` clause and moves comments relative to separators. None of those
+//! a `uses` clause without directives and moves comments relative to
+//! separators. None of those
 //! change the multiset of the source's tokens, where a token is
 //!
 //! - a comment (`// …` to the end of its line, `{ … }`, `(* … *)`, compiler
@@ -19,13 +20,20 @@
 //! control character (#1..#31) in code, a blank to the compiler. On top of the
 //! multiset, the compiler directives (`{$…}`, `(*$…*)`) must keep their exact
 //! order: dropping one `{$ENDIF}` and duplicating another changes the
-//! conditional structure without changing the multiset.
+//! conditional structure without changing the multiset. And the check is
+//! positional: the directives split the input and the output into regions
+//! (before the first, between two consecutive ones, after the last), and
+//! each region of the output must hold the multiset of its input region,
+//! so no code, comment or string crosses a directive (a unit sorted into a
+//! `{$WARNINGS OFF}` stretch changes what the switch covers).
 //!
 //! Two rewrites do change the multiset, and the doc builder records each one
-//! it emits as a [`ContentAllowance`]:
+//! it emits as an [`AllowanceEntry`], applied in the region of the node:
 //!
 //! - expanding `A, B: T = V;` into one declaration per identifier drops the
-//!   commas and repeats the `: T = V;` suffix (without its comments);
+//!   commas and repeats the `: T = V;` suffix (without its comments); the
+//!   repeated tokens must come from that suffix in the input, and the
+//!   suffix must hold no directive;
 //! - laying out a `uses` clause rewrites the `,`/`;` separators between its
 //!   items.
 //!
@@ -128,7 +136,17 @@ fn number_len(rest: &str) -> usize {
 /// Calls `visit(token, line)` for every token of `text`, with 1-based lines
 /// of the token's start.
 fn for_each_token<'a>(text: &'a str, mut visit: impl FnMut(Token<'a>, usize)) {
-    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+    for_each_token_at(text, |token, line, _| visit(token, line));
+}
+
+/// Like [`for_each_token`], also passing the token's byte offset in `text`.
+fn for_each_token_at<'a>(text: &'a str, mut visit: impl FnMut(Token<'a>, usize, usize)) {
+    let base = if text.starts_with('\u{FEFF}') {
+        '\u{FEFF}'.len_utf8()
+    } else {
+        0
+    };
+    let text = &text[base..];
     let mut line = 1;
     let mut offset = 0;
     while let Some(c) = text[offset..].chars().next() {
@@ -163,7 +181,7 @@ fn for_each_token<'a>(text: &'a str, mut visit: impl FnMut(Token<'a>, usize)) {
             (Some(Token::Char(c)), c.len_utf8())
         };
         if let Some(token) = token {
-            visit(token, line);
+            visit(token, line, base + offset);
         }
         line += rest[..len].matches('\n').count();
         offset += len;
@@ -299,75 +317,10 @@ fn directives(text: &str) -> Vec<(String, Token<'_>, usize)> {
     found
 }
 
-/// The directives of `input` in the order the output must hold them: the
-/// source order, with each run a [`DirectiveRewrite`] covers replaced by the
-/// directives it records for the output. A rewrite applies to the first run
-/// of exactly its source directives that starts on or after its line; one
-/// that matches no run changes nothing. Each directive is paired with how a
-/// summary shows it.
-fn expected_directives(input: &str, rewrites: &[DirectiveRewrite]) -> Vec<(String, String)> {
-    let shown_at = |token: Token<'_>, line: usize, side: &str| {
-        format!("{} ({side} line {line})", shown(token))
-    };
+/// Describes where the ordered directives of `input` and `output` first
+/// differ, if they do; returns whether they do.
+fn describe_directive_order(input: &str, output: &str, summary: &mut String) -> bool {
     let before = directives(input);
-    let mut rewrites: Vec<&DirectiveRewrite> = rewrites.iter().collect();
-    rewrites.sort_by_key(|r| r.first_line);
-    let mut expected = Vec::new();
-    let mut next = 0;
-    for rewrite in rewrites {
-        let source: Vec<String> = directives(&rewrite.source)
-            .into_iter()
-            .map(|(key, _, _)| key)
-            .collect();
-        if source.is_empty() {
-            continue;
-        }
-        let found = (next..before.len()).find(|&start| {
-            before[start].2 >= rewrite.first_line
-                && before.len() - start >= source.len()
-                && before[start..start + source.len()]
-                    .iter()
-                    .zip(&source)
-                    .all(|(b, s)| b.0 == *s)
-        });
-        let Some(start) = found else {
-            continue;
-        };
-        expected.extend(
-            before[next..start]
-                .iter()
-                .map(|(key, token, line)| (key.clone(), shown_at(*token, *line, "source"))),
-        );
-        expected.extend(
-            directives(&rewrite.output)
-                .into_iter()
-                .map(|(key, token, _)| {
-                    let line = before[start].2;
-                    (
-                        key,
-                        format!("{} (rewritten from source line {line})", shown(token)),
-                    )
-                }),
-        );
-        next = start + source.len();
-    }
-    expected.extend(
-        before[next..]
-            .iter()
-            .map(|(key, token, line)| (key.clone(), shown_at(*token, *line, "source"))),
-    );
-    expected
-}
-
-/// Describes where the ordered directives of `output` first differ from the
-/// ones expected from `input` (see [`expected_directives`]), if they do.
-fn describe_directive_order(
-    input: &str,
-    output: &str,
-    rewrites: &[DirectiveRewrite],
-    summary: &mut String,
-) {
-    let before = expected_directives(input, rewrites);
     let after = directives(output);
     let first_difference = before
         .iter()
@@ -375,57 +328,79 @@ fn describe_directive_order(
         .position(|(b, a)| b.0 != a.0)
         .or_else(|| (before.len() != after.len()).then(|| before.len().min(after.len())));
     let Some(index) = first_difference else {
-        return;
+        return false;
     };
-    let expected = before
-        .get(index)
-        .map_or("nothing".to_string(), |(_, shown)| {
-            shown.replace(" (source line ", " (line ")
-        });
-    let actual = after
-        .get(index)
-        .map_or("nothing".to_string(), |(_, token, line)| {
-            format!("{} (line {line})", shown(*token))
-        });
+    let side = |list: &[(String, Token<'_>, usize)]| {
+        list.get(index)
+            .map_or("nothing".to_string(), |(_, token, line)| {
+                format!("{} (line {line})", shown(*token))
+            })
+    };
     append(
         summary,
         &format!(
-            "would change the order of compiler directives: directive {} is {expected} in the \
-             source but {actual} in the output",
+            "would change the order of compiler directives: directive {} is {} in the source \
+             but {} in the output",
             index + 1,
+            side(&before),
+            side(&after)
         ),
     );
+    true
 }
 
 /// Content the formatter knowingly drops from or adds to the source (see the
-/// module documentation), as texts whose tokens are counted.
+/// module documentation).
 #[derive(Debug, Default)]
 pub(crate) struct ContentAllowance {
-    pub(crate) dropped: String,
-    pub(crate) added: String,
-    /// Runs of directives the output holds in another order or repeated.
-    pub(crate) directive_rewrites: Vec<DirectiveRewrite>,
+    pub(crate) entries: Vec<AllowanceEntry>,
 }
 
-/// A rewrite that changes the order of directives: the directives of the
-/// source text `source`, starting on 1-based line `first_line` of the input,
-/// are emitted as the directives of `output`, in that order.
-#[derive(Debug, Clone)]
-pub(crate) struct DirectiveRewrite {
-    pub(crate) first_line: usize,
-    pub(crate) source: String,
-    pub(crate) output: String,
+/// One rewrite's change to the content: the tokens of `dropped` and of
+/// `added` (texts whose tokens are counted), in the region of the input
+/// (between two directives) holding byte offset `at`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AllowanceEntry {
+    pub(crate) at: usize,
+    pub(crate) dropped: String,
+    pub(crate) added: String,
+    /// The input bytes the added tokens repeat, and how many times: every
+    /// added token must occur there that often, and the span must hold no
+    /// directive, else the entry does not apply (code guarded by a
+    /// directive must not be copied outside it).
+    pub(crate) repeats: Option<(std::ops::Range<usize>, usize)>,
 }
 
 impl ContentAllowance {
     pub(crate) fn extend(&mut self, other: &ContentAllowance) {
-        self.dropped.push(' ');
-        self.dropped.push_str(&other.dropped);
-        self.added.push(' ');
-        self.added.push_str(&other.added);
-        self.directive_rewrites
-            .extend(other.directive_rewrites.iter().cloned());
+        self.entries.extend(other.entries.iter().cloned());
     }
+}
+
+/// Whether `entry` may apply to `input`: what it adds comes from the span it
+/// repeats, which holds no directive.
+fn entry_applies(input: &str, entry: &AllowanceEntry) -> bool {
+    let Some((span, copies)) = &entry.repeats else {
+        return true;
+    };
+    let Some(source) = input.get(span.clone()) else {
+        return false;
+    };
+    let mut available = Counts::default();
+    let mut directive = false;
+    for_each_token(source, |token, _| {
+        directive |= token.is_directive();
+        available.add(token, *copies as i64);
+    });
+    if directive {
+        return false;
+    }
+    let mut fits = true;
+    for_each_token(&entry.added, |token, _| {
+        available.add(token, -1);
+        fits &= available.surplus(token) >= 0;
+    });
+    fits
 }
 
 /// Counts the `,` and `;` of `text` outside comments, directives and string
@@ -441,26 +416,56 @@ pub(crate) fn code_separators(text: &str) -> (usize, usize) {
 }
 
 /// Checks that `output` holds exactly the content of `input` but for the
-/// `allowance` (see the module documentation). On a difference, returns a
-/// short summary naming the first lost tokens with their input lines, the
-/// first extra tokens with their output lines, and the first directive out
-/// of order.
+/// `allowance` (see the module documentation), in the same regions between
+/// compiler directives. On a difference, returns a short summary naming the
+/// first lost tokens with their input lines, the first extra tokens with
+/// their output lines, the first directive out of order, or the first token
+/// moved across a directive.
 pub(crate) fn check_content_preserved(
     input: &str,
     output: &str,
     allowance: &ContentAllowance,
 ) -> Result<(), String> {
     let mut counts = Counts::default();
-    for_each_token(input, |token, _| counts.add(token, 1));
-    for_each_token(&allowance.dropped, |token, _| counts.add(token, -1));
-    for_each_token(&allowance.added, |token, _| counts.add(token, 1));
-    for_each_token(output, |token, _| counts.add(token, -1));
+    let mut regions = RegionCounts::default();
+    let mut input_directives = Vec::new();
+    for_each_token_at(input, |token, _, offset| {
+        counts.add(token, 1);
+        if token.is_directive() {
+            input_directives.push(offset);
+        } else {
+            regions.add(input_directives.len(), token, 1);
+        }
+    });
+    for entry in allowance.entries.iter().filter(|e| entry_applies(input, e)) {
+        let region = input_directives.partition_point(|&d| d < entry.at);
+        for_each_token(&entry.dropped, |token, _| {
+            counts.add(token, -1);
+            regions.add(region, token, -1);
+        });
+        for_each_token(&entry.added, |token, _| {
+            counts.add(token, 1);
+            regions.add(region, token, 1);
+        });
+    }
+    let mut output_region = 0;
+    for_each_token(output, |token, _| {
+        counts.add(token, -1);
+        if token.is_directive() {
+            output_region += 1;
+        } else {
+            regions.add(output_region, token, -1);
+        }
+    });
     let mut summary = String::new();
     if !counts.is_balanced() {
         describe(input, &mut counts, 1, "would drop", &mut summary);
         describe(output, &mut counts, -1, "would add", &mut summary);
     }
-    describe_directive_order(input, output, &allowance.directive_rewrites, &mut summary);
+    let reordered = describe_directive_order(input, output, &mut summary);
+    if summary.is_empty() && !reordered && !regions.is_balanced() {
+        describe_move(input, output, &mut regions, &mut summary);
+    }
     if summary.is_empty() {
         Ok(())
     } else {
@@ -468,9 +473,68 @@ pub(crate) fn check_content_preserved(
     }
 }
 
+/// Token counts per region: the code, comments and strings between two
+/// consecutive compiler directives (or before the first, or after the
+/// last), numbered in order.
+#[derive(Default)]
+struct RegionCounts {
+    counts: HashMap<(usize, String), i64>,
+    key: String,
+}
+
+impl RegionCounts {
+    fn add(&mut self, region: usize, token: Token<'_>, delta: i64) {
+        token_key(token, &mut self.key);
+        *self
+            .counts
+            .entry((region, std::mem::take(&mut self.key)))
+            .or_insert(0) += delta;
+    }
+
+    fn surplus(&mut self, region: usize, token: Token<'_>) -> i64 {
+        token_key(token, &mut self.key);
+        self.counts
+            .get(&(region, std::mem::take(&mut self.key)))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn is_balanced(&self) -> bool {
+        self.counts.values().all(|count| *count == 0)
+    }
+}
+
+/// Names the first token of `input` missing from its region in `output`
+/// (else the first token of `output` extra in its region): with the same
+/// tokens and the same directives overall, it crossed a directive.
+fn describe_move(input: &str, output: &str, regions: &mut RegionCounts, summary: &mut String) {
+    for (text, sign) in [(input, 1), (output, -1)] {
+        let mut region = 0;
+        let mut found = None;
+        for_each_token(text, |token, line| {
+            if found.is_some() {
+                return;
+            }
+            if token.is_directive() {
+                region += 1;
+            } else if regions.surplus(region, token) * sign > 0 {
+                found = Some((shown(token), line));
+            }
+        });
+        if let Some((token, line)) = found {
+            let side = if sign > 0 { "source" } else { "output" };
+            append(
+                summary,
+                &format!("would move {token} ({side} line {line}) across a compiler directive"),
+            );
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ContentAllowance, check_content_preserved, code_separators};
+    use super::{AllowanceEntry, ContentAllowance, check_content_preserved, code_separators};
 
     fn check(input: &str, output: &str) -> Result<(), String> {
         check_content_preserved(input, output, &ContentAllowance::default())
@@ -519,12 +583,21 @@ mod tests {
         let input = "var A, B: Integer = 1; // n\n";
         let output = "var\n  A: Integer = 1;\n  B: Integer = 1; // n\n";
         assert!(check(input, output).is_err());
-        let allowance = ContentAllowance {
-            dropped: ",".into(),
-            added: ": Integer = 1;".into(),
-            ..ContentAllowance::default()
+        let suffix = input.find(':').unwrap()..input.find(';').unwrap() + 1;
+        let allowance = |added: &str| ContentAllowance {
+            entries: vec![AllowanceEntry {
+                at: 0,
+                dropped: ",".into(),
+                added: added.into(),
+                repeats: Some((suffix.clone(), 1)),
+            }],
         };
-        assert_eq!(check_content_preserved(input, output, &allowance), Ok(()));
+        assert_eq!(
+            check_content_preserved(input, output, &allowance(": Integer = 1;")),
+            Ok(())
+        );
+        // Added tokens must come from the repeated span.
+        assert!(check_content_preserved(input, output, &allowance(": Integer = 2;")).is_err());
     }
 
     #[test]
@@ -557,25 +630,57 @@ mod tests {
     }
 
     #[test]
-    fn a_recorded_directive_rewrite_allows_exactly_its_order() {
-        use super::DirectiveRewrite;
-        let input = "{$A}\nuses {$IFDEF Y} Y, {$ENDIF} {$IFDEF X} X, {$ENDIF};\n{$B}\n";
-        let output = "{$A}\nuses {$IFDEF X} X, {$ENDIF} {$IFDEF Y} Y, {$ENDIF};\n{$B}\n";
+    fn code_moved_across_a_directive_is_refused() {
+        // Review of de1f3c6: the multiset and the directive order were
+        // intact, but units changed sides of the switches.
+        let input =
+            "uses Windows, {$WARN UNIT_PLATFORM OFF} FileCtrl, {$WARN UNIT_PLATFORM ON} Classes;";
+        let output =
+            "uses Classes, {$WARN UNIT_PLATFORM OFF} FileCtrl, {$WARN UNIT_PLATFORM ON} Windows;";
         assert!(check(input, output).is_err());
-        let rewrite = |first_line| ContentAllowance {
-            directive_rewrites: vec![DirectiveRewrite {
-                first_line,
-                source: "uses {$IFDEF Y} Y, {$ENDIF} {$IFDEF X} X, {$ENDIF};".into(),
-                output: "{$IFDEF X}\nX,\n{$ENDIF}\n{$IFDEF Y}\nY,\n{$ENDIF}".into(),
+        let input = "uses SysUtils, Forms, {$WARNINGS OFF}OleAuto{$WARNINGS ON}, mscorlib_tlb;";
+        let output = "uses {$WARNINGS OFF}Forms, mscorlib_tlb, OleAuto, {$WARNINGS ON}SysUtils;";
+        assert!(check(input, output).is_err());
+        // A comment changing sides of a directive is refused too.
+        assert!(
+            check(
+                "{$IFDEF X} // c\nA;\n{$ENDIF}",
+                "// c\n{$IFDEF X}\nA;\n{$ENDIF}"
+            )
+            .is_err()
+        );
+        // Layout within each region is fine.
+        assert_eq!(
+            check(
+                "uses A,{$IFDEF X}B,{$ENDIF}C;",
+                "uses\n  A,\n  {$IFDEF X}\n  B,\n  {$ENDIF}\n  C;"
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_define_reordered_in_a_uses_clause_is_refused() {
+        let input = "uses Zed, {$DEFINE FOO} Alpha, {$UNDEF FOO} Mid;";
+        let output = "uses Alpha, {$UNDEF FOO} Mid, Zed {$DEFINE FOO};";
+        assert!(check(input, output).is_err());
+    }
+
+    #[test]
+    fn a_var_list_allowance_does_not_carry_code_across_a_directive() {
+        // The repeated `absolute X` came from inside `{$IFDEF Q}`.
+        let input = "var A, B: Integer {$IFDEF Q} absolute X {$ENDIF};";
+        let output = "var A: Integer absolute X;\n  B: Integer {$IFDEF Q} absolute X {$ENDIF};";
+        let suffix = input.find(':').unwrap()..input.rfind(';').unwrap() + 1;
+        let allowance = ContentAllowance {
+            entries: vec![AllowanceEntry {
+                at: 0,
+                dropped: ",".into(),
+                added: ": Integer absolute X;".into(),
+                repeats: Some((suffix, 1)),
             }],
-            ..ContentAllowance::default()
         };
-        assert_eq!(check_content_preserved(input, output, &rewrite(2)), Ok(()));
-        // A rewrite anchored after its run does not apply.
-        assert!(check_content_preserved(input, output, &rewrite(3)).is_err());
-        // It allows no other order change.
-        let moved_b = "{$B}\nuses {$IFDEF X} X, {$ENDIF} {$IFDEF Y} Y, {$ENDIF};\n{$A}\n";
-        assert!(check_content_preserved(input, moved_b, &rewrite(2)).is_err());
+        assert!(check_content_preserved(input, output, &allowance).is_err());
     }
 
     #[test]

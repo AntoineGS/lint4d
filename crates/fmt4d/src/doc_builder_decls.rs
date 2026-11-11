@@ -2,7 +2,7 @@
 //! procedure declarations and definitions, and comma-separated identifier decls.
 //! Extracted from doc_builder.rs during Phase F decomposition (review AH1 / BP-M5).
 
-use crate::content_check::ContentAllowance;
+use crate::content_check::{AllowanceEntry, ContentAllowance};
 use crate::doc::{self, Doc};
 use crate::doc_builder::{
     DocBuilder, ends_with_hardline, starts_with_hardline, strip_trailing_hardline,
@@ -400,8 +400,10 @@ impl<'a> DocBuilder<'a> {
             None => (&children[..], &[][..]),
         };
 
-        // ── DECL_VAR: always expand into separate declarations ──────
-        if node.kind() == K::DECL_VAR {
+        // ── DECL_VAR: expand into separate declarations ─────────────
+        // Not when the declaration holds a directive: a copy of its type
+        // or initializer would carry code out of the directive's reach.
+        if node.kind() == K::DECL_VAR && !self.holds_directive(node) {
             let idents: Vec<Node<'a>> = before_colon
                 .iter()
                 .copied()
@@ -441,10 +443,7 @@ impl<'a> DocBuilder<'a> {
                         parts.push(item);
                     }
                 }
-                let expansion = doc::concat(parts);
-                // Each copy of the suffix repeats its directives.
-                self.allow_directive_rewrite(node, self.span_with_outer_trivia(node), &expansion);
-                return expansion;
+                return doc::concat(parts);
             }
         }
 
@@ -536,12 +535,19 @@ impl<'a> DocBuilder<'a> {
     ) -> Doc {
         let commas = before_colon.iter().filter(|c| c.kind() == K::COMMA).count();
         let suffix = doc::text_of(bare_suffix);
+        let copies = count.saturating_sub(1);
+        let suffix_start = before_colon
+            .last()
+            .map_or(node.start_byte(), |n| n.end_byte());
         self.allow_content_change(
             node,
             ContentAllowance {
-                dropped: ",".repeat(commas),
-                added: suffix.repeat(count.saturating_sub(1)),
-                ..ContentAllowance::default()
+                entries: vec![AllowanceEntry {
+                    at: node.start_byte(),
+                    dropped: ",".repeat(commas),
+                    added: suffix.repeat(copies),
+                    repeats: Some((suffix_start..node.end_byte(), copies)),
+                }],
             },
         )
     }

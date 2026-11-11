@@ -266,3 +266,22 @@ end.
       (declExport (identifier)))
     (block (kBegin) (kEnd))
     (kEndDot)))
+
+===
+Control characters are whitespace
+===
+
+procedure P;
+begin
+  x :=1;x := x+ 1;
+end;
+
+---
+
+(root
+  (defProc
+    (declProc (kProcedure) (identifier))
+    (block (kBegin)
+      (assignment (identifier) (kAssign) (literalNumber))
+      (assignment (identifier) (kAssign) (exprBinary (identifier) (kAdd) (literalNumber)))
+      (kEnd))))

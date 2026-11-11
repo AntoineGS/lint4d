@@ -1695,8 +1695,9 @@ module.exports = grammar({
 		kFalse:            $ => /false/i,
 		labelNumber:       $ => token(prec(1, /[0-9]+/)),
 
-	  	// \x1a is the DOS end-of-file marker some old sources end with.
-	  	_space:            $ => /[\s\r\n\t\x1a]+/,
+	  	// dcc treats every control character as a blank, including \x1a,
+	  	// the DOS end-of-file marker some old sources end with.
+	  	_space:            $ => /[\s\x01-\x1f]+/,
 		ppDirective:       $ => token(prec(-1, choice(
 			/\{\$[^}]*\}/,
 			/\(\*\$[^*]*(\*+[^*)][^*]*)*\*+\)/

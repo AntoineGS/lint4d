@@ -15518,7 +15518,7 @@
     },
     "_space": {
       "type": "PATTERN",
-      "value": "[\\s\\r\\n\\t\\x1a]+"
+      "value": "[\\s\\x01-\\x1f]+"
     },
     "ppDirective": {
       "type": "TOKEN",

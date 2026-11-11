@@ -27781,9 +27781,10 @@ fn formatting_rejects_include_sources_without_editing_them() {
 fn formatting_refuses_output_that_would_drop_source_content() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let path = temp.path().join("Lossy.pas");
-    // fmt4d drops the conditional inside the ancestor list (l4d-um8g); the
-    // content safety net must turn that into a refusal, not an edit.
-    let source = "unit Lossy;\ninterface\ntype\n  TFoo = class(TForm{$IFDEF X}, ISkinable{$ENDIF})\n  end;\nimplementation\nend.\n";
+    // fmt4d drops a stray control character, blank to the compiler, from
+    // the code (l4d-um8g); the content safety net must turn that into a
+    // refusal, not an edit.
+    let source = "unit Lossy;\ninterface\nimplementation\nprocedure P;\nbegin\n  X := 1; \u{16}\nend;\nend.\n";
     write_file(&path, source);
 
     let mut server = TestServer::launch();
@@ -27818,7 +27819,7 @@ fn formatting_refuses_output_that_would_drop_source_content() {
             );
         };
         assert!(
-            error.message.contains("IFDEF"),
+            error.message.contains("u{16}"),
             "{method} error does not name the lost content: {}",
             error.message
         );

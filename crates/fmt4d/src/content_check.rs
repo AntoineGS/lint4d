@@ -15,7 +15,8 @@
 //!   strings, compared case-insensitively because Pascal is;
 //! - any other non-whitespace character, compared exactly.
 //!
-//! A U+FEFF byte-order mark at the very start is not content. On top of the
+//! A U+FEFF byte-order mark at the very start is not content, nor is a C0
+//! control character (#1..#31) in code, a blank to the compiler. On top of the
 //! multiset, the compiler directives (`{$…}`, `(*$…*)`) must keep their exact
 //! order: dropping one `{$ENDIF}` and duplicating another changes the
 //! conditional structure without changing the multiset.
@@ -55,6 +56,12 @@ impl Token<'_> {
     fn is_directive(&self) -> bool {
         matches!(self, Token::Comment(text) if text.starts_with("{$") || text.starts_with("(*$"))
     }
+}
+
+/// A C0 control character (#1..#31), which the compiler, like the grammar,
+/// reads as a blank outside comments and string literals.
+fn is_code_blank_control(c: char) -> bool {
+    matches!(c, '\u{1}'..='\u{1f}')
 }
 
 fn is_word_char(c: char) -> bool {
@@ -150,7 +157,7 @@ fn for_each_token<'a>(text: &'a str, mut visit: impl FnMut(Token<'a>, usize)) {
                 .find(|(_, next)| !is_word_char(*next))
                 .map_or(rest.len(), |(index, _)| index);
             (Some(Token::Word(&rest[..len])), len)
-        } else if c.is_whitespace() {
+        } else if c.is_whitespace() || is_code_blank_control(c) {
             (None, c.len_utf8())
         } else {
             (Some(Token::Char(c)), c.len_utf8())
@@ -569,6 +576,17 @@ mod tests {
         // It allows no other order change.
         let moved_b = "{$B}\nuses {$IFDEF X} X, {$ENDIF} {$IFDEF Y} Y, {$ENDIF};\n{$A}\n";
         assert!(check_content_preserved(input, moved_b, &rewrite(2)).is_err());
+    }
+
+    #[test]
+    fn control_characters_in_code_are_blanks_but_exact_in_comments_and_strings() {
+        // The compiler reads C0 controls outside comments and strings as
+        // blanks: dropping one from code is not content loss.
+        assert_eq!(check("X := 1; \u{16}\nY := 2;", "X := 1;\nY := 2;"), Ok(()));
+        assert_eq!(check("A :=\u{1c}B;", "A := B;"), Ok(()));
+        assert!(check("X := 1; // a\u{16}b\n", "X := 1; // ab\n").is_err());
+        assert!(check("X := 1; { a\u{16}b }", "X := 1; { ab }").is_err());
+        assert!(check("X := 'a\u{16}b';", "X := 'ab';").is_err());
     }
 
     #[test]

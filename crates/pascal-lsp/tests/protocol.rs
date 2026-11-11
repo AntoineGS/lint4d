@@ -27778,13 +27778,13 @@ fn formatting_rejects_include_sources_without_editing_them() {
 }
 
 #[test]
-fn formatting_refuses_output_that_would_drop_source_content() {
+fn formatting_returns_an_error_and_no_edit_when_fmt4d_refuses() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let path = temp.path().join("Lossy.pas");
-    // fmt4d drops a stray control character, blank to the compiler, from
-    // the code (l4d-um8g); the content safety net must turn that into a
-    // refusal, not an edit.
-    let source = "unit Lossy;\ninterface\nimplementation\nprocedure P;\nbegin\n  X := 1; \u{16}\nend;\nend.\n";
+    // No known input makes fmt4d lose content any more (its content net,
+    // l4d-um8g, is covered by fmt4d's tests); every refusal takes the same
+    // path to the client as this one: an error, never an edit.
+    let source = "unit Lossy;\ninterface\nimplementation\nprocedure P;\nbegin\n  X := 1; \u{0}\nend;\nend.\n";
     write_file(&path, source);
 
     let mut server = TestServer::launch();
@@ -27813,14 +27813,11 @@ fn formatting_refuses_output_that_would_drop_source_content() {
         server.send_request(request_id.clone(), method, params);
         let response = server.response(&request_id);
         let Some(error) = response.error else {
-            panic!(
-                "{method} must refuse lossy output, got {:?}",
-                response.result
-            );
+            panic!("{method} must refuse, got {:?}", response.result);
         };
         assert!(
-            error.message.contains("u{16}"),
-            "{method} error does not name the lost content: {}",
+            error.message.contains("parse error"),
+            "{method} error does not give fmt4d's reason: {}",
             error.message
         );
     }

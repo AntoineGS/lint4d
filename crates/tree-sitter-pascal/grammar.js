@@ -934,7 +934,8 @@ module.exports = grammar({
 		)),
 		_subRangeBound:  $ => choice(
 			$.literalNumber,
-			$.literalString,
+			// No `^M` control characters: `= ^TFoo` is a pointer type.
+			alias($._subRangeString, $.literalString),
 			$._typeref,
 			alias($._subRangeCall,   $.exprCall),
 			alias($._subRangeUnary,  $.exprUnary),
@@ -1017,7 +1018,10 @@ module.exports = grammar({
 			$.kNil, $.kTrue, $.kFalse
 		),
 		literalString:   $ => repeat1($._literalString),
-		_literalString:  $ => choice(/'[^']*'/, $.literalChar, $._literalStringMultiline),
+		_subRangeString: $ => repeat1(choice(/'[^']*'/, $.literalChar, $._literalStringMultiline)),
+		_literalString:  $ => choice(/'[^']*'/, $.literalChar, $._literalStringMultiline, $._controlChar),
+		// `^M` is the control character #13.
+		_controlChar:    $ => token(/\^[A-Za-z@\[\\\]^_]/),
 		literalChar:     $ => seq('#', $._literalInt),
 		literalNumber:   $ => choice($._literalInt, $._literalFloat),
 		// Delphi 11 allows `_` as a digit separator after the first digit.

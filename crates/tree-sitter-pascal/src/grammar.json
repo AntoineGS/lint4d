@@ -5442,8 +5442,13 @@
           "name": "literalNumber"
         },
         {
-          "type": "SYMBOL",
-          "name": "literalString"
+          "type": "ALIAS",
+          "content": {
+            "type": "SYMBOL",
+            "name": "_subRangeString"
+          },
+          "named": true,
+          "value": "literalString"
         },
         {
           "type": "SYMBOL",
@@ -6168,6 +6173,26 @@
         "name": "_literalString"
       }
     },
+    "_subRangeString": {
+      "type": "REPEAT1",
+      "content": {
+        "type": "CHOICE",
+        "members": [
+          {
+            "type": "PATTERN",
+            "value": "'[^']*'"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "literalChar"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "_literalStringMultiline"
+          }
+        ]
+      }
+    },
     "_literalString": {
       "type": "CHOICE",
       "members": [
@@ -6182,8 +6207,19 @@
         {
           "type": "SYMBOL",
           "name": "_literalStringMultiline"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_controlChar"
         }
       ]
+    },
+    "_controlChar": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PATTERN",
+        "value": "\\^[A-Za-z@\\[\\\\\\]^_]"
+      }
     },
     "literalChar": {
       "type": "SEQ",

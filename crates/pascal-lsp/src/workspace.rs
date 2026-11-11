@@ -6961,6 +6961,18 @@ impl Workspace {
         }
     }
 
+    /// The publication standing for a document's report when that report
+    /// exceeds the publication bounds: one diagnostic saying it was
+    /// withheld, never a partial report, and never nothing, which would
+    /// leave the client showing a previous report.
+    fn withheld_diagnostic_publication(&self, uri: &Url) -> queries::DiagnosticPublication {
+        queries::DiagnosticPublication {
+            version: self.document_version(uri),
+            uri: uri.clone(),
+            diagnostics: vec![withheld_report_diagnostic()],
+        }
+    }
+
     fn aggregate_diagnostic_publication(
         &self,
         uri: &Url,
@@ -6987,7 +6999,7 @@ impl Workspace {
             for diagnostic in contribution {
                 visits = visits.saturating_add(1);
                 if visits > MAX_DIAGNOSTIC_PUBLICATION_AGGREGATE_VISITS {
-                    return (None, true);
+                    return (Some(self.withheld_diagnostic_publication(uri)), true);
                 }
                 let Ok(encoded) = serde_json::to_vec(diagnostic) else {
                     return (None, true);
@@ -6995,7 +7007,7 @@ impl Workspace {
                 if seen_diagnostics.insert(encoded.clone()) {
                     diagnostics_bytes = diagnostics_bytes.saturating_add(encoded.len());
                     if diagnostics.len() >= 10_000 || diagnostics_bytes > 64 * 1024 {
-                        return (None, true);
+                        return (Some(self.withheld_diagnostic_publication(uri)), true);
                     }
                     diagnostics.push(diagnostic.clone());
                 }
@@ -17220,6 +17232,15 @@ fn metadata_payload_is_current_in_pass(
         observation,
         read_limit,
         budget.map(|budget| budget as &dyn ProjectWorkBudget),
+    )
+}
+
+/// The diagnostic replacing a document report too large to publish.
+pub(crate) fn withheld_report_diagnostic() -> LspDiagnostic {
+    server_diagnostic(
+        "this document's diagnostics exceed the publication limit (10,000 diagnostics or \
+         64 KiB); they were withheld",
+        DiagnosticSeverity::WARNING,
     )
 }
 

@@ -15706,21 +15706,32 @@ fn pump_pending_diagnostic_publications_with_budget(
             workspace.complete_pending_diagnostic_publication(&uri);
             continue;
         };
-        let message = diagnostics_notification(
+        let mut message = diagnostics_notification(
             &publication.uri,
             publication.version,
             publication.diagnostics,
         );
-        let bytes = serde_json::to_vec(&message)?
+        let mut bytes = serde_json::to_vec(&message)?
             .len()
             .saturating_add(LSP_FRAME_HEADER_RESERVE_BYTES);
-        if bytes > MAX_PUSH_DIAGNOSTIC_NOTIFICATION_BYTES {
-            // Omit the complete report rather than publishing a truncated or
-            // false-empty notification. The operational warning is retained
-            // and retried by a later pump if output is temporarily full.
-            workspace.complete_pending_diagnostic_publication(&uri);
-            workspace.mark_pending_diagnostic_publication_incomplete();
-            continue;
+        let oversized = bytes > MAX_PUSH_DIAGNOSTIC_NOTIFICATION_BYTES;
+        if oversized {
+            // Withhold the complete report rather than publishing a truncated
+            // or false-empty one, but say so in the document: otherwise the
+            // client keeps the previous report, or shows none at all.
+            message = diagnostics_notification(
+                &publication.uri,
+                publication.version,
+                vec![crate::workspace::withheld_report_diagnostic()],
+            );
+            bytes = serde_json::to_vec(&message)?
+                .len()
+                .saturating_add(LSP_FRAME_HEADER_RESERVE_BYTES);
+            if bytes > MAX_PUSH_DIAGNOSTIC_NOTIFICATION_BYTES {
+                workspace.complete_pending_diagnostic_publication(&uri);
+                workspace.mark_pending_diagnostic_publication_incomplete();
+                continue;
+            }
         }
         if budget.serialized_bytes.saturating_add(bytes) > MAX_PUSH_DIAGNOSTIC_BYTES_PER_TURN {
             break;
@@ -15728,6 +15739,9 @@ fn pump_pending_diagnostic_publications_with_budget(
         match connection.send_control(message) {
             Ok(()) => {
                 workspace.complete_pending_diagnostic_publication(&uri);
+                if oversized {
+                    workspace.mark_pending_diagnostic_publication_incomplete();
+                }
                 budget.notification_count += 1;
                 budget.serialized_bytes = budget.serialized_bytes.saturating_add(bytes);
             }
@@ -18053,7 +18067,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_aggregate_is_omitted_with_operational_warning_not_empty_report() {
+    fn oversized_aggregate_is_replaced_by_a_withheld_notice_and_warning_not_a_partial_report() {
         let temp = tempfile::tempdir().expect("workspace");
         let mut workspace = test_workspace(
             vec![temp.path().to_path_buf()],
@@ -18085,7 +18099,25 @@ mod tests {
         }
 
         pump_pending_diagnostic_publications(&server, &mut workspace)
-            .expect("oversized report is skipped, not sent partially");
+            .expect("oversized report is replaced, not sent partially");
+        // The document learns that its report was withheld (l4d-zgyw):
+        // without a publication the client keeps showing the previous one.
+        let Message::Notification(replacement) = client
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("withheld-report publication")
+        else {
+            panic!("expected publishDiagnostics");
+        };
+        assert_eq!(replacement.method, "textDocument/publishDiagnostics");
+        assert_eq!(replacement.params["uri"], target.as_str());
+        let diagnostics = replacement.params["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0]["message"],
+            "this document's diagnostics exceed the publication limit (10,000 diagnostics or \
+             64 KiB); they were withheld"
+        );
         let Message::Notification(warning) = client
             .receiver
             .recv_timeout(Duration::from_secs(1))

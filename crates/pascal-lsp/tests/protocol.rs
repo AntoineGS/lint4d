@@ -138,6 +138,52 @@ fn withheld_lint_names_its_conditional_cause_not_include_expansion() {
     assert_eq!(messages, expected);
 }
 
+/// Windows.pas (Delphi 2010) has more lint findings than one publication may
+/// carry. The report was dropped and nothing was published, so the client
+/// showed no diagnostics, or kept a previous report (l4d-zgyw).
+#[test]
+fn an_oversized_report_still_publishes_that_it_was_withheld() {
+    let mut source = String::from("unit Big;\ninterface\nconst\n");
+    for i in 0..1500 {
+        source.push_str(&format!("  lowerCaseConstant{i} = {i};\n"));
+    }
+    source.push_str("implementation\nend.\n");
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("Big.pas");
+    write_file(&path, &source);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+    let publication = server
+        .diagnostic_with_timeout(&uri(&path), Duration::from_secs(60))
+        .expect("a publishDiagnostics notification for the opened document");
+    let messages = publication["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .map(|diagnostic| diagnostic["message"].as_str().unwrap_or("").to_string())
+        .collect::<Vec<_>>();
+    server.shutdown();
+    assert_eq!(
+        messages,
+        vec![
+            "this document's diagnostics exceed the publication limit (10,000 diagnostics or \
+             64 KiB); they were withheld"
+                .to_string()
+        ]
+    );
+}
+
 #[test]
 fn compiled_dcu_source_navigation_serves_read_only_virtual_type() {
     let temp = tempfile::tempdir().expect("isolated workspace");

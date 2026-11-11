@@ -131,13 +131,22 @@ pub fn predefined_defines(
     defines.insert("CPPBUILDER".to_owned(), ConditionalFact::False);
     defines.insert("BCB".to_owned(), ConditionalFact::False);
     defines.insert("CONSOLE".to_owned(), console);
+    // dcc32 21.0 already defines NATIVECODE; DCC first appears in XE2's
+    // compilers (absent from dcc32 21.0, present in 24.0 and 37.0).
     defines.insert(
         "NATIVECODE".to_owned(),
-        since_fact(version, Since::ConfirmedFrom(23, 0), true),
+        since_fact(version, Since::ConfirmedFrom(21, 0), true),
     );
     defines.insert(
         "DCC".to_owned(),
-        since_fact(version, Since::ConfirmedFrom(23, 0), true),
+        since_fact(
+            version,
+            Since::Observed {
+                absent_through: (21, 0),
+                present_from: (23, 0),
+            },
+            true,
+        ),
     );
 
     for &(symbol, win32, win64, since) in WINDOWS_SYMBOLS {
@@ -165,7 +174,12 @@ enum Since {
     Always,
     At(u32, u32),
     ConfirmedFrom(u32, u32),
-    Unverified,
+    /// Observed absent up to `absent_through` and present from
+    /// `present_from`; unknown between them.
+    Observed {
+        absent_through: (u32, u32),
+        present_from: (u32, u32),
+    },
 }
 
 fn since_fact(version: Option<CompilerVersion>, since: Since, defined: bool) -> ConditionalFact {
@@ -185,7 +199,26 @@ fn since_fact(version: Option<CompilerVersion>, since: Since, defined: bool) -> 
                 Some(Ordering::Equal | Ordering::Greater) => bool_fact(defined),
             }
         }
-        Since::Unverified => ConditionalFact::Unknown,
+        Since::Observed {
+            absent_through,
+            present_from,
+        } => {
+            let at_least = |(major, minor)| {
+                version
+                    .and_then(|version| version.cmp_numeric(CompilerVersion::new(major, minor)))
+                    .map(|ordering| ordering != Ordering::Less)
+            };
+            match (
+                at_least(present_from),
+                version.and_then(|version| {
+                    version.cmp_numeric(CompilerVersion::new(absent_through.0, absent_through.1))
+                }),
+            ) {
+                (Some(true), _) => bool_fact(defined),
+                (_, Some(Ordering::Less | Ordering::Equal)) => ConditionalFact::False,
+                _ => ConditionalFact::Unknown,
+            }
+        }
     }
 }
 
@@ -220,7 +253,28 @@ const WINDOWS_SYMBOLS: &[(&str, bool, bool, Since)] = &[
     ("CPU32BITS", true, false, Since::At(29, 0)),
     ("CPU64BITS", false, true, Since::At(29, 0)),
     ("ASSEMBLER", true, true, Since::At(15, 0)),
-    ("CPUINTEL", true, true, Since::Unverified),
+    // Never defined by dcc32 21.0, 24.0, 37.0 or dcc64 24.0, 37.0.
+    ("CPUINTEL", false, false, Since::Always),
+    // Delphi for .NET only.
+    ("CLR", false, false, Since::Always),
+    (
+        "UNDERSCOREIMPORTNAME",
+        true,
+        false,
+        Since::Observed {
+            absent_through: (21, 0),
+            present_from: (24, 0),
+        },
+    ),
+    (
+        "WEAKREF",
+        true,
+        true,
+        Since::Observed {
+            absent_through: (24, 0),
+            present_from: (37, 0),
+        },
+    ),
 ];
 
 const NON_WINDOWS_SYMBOLS: &[&str] = &[
@@ -248,12 +302,10 @@ const NON_WINDOWS_SYMBOLS: &[&str] = &[
     "CPUARM64",
     "NEXTGEN",
     "AUTOREFCOUNT",
-    "WEAKREF",
     "WEAKINSTREF",
     "EXTERNALLINKER",
     "ELF",
     "PIC",
-    "UNDERSCOREIMPORTNAME",
     "ALIGN_STACK",
     "PC_MAPPED_EXCEPTIONS",
 ];
@@ -311,6 +363,106 @@ mod tests {
         assert_eq!(d13["ANDROID"], F::False);
     }
 
+    /// What dcc itself defines, compiling a unit with `--no-config` and no
+    /// `-D` (one `{$IFDEF}` hint per symbol; dcc32 21.0, dcc32/dcc64 24.0,
+    /// dcc32/dcc64 37.0; `.superpowers/goal/sysutils-expansion/dcc-predefined.txt`,
+    /// l4d-zgyw). Every modeled symbol must agree where its fact is known.
+    #[test]
+    fn predefined_symbols_match_what_dcc_defines() {
+        let observed: &[(u32, &str, &str)] = &[
+            (
+                21,
+                "Win32",
+                "MSWINDOWS WIN32 CPU386 ASSEMBLER CONDITIONALEXPRESSIONS UNICODE NATIVECODE VER210",
+            ),
+            (
+                24,
+                "Win32",
+                "MSWINDOWS WIN32 CPU386 CPUX86 ASSEMBLER CONDITIONALEXPRESSIONS UNICODE NATIVECODE \
+                 DCC UNDERSCOREIMPORTNAME VER240",
+            ),
+            (
+                24,
+                "Win64",
+                "MSWINDOWS WIN64 CPUX64 ASSEMBLER CONDITIONALEXPRESSIONS UNICODE NATIVECODE DCC \
+                 VER240",
+            ),
+            (
+                37,
+                "Win32",
+                "MSWINDOWS WIN32 CPU386 CPUX86 CPU32BITS ASSEMBLER CONDITIONALEXPRESSIONS UNICODE \
+                 NATIVECODE DCC WEAKREF UNDERSCOREIMPORTNAME VER370",
+            ),
+            (
+                37,
+                "Win64",
+                "MSWINDOWS WIN64 CPUX64 CPU64BITS ASSEMBLER CONDITIONALEXPRESSIONS UNICODE \
+                 NATIVECODE DCC WEAKREF VER370",
+            ),
+        ];
+        // Also probed, and undefined by every compiler above.
+        let probed_undefined = [
+            "CPUINTEL",
+            "CPPBUILDER",
+            "BCB",
+            "CLR",
+            "POSIX",
+            "LINUX",
+            "MACOS",
+            "ANDROID",
+            "IOS",
+            "CPUARM",
+            "NEXTGEN",
+            "AUTOREFCOUNT",
+            "WEAKINSTREF",
+            "EXTERNALLINKER",
+            "ELF",
+            "PIC",
+            "ALIGN_STACK",
+            "PC_MAPPED_EXCEPTIONS",
+            "WIN64",
+            "WIN32",
+            "CPU386",
+            "CPUX86",
+            "CPUX64",
+            "CPU32BITS",
+            "CPU64BITS",
+            "DCC",
+            "WEAKREF",
+            "UNDERSCOREIMPORTNAME",
+        ];
+        let mut mismatches = Vec::new();
+        for (major, platform, defined) in observed {
+            let defined = defined.split_whitespace().collect::<Vec<_>>();
+            let facts = facts(*major, 0, platform);
+            for (symbol, fact) in &facts {
+                let expected = if defined.contains(&symbol.as_str()) {
+                    F::True
+                } else if probed_undefined.contains(&symbol.as_str()) || symbol.starts_with("VER") {
+                    F::False
+                } else {
+                    continue;
+                };
+                if *fact != expected {
+                    mismatches.push(format!(
+                        "{major}.0 {platform} {symbol}: {fact:?}, dcc {expected:?}"
+                    ));
+                }
+            }
+            for symbol in &defined {
+                if !facts.contains_key(*symbol) {
+                    mismatches.push(format!("{major}.0 {platform} {symbol}: missing, dcc True"));
+                }
+            }
+            for symbol in ["CLR", "CPUINTEL"] {
+                if !facts.contains_key(symbol) {
+                    mismatches.push(format!("{major}.0 {platform} {symbol}: missing, dcc False"));
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
     #[test]
     fn unmodeled_platforms_leave_the_platform_group_unknown() {
         let linux = facts(37, 0, "Linux64");
@@ -353,10 +505,12 @@ mod tests {
     }
 
     #[test]
-    fn cpuintel_stays_unknown_and_dcc_is_confirmed_from_xe2() {
+    fn cpuintel_is_never_defined_and_dcc_is_confirmed_from_xe2() {
+        // dcc32 21.0/24.0/37.0 and dcc64 24.0/37.0 leave CPUINTEL undefined;
+        // dcc32 21.0 does not define DCC (l4d-zgyw).
         let win32 = facts(37, 0, "Win32");
-        assert_eq!(win32["CPUINTEL"], F::Unknown);
-        assert_eq!(facts(21, 0, "Win32")["DCC"], F::Unknown);
+        assert_eq!(win32["CPUINTEL"], F::False);
+        assert_eq!(facts(21, 0, "Win32")["DCC"], F::False);
         assert_eq!(win32["DCC"], F::True);
     }
 
@@ -369,7 +523,8 @@ mod tests {
         assert_eq!(facts(22, 0, "Win64")["WIN64"], F::False);
         assert_eq!(facts(23, 0, "Win64")["WIN64"], F::True);
         assert_eq!(facts(22, 0, "Win32")["DCC"], F::Unknown);
-        assert_eq!(facts(22, 0, "Win32")["NATIVECODE"], F::Unknown);
+        assert_eq!(facts(20, 0, "Win32")["NATIVECODE"], F::Unknown);
+        assert_eq!(facts(21, 0, "Win32")["NATIVECODE"], F::True);
         assert_eq!(facts(23, 0, "Win32")["DCC"], F::True);
         assert_eq!(facts(23, 0, "Win32")["NATIVECODE"], F::True);
         assert_eq!(facts(14, 0, "Win32")["ASSEMBLER"], F::False);

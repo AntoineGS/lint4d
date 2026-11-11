@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem IdenticalResult.pas
+IdenticalResult.pas(8) E2252 Method 'Foo' with identical parameters already exists

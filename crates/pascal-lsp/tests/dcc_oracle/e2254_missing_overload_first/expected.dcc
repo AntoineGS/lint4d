@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem MissingOverloadFirst.pas
+MissingOverloadFirst.pas(6) E2267 Previous declaration of 'Foo' was not marked with the 'overload' directive

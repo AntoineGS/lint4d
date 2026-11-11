@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem MissingOverloadSecond.pas
+MissingOverloadSecond.pas(6) E2254 Overloaded procedure 'Foo' must be marked with the 'overload' directive
+MissingOverloadSecond.pas(14) E2254 Overloaded procedure 'Foo' must be marked with the 'overload' directive

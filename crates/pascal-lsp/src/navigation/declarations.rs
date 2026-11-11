@@ -3,6 +3,7 @@ use pascal_core::facts::{IncludeSlotOutcome, include_slots};
 use std::collections::HashMap;
 
 type RoutineGroupKey = (Option<String>, String, Option<usize>);
+type RedeclarationGroupKey = (Option<String>, usize, String, usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeclarationComparison {
@@ -282,7 +283,309 @@ impl NavigationIndex {
             }
         }
 
+        if document.conditionals.complete
+            && !document
+                .conditionals
+                .unknown_activity_requires_fail_closed()
+            && include_expansion_complete(document)
+        {
+            let mut declarations_by_scope = HashMap::<RedeclarationGroupKey, Vec<usize>>::new();
+            let mut routines_by_scope = HashMap::<RedeclarationGroupKey, Vec<usize>>::new();
+            budget.require_work(document.symbols.len(), cancel)?;
+            let group_storage_bytes = document.symbols.iter().fold(0usize, |bytes, symbol| {
+                let entry_bytes = std::mem::size_of::<RedeclarationGroupKey>()
+                    .saturating_add(std::mem::size_of::<usize>())
+                    .saturating_add(symbol.key.len())
+                    .saturating_add(symbol.owner_type.as_ref().map_or(0, String::len));
+                let declaration_entries = usize::from(is_redeclaration_candidate(symbol));
+                let routine_entries = usize::from(symbol.kind == SymbolKind::Routine);
+                bytes.saturating_add(
+                    entry_bytes.saturating_mul(declaration_entries + routine_entries),
+                )
+            });
+            budget.require_owned_bytes(group_storage_bytes, cancel)?;
+            for (index, symbol) in document.symbols.iter().enumerate() {
+                check_navigation_cancel(cancel)?;
+                let key = redeclaration_group_key(symbol);
+                if is_redeclaration_candidate(symbol) {
+                    declarations_by_scope
+                        .entry(key.clone())
+                        .or_default()
+                        .push(index);
+                }
+                if symbol.kind == SymbolKind::Routine {
+                    routines_by_scope.entry(key).or_default().push(index);
+                }
+            }
+            if declarations_by_scope
+                .values()
+                .any(|indices| indices.len() > overload::MAX_OVERLOAD_GROUPS)
+                || routines_by_scope
+                    .values()
+                    .any(|indices| indices.len() > overload::MAX_OVERLOAD_GROUPS)
+            {
+                return Err("declaration group exceeds the supported overload bound".to_owned());
+            }
+
+            let mut declaration_groups = declarations_by_scope.into_values().collect::<Vec<_>>();
+            declaration_groups.sort_unstable_by_key(|indices| {
+                indices
+                    .iter()
+                    .filter_map(|index| document.symbols.get(*index))
+                    .map(|symbol| symbol.selection_span.start)
+                    .min()
+                    .unwrap_or(usize::MAX)
+            });
+            for mut indices in declaration_groups {
+                check_navigation_cancel(cancel)?;
+                budget.require_work(1, cancel)?;
+                if !declaration_group_is_proven(document, &indices, proven_end) {
+                    continue;
+                }
+                indices.sort_unstable_by_key(|index| {
+                    document
+                        .symbols
+                        .get(*index)
+                        .map_or(usize::MAX, |symbol| symbol.selection_span.start)
+                });
+                if has_forward_class_pair(document, &indices) {
+                    indices.retain(|index| {
+                        document
+                            .symbols
+                            .get(*index)
+                            .is_none_or(|symbol| !is_forward_class_declaration(document, symbol))
+                    });
+                }
+                if indices.len() < 2 {
+                    continue;
+                }
+                let all_routines = indices.iter().all(|index| {
+                    document
+                        .symbols
+                        .get(*index)
+                        .is_some_and(|symbol| symbol.kind == SymbolKind::Routine)
+                });
+                if all_routines {
+                    let Some(owner) = indices
+                        .first()
+                        .and_then(|index| document.symbols.get(*index))
+                        .and_then(|symbol| symbol.owner_type.as_deref())
+                    else {
+                        continue;
+                    };
+                    if !matches!(
+                        owner_type_kind(document, owner),
+                        Some(TypeKind::Class | TypeKind::Record)
+                    ) {
+                        continue;
+                    }
+                    let mut duplicate_pair = None;
+                    'pairs: for second_position in 1..indices.len() {
+                        let second_index = indices[second_position];
+                        let Some(second) = document.symbols.get(second_index) else {
+                            continue;
+                        };
+                        for &first_index in &indices[..second_position] {
+                            budget.require_work(1, cancel)?;
+                            let Some(first) = document.symbols.get(first_index) else {
+                                continue;
+                            };
+                            if self.duplicate_routine_parameters_match(
+                                uri, first, second, cancel, budget,
+                            )? == ContractMatch::Yes
+                            {
+                                duplicate_pair = Some(second_index);
+                                break 'pairs;
+                            }
+                        }
+                    }
+                    if let Some(index) = duplicate_pair {
+                        let symbol = &document.symbols[index];
+                        let message = DccMessage::E2252.format(&[&symbol.name]);
+                        if !push_diagnostic(
+                            &mut diagnostics,
+                            capacity,
+                            DccMessage::E2252,
+                            symbol.selection_span,
+                            message,
+                            cancel,
+                            budget,
+                        )? {
+                            *diagnostic_cap_reached = true;
+                            return Ok(diagnostics);
+                        }
+                    }
+                    continue;
+                }
+
+                let second = &document.symbols[indices[1]];
+                let message = DccMessage::E2004.format(&[&second.name]);
+                if !push_diagnostic(
+                    &mut diagnostics,
+                    capacity,
+                    DccMessage::E2004,
+                    second.selection_span,
+                    message,
+                    cancel,
+                    budget,
+                )? {
+                    *diagnostic_cap_reached = true;
+                    return Ok(diagnostics);
+                }
+            }
+
+            let mut routine_groups = routines_by_scope.into_values().collect::<Vec<_>>();
+            routine_groups.sort_unstable_by_key(|indices| {
+                indices
+                    .iter()
+                    .filter_map(|index| document.symbols.get(*index))
+                    .map(|symbol| symbol.selection_span.start)
+                    .min()
+                    .unwrap_or(usize::MAX)
+            });
+            for mut indices in routine_groups {
+                check_navigation_cancel(cancel)?;
+                budget.require_work(1, cancel)?;
+                if indices.len() < 2 || !declaration_group_is_proven(document, &indices, proven_end)
+                {
+                    continue;
+                }
+                indices.sort_unstable_by_key(|index| {
+                    document
+                        .symbols
+                        .get(*index)
+                        .map_or(usize::MAX, |symbol| symbol.selection_span.start)
+                });
+                for position in 0..indices.len() {
+                    check_navigation_cancel(cancel)?;
+                    let current_index = indices[position];
+                    let Some(current) = document.symbols.get(current_index) else {
+                        continue;
+                    };
+                    if current.routine_directives.overload {
+                        continue;
+                    }
+                    let mut evidence_end = position;
+                    if current.origin == Origin::Definition {
+                        let mut matching_declaration = None;
+                        for (declaration_position, &declaration_index) in
+                            indices[..position].iter().enumerate()
+                        {
+                            let Some(declaration) = document.symbols.get(declaration_index) else {
+                                continue;
+                            };
+                            if declaration.origin != Origin::Declaration {
+                                continue;
+                            }
+                            budget.require_work(1, cancel)?;
+                            if self.duplicate_routine_parameters_match(
+                                uri,
+                                declaration,
+                                current,
+                                cancel,
+                                budget,
+                            )? == ContractMatch::Yes
+                            {
+                                matching_declaration = Some((declaration_position, declaration));
+                                break;
+                            }
+                        }
+                        if let Some((declaration_position, declaration)) = matching_declaration {
+                            if declaration.routine_directives.overload {
+                                continue;
+                            }
+                            evidence_end = declaration_position;
+                        }
+                    }
+                    let mut missing_overload = false;
+                    for &previous_index in &indices[..evidence_end] {
+                        budget.require_work(1, cancel)?;
+                        let Some(previous) = document.symbols.get(previous_index) else {
+                            continue;
+                        };
+                        if !previous.routine_directives.overload {
+                            continue;
+                        }
+                        if self.duplicate_routine_parameters_match(
+                            uri, previous, current, cancel, budget,
+                        )? == ContractMatch::No
+                        {
+                            missing_overload = true;
+                            break;
+                        }
+                    }
+                    if !missing_overload {
+                        continue;
+                    }
+                    let message = DccMessage::E2254.format(&[&current.name]);
+                    if !push_diagnostic(
+                        &mut diagnostics,
+                        capacity,
+                        DccMessage::E2254,
+                        current.selection_span,
+                        message,
+                        cancel,
+                        budget,
+                    )? {
+                        *diagnostic_cap_reached = true;
+                        return Ok(diagnostics);
+                    }
+                }
+            }
+        }
+
         Ok(diagnostics)
+    }
+
+    fn duplicate_routine_parameters_match(
+        &self,
+        uri: &Url,
+        left: &Symbol,
+        right: &Symbol,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<ContractMatch, String> {
+        if left.routine_kind != right.routine_kind
+            || left.is_static != right.is_static
+            || !left.generic_parameters.is_empty()
+            || !right.generic_parameters.is_empty()
+        {
+            return Ok(ContractMatch::Unknown);
+        }
+        if left.routine_parameters.len() != right.routine_parameters.len() {
+            return Ok(ContractMatch::No);
+        }
+
+        let empty = GenericSubstitution::empty();
+        let mut unknown = false;
+        for (left_parameter, right_parameter) in left
+            .routine_parameters
+            .iter()
+            .zip(&right.routine_parameters)
+        {
+            if left_parameter.mode != right_parameter.mode {
+                return Ok(ContractMatch::No);
+            }
+            match self.contract_parameter_type_match(
+                uri,
+                left_parameter.type_ref.as_ref(),
+                &empty,
+                uri,
+                right_parameter.type_ref.as_ref(),
+                &empty,
+                cancel,
+                budget,
+            )? {
+                ContractMatch::Yes => {}
+                ContractMatch::No => return Ok(ContractMatch::No),
+                ContractMatch::Unknown => unknown = true,
+            }
+        }
+        Ok(if unknown {
+            ContractMatch::Unknown
+        } else {
+            ContractMatch::Yes
+        })
     }
 
     fn definition_satisfies_declaration(
@@ -422,6 +725,72 @@ impl NavigationIndex {
             DeclarationComparison::Same
         })
     }
+}
+
+fn redeclaration_group_key(symbol: &Symbol) -> RedeclarationGroupKey {
+    (
+        symbol.owner_type.clone(),
+        symbol.scope,
+        symbol.key.clone(),
+        symbol.generic_parameters.len(),
+    )
+}
+
+fn is_redeclaration_candidate(symbol: &Symbol) -> bool {
+    symbol.origin == Origin::Declaration
+        && symbol.generic_parameter.is_none()
+        && !symbol.local_only
+        && matches!(
+            symbol.kind,
+            SymbolKind::Type
+                | SymbolKind::Routine
+                | SymbolKind::Variable
+                | SymbolKind::Constant
+                | SymbolKind::Parameter
+                | SymbolKind::Field
+                | SymbolKind::Property
+        )
+}
+
+fn declaration_group_is_proven(document: &Document, indices: &[usize], proven_end: usize) -> bool {
+    indices.iter().all(|index| {
+        document.symbols.get(*index).is_some_and(|symbol| {
+            !symbol.unresolved_abbreviated
+                && symbol_is_proven(symbol, proven_end)
+                && !symbol_conditional_state_is_unknown(document, *index)
+        })
+    })
+}
+
+fn has_forward_class_pair(document: &Document, indices: &[usize]) -> bool {
+    indices.iter().any(|index| {
+        document
+            .symbols
+            .get(*index)
+            .is_some_and(|symbol| is_forward_class_declaration(document, symbol))
+    }) && indices.iter().any(|index| {
+        document.symbols.get(*index).is_some_and(|symbol| {
+            symbol.kind == SymbolKind::Type
+                && symbol.type_kind == TypeKind::Class
+                && !is_forward_class_declaration(document, symbol)
+        })
+    })
+}
+
+fn is_forward_class_declaration(document: &Document, symbol: &Symbol) -> bool {
+    symbol.kind == SymbolKind::Type
+        && symbol.type_kind == TypeKind::Class
+        && symbol.type_excerpt_end.is_some_and(|end| {
+            document.source.get(..end).is_some_and(|prefix| {
+                prefix
+                    .split_whitespace()
+                    .last()
+                    .is_some_and(|word| word.eq_ignore_ascii_case("class"))
+            }) && document
+                .source
+                .get(end..symbol.declaration_span.end)
+                .is_some_and(|suffix| suffix.trim_start().starts_with(';'))
+        })
 }
 
 fn routine_group_key(symbol: &Symbol) -> RoutineGroupKey {

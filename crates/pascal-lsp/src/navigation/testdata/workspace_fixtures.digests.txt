@@ -169,6 +169,13 @@ crates/lint4d/tests/fixtures/use_after_free/good_nil_checks_after_freeandnil.pas
 crates/lint4d/tests/fixtures/use_after_free/good_no_use_after_free.pas f9cd51c3518ad7ec 3
 crates/lint4d/tests/fixtures/use_after_free/good_reassign_after_free.pas 8ed5e6a394f34400 3
 crates/pascal-lsp/tests/dcc_oracle/clean_unit/Clean.pas 5750b89e1830adf4 10
+crates/pascal-lsp/tests/dcc_oracle/e2004_class_field_method/ClassFieldMethod.pas e8af61e6bc95ec1a 4
+crates/pascal-lsp/tests/dcc_oracle/e2004_class_fields/ClassFields.pas b628dd5a49286ea8 4
+crates/pascal-lsp/tests/dcc_oracle/e2004_implementation_redeclaration/ImplementationRedeclaration.pas 1c788c2121ff52bb 3
+crates/pascal-lsp/tests/dcc_oracle/e2004_local_duplicates/LocalDuplicates.pas b8eb38438c583c3f 5
+crates/pascal-lsp/tests/dcc_oracle/e2004_local_parameter_local/LocalParameter.pas 631209e9058dcc4a 6
+crates/pascal-lsp/tests/dcc_oracle/e2004_not_redeclared/NotRedeclared.pas 51d8f8764a82b563 14
+crates/pascal-lsp/tests/dcc_oracle/e2004_unit_level/UnitLevel.pas e1d7ba782242378d 3
 crates/pascal-lsp/tests/dcc_oracle/e2037_abbreviated_header/AbbreviatedHeader.pas 1792f7b725f30cca 6
 crates/pascal-lsp/tests/dcc_oracle/e2037_calling_convention/CallingConvention.pas de86bb3ce01097b1 3
 crates/pascal-lsp/tests/dcc_oracle/e2037_class_flag/ClassFlag.pas 6744018646c28ff3 4
@@ -189,6 +196,12 @@ crates/pascal-lsp/tests/dcc_oracle/e2065_method_missing/MethodMissing.pas 101c3b
 crates/pascal-lsp/tests/dcc_oracle/e2065_nested_forward/NestedForward.pas 9b9bb316797dbec1 5
 crates/pascal-lsp/tests/dcc_oracle/e2065_object_missing/ObjectMissing.pas 0579c65bcee39076 3
 crates/pascal-lsp/tests/dcc_oracle/e2065_standalone_missing/StandaloneMissing.pas eb755cdcb78aea91 2
+crates/pascal-lsp/tests/dcc_oracle/e2252_identical_params/IdenticalParams.pas ba5a88bf40cfb68f 6
+crates/pascal-lsp/tests/dcc_oracle/e2254_missing_overload_definition/MissingOverloadDefinition.pas f7c8445f894f5f68 7
+crates/pascal-lsp/tests/dcc_oracle/e2254_missing_overload_first/MissingOverloadFirst.pas 81b280fd253ab1dc 7
+crates/pascal-lsp/tests/dcc_oracle/e2254_missing_overload_second/MissingOverloadSecond.pas 36a8ef3cccb5ee72 7
+crates/pascal-lsp/tests/dcc_oracle/e2301_identical_procedure/IdenticalProcedure.pas 0b377b2bb90e4e44 6
+crates/pascal-lsp/tests/dcc_oracle/e2301_identical_result/IdenticalResult.pas 856278cf06fa9f5d 6
 crates/pascal-lsp/tests/dcc_oracle/probe_basic/Probe.pas 2baab173c2f82413 14
 crates/tree-sitter-pascal/examples/anon.pas 5179f19b9bf474c7 8
 crates/tree-sitter-pascal/examples/codetoolmanager.pas 17edb8c787ae1561 2737

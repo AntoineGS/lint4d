@@ -1269,6 +1269,8 @@ pub(crate) fn mapped(
         .first()
         .ok_or("compile-time session has no root occurrence")?
         .id;
+    // Recorded after the analysis's own reasons, which name the cause.
+    let mut unresolved = Vec::new();
     {
         let mut mapping = Mapping {
             analysis: &analysis,
@@ -1279,6 +1281,7 @@ pub(crate) fn mapped(
             directives: 0,
             result: &mut result,
             projection: &mut projection,
+            unresolved: &mut unresolved,
         };
         mapping.append_occurrence(root, 0)?;
         mapping.charge_work(analysis.observations.len())?;
@@ -1288,7 +1291,7 @@ pub(crate) fn mapped(
         result.errors.extend(analysis.warnings.iter().cloned());
         result
             .errors
-            .extend(analysis.reasons.iter().map(|r| format!("{r:?}")));
+            .extend(analysis.reasons.iter().map(describe_incomplete_reason));
         result.errors.push(
             if projection.unknown_activity_requires_fail_closed() {
                 "shared compile-time analysis has unknown conditional compilation activity"
@@ -1298,6 +1301,7 @@ pub(crate) fn mapped(
             .into(),
         );
     }
+    result.errors.append(&mut unresolved);
     for value in &analysis.observations {
         if cancel.is_cancelled() {
             return Err(super::CANCELLATION_MESSAGE.into());
@@ -1311,6 +1315,24 @@ pub(crate) fn mapped(
     Ok(result)
 }
 
+/// Prefix of an expansion error naming an include the session could not
+/// resolve.
+pub(crate) const UNRESOLVED_INCLUDE: &str = "unresolved include";
+
+fn describe_incomplete_reason(reason: &pascal_core::compile_time::IncompleteReason) -> String {
+    use pascal_core::compile_time::IncompleteReason;
+    match reason {
+        IncompleteReason::Limit { name, maximum } => {
+            format!("the {name} limit ({maximum}) was reached")
+        }
+        IncompleteReason::RequiredSource { source, reason } => {
+            format!("{} is required: {reason}", source.as_str())
+        }
+        IncompleteReason::MalformedSource => "a directive could not be analysed".into(),
+        IncompleteReason::Cancelled => "the analysis was cancelled".into(),
+    }
+}
+
 struct Mapping<'a> {
     analysis: &'a CompileTimeAnalysis,
     limits: ExpansionLimits,
@@ -1320,6 +1342,7 @@ struct Mapping<'a> {
     directives: usize,
     result: &'a mut ExpansionResult,
     projection: &'a mut ConditionalAnalysis,
+    unresolved: &'a mut Vec<String>,
 }
 
 impl Mapping<'_> {
@@ -1448,6 +1471,10 @@ impl Mapping<'_> {
             } else if !inactive {
                 // A missing/unknown child is a barrier, not a successful EOF.
                 self.result.complete = false;
+                self.unresolved.push(format!(
+                    "{UNRESOLVED_INCLUDE} {}",
+                    &source[include.directive.range.clone()]
+                ));
                 self.synthetic("\n{ unresolved include }\n")?;
             }
             cursor = range.end;

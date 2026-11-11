@@ -15,6 +15,7 @@ import {
   statusIcon,
   statusText,
   statusTooltip,
+  shouldPollStatus,
   type StatusSnapshot,
   fileName,
 } from '../../src/statusFormat';
@@ -167,6 +168,13 @@ describe('status tooltip', () => {
 });
 
 describe('polling and URI labels', () => {
+  it('polls only while focused, running, and showing a Pascal editor', () => {
+    expect(shouldPollStatus({ focused: true, clientStatus: 'running', hasVisiblePascalEditor: true })).toBe(true);
+    expect(shouldPollStatus({ focused: false, clientStatus: 'running', hasVisiblePascalEditor: true })).toBe(false);
+    expect(shouldPollStatus({ focused: true, clientStatus: 'starting', hasVisiblePascalEditor: true })).toBe(false);
+    expect(shouldPollStatus({ focused: true, clientStatus: 'running', hasVisiblePascalEditor: false })).toBe(false);
+  });
+
   it('polls quickly until all index contexts are complete', () => {
     expect(FAST_POLL_MS).toBe(5000);
     expect(SLOW_POLL_MS).toBe(30000);

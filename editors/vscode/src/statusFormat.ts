@@ -19,6 +19,16 @@ export interface StatusSnapshot {
 export const FAST_POLL_MS = 5000;
 export const SLOW_POLL_MS = 30000;
 
+export function shouldPollStatus(conditions: {
+  focused: boolean;
+  clientStatus: StatusSnapshot['clientStatus'];
+  hasVisiblePascalEditor: boolean;
+}): boolean {
+  return conditions.focused
+    && conditions.clientStatus === 'running'
+    && conditions.hasVisiblePascalEditor;
+}
+
 export function statusIcon(snapshot: StatusSnapshot): '' | '$(error) ' | '$(sync~spin) ' | '$(warning) ' {
   if (snapshot.clientStatus === 'stopped' || snapshot.clientStatus === 'failed') return '$(error) ';
   if (snapshot.clientStatus === 'starting' || snapshot.index?.contexts.some((context) => context.pending > 0)) {

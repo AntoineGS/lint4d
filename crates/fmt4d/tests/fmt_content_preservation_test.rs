@@ -378,3 +378,47 @@ end.
 ",
     );
 }
+
+/// The class ancestor list was rebuilt from the text of its type
+/// references, losing the directives and comments attached around them
+/// (`class(TForm{$IFDEF CDLAMIA}, ISkinable{$ENDIF})` in many forms).
+#[test]
+fn trivia_in_class_ancestor_lists_is_kept() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+type
+  TFoo = class(TForm{$IFDEF X}, ISkinable{$ENDIF})
+  end;
+  TBar = class(TA, IB{$IFNDEF NO_SAFECALL}, IC{$ENDIF}) // c
+  end;
+  TBaz = class({ base } TObject, {$IFDEF Y} IY {$ENDIF})
+  end;
+implementation
+end.
+",
+        "\
+unit T;
+
+interface
+
+type
+  TFoo = class(TForm {$IFDEF X}, ISkinable {$ENDIF})
+
+  end;
+
+  TBar = class(TA, IB {$IFNDEF NO_SAFECALL}, IC {$ENDIF}) // c
+
+  end;
+
+  TBaz = class( { base } TObject, {$IFDEF Y} IY {$ENDIF})
+
+  end;
+
+implementation
+
+end.
+",
+    );
+}

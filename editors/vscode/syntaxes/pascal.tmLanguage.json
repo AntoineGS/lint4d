@@ -1,1 +1,77 @@
-{"scopeName":"source.pascal","name":"Pascal","patterns":[]}
+{
+  "scopeName": "source.pascal",
+  "name": "Pascal",
+  "patterns": [
+    {
+      "name": "meta.preprocessor.pascal",
+      "begin": "\\{\\$",
+      "end": "\\}"
+    },
+    {
+      "name": "meta.preprocessor.pascal",
+      "begin": "\\(\\*\\$",
+      "end": "\\*\\)"
+    },
+    {
+      "name": "comment.block.brace.pascal",
+      "begin": "\\{",
+      "end": "\\}"
+    },
+    {
+      "name": "comment.block.paren.pascal",
+      "begin": "\\(\\*",
+      "end": "\\*\\)"
+    },
+    {
+      "name": "comment.line.double-slash.pascal",
+      "match": "//.*$"
+    },
+    {
+      "name": "string.quoted.single.pascal",
+      "begin": "'",
+      "end": "'(?!')",
+      "patterns": [
+        {
+          "name": "constant.character.escape.pascal",
+          "match": "''"
+        }
+      ]
+    },
+    {
+      "name": "constant.character.pascal",
+      "match": "#(\\$[0-9A-Fa-f]+|[0-9]+)"
+    },
+    {
+      "name": "constant.numeric.pascal",
+      "match": "\\$[0-9A-Fa-f]+"
+    },
+    {
+      "name": "constant.numeric.pascal",
+      "match": "%[01]+"
+    },
+    {
+      "name": "constant.numeric.pascal",
+      "match": "&[0-7]+"
+    },
+    {
+      "name": "constant.numeric.pascal",
+      "match": "\\b[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)?\\b"
+    },
+    {
+      "name": "keyword.control.pascal",
+      "match": "(?i)\\b(begin|end|if|then|else|case|of|for|to|downto|do|while|repeat|until|try|except|finally|raise|with)\\b"
+    },
+    {
+      "name": "keyword.other.pascal",
+      "match": "(?i)\\b(unit|interface|implementation|uses|program|library|package|initialization|finalization)\\b"
+    },
+    {
+      "name": "storage.type.pascal",
+      "match": "(?i)\\b(procedure|function|constructor|destructor|property|class|record|object|type|var|const|resourcestring|threadvar|array|set|string)\\b"
+    },
+    {
+      "name": "constant.language.pascal",
+      "match": "(?i)\\b(nil|true|false)\\b"
+    }
+  ]
+}

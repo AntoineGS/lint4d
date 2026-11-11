@@ -173,23 +173,26 @@ export function mainSourceConfirmed(sourceContext: ProjectContext, targetUri: st
   return sourceContext.selectedProjectUri === targetUri;
 }
 
+export function activeDocumentMatches(
+  capturedUri: string | undefined,
+  activeUri: string | undefined,
+): boolean {
+  return capturedUri !== undefined && activeUri === capturedUri;
+}
+
 export function buildSelectionMessage(field: BuildField, ctx: BuildContext): string {
   const info = ctx[field];
-  const name = field === 'config' ? 'Build configuration' : 'Build platform';
-  const value = info.selected === null ? 'Automatic' : `${info.selected} (${info.mode})`;
+  const name = field === 'config' ? 'Build configuration' : 'Platform';
+  const value = `${info.selected ?? 'Automatic'} (${info.mode})`;
   const conditionals = ctx.conditionals.closed
     ? 'conditionals closed'
-    : ctx.conditionals.openReasons.length > 0
-      ? `conditionals open: ${ctx.conditionals.openReasons.join(', ')}`
-      : 'conditionals open';
+    : `conditionals open: ${ctx.conditionals.openReasons.join(', ')}`;
   return `${name}: ${value}; ${conditionals}`;
 }
 
 export function installationSelectionMessage(ctx: InstallationContext): string {
-  const value = ctx.selectedInstallationId === null
-    ? 'Automatic'
-    : `${ctx.selectedInstallationId} (${ctx.selectionMode})`;
-  return `Delphi installation: ${value}`;
+  const value = `${ctx.selectedInstallationId ?? 'Automatic'} (${ctx.selectionMode})`;
+  return `Delphi installation selection: ${value}`;
 }
 
 export function summarizeWarnings(warnings: readonly string[]): string | undefined {

@@ -12,6 +12,7 @@ import type {
   ProjectContext,
 } from '../../src/protocol';
 import {
+  activeDocumentMatches,
   browseDestination,
   buildItems,
   buildSelectionMessage,
@@ -184,7 +185,7 @@ describe('build and installation choices', () => {
       { value: 'studio-22', label: 'studio-22' },
     ]);
     expect(installationSelectionMessage(installationContext))
-      .toBe('Delphi installation: studio-23 (configured)');
+      .toBe('Delphi installation selection: studio-23 (configured)');
   });
 });
 
@@ -280,6 +281,13 @@ describe('project candidate and browse decisions', () => {
     expect(mainSourceConfirmed(selected, selected.selectedProjectUri!)).toBe(true);
     expect(mainSourceConfirmed(selected, 'file:///c%3A/src/Other/Other.dproj')).toBe(false);
   });
+
+  it('permits browse navigation only while the originating document is active', () => {
+    const origin = 'file:///home/u/src/App/Unit.pas';
+    expect(activeDocumentMatches(origin, origin)).toBe(true);
+    expect(activeDocumentMatches(origin, 'file:///home/u/src/Other/Other.pas')).toBe(false);
+    expect(activeDocumentMatches(origin, undefined)).toBe(false);
+  });
 });
 
 describe('selection messages and warning summaries', () => {
@@ -293,7 +301,28 @@ describe('selection messages and warning summaries', () => {
     expect(buildSelectionMessage('config', {
       ...buildContext,
       config: { ...buildContext.config, selected: null },
-    })).toBe('Build configuration: Automatic; conditionals open: compilerVersion unknown');
+    })).toBe('Build configuration: Automatic (projectDefault); conditionals open: compilerVersion unknown');
+    expect(buildSelectionMessage('platform', buildContext))
+      .toBe('Platform: Win32 (configured); conditionals open: compilerVersion unknown');
+    expect(buildSelectionMessage('platform', {
+      ...buildContext,
+      platform: { ...buildContext.platform, selected: null },
+      conditionals: { ...buildContext.conditionals, closed: true },
+    })).toBe('Platform: Automatic (configured); conditionals closed');
+    expect(buildSelectionMessage('platform', {
+      ...buildContext,
+      conditionals: { ...buildContext.conditionals, openReasons: [] },
+    })).toBe('Platform: Win32 (configured); conditionals open: ');
+  });
+
+  it('reports Delphi installation selection with mode for selected and Automatic values', () => {
+    expect(installationSelectionMessage(installationContext))
+      .toBe('Delphi installation selection: studio-23 (configured)');
+    expect(installationSelectionMessage({
+      ...installationContext,
+      selectedInstallationId: null,
+      selectionMode: 'automatic',
+    })).toBe('Delphi installation selection: Automatic (automatic)');
   });
 
   it('summarizes zero, one, and multiple warnings', () => {

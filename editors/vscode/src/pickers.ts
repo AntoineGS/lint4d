@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import type { ClientHost } from './clientHost';
 import {
+  activeDocumentMatches,
   browseDestination,
   buildItems,
   buildSelectionMessage,
@@ -161,6 +162,13 @@ export function registerPickers(host: ClientHost): vscode.Disposable {
     previousContext: ProjectContext | undefined,
     gen: number,
   ): Promise<void> => {
+    const capturedDocumentUri = vscode.window.activeTextEditor?.document.uri.toString();
+    const canNavigate = (): boolean => generation.isCurrent(gen)
+      && activeDocumentMatches(
+        capturedDocumentUri,
+        vscode.window.activeTextEditor?.document.uri.toString(),
+      );
+
     if (!requireFlag('projectCatalogue', 'repository project browsing')) return;
     const context = previousContext ?? await request<ProjectContext>(
       Methods.projectContext,
@@ -225,7 +233,7 @@ export function registerPickers(host: ClientHost): vscode.Disposable {
       didSelectEmitter.fire();
 
       const destination = browseDestination(context, uri, targetUri, selected);
-      if (destination.kind === 'stay' || !generation.isCurrent(gen)) return;
+      if (destination.kind === 'stay' || !canNavigate()) return;
       if (destination.kind === 'open-project') {
         void vscode.window.showWarningMessage(destination.reason);
         await openDocument(targetUri, gen);
@@ -237,7 +245,7 @@ export function registerPickers(host: ClientHost): vscode.Disposable {
         { textDocument: { uri: destination.mainSourceUri } },
         gen,
       );
-      if (!generation.isCurrent(gen)) return;
+      if (!canNavigate()) return;
       if (source && mainSourceConfirmed(source, targetUri)) {
         await openDocument(destination.mainSourceUri, gen);
       } else {

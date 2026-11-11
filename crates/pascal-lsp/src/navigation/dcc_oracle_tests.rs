@@ -169,6 +169,30 @@ fn finding_differences_compare_duplicate_occurrences() {
 }
 
 #[test]
+fn identical_parameter_methods_match_dcc_across_overload_directives() {
+    for name in [
+        "e2252_identical_params_unmarked",
+        "e2252_identical_params_first_overload",
+        "e2252_identical_params_second_overload",
+    ] {
+        let case = load_case(&cases_root().join(name));
+        let expected = parse_expected(&case)
+            .into_iter()
+            .filter(|finding| finding.code == "E2252")
+            .collect::<Vec<_>>();
+        let actual = actual_findings(&case)
+            .into_iter()
+            .filter(|finding| finding.code == "E2252")
+            .collect::<Vec<_>>();
+        let (invented, missed) = finding_differences(&expected, &actual);
+
+        assert_eq!(expected.len(), 1, "{name}: expected one dcc E2252");
+        assert!(invented.is_empty(), "{name}: invented E2252: {invented:?}");
+        assert!(missed.is_empty(), "{name}: missed dcc E2252: {missed:?}");
+    }
+}
+
+#[test]
 fn dcc_oracle_cases_match_recorded_dcc_output() {
     let rtl_available = std::env::var_os("PASCAL_RTL").is_some();
     let mut dirs = std::fs::read_dir(cases_root())

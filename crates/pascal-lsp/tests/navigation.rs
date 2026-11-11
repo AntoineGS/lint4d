@@ -18247,3 +18247,21 @@ fn under_x_plus_with_beats_the_implicit_result() {
     assert_eq!(locations.len(), 1, "{locations:?}");
     assert_eq!(locations[0].range.start, position_of(consumer, "Result", 0));
 }
+
+#[test]
+fn under_x_plus_a_nested_procedures_own_local_result_shadows_the_outer_one() {
+    // R11: `procedure N; var Result: Integer;` nested in a function.
+    let consumer = "unit ImportedConsumer;\n{$X+}\ninterface\nuses ImportedProvider;\nfunction G: Integer;\nimplementation\nfunction G: Integer;\n  procedure N;\n  var\n    Result: Integer;\n  begin\n    Result := 42;\n  end;\nbegin\n  Result := 1;\n  N;\nend;\nend.\n";
+    let locations = result_binding(consumer, 1);
+    assert_eq!(locations.len(), 1, "{locations:?}");
+    assert_eq!(locations[0].range.start, position_of(consumer, "Result", 0));
+}
+
+#[test]
+fn under_x_plus_a_nested_procedures_result_parameter_shadows_the_outer_one() {
+    // R11: `procedure M(Result: Integer);` nested in a function.
+    let consumer = "unit ImportedConsumer;\n{$X+}\ninterface\nuses ImportedProvider;\nfunction G: Integer;\nimplementation\nfunction G: Integer;\n  procedure M(Result: Integer);\n  begin\n    Result := 43;\n  end;\nbegin\n  Result := 1;\n  M(0);\nend;\nend.\n";
+    let locations = result_binding(consumer, 1);
+    assert_eq!(locations.len(), 1, "{locations:?}");
+    assert_eq!(locations[0].range.start, position_of(consumer, "Result", 0));
+}

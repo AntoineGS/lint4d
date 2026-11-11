@@ -7741,6 +7741,8 @@ impl Workspace {
         walk: ImportWalk,
         probe: &mut dyn FnMut(&Self) -> Result<bool, String>,
     ) -> Result<ImportWalkOutcome, String> {
+        // Only this walk's absences reach its caller.
+        self.lazy_absences.clear();
         let mut frontier = vec![uri.clone()];
         let mut visited = HashSet::new();
         let mut initialized = HashSet::from([uri.clone()]);

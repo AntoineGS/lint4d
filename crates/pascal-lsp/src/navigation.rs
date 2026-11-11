@@ -7737,9 +7737,6 @@ impl NavigationIndex {
                 WithLookup::NotFound => {}
             }
         }
-        if key == "result" && document.implicit_result_at(offset, scope) {
-            return Ok(Vec::new());
-        }
         let owner_type =
             document.owner_type_at_identifier_with_budget(identifier, scope, cancel, budget)?;
 
@@ -7781,6 +7778,12 @@ impl NavigationIndex {
             if !local.is_empty() {
                 return Ok(local);
             }
+        }
+        // Below the locals (a nested routine's own `Result` local or
+        // parameter wins, dcc R11; a function's cannot exist, E2004) and
+        // above the class members.
+        if key == "result" && document.implicit_result_at(offset, scope) {
+            return Ok(Vec::new());
         }
 
         if let Some(owner_type) = owner_type.as_deref() {
@@ -9357,9 +9360,6 @@ impl NavigationIndex {
             WithLookup::Unknown => return Vec::new(),
             WithLookup::NotFound => {}
         }
-        if key == "result" && document.implicit_result_at(offset, scope) {
-            return Vec::new();
-        }
 
         // Search lexical scopes from the innermost outward. A local symbol
         // shadows both the unit's declarations and imported declarations.
@@ -9389,6 +9389,10 @@ impl NavigationIndex {
             if !local.is_empty() {
                 return local;
             }
+        }
+        // Below the locals (dcc R11) and above the class members.
+        if key == "result" && document.implicit_result_at(offset, scope) {
+            return Vec::new();
         }
 
         // Class members are the next lexical scope in Delphi. They must be

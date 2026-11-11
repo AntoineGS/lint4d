@@ -440,7 +440,10 @@ impl<'a> DocBuilder<'a> {
                         parts.push(item);
                     }
                 }
-                return doc::concat(parts);
+                let expansion = doc::concat(parts);
+                // Each copy of the suffix repeats its directives.
+                self.allow_directive_rewrite(node, self.span_with_outer_trivia(node), &expansion);
+                return expansion;
             }
         }
 
@@ -537,6 +540,7 @@ impl<'a> DocBuilder<'a> {
             ContentAllowance {
                 dropped: ",".repeat(commas),
                 added: suffix.repeat(count.saturating_sub(1)),
+                ..ContentAllowance::default()
             },
         )
     }

@@ -506,3 +506,52 @@ end.
 ",
     );
 }
+
+/// Two rewrites change the order of compiler directives by design and are
+/// recorded exactly: sorting a `uses` clause moves a conditional group with
+/// its unit, and expanding `A, B: T` repeats the directives of `T`.
+#[test]
+fn recorded_directive_rewrites_are_accepted() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+uses
+  Zeta, {$IFDEF Y} Yankee, {$ENDIF} Mid, {$IFDEF X} Alpha, {$ENDIF} Beta;
+implementation
+procedure P;
+var
+  ctx, ctx1: {$IFNDEF FPC}TMD5_CTX{$ELSE}TMD5Context{$IFEND};
+begin
+end;
+end.
+",
+        "\
+unit T;
+
+interface
+
+uses
+  Beta,
+  Mid,
+  {$IFDEF X}
+  Alpha,
+  {$ENDIF}
+  {$IFDEF Y}
+  Yankee,
+  {$ENDIF}
+  Zeta;
+
+implementation
+
+procedure P;
+var
+  ctx: {$IFNDEF FPC}TMD5_CTX{$ELSE}TMD5Context{$IFEND};
+  ctx1: {$IFNDEF FPC}TMD5_CTX{$ELSE}TMD5Context{$IFEND};
+begin
+end;
+
+end.
+",
+    );
+}

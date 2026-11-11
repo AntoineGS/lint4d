@@ -1,6 +1,6 @@
 use crate::comments::CommentMap;
 use crate::config::FmtConfig;
-use crate::content_check::{ContentAllowance, code_separators};
+use crate::content_check::{ContentAllowance, DirectiveRewrite, code_separators};
 use crate::directive_map::DirectiveMap;
 use crate::doc::{self, Doc};
 use pascal_core::FormatOffRegion;
@@ -141,6 +141,55 @@ impl<'a> DocBuilder<'a> {
             .borrow_mut()
             .insert(node.id(), allowance);
         Doc::ContentMark(node.id())
+    }
+
+    /// Record that the doc `output`, emitted for `node` (whose allowance is
+    /// already recorded, see [`Self::allow_content_change`]), holds the
+    /// directives of the source bytes `span` in its own order. Nothing is
+    /// recorded when `span` holds no directive.
+    pub(crate) fn allow_directive_rewrite(&self, node: Node<'a>, span: Range<usize>, output: &Doc) {
+        let text = &self.source[span.clone()];
+        if !text.windows(2).any(|w| w == b"{$") && !text.windows(3).any(|w| w == b"(*$") {
+            return;
+        }
+        let first_line = 1 + self.source[..span.start]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        self.content_allowances
+            .borrow_mut()
+            .entry(node.id())
+            .or_default()
+            .directive_rewrites
+            .push(DirectiveRewrite {
+                first_line,
+                source: pascal_core::decode_bytes(text).into_owned(),
+                output: doc::text_lines_of(output),
+            });
+    }
+
+    /// The source span of `node` with the comments and directives attached
+    /// before its first leaf and after its last one.
+    pub(crate) fn span_with_outer_trivia(&self, node: Node<'a>) -> Range<usize> {
+        let first = first_leaf(node);
+        let start = self
+            .comments
+            .leading_comments(first.id())
+            .iter()
+            .map(|c| c.span.start)
+            .chain(
+                self.directives
+                    .leading_directives(first.id())
+                    .iter()
+                    .map(|d| d.span.start),
+            )
+            .fold(node.start_byte(), usize::min);
+        let end = self
+            .trailing_items(last_leaf(node))
+            .iter()
+            .map(|item| item.span.end)
+            .fold(node.end_byte(), usize::max);
+        start..end
     }
 
     /// Record the parent kind of every node under `root` in one walk.
@@ -921,7 +970,10 @@ impl<'a> DocBuilder<'a> {
         if !lines.is_empty() {
             parts.push(Doc::Hardline);
         }
-        doc::concat(parts)
+        let uses = doc::concat(parts);
+        // Sorting moves conditional groups with their units.
+        self.allow_directive_rewrite(node, self.span_with_outer_trivia(node), &uses);
+        uses
     }
 
     /// Comments and directives leading the leaf `keyword`, laid out as in
@@ -1215,7 +1267,7 @@ mod tests {
             tree.root_node(),
             crate::content_check::ContentAllowance {
                 dropped: ";".into(),
-                added: String::new(),
+                ..Default::default()
             },
         );
         drop(discarded);

@@ -155,19 +155,34 @@ pub fn token(text: impl Into<String>, kind: &'static str, parent_kind: &'static 
 /// the rendered output, whatever its layout. Of an `IfBreak`, the broken
 /// branch.
 pub fn text_of(doc: &Doc) -> String {
-    fn collect(doc: &Doc, out: &mut String) {
+    text_joined(doc, ' ')
+}
+
+/// The text of `doc`'s tokens and raw pieces, one per line, so that a `//`
+/// comment in one piece does not run into the next.
+pub fn text_lines_of(doc: &Doc) -> String {
+    text_joined(doc, '\n')
+}
+
+fn text_joined(doc: &Doc, separator: char) -> String {
+    fn collect(doc: &Doc, separator: char, out: &mut String) {
         match doc {
             Doc::Token { text, .. } | Doc::Raw(text) | Doc::LineStart(text) => {
-                out.push(' ');
+                out.push(separator);
                 out.push_str(text);
             }
             Doc::Concat(docs) | Doc::Fill(docs) | Doc::AlignGroup(docs) => {
-                docs.iter().for_each(|d| collect(d, out));
+                docs.iter().for_each(|d| collect(d, separator, out));
             }
-            Doc::Indent(inner) | Doc::Group(inner) => collect(inner, out),
-            Doc::IfBreak { broken, .. } => collect(broken, out),
-            Doc::FillRest(rest) => rest.as_slice().iter().for_each(|d| collect(d, out)),
-            Doc::AlignRow(cells) => cells.iter().for_each(|c| collect(&c.content, out)),
+            Doc::Indent(inner) | Doc::Group(inner) => collect(inner, separator, out),
+            Doc::IfBreak { broken, .. } => collect(broken, separator, out),
+            Doc::FillRest(rest) => rest
+                .as_slice()
+                .iter()
+                .for_each(|d| collect(d, separator, out)),
+            Doc::AlignRow(cells) => cells
+                .iter()
+                .for_each(|c| collect(&c.content, separator, out)),
             Doc::Hardline
             | Doc::BlankLine
             | Doc::Line
@@ -178,7 +193,7 @@ pub fn text_of(doc: &Doc) -> String {
         }
     }
     let mut out = String::new();
-    collect(doc, &mut out);
+    collect(doc, separator, &mut out);
     out
 }
 

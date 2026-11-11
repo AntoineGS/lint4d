@@ -292,10 +292,75 @@ fn directives(text: &str) -> Vec<(String, Token<'_>, usize)> {
     found
 }
 
-/// Describes where the ordered directives of `input` and `output` first
-/// differ, if they do.
-fn describe_directive_order(input: &str, output: &str, summary: &mut String) {
+/// The directives of `input` in the order the output must hold them: the
+/// source order, with each run a [`DirectiveRewrite`] covers replaced by the
+/// directives it records for the output. A rewrite applies to the first run
+/// of exactly its source directives that starts on or after its line; one
+/// that matches no run changes nothing. Each directive is paired with how a
+/// summary shows it.
+fn expected_directives(input: &str, rewrites: &[DirectiveRewrite]) -> Vec<(String, String)> {
+    let shown_at = |token: Token<'_>, line: usize, side: &str| {
+        format!("{} ({side} line {line})", shown(token))
+    };
     let before = directives(input);
+    let mut rewrites: Vec<&DirectiveRewrite> = rewrites.iter().collect();
+    rewrites.sort_by_key(|r| r.first_line);
+    let mut expected = Vec::new();
+    let mut next = 0;
+    for rewrite in rewrites {
+        let source: Vec<String> = directives(&rewrite.source)
+            .into_iter()
+            .map(|(key, _, _)| key)
+            .collect();
+        if source.is_empty() {
+            continue;
+        }
+        let found = (next..before.len()).find(|&start| {
+            before[start].2 >= rewrite.first_line
+                && before.len() - start >= source.len()
+                && before[start..start + source.len()]
+                    .iter()
+                    .zip(&source)
+                    .all(|(b, s)| b.0 == *s)
+        });
+        let Some(start) = found else {
+            continue;
+        };
+        expected.extend(
+            before[next..start]
+                .iter()
+                .map(|(key, token, line)| (key.clone(), shown_at(*token, *line, "source"))),
+        );
+        expected.extend(
+            directives(&rewrite.output)
+                .into_iter()
+                .map(|(key, token, _)| {
+                    let line = before[start].2;
+                    (
+                        key,
+                        format!("{} (rewritten from source line {line})", shown(token)),
+                    )
+                }),
+        );
+        next = start + source.len();
+    }
+    expected.extend(
+        before[next..]
+            .iter()
+            .map(|(key, token, line)| (key.clone(), shown_at(*token, *line, "source"))),
+    );
+    expected
+}
+
+/// Describes where the ordered directives of `output` first differ from the
+/// ones expected from `input` (see [`expected_directives`]), if they do.
+fn describe_directive_order(
+    input: &str,
+    output: &str,
+    rewrites: &[DirectiveRewrite],
+    summary: &mut String,
+) {
+    let before = expected_directives(input, rewrites);
     let after = directives(output);
     let first_difference = before
         .iter()
@@ -305,20 +370,22 @@ fn describe_directive_order(input: &str, output: &str, summary: &mut String) {
     let Some(index) = first_difference else {
         return;
     };
-    let side = |list: &[(String, Token<'_>, usize)]| {
-        list.get(index)
-            .map_or("nothing".to_string(), |(_, token, line)| {
-                format!("{} (line {line})", shown(*token))
-            })
-    };
+    let expected = before
+        .get(index)
+        .map_or("nothing".to_string(), |(_, shown)| {
+            shown.replace(" (source line ", " (line ")
+        });
+    let actual = after
+        .get(index)
+        .map_or("nothing".to_string(), |(_, token, line)| {
+            format!("{} (line {line})", shown(*token))
+        });
     append(
         summary,
         &format!(
-            "would change the order of compiler directives: directive {} is {} in the source \
-             but {} in the output",
+            "would change the order of compiler directives: directive {} is {expected} in the \
+             source but {actual} in the output",
             index + 1,
-            side(&before),
-            side(&after)
         ),
     );
 }
@@ -329,6 +396,18 @@ fn describe_directive_order(input: &str, output: &str, summary: &mut String) {
 pub(crate) struct ContentAllowance {
     pub(crate) dropped: String,
     pub(crate) added: String,
+    /// Runs of directives the output holds in another order or repeated.
+    pub(crate) directive_rewrites: Vec<DirectiveRewrite>,
+}
+
+/// A rewrite that changes the order of directives: the directives of the
+/// source text `source`, starting on 1-based line `first_line` of the input,
+/// are emitted as the directives of `output`, in that order.
+#[derive(Debug, Clone)]
+pub(crate) struct DirectiveRewrite {
+    pub(crate) first_line: usize,
+    pub(crate) source: String,
+    pub(crate) output: String,
 }
 
 impl ContentAllowance {
@@ -337,6 +416,8 @@ impl ContentAllowance {
         self.dropped.push_str(&other.dropped);
         self.added.push(' ');
         self.added.push_str(&other.added);
+        self.directive_rewrites
+            .extend(other.directive_rewrites.iter().cloned());
     }
 }
 
@@ -372,7 +453,7 @@ pub(crate) fn check_content_preserved(
         describe(input, &mut counts, 1, "would drop", &mut summary);
         describe(output, &mut counts, -1, "would add", &mut summary);
     }
-    describe_directive_order(input, output, &mut summary);
+    describe_directive_order(input, output, &allowance.directive_rewrites, &mut summary);
     if summary.is_empty() {
         Ok(())
     } else {
@@ -434,6 +515,7 @@ mod tests {
         let allowance = ContentAllowance {
             dropped: ",".into(),
             added: ": Integer = 1;".into(),
+            ..ContentAllowance::default()
         };
         assert_eq!(check_content_preserved(input, output, &allowance), Ok(()));
     }
@@ -468,9 +550,34 @@ mod tests {
     }
 
     #[test]
+    fn a_recorded_directive_rewrite_allows_exactly_its_order() {
+        use super::DirectiveRewrite;
+        let input = "{$A}\nuses {$IFDEF Y} Y, {$ENDIF} {$IFDEF X} X, {$ENDIF};\n{$B}\n";
+        let output = "{$A}\nuses {$IFDEF X} X, {$ENDIF} {$IFDEF Y} Y, {$ENDIF};\n{$B}\n";
+        assert!(check(input, output).is_err());
+        let rewrite = |first_line| ContentAllowance {
+            directive_rewrites: vec![DirectiveRewrite {
+                first_line,
+                source: "uses {$IFDEF Y} Y, {$ENDIF} {$IFDEF X} X, {$ENDIF};".into(),
+                output: "{$IFDEF X}\nX,\n{$ENDIF}\n{$IFDEF Y}\nY,\n{$ENDIF}".into(),
+            }],
+            ..ContentAllowance::default()
+        };
+        assert_eq!(check_content_preserved(input, output, &rewrite(2)), Ok(()));
+        // A rewrite anchored after its run does not apply.
+        assert!(check_content_preserved(input, output, &rewrite(3)).is_err());
+        // It allows no other order change.
+        let moved_b = "{$B}\nuses {$IFDEF X} X, {$ENDIF} {$IFDEF Y} Y, {$ENDIF};\n{$A}\n";
+        assert!(check_content_preserved(input, moved_b, &rewrite(2)).is_err());
+    }
+
+    #[test]
     fn a_number_glued_to_a_keyword_may_be_separated() {
         // `1do` is the number `1` then `do` to the compiler.
-        assert_eq!(check("for I := 0 to 1do X;", "for I := 0 to 1 do X;"), Ok(()));
+        assert_eq!(
+            check("for I := 0 to 1do X;", "for I := 0 to 1 do X;"),
+            Ok(())
+        );
         assert_eq!(check("if A = 1then B;", "if A = 1 then B;"), Ok(()));
         assert_eq!(check("X := 1e5;", "X := 1e5;"), Ok(()));
         assert!(check("X := 1e5;", "X := 1 e5;").is_err());

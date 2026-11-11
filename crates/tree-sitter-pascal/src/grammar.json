@@ -4858,6 +4858,10 @@
                 },
                 {
                   "type": "SYMBOL",
+                  "name": "declStringCodePage"
+                },
+                {
+                  "type": "SYMBOL",
                   "name": "declProcRef"
                 },
                 {
@@ -4922,6 +4926,10 @@
                 },
                 {
                   "type": "SYMBOL",
+                  "name": "declStringCodePage"
+                },
+                {
+                  "type": "SYMBOL",
                   "name": "declProcRef"
                 },
                 {
@@ -4983,6 +4991,10 @@
                       {
                         "type": "SYMBOL",
                         "name": "declString"
+                      },
+                      {
+                        "type": "SYMBOL",
+                        "name": "declStringCodePage"
                       },
                       {
                         "type": "SYMBOL",
@@ -8760,6 +8772,27 @@
         ]
       }
     },
+    "declStringCodePage": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "identifier"
+        },
+        {
+          "type": "STRING",
+          "value": "("
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_expr"
+        },
+        {
+          "type": "STRING",
+          "value": ")"
+        }
+      ]
+    },
     "declProcRef": {
       "type": "PREC_RIGHT",
       "value": 1,
@@ -12103,6 +12136,10 @@
     [
       "_ref",
       "_typeref"
+    ],
+    [
+      "exprArgs",
+      "declStringCodePage"
     ],
     [
       "defProc",

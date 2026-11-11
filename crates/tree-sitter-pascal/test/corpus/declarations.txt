@@ -830,3 +830,33 @@ const
         (literalNumber)
         (exprBinary (identifier) (kSub) (literalNumber))))
       (defaultValue (kEq) (literalNumber)))))
+
+===
+Code page string types
+===
+
+type
+  RawByteString = type AnsiString($ffff);
+  UTF8String = type AnsiString(65001);
+  Latin1 = AnsiString(1252);
+
+var
+  a: AnsiString(CP_ACP);
+
+---
+
+(root
+  (declTypes (kType)
+    (declType (identifier) (kEq) (kType)
+      (type
+        (declStringCodePage (identifier) (literalNumber))))
+    (declType (identifier) (kEq) (kType)
+      (type
+        (declStringCodePage (identifier) (literalNumber))))
+    (declType (identifier) (kEq)
+      (type
+        (declStringCodePage (identifier) (literalNumber)))))
+  (declVars (kVar)
+    (declVar
+      (identifier)
+      (type (declStringCodePage (identifier) (identifier))))))

@@ -848,6 +848,30 @@ fn an_unknown_define_keeps_the_value_its_branch_assumed() {
     assert_eq!(activity(&a, "DEFINE STILL"), Truth::False);
 }
 
+/// Delphi 2010's System.pas declares `RawByteString = type AnsiString($ffff)`
+/// before getmem.inc tests `{$if RTLVersion < 20}`. A code-page string type
+/// left every later constant condition unknown, and System.pas withheld lint
+/// (l4d-zgyw). dcc32 21.0 and dcc64 37.0 take the `{$ELSE}` branch here.
+#[test]
+fn a_code_page_string_type_keeps_later_constant_conditions_known() {
+    for declaration in [
+        "type R = type AnsiString($ffff);",
+        "type R = type AnsiString(1252);",
+        "type R = AnsiString(65001);",
+    ] {
+        let source = format!(
+            "unit T; interface const V = 21.00; {declaration} \
+             {{$IF V < 20}}{{$DEFINE OLD}}{{$ELSE}}{{$DEFINE NEW}}{{$IFEND}} implementation end."
+        );
+        let a = Fixture::new(&source, context(LayoutPlatform::Win32))
+            .analyze()
+            .unwrap();
+        assert!(a.root.complete, "{declaration}: {:?}", a.reasons);
+        assert_eq!(activity(&a, "DEFINE OLD"), Truth::False, "{declaration}");
+        assert_eq!(activity(&a, "DEFINE NEW"), Truth::True, "{declaration}");
+    }
+}
+
 #[test]
 fn phase_b_caller_branch_budget_is_shared_with_sequential_forks() {
     let mut f = Fixture::new(

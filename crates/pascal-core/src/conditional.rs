@@ -186,23 +186,28 @@ impl ConditionalAnalysis {
     /// that conditional, and for an `ELSE`/`ELSEIF` arm also the `IF` that
     /// starts its frame.
     pub fn unknown_code_conditions(&self) -> Vec<&ConditionalDirective> {
-        let mut frames: Vec<usize> = Vec::new();
-        let mut frame_start = vec![None; self.directives.len()];
-        for (index, directive) in self.directives.iter().enumerate() {
-            match directive.kind {
-                DirectiveKind::ConditionalStart => {
-                    frames.push(index);
-                    frame_start[index] = Some(index);
-                }
-                DirectiveKind::ConditionalMiddle => frame_start[index] = frames.last().copied(),
-                DirectiveKind::ConditionalEnd => {
-                    frames.pop();
-                }
-                _ => {}
-            }
-        }
         let mut conditions: Vec<&ConditionalDirective> = Vec::new();
+        // Each open frame: its IF and the ELSE/ELSEIF arms seen so far.
+        let mut frames: Vec<Vec<usize>> = Vec::new();
+        let mut next = 0;
         for span in &self.unknown_spans {
+            while let Some(directive) = self.directives.get(next)
+                && directive.end <= span.start
+            {
+                match directive.kind {
+                    DirectiveKind::ConditionalStart => frames.push(vec![next]),
+                    DirectiveKind::ConditionalMiddle => {
+                        if let Some(frame) = frames.last_mut() {
+                            frame.push(next);
+                        }
+                    }
+                    DirectiveKind::ConditionalEnd => {
+                        frames.pop();
+                    }
+                    _ => {}
+                }
+                next += 1;
+            }
             if !self
                 .projected_source
                 .get(span.clone())
@@ -210,25 +215,25 @@ impl ConditionalAnalysis {
             {
                 continue;
             }
-            let Some(index) = self.directives.iter().position(|directive| {
-                directive.end == span.start
-                    && directive.activity == Truth::True
-                    && matches!(
-                        directive.kind,
-                        DirectiveKind::ConditionalStart | DirectiveKind::ConditionalMiddle
-                    )
-            }) else {
-                continue;
-            };
-            let start = frame_start[index].filter(|start| *start != index);
-            let own = (!is_else_directive(&self.directives[index].body)).then_some(index);
-            for found in start.into_iter().chain(own) {
-                let directive = &self.directives[found];
-                if !conditions
-                    .iter()
-                    .any(|known| known.start == directive.start)
-                {
-                    conditions.push(directive);
+            // A frame that is itself certainly reached puts the code under
+            // unknown activity through the conditions of its current arm and
+            // of the arms before it.
+            for frame in &frames {
+                let Some(&start) = frame.first() else {
+                    continue;
+                };
+                if self.directives[start].activity != Truth::True {
+                    continue;
+                }
+                for &index in frame {
+                    let directive = &self.directives[index];
+                    if directive.condition == Some(Truth::Unknown)
+                        && !conditions
+                            .iter()
+                            .any(|known| known.start == directive.start)
+                    {
+                        conditions.push(directive);
+                    }
                 }
             }
         }
@@ -5963,6 +5968,45 @@ fn is_harmless_keyword(keyword: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Review M3 (l4d-zgyw): the conditionals named for code under unknown
+    /// activity include code after a nested `ENDIF` or a `DEFINE` inside the
+    /// unknown arm, and every condition an `ELSE`/`ELSEIF` arm depends on.
+    #[test]
+    fn unknown_code_conditions_cover_nested_ends_defines_and_elseif_chains() {
+        let named = |source: &str| {
+            let analysis = super::analyze(source, &[]);
+            analysis
+                .unknown_code_conditions()
+                .iter()
+                .map(|directive| directive.body.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            named(
+                "unit T; interface {$IFDEF A}{$IFDEF B}{$ENDIF}var X: Integer;{$ENDIF} implementation end."
+            ),
+            ["IFDEF A"]
+        );
+        assert_eq!(
+            named(
+                "unit T; interface {$IFDEF A}{$DEFINE C}var X: Integer;{$ENDIF} implementation end."
+            ),
+            ["IFDEF A"]
+        );
+        assert_eq!(
+            named(
+                "unit T; interface {$IF Defined(A)}{$ELSEIF Defined(B)}{$ELSE}var X: Integer;{$IFEND} implementation end."
+            ),
+            ["IF Defined(A)", "ELSEIF Defined(B)"]
+        );
+        assert_eq!(
+            named(
+                "unit T; interface {$IFDEF MSWINDOWS_IS_UNKNOWN}{$ENDIF}var X: Integer; implementation end."
+            ),
+            Vec::<String>::new()
+        );
+    }
+
     /// l4d-9bxx: a trivia search is charged for the bytes it visits, not for
     /// a 4 KiB window ending far past the delimiter.
     #[test]

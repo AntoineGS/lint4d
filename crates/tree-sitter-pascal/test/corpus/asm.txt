@@ -68,3 +68,21 @@ end;
         (identifier)
         (kDiv))
       (kEnd))))
+
+===
+Asm parenthesised character operands
+===
+
+procedure P;
+asm
+  ADD     DX,('A'-'0')-10
+end;
+
+---
+
+(root
+  (defProc
+    (declProc (kProcedure) (identifier))
+    (asm (kAsm)
+      (asmBody (identifier) (identifier))
+      (kEnd))))

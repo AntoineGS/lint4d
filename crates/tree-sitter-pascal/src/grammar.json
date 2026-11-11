@@ -3546,8 +3546,12 @@
             "value": "\"[^\"\\r\\n]*\""
           },
           {
-            "type": "PATTERN",
-            "value": "\\([^*]|\\)"
+            "type": "STRING",
+            "value": "("
+          },
+          {
+            "type": "STRING",
+            "value": ")"
           }
         ]
       }
@@ -4737,6 +4741,10 @@
                           ]
                         },
                         {
+                          "type": "SYMBOL",
+                          "name": "namedArgument"
+                        },
+                        {
                           "type": "PREC",
                           "value": -1,
                           "content": {
@@ -4789,6 +4797,10 @@
               ]
             },
             {
+              "type": "SYMBOL",
+              "name": "namedArgument"
+            },
+            {
               "type": "PREC",
               "value": -1,
               "content": {
@@ -4802,6 +4814,31 @@
               }
             }
           ]
+        }
+      ]
+    },
+    "namedArgument": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "SYMBOL",
+            "name": "identifier"
+          }
+        },
+        {
+          "type": "SYMBOL",
+          "name": "kAssign"
+        },
+        {
+          "type": "FIELD",
+          "name": "value",
+          "content": {
+            "type": "SYMBOL",
+            "name": "_expr"
+          }
         }
       ]
     },
@@ -6313,6 +6350,15 @@
           "name": "identifier"
         },
         {
+          "type": "ALIAS",
+          "content": {
+            "type": "SYMBOL",
+            "name": "kReference"
+          },
+          "named": true,
+          "value": "identifier"
+        },
+        {
           "type": "PREC",
           "value": -1,
           "content": {
@@ -6427,8 +6473,22 @@
             "type": "FIELD",
             "name": "operand",
             "content": {
-              "type": "SYMBOL",
-              "name": "_typeref"
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "SYMBOL",
+                  "name": "_typeref"
+                },
+                {
+                  "type": "ALIAS",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "kFile"
+                  },
+                  "named": true,
+                  "value": "identifier"
+                }
+              ]
             }
           }
         ]
@@ -8590,6 +8650,24 @@
                                 "type": "ALIAS",
                                 "content": {
                                   "type": "SYMBOL",
+                                  "name": "kRequired"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kOptional"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
                                   "name": "kAlias"
                                 },
                                 "named": true,
@@ -9009,6 +9087,24 @@
                     "content": {
                       "type": "SYMBOL",
                       "name": "kMessage"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kRequired"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kOptional"
                     },
                     "named": true,
                     "value": "identifier"
@@ -11001,6 +11097,24 @@
                                 "type": "ALIAS",
                                 "content": {
                                   "type": "SYMBOL",
+                                  "name": "kRequired"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kOptional"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
                                   "name": "kAlias"
                                 },
                                 "named": true,
@@ -11420,6 +11534,24 @@
                     "content": {
                       "type": "SYMBOL",
                       "name": "kMessage"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kRequired"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kOptional"
                     },
                     "named": true,
                     "value": "identifier"
@@ -11937,6 +12069,24 @@
                                 "type": "ALIAS",
                                 "content": {
                                   "type": "SYMBOL",
+                                  "name": "kRequired"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kOptional"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
                                   "name": "kAlias"
                                 },
                                 "named": true,
@@ -12356,6 +12506,24 @@
                     "content": {
                       "type": "SYMBOL",
                       "name": "kMessage"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kRequired"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kOptional"
                     },
                     "named": true,
                     "value": "identifier"
@@ -15609,6 +15777,26 @@
     },
     {
       "type": "SYMBOL",
+      "name": "kPackage"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kRequires"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kContains"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kReadonly"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kWriteonly"
+    },
+    {
+      "type": "SYMBOL",
       "name": "kTrue"
     },
     {
@@ -15870,26 +16058,6 @@
     {
       "type": "SYMBOL",
       "name": "kXor"
-    },
-    {
-      "type": "SYMBOL",
-      "name": "kPackage"
-    },
-    {
-      "type": "SYMBOL",
-      "name": "kRequires"
-    },
-    {
-      "type": "SYMBOL",
-      "name": "kContains"
-    },
-    {
-      "type": "SYMBOL",
-      "name": "kReadonly"
-    },
-    {
-      "type": "SYMBOL",
-      "name": "kWriteonly"
     }
   ],
   "inline": [],

@@ -69,6 +69,7 @@ function varName($) {
 			$.kNoreturn, $.kLocal, $.kFar, $.kNear,
 			$.kDefault, $.kNodefault, $.kDeprecated, $.kExperimental,
 			$.kMessage,
+			...enable_if(objc, $.kRequired, $.kOptional),
 			...enable_if(fpc,
 				$.kAlias,
 				$.kPlatform, $.kUnimplemented,
@@ -446,6 +447,11 @@ module.exports = grammar({
 		$.kWinapi,
 		$.kAlias,
 		$.kDelayed,
+		$.kPackage,
+		$.kRequires,
+		$.kContains,
+		$.kReadonly,
+		$.kWriteonly,
 		$.kTrue,
 		$.kFalse,
 		$.kAnd,
@@ -512,11 +518,6 @@ module.exports = grammar({
 		$.kWhile,
 		$.kWith,
 		$.kXor,
-		$.kPackage,
-		$.kRequires,
-		$.kContains,
-		$.kReadonly,
-		$.kWriteonly,
 	],
 
 	extras: $ => [$._space, $.comment, $.ppDirective],
@@ -737,7 +738,7 @@ module.exports = grammar({
 			/[.,:;+\-*\/\[\]<>=&%$@#^!|?~]/, // Punctuation, including local labels
 			/'[^'\r\n]*'/,      // Character and string operands
 			/"[^"\r\n]*"/,
-			/\([^*]|\)/         // Parentheses that are not comments
+			'(', ')',           // `(*` still starts a comment (longest match)
 		)),
 
 		// EXPRESSIONS ---------------------------------------------------------
@@ -874,8 +875,11 @@ module.exports = grammar({
 		// Default(String), TypeInfo(String).
 		exprArgs:        $ => delimited1(choice(
 			seq($._expr, optional($.legacyFormat)),
+			$.namedArgument,
 			prec(-1, alias($.kString, $.identifier)),
 		)),
+		// Automation calls name their arguments: `Add(Name := 'a')`.
+		namedArgument:   $ => seq(field('name', $.identifier), $.kAssign, field('value', $._expr)),
 		// A separate reduction distinguishes `is not T` from `is (not T)`.
 		_exprIsNot:      $ => prec(5, seq($.kIs, $.kNot)),
 
@@ -979,6 +983,9 @@ module.exports = grammar({
 
 		_typeref:        $ => choice(
 			$.identifier,
+			// A type named `Reference` (type libraries): `reference to` is
+			// only a procedure reference when `to` follows.
+			alias($.kReference, $.identifier),
 			// Keep `string` usable as a typeref in signatures/generic arguments,
 			// but prefer `declString` where the full string-type rule is available.
 			prec(-1, alias($.kString, $.identifier)),
@@ -990,7 +997,9 @@ module.exports = grammar({
 
 		typerefDot:      $ => op.infix(1,$._typeref, $.kDot, $._typeref),
 		typerefTpl:      $ => op.args(1, $._typeref, $.kLt, $.typerefArgs, $.kGt),
-		typerefPtr:      $ => op.prefix(1,$.kHat, $._typeref),
+		typerefPtr:      $ => op.prefix(1,$.kHat, choice(
+			$._typeref, alias($.kFile, $.identifier)
+		)),
 		typerefArgs:     $ => delimited1($._typeref),
 
 		// GENERIC TYPE DECLARATION --------------------------------------------

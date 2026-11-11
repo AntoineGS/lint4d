@@ -140,3 +140,56 @@ end.
     (implementation (kImplementation))
     (kEnd)
     (kEndDot)))
+
+===
+Directive words as field and type names
+===
+
+type
+  TFoo = class
+  public
+    required: Boolean;
+    optional: Integer;
+  end;
+  PF = ^FILE;
+  TP = procedure(const Reference: Reference);
+
+---
+
+(root
+  (declTypes (kType)
+    (declType (identifier) (kEq)
+      (declClass (kClass)
+        (declSection (kPublic)
+          (declField (identifier) (type (typeref (identifier))))
+          (declField (identifier) (type (typeref (identifier)))))
+        (kEnd)))
+    (declType (identifier) (kEq)
+      (type (typeref (typerefPtr (kHat) (identifier)))))
+    (declType (identifier) (kEq)
+      (type (declProcRef (kProcedure)
+        (declArgs (declArg (kConst) (identifier) (type (typeref (identifier))))))))))
+
+===
+Named arguments of automation calls
+===
+
+procedure P;
+begin
+  o.Names.Add(Name := 'a', RefersToR1C1 := Liste);
+end;
+
+---
+
+(root
+  (defProc
+    (declProc (kProcedure) (identifier))
+    (block (kBegin)
+      (statement
+        (exprCall
+          (exprDot (exprDot (identifier) (kDot) (identifier)) (kDot) (identifier))
+          (exprArgs
+            (namedArgument (identifier) (kAssign) (literalString))
+            (namedArgument (identifier) (kAssign) (identifier)))))
+      (kEnd))))
+

@@ -99,6 +99,11 @@ typedef enum {
     KWINAPI,
     KALIAS,
     KDELAYED,
+    KPACKAGE,
+    KREQUIRES,
+    KCONTAINS,
+    KREADONLY,
+    KWRITEONLY,
     KTRUE,
     KFALSE,
     KAND,
@@ -165,11 +170,6 @@ typedef enum {
     KWHILE,
     KWITH,
     KXOR,
-    KPACKAGE,
-    KREQUIRES,
-    KCONTAINS,
-    KREADONLY,
-    KWRITEONLY,
 } TokenType;
 
 static inline bool is_ascii_letter(int32_t c) {

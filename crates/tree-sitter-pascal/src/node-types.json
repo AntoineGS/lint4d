@@ -4234,6 +4234,10 @@
           "named": true
         },
         {
+          "type": "namedArgument",
+          "named": true
+        },
+        {
           "type": "ppFragmentExpr",
           "named": true
         }
@@ -7513,6 +7517,114 @@
         },
         {
           "type": "kDot",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "namedArgument",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "value": {
+        "multiple": true,
+        "required": true,
+        "types": [
+          {
+            "type": "exprBinary",
+            "named": true
+          },
+          {
+            "type": "exprBrackets",
+            "named": true
+          },
+          {
+            "type": "exprCall",
+            "named": true
+          },
+          {
+            "type": "exprConditional",
+            "named": true
+          },
+          {
+            "type": "exprDot",
+            "named": true
+          },
+          {
+            "type": "exprParens",
+            "named": true
+          },
+          {
+            "type": "exprSubscript",
+            "named": true
+          },
+          {
+            "type": "exprTpl",
+            "named": true
+          },
+          {
+            "type": "exprUnary",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "inherited",
+            "named": true
+          },
+          {
+            "type": "kFalse",
+            "named": true
+          },
+          {
+            "type": "kNil",
+            "named": true
+          },
+          {
+            "type": "kSpecialize",
+            "named": true
+          },
+          {
+            "type": "kTrue",
+            "named": true
+          },
+          {
+            "type": "lambda",
+            "named": true
+          },
+          {
+            "type": "literalNumber",
+            "named": true
+          },
+          {
+            "type": "literalString",
+            "named": true
+          },
+          {
+            "type": "ppFragmentExpr",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "kAssign",
           "named": true
         }
       ]

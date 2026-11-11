@@ -1,5 +1,6 @@
 use crate::comments::CommentMap;
 use crate::config::FmtConfig;
+use crate::content_check::{ContentAllowance, code_separators};
 use crate::directive_map::DirectiveMap;
 use crate::doc::{self, Doc};
 use pascal_core::FormatOffRegion;
@@ -77,6 +78,9 @@ pub struct DocBuilder<'a> {
     /// Set while building a copy of a node whose comments and directives
     /// are emitted with another copy (see [`Self::without_trivia`]).
     trivia_suppressed: Cell<bool>,
+    /// Content each rewriting node knowingly drops or adds, by node id, for
+    /// the content-preservation check.
+    content_allowances: RefCell<HashMap<usize, ContentAllowance>>,
 }
 
 impl<'a> DocBuilder<'a> {
@@ -98,6 +102,7 @@ impl<'a> DocBuilder<'a> {
             blank_line_rows: blank_line_rows(source),
             parent_kinds: RefCell::new(HashMap::new()),
             trivia_suppressed: Cell::new(false),
+            content_allowances: RefCell::new(HashMap::new()),
         }
     }
 
@@ -110,6 +115,23 @@ impl<'a> DocBuilder<'a> {
             return body;
         }
         doc::concat(vec![body, self.eof_trivia_doc(root)])
+    }
+
+    /// Everything the built docs knowingly drop from or add to the source.
+    pub(crate) fn content_allowance(&self) -> ContentAllowance {
+        let mut total = ContentAllowance::default();
+        for allowance in self.content_allowances.borrow().values() {
+            total.extend(allowance);
+        }
+        total
+    }
+
+    /// Record what the doc of `node` drops from or adds to its source text.
+    /// A node built again replaces its earlier record.
+    pub(crate) fn allow_content_change(&self, node: Node<'a>, allowance: ContentAllowance) {
+        self.content_allowances
+            .borrow_mut()
+            .insert(node.id(), allowance);
     }
 
     /// Record the parent kind of every node under `root` in one walk.
@@ -797,6 +819,24 @@ impl<'a> DocBuilder<'a> {
                 self.external_units,
             )
         };
+
+        let source_separators = code_separators(&pascal_core::decode_bytes(
+            &self.source[node.start_byte()..node.end_byte()],
+        ));
+        let laid_out_separators = code_separators(&lines.join("\n"));
+        let mut allowance = ContentAllowance::default();
+        for (c, source, laid_out) in [
+            (',', source_separators.0, laid_out_separators.0),
+            (';', source_separators.1, laid_out_separators.1),
+        ] {
+            let target = if source > laid_out {
+                &mut allowance.dropped
+            } else {
+                &mut allowance.added
+            };
+            target.extend(std::iter::repeat_n(c, source.abs_diff(laid_out)));
+        }
+        self.allow_content_change(node, allowance);
 
         let mut parts = Vec::new();
         parts.push(Doc::Hardline);

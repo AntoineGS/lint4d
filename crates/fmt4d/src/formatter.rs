@@ -19,6 +19,11 @@ use std::collections::HashSet;
 /// If `source` has parse errors, returns [`crate::error::FmtError::Parse`]
 /// — the formatter will not rewrite a file whose AST it doesn't trust.
 ///
+/// If the output would not hold exactly the source's content (a formatter
+/// bug dropping, duplicating or inventing text), returns
+/// [`crate::error::FmtError::ContentChanged`] instead of the output, so no
+/// caller writes it.
+///
 /// **For disk I/O, prefer [`format_bytes`]**, which also detects and preserves
 /// the source encoding on output.
 ///
@@ -69,6 +74,7 @@ pub fn format_source(
         external_units,
     );
     let doc = builder.build(root);
+    let allowance = builder.content_allowance();
     // Source length is a good upper bound for output length (the
     // formatter mostly adds/removes whitespace). Slight overshoot
     // avoids the final realloc. Review PERF-H4.
@@ -83,6 +89,16 @@ pub fn format_source(
     if has_bom && !final_output.starts_with('\u{FEFF}') {
         final_output.insert(0, '\u{FEFF}');
     }
+
+    crate::content_check::check_content_preserved(
+        &pascal_core::decode_bytes(source),
+        &final_output,
+        &allowance,
+    )
+    .map_err(|summary| crate::error::FmtError::ContentChanged {
+        path: info.path.clone(),
+        summary,
+    })?;
 
     Ok(final_output)
 }

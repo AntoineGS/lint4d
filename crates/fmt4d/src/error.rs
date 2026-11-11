@@ -11,6 +11,15 @@ pub enum FmtError {
     #[error("parse error in {}: {message}", path.display())]
     Parse { path: PathBuf, message: String },
 
+    /// The formatted output would not hold exactly the source's content
+    /// (a formatter bug). Nothing is returned, so callers write nothing.
+    #[error(
+        "refusing to format {}: the formatter {summary}; the source was left unchanged \
+         (this is an fmt4d bug, please report it)",
+        path.display()
+    )]
+    ContentChanged { path: PathBuf, summary: String },
+
     /// Failed to load or deserialize `.fmt4d.toml`.
     ///
     /// `source` is boxed because `toml::de::Error` is ~120 bytes — without

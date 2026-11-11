@@ -146,6 +146,36 @@ pub fn token(text: impl Into<String>, kind: &'static str, parent_kind: &'static 
     }
 }
 
+/// The text `doc` emits, its pieces separated by spaces: the same tokens as
+/// the rendered output, whatever its layout. Of an `IfBreak`, the broken
+/// branch.
+pub fn text_of(doc: &Doc) -> String {
+    fn collect(doc: &Doc, out: &mut String) {
+        match doc {
+            Doc::Token { text, .. } | Doc::Raw(text) | Doc::LineStart(text) => {
+                out.push(' ');
+                out.push_str(text);
+            }
+            Doc::Concat(docs) | Doc::Fill(docs) | Doc::AlignGroup(docs) => {
+                docs.iter().for_each(|d| collect(d, out));
+            }
+            Doc::Indent(inner) | Doc::Group(inner) => collect(inner, out),
+            Doc::IfBreak { broken, .. } => collect(broken, out),
+            Doc::FillRest(rest) => rest.as_slice().iter().for_each(|d| collect(d, out)),
+            Doc::AlignRow(cells) => cells.iter().for_each(|c| collect(&c.content, out)),
+            Doc::Hardline
+            | Doc::BlankLine
+            | Doc::Line
+            | Doc::Softline
+            | Doc::PreservedLine
+            | Doc::Empty => {}
+        }
+    }
+    let mut out = String::new();
+    collect(doc, &mut out);
+    out
+}
+
 /// Join docs with a separator between each pair.
 #[allow(dead_code)] // Phase F follow-up: builder integration pending.
 pub fn join(docs: Vec<Doc>, separator: Doc) -> Doc {

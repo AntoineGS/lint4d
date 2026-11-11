@@ -2,6 +2,7 @@
 //! procedure declarations and definitions, and comma-separated identifier decls.
 //! Extracted from doc_builder.rs during Phase F decomposition (review AH1 / BP-M5).
 
+use crate::content_check::ContentAllowance;
 use crate::doc::{self, Doc};
 use crate::doc_builder::{
     DocBuilder, ends_with_hardline, starts_with_hardline, strip_trailing_hardline,
@@ -408,6 +409,7 @@ impl<'a> DocBuilder<'a> {
             if !idents.is_empty() && !from_colon.is_empty() {
                 let suffix = self.suffix_doc(from_colon);
                 let bare_suffix = self.without_trivia(|| self.suffix_doc(from_colon));
+                self.allow_var_list_expansion(node, before_colon, idents.len(), &bare_suffix);
 
                 let mut parts = Vec::new();
                 for (i, ident) in idents.iter().enumerate() {
@@ -509,6 +511,27 @@ impl<'a> DocBuilder<'a> {
             doc::concat(ident_parts),
             doc::concat(suffix_docs),
         ]))
+    }
+
+    /// Record that expanding the `declVar` `node` of `count` identifiers
+    /// drops the commas of `before_colon` and repeats `bare_suffix` (the
+    /// `: Type = Value;` built without its comments) for all but the last.
+    pub(crate) fn allow_var_list_expansion(
+        &self,
+        node: Node<'a>,
+        before_colon: &[Node<'a>],
+        count: usize,
+        bare_suffix: &Doc,
+    ) {
+        let commas = before_colon.iter().filter(|c| c.kind() == K::COMMA).count();
+        let suffix = doc::text_of(bare_suffix);
+        self.allow_content_change(
+            node,
+            ContentAllowance {
+                dropped: ",".repeat(commas),
+                added: suffix.repeat(count.saturating_sub(1)),
+            },
+        );
     }
 
     /// The `: Type;` part of a `declVar` (children from the colon on).

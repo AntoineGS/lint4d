@@ -57,7 +57,7 @@ impl<'a> DocBuilder<'a> {
             K::K_CLASS => {
                 pending_class_prefix = Some(child);
             }
-            K::K_VAR | K::K_CONST | K::K_TYPE => {
+            K::K_VAR | K::K_CONST | K::K_TYPE | K::K_THREADVAR | K::K_RESOURCESTRING => {
                 parts.push(Doc::Hardline);
                 if let Some(class_node) = pending_class_prefix.take() {
                     parts.push(self.doc_for_node(class_node));
@@ -128,7 +128,7 @@ impl<'a> DocBuilder<'a> {
 
                 if after_strict {
                     parts.push(Doc::Raw(" ".into()));
-                    parts.push(Doc::Raw(self.node_text(child)));
+                    parts.push(self.with_outer_trivia(child, Doc::Raw(self.node_text(child))));
                     parts.push(Doc::Hardline);
                     after_strict = false;
                 } else {
@@ -138,7 +138,7 @@ impl<'a> DocBuilder<'a> {
                         first = false;
                     } else {
                         parts.push(Doc::Raw(" ".into()));
-                        parts.push(Doc::Raw(self.node_text(child)));
+                        parts.push(self.with_outer_trivia(child, Doc::Raw(self.node_text(child))));
                     }
                     if is_strict {
                         after_strict = true;
@@ -228,7 +228,7 @@ impl<'a> DocBuilder<'a> {
             K::K_PUBLIC | K::K_PRIVATE | K::K_PROTECTED | K::K_PUBLISHED => {
                 if after_strict {
                     parts.push(Doc::Raw(" ".into()));
-                    parts.push(Doc::Raw(self.node_text(child)));
+                    parts.push(self.with_outer_trivia(child, Doc::Raw(self.node_text(child))));
                     after_strict = false;
                 } else {
                     parts.push(Doc::Hardline);

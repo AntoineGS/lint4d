@@ -883,3 +883,47 @@ fn eight_bit_sources_are_decoded_as_a_whole() {
     assert_eq!(output, expected, "{}", String::from_utf8_lossy(&output));
     assert_eq!(format(&output), output, "not idempotent");
 }
+
+/// `class threadvar` sections lost `class` (only `var`, `const` and `type`
+/// took the prefix), and a comment after `strict private` was dropped with
+/// the visibility emitted as text (Spring4D, OverbyteICS, WSS units).
+#[test]
+fn class_threadvar_and_comments_after_strict_visibility_are_kept() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+type
+  TA = record
+    class threadvar Stack: Integer;
+  end;
+  TB = class
+  strict private // no access here
+    F: Integer;
+  end;
+implementation
+end.
+",
+        "\
+unit T;
+
+interface
+
+type
+  TA = record
+
+    class threadvar
+      Stack: Integer;
+  end;
+
+  TB = class
+  strict private // no access here
+    F: Integer;
+  end;
+
+implementation
+
+end.
+",
+    );
+}

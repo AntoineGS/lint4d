@@ -144,6 +144,8 @@ pub const K_GT: &str = "kGt";
 // Block / control-flow keywords
 pub const K_BEGIN: &str = "kBegin";
 pub const K_END: &str = "kEnd";
+pub const K_THREADVAR: &str = "kThreadvar";
+pub const K_RESOURCESTRING: &str = "kResourcestring";
 pub const K_END_DOT: &str = "kEndDot";
 pub const K_REQUIRES: &str = "kRequires";
 pub const K_CONTAINS: &str = "kContains";

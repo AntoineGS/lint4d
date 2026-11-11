@@ -436,3 +436,37 @@ fn end_of_file_mark_is_kept() {
         "unit T;\n\ninterface\n\nimplementation\n\nend.\n\u{1a}",
     );
 }
+
+/// A string literal made of several parts is emitted as its text; the
+/// comments attached to its first and last parts lie outside that text.
+#[test]
+fn comments_around_multi_part_string_literals_are_kept() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  S := S + #13#10{#13#10};
+  S := 'a'#9{tab} + 'b';
+end;
+end.
+",
+        "\
+unit T;
+
+interface
+
+implementation
+
+procedure P;
+begin
+  S := S + #13#10 {#13#10};
+  S := 'a'#9 {tab} + 'b';
+end;
+
+end.
+",
+    );
+}

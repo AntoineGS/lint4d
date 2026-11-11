@@ -1,5 +1,5 @@
 use crate::doc::{self, Doc};
-use crate::doc_builder::{DocBuilder, first_leaf, last_leaf, strip_trailing_hardline};
+use crate::doc_builder::{DocBuilder, strip_trailing_hardline};
 use pascal_core::node_kind as K;
 use tree_sitter::Node;
 
@@ -134,17 +134,6 @@ impl<'a> DocBuilder<'a> {
             }
         }
         doc::concat(parts)
-    }
-
-    /// `body`, laid out for `node` from its text, with the comments and
-    /// directives attached before its first leaf and after its last one
-    /// (the ones inside its text are part of `body`).
-    fn with_outer_trivia(&self, node: Node<'a>, body: Doc) -> Doc {
-        doc::concat(vec![
-            self.leading_trivia_doc(first_leaf(node)),
-            body,
-            self.trailing_trivia_doc(last_leaf(node)),
-        ])
     }
 
     /// Build body parts from collected children using the original

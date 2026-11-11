@@ -500,11 +500,35 @@ impl<'a> DocBuilder<'a> {
 
     /// Emit a leaf token as verbatim text — used for `literalChar` /
     /// `literalString` where child nodes don't cover the full source span.
+    /// The comments and directives attached before its first part and after
+    /// its last one lie outside that text and are emitted around it.
     fn build_verbatim_leaf(&self, node: Node<'a>) -> Doc {
         let text = self.node_text(node);
         let kind = node.kind();
         let parent_kind = self.parent_kind(node);
-        doc::token(text, kind, parent_kind)
+        let token = doc::token(text, kind, parent_kind);
+        if node.child_count() == 0 {
+            return token;
+        }
+        self.with_outer_trivia(node, token)
+    }
+
+    /// `body`, laid out for `node` from its text, with the comments and
+    /// directives attached before its first leaf and after its last one
+    /// (the ones inside its text are part of `body`).
+    pub(crate) fn with_outer_trivia(&self, node: Node<'a>, body: Doc) -> Doc {
+        let trailing = self.trailing_items(last_leaf(node));
+        // The leaf may end before the node's text does (`#13#10` ends after
+        // its last `#` leaf): the first item keeps its distance from the
+        // text.
+        let first_gap = trailing
+            .first()
+            .map(|item| item.span.start.saturating_sub(node.end_byte()));
+        doc::concat(vec![
+            self.leading_trivia_doc(first_leaf(node)),
+            body,
+            self.trailing_run_doc(&trailing, first_gap),
+        ])
     }
 
     // ── Recursion helpers ────────────────────────────────────────────

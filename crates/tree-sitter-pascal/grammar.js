@@ -795,7 +795,25 @@ module.exports = grammar({
 
 		inherited:       $ => prec.right(seq($.kInherited, optional($.identifier))),
 
-		exprDot:         $ => op.infix(5, $._ref, $.kDot, $._ref),
+		exprDot:         $ => op.infix(5, $._ref, $.kDot, choice(
+			$._ref, $._memberKeyword
+		)),
+		// After a dot a reserved word is a member name: `Parallel.For`,
+		// `Excel.Goto`. `end` is left out so that an unfinished `x.` before
+		// `end` keeps the block's end.
+		_memberKeyword:  $ => prec(1, choice(...[
+			$.kAnd, $.kArray, $.kAs, $.kAsm, $.kBegin, $.kCase, $.kClass,
+			$.kConst, $.kConstructor, $.kDestructor, $.kDispInterface, $.kDiv,
+			$.kDo, $.kDownto, $.kElse, $.kExcept, $.kExports, $.kFile,
+			$.kFinalization, $.kFinally, $.kFor, $.kFunction, $.kGoto, $.kIf,
+			$.kImplementation, $.kIn, $.kInherited, $.kInitialization,
+			$.kInline, $.kInterface, $.kIs, $.kLabel, $.kLibrary, $.kMod,
+			$.kNil, $.kNot, $.kObject, $.kOf, $.kOr, $.kPacked, $.kProcedure,
+			$.kProgram, $.kProperty, $.kRaise, $.kRecord, $.kRepeat,
+			$.kResourcestring, $.kSet, $.kShl, $.kShr, $.kString, $.kThen,
+			$.kThreadvar, $.kTo, $.kTry, $.kType, $.kUnit, $.kUntil, $.kUses,
+			$.kVar, $.kWhile, $.kWith, $.kXor,
+		].map(keyword => alias(keyword, $.identifier)))),
 		exprDeref:       $ => op.postfix(4, $._expr, $.kHat),
 
 		exprAs:          $ => op.infix(3, $._expr, $.kAs,  $._expr),

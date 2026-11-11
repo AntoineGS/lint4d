@@ -555,3 +555,34 @@ end.
 ",
     );
 }
+
+/// A string literal continued after a directive (`'a'` `{$ELSE}` `'b'`) is
+/// one node whose only children are its directives: its text holds them,
+/// but they were also attached to the next token and emitted twice.
+#[test]
+fn directives_inside_a_string_literal_are_emitted_once() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+const
+  K = {$IFDEF SANDBOX}'/a.asmx'
+      {$ELSE}'/b.asmx'{$ENDIF};
+implementation
+end.
+",
+        "\
+unit T;
+
+interface
+
+const
+  K = {$IFDEF SANDBOX} '/a.asmx'
+      {$ELSE}'/b.asmx' {$ENDIF};
+
+implementation
+
+end.
+",
+    );
+}

@@ -526,7 +526,7 @@ impl<'a> DocBuilder<'a> {
                 let parent_kind = self.parent_kind(node);
                 doc::token(text, kind, parent_kind)
             }
-            _ if node.child_count() == 0 && !node.is_extra() => self.build_leaf(node),
+            _ if crate::trivia::is_text_leaf(node) => self.build_leaf(node),
             _ => {
                 if node.child_count() > 0 && self.has_breakable_operators(node) {
                     self.build_expression_breaking(node)
@@ -556,7 +556,7 @@ impl<'a> DocBuilder<'a> {
         let kind = node.kind();
         let parent_kind = self.parent_kind(node);
         let token = doc::token(text, kind, parent_kind);
-        if node.child_count() == 0 {
+        if crate::trivia::is_text_leaf(node) {
             return token;
         }
         self.with_outer_trivia(node, token)

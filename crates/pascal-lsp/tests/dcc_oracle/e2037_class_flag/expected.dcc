@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem ClassFlag.pas
+ClassFlag.pas(12) E2037 Declaration of 'Run' differs from previous declaration
+ClassFlag.pas(7) E2065 Unsatisfied forward or external declaration: 'TFoo.Run'

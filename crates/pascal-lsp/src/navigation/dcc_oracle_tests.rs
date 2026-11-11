@@ -6,7 +6,7 @@ use super::*;
 use std::path::{Path, PathBuf};
 
 /// dcc codes whose findings are compared. Grows as each rule lands.
-const ENABLED_CODES: &[&str] = &[];
+const ENABLED_CODES: &[&str] = &["E2037", "E2065"];
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Finding {
@@ -21,6 +21,7 @@ struct Case {
     dir: PathBuf,
     unit: String,
     requires_rtl: bool,
+    recall: bool,
 }
 
 fn cases_root() -> PathBuf {
@@ -37,9 +38,15 @@ fn load_case(dir: &Path) -> Case {
             (k.trim() == key).then(|| v.trim().trim_matches('"').to_owned())
         })
     };
+    let recall = value("recall").as_deref() != Some("false");
+    assert!(
+        recall || value("reason").is_some(),
+        "{name}: recall = false requires a reason"
+    );
     Case {
         unit: value("unit").unwrap_or_else(|| panic!("{name}: case.toml has no unit")),
         requires_rtl: value("requires_rtl").as_deref() == Some("true"),
+        recall,
         name,
         dir: dir.to_path_buf(),
     }
@@ -187,7 +194,7 @@ fn dcc_oracle_cases_match_recorded_dcc_output() {
         if !invented.is_empty() {
             failures.push(format!("{}: not reported by dcc: {invented:?}", case.name));
         }
-        if (!case.requires_rtl || rtl_available) && !missed.is_empty() {
+        if case.recall && (!case.requires_rtl || rtl_available) && !missed.is_empty() {
             failures.push(format!(
                 "{}: dcc reported, we missed: {missed:?}",
                 case.name

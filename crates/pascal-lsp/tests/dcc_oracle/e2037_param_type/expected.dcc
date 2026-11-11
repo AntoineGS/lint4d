@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem ParamType.pas
+ParamType.pas(9) E2267 Previous declaration of 'Foo' was not marked with the 'overload' directive
+ParamType.pas(5) E2065 Unsatisfied forward or external declaration: 'Foo'

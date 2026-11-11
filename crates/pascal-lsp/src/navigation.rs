@@ -85,6 +85,7 @@ pub mod compiled_dcu;
 mod dcc_message;
 #[cfg(test)]
 mod dcc_oracle_tests;
+mod declarations;
 pub(crate) use dcc_message::{DccMessage, DccSeverity};
 mod documentation;
 mod facts;
@@ -3145,6 +3146,22 @@ impl NavigationIndex {
                     if let Some(contracts) = report.checked_candidate(result, &budget)? {
                         report.diagnostics.extend(contracts);
                     }
+                }
+            }
+            let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
+            let mut declaration_cap_reached = false;
+            let result = self.declaration_diagnostics_with_budget(
+                uri,
+                document,
+                capacity,
+                &mut declaration_cap_reached,
+                cancel,
+                &mut budget,
+            );
+            if let Some(declarations) = report.checked_candidate(result, &budget)? {
+                report.diagnostics.extend(declarations);
+                if declaration_cap_reached {
+                    report.note(SemanticCoverageGap::DiagnosticCap);
                 }
             }
         }
@@ -15577,6 +15594,7 @@ struct Symbol {
     type_shape: Option<TypeShape>,
     result_type_name: Option<String>,
     result_type_ref: Option<TypeRef>,
+    implementation_result_type_ref: Option<TypeRef>,
     result_type_span: Option<Span>,
     region: Region,
     origin: Origin,
@@ -15612,6 +15630,7 @@ struct RoutineDirectives {
     override_: bool,
     reintroduce: bool,
     forward: bool,
+    external: bool,
     abstract_: bool,
     calling_convention: Option<CallingConvention>,
     calling_convention_unknown: bool,
@@ -17309,6 +17328,7 @@ impl Document {
                 type_shape: None,
                 result_type_name: None,
                 result_type_ref: None,
+                implementation_result_type_ref: None,
                 result_type_span: None,
                 region: Region::Other,
                 origin: Origin::Declaration,
@@ -18492,6 +18512,7 @@ fn inject_abbreviated_parameters(
                 type_shape: type_shape.clone(),
                 result_type_name: None,
                 result_type_ref: None,
+                implementation_result_type_ref: None,
                 result_type_span: None,
                 region: Region::Implementation,
                 origin: Origin::Declaration,
@@ -18571,6 +18592,7 @@ fn add_definition_symbol<'a>(
         type_ref: None,
         type_shape: None,
         result_type_name: result_type.as_ref().map(|(name, _)| name.clone()),
+        implementation_result_type_ref: result_type_ref.clone(),
         result_type_ref,
         result_type_span: result_type.map(|(_, span)| span),
         region,
@@ -18650,6 +18672,7 @@ fn add_routine_symbol<'a>(
         type_shape: None,
         result_type_name: result_type.as_ref().map(|(name, _)| name.clone()),
         result_type_ref,
+        implementation_result_type_ref: None,
         result_type_span: result_type.map(|(_, span)| span),
         region,
         origin: Origin::Declaration,
@@ -18708,6 +18731,7 @@ fn push_routine_generic_parameter_symbols(
             type_shape: None,
             result_type_name: None,
             result_type_ref: None,
+            implementation_result_type_ref: None,
             result_type_span: None,
             region,
             origin: Origin::Declaration,
@@ -18813,6 +18837,7 @@ fn add_named_symbol<'a>(
             type_shape: type_shape.clone(),
             result_type_name: None,
             result_type_ref: None,
+            implementation_result_type_ref: None,
             result_type_span: None,
             region,
             origin: Origin::Declaration,
@@ -18855,6 +18880,7 @@ fn add_named_symbol<'a>(
                 type_shape: None,
                 result_type_name: None,
                 result_type_ref: None,
+                implementation_result_type_ref: None,
                 result_type_span: None,
                 region,
                 origin: Origin::Declaration,
@@ -19480,6 +19506,7 @@ fn routine_directives(node: Node<'_>) -> RoutineDirectives {
         "kOverride" => directives.override_ = true,
         "kReintroduce" => directives.reintroduce = true,
         "kForward" => directives.forward = true,
+        "kExternal" => directives.external = true,
         "kAbstract" => directives.abstract_ = true,
         "kCdecl" => directives.calling_convention = Some(CallingConvention::Cdecl),
         "kStdcall" => directives.calling_convention = Some(CallingConvention::Stdcall),
@@ -23049,6 +23076,17 @@ mod tests {
     use super::*;
     use std::fmt::Write as _;
 
+    fn diagnostics_without_declaration_pairing_findings(
+        diagnostics: &[SemanticDiagnostic],
+    ) -> impl Iterator<Item = &SemanticDiagnostic> {
+        diagnostics.iter().filter(|diagnostic| {
+            !matches!(
+                diagnostic.kind,
+                SemanticDiagnosticKind::Dcc(DccMessage::E2037 | DccMessage::E2065)
+            )
+        })
+    }
+
     fn repeated_class_field_source(repetitions: usize) -> String {
         let mut source = String::from(
             "unit RepeatedClassField;\ninterface\ntype\n  TFirst = class\n    FValue: Integer;\n    procedure Touch;\n  end;\nimplementation\nprocedure TFirst.Touch;\nbegin\n",
@@ -26370,6 +26408,49 @@ mod tests {
     }
 
     #[test]
+    fn declaration_diagnostics_do_not_pair_nested_routines_with_unit_routines() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-nested-routine-pairing.pas")
+            .expect("nested routine URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsNestedRoutinePairing;\n",
+            "interface\n",
+            "procedure Foo(Value: Integer);\n",
+            "implementation\n",
+            "procedure Outer;\n",
+            "  procedure Foo(Value: Integer); begin end;\n",
+            "begin end;\n",
+            "procedure AnotherOuter;\n",
+            "  procedure Foo(Other: Integer); begin end;\n",
+            "begin end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("nested routine fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("nested routine diagnostics complete");
+        let declaration_start = source
+            .find("Foo(Value: Integer)")
+            .expect("unit-level interface declaration");
+
+        assert_eq!(
+            diagnostics,
+            vec![SemanticDiagnostic {
+                kind: SemanticDiagnosticKind::Dcc(DccMessage::E2065),
+                span: SourceSpan {
+                    start: declaration_start,
+                    end: declaration_start + "Foo".len(),
+                },
+                message: "Unsatisfied forward or external declaration: 'Foo'".to_owned(),
+            }],
+            "nested routines must neither satisfy nor mismatch a unit-level routine: {diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn semantic_diagnostics_keep_the_first_findings_up_to_the_cap() {
         let uri = Url::parse("file:///tmp/semantic-diagnostics-cap.pas").expect("cap URI");
         let mut source = String::from(
@@ -26402,6 +26483,41 @@ mod tests {
         assert_eq!(
             report.diagnostics[0].span.start,
             source.find("I;\n").expect("first mismatch")
+        );
+        assert_eq!(report.gaps, vec![SemanticCoverageGap::DiagnosticCap]);
+    }
+
+    #[test]
+    fn semantic_diagnostics_preserve_declaration_findings_at_the_cap() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-declaration-cap.pas")
+            .expect("declaration cap URI");
+        let mut source = String::from(
+            "unit SemanticDiagnosticsDeclarationCap;\ninterface\ntype\n  TMany = class\n",
+        );
+        for index in 0..=MAX_SEMANTIC_DIAGNOSTICS {
+            writeln!(&mut source, "    procedure Missing{index};").expect("write missing method");
+        }
+        source.push_str("  end;\nimplementation\nend.\n");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.clone())
+            .expect("declaration cap fixture parses");
+
+        let report = index
+            .semantic_diagnostic_report_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("declaration cap diagnostics complete");
+
+        assert_eq!(
+            report.diagnostics.len(),
+            MAX_SEMANTIC_DIAGNOSTICS,
+            "retain proven declaration findings up to the cap: {report:?}"
+        );
+        assert!(report.diagnostics.iter().all(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::Dcc(DccMessage::E2065)
+        }));
+        assert_eq!(
+            report.diagnostics[0].span.start,
+            source.find("Missing0").expect("first missing method")
         );
         assert_eq!(report.gaps, vec![SemanticCoverageGap::DiagnosticCap]);
     }
@@ -26766,8 +26882,7 @@ mod tests {
         let diagnostics = index
             .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
             .expect("R1 diagnostics complete");
-        let messages = diagnostics
-            .iter()
+        let messages = diagnostics_without_declaration_pairing_findings(&diagnostics)
             .map(|diagnostic| diagnostic.message.as_str())
             .collect::<Vec<_>>();
 
@@ -26807,8 +26922,7 @@ mod tests {
             .expect("R2 diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec!["incompatible argument: expected 'Char', found 'String'"],
@@ -26843,8 +26957,7 @@ mod tests {
             .expect("R2 composite diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec!["incompatible argument: expected 'Char', found 'String'"],
@@ -26879,8 +26992,7 @@ mod tests {
         let diagnostics = index
             .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
             .expect("R3 diagnostics complete");
-        let messages = diagnostics
-            .iter()
+        let messages = diagnostics_without_declaration_pairing_findings(&diagnostics)
             .map(|diagnostic| diagnostic.message.as_str())
             .collect::<Vec<_>>();
 
@@ -26924,7 +27036,9 @@ mod tests {
             .expect("R3 incomplete diagnostics complete");
 
         assert!(
-            diagnostics.is_empty(),
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
+                .next()
+                .is_none(),
             "incomplete imports and with receivers must suppress argument claims: {diagnostics:?}"
         );
     }
@@ -26957,8 +27071,7 @@ mod tests {
             .expect("R3 unknown actual diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec![
@@ -26999,7 +27112,9 @@ mod tests {
             .expect("R3 unknown formal diagnostics complete");
 
         assert!(
-            diagnostics.is_empty(),
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
+                .next()
+                .is_none(),
             "unknown by-reference formals and overload candidates suppress claims: {diagnostics:?}"
         );
     }
@@ -27037,8 +27152,7 @@ mod tests {
             .expect("R3 element diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec![
@@ -27110,7 +27224,9 @@ mod tests {
             .expect("ambiguous element diagnostics complete");
 
         assert!(
-            diagnostics.is_empty(),
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
+                .next()
+                .is_none(),
             "differing candidate element types remain uncertain: {diagnostics:?}"
         );
     }
@@ -27162,8 +27278,7 @@ mod tests {
             .expect("R3 addressed-storage diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec![
@@ -27221,8 +27336,7 @@ mod tests {
             .expect("R3 default-property diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec![
@@ -27261,8 +27375,7 @@ mod tests {
             .expect("R3 unresolved-index diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec!["missing member 'Missing'", "missing member 'Missing'",],
@@ -27339,8 +27452,7 @@ mod tests {
         let diagnostics = index
             .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
             .expect("R4 generic default-property diagnostics complete");
-        let messages = diagnostics
-            .iter()
+        let messages = diagnostics_without_declaration_pairing_findings(&diagnostics)
             .map(|diagnostic| diagnostic.message.as_str())
             .collect::<Vec<_>>();
 
@@ -27359,8 +27471,7 @@ mod tests {
             .expect("forward call")
             + "TakeInteger(".len();
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.span)
                 .collect::<Vec<_>>(),
             vec![
@@ -27450,7 +27561,9 @@ mod tests {
             .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
             .expect("R4 imported-private diagnostics complete");
         assert!(
-            imported_diagnostics.is_empty(),
+            diagnostics_without_declaration_pairing_findings(&imported_diagnostics)
+                .next()
+                .is_none(),
             "private explicit and default properties must remain inaccessible: {imported_diagnostics:?}"
         );
 
@@ -27458,7 +27571,9 @@ mod tests {
             .semantic_diagnostics_with_cancel(&local_uri, &AtomicBool::new(false))
             .expect("R4 strict-private diagnostics complete");
         assert!(
-            local_diagnostics.is_empty(),
+            diagnostics_without_declaration_pairing_findings(&local_diagnostics)
+                .next()
+                .is_none(),
             "strict-private explicit and default properties must remain inaccessible: {local_diagnostics:?}"
         );
     }
@@ -27501,8 +27616,7 @@ mod tests {
         let diagnostics = index
             .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
             .expect("R4 index-argument diagnostics complete");
-        let messages = diagnostics
-            .iter()
+        let messages = diagnostics_without_declaration_pairing_findings(&diagnostics)
             .map(|diagnostic| diagnostic.message.as_str())
             .collect::<Vec<_>>();
 
@@ -27602,8 +27716,7 @@ mod tests {
             .semantic_diagnostics_with_cancel(&local_uri, &AtomicBool::new(false))
             .expect("R5 local public-default diagnostics complete");
         assert_eq!(
-            local_diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&local_diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec![
@@ -27619,8 +27732,7 @@ mod tests {
             .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
             .expect("R5 imported public-default diagnostics complete");
         assert_eq!(
-            imported_diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&imported_diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec![
@@ -27671,8 +27783,7 @@ mod tests {
         let diagnostics = index
             .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
             .expect("R4 diagnostics complete");
-        let messages = diagnostics
-            .iter()
+        let messages = diagnostics_without_declaration_pairing_findings(&diagnostics)
             .map(|diagnostic| diagnostic.message.as_str())
             .collect::<Vec<_>>();
 
@@ -27712,8 +27823,7 @@ mod tests {
             .expect("R5 diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec!["type mismatch: cannot assign 'Integer' to 'Boolean'"],
@@ -27748,8 +27858,7 @@ mod tests {
             .expect("R5 record nil diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec!["type mismatch: cannot assign 'Integer' to 'Boolean'"],
@@ -27800,8 +27909,7 @@ mod tests {
             .expect("R6 diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec!["type mismatch: cannot assign 'Integer' to 'Boolean'"],
@@ -27851,8 +27959,7 @@ mod tests {
             .expect("same-System diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec!["type mismatch: cannot assign 'Integer' to 'Boolean'"],

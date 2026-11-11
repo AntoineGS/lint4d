@@ -267,3 +267,52 @@ end.
 ",
     );
 }
+
+/// A `//` comment must end its output line: code after it in the output
+/// would become part of the comment (`if A // c` + newline + `then` became
+/// `if A // c then`; a `//` comment trailing a standalone directive
+/// swallowed the next declaration).
+#[test]
+fn line_comments_always_end_their_line() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+implementation
+{$IFDEF D2010} // D2010
+procedure P(A: Integer);
+{$ENDIF}
+begin
+  if A = 0   // no mask
+     then Exit;
+  if A // c
+  then B := 1
+  else C := 2;
+end;
+end.
+",
+        "\
+unit T;
+
+interface
+
+implementation
+
+{$IFDEF D2010} // D2010
+procedure P(A: Integer);
+{$ENDIF}
+begin
+  if A = 0   // no mask
+  then
+    Exit;
+  if A // c
+  then
+    B := 1
+  else
+    C := 2;
+end;
+
+end.
+",
+    );
+}

@@ -316,3 +316,65 @@ end.
 ",
     );
 }
+
+/// Since the grammar parses `asm` blocks (l4d-1nk2), their bodies hold
+/// only the identifiers as nodes: the formatter re-joined those and dropped
+/// operands, commas, brackets, numbers and line breaks. The body is now
+/// copied as written, with its comments and line structure.
+#[test]
+fn asm_bodies_are_copied_verbatim() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+implementation
+function F(X: Integer): Integer;
+asm
+  // entry
+  mov eax, [ebp+8]   // load
+@@L1:   rol eax, 16;
+        db $90, $90
+  { before end }
+end;
+procedure Q;
+begin
+  X:=1;
+  asm
+    mov   eax,[ebp]  { frame }
+    mov   x,eax
+  end;
+  asm end;
+end;
+end.
+",
+        "\
+unit T;
+
+interface
+
+implementation
+
+function F(X: Integer): Integer;
+asm
+  // entry
+  mov eax, [ebp+8]   // load
+@@L1:   rol eax, 16;
+        db $90, $90
+  { before end }
+end;
+
+procedure Q;
+begin
+  X := 1;
+  asm
+    mov   eax,[ebp]  { frame }
+    mov   x,eax
+  end;
+  asm
+  end;
+end;
+
+end.
+",
+    );
+}

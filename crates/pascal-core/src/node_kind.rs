@@ -15,6 +15,8 @@ pub const INITIALIZATION: &str = "initialization";
 pub const FINALIZATION: &str = "finalization";
 pub const BLOCK: &str = "block";
 pub const STATEMENTS: &str = "statements";
+pub const ASM: &str = "asm";
+pub const ASM_BODY: &str = "asmBody";
 pub const COMMENT: &str = "comment";
 
 // ── Preprocessor nodes ─────────────────────────────────────────────

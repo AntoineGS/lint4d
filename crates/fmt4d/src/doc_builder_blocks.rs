@@ -3,13 +3,88 @@
 //! Extracted from doc_builder.rs during Phase F decomposition (review AH1 / BP-M5).
 
 use crate::doc::{self, Doc};
-use crate::doc_builder::{DocBuilder, starts_with_hardline, strip_trailing_hardline};
+use crate::doc_builder::{
+    DocBuilder, first_leaf, last_leaf, starts_with_hardline, strip_trailing_hardline,
+};
 use pascal_core::node_kind as K;
 use tree_sitter::Node;
 
 impl<'a> DocBuilder<'a> {
     pub(crate) fn build_block(&self, node: Node<'a>) -> Doc {
         self.build_children_preserving_blank_lines(node)
+    }
+
+    /// An `asm … end` block. The grammar keeps only the identifiers and
+    /// reserved words of an `asmBody` as nodes, so the body is copied as
+    /// written, from its first to its last line, with the comments and
+    /// directives around it up to `end`; `asm` and `end` start their own
+    /// lines.
+    pub(crate) fn build_asm(&self, node: Node<'a>) -> Doc {
+        let mut parts = Vec::new();
+        let mut body_end: Option<usize> = None;
+        for child in self.code_children(node) {
+            match child.kind() {
+                K::ASM_BODY => {
+                    let first = first_leaf(child);
+                    let last = last_leaf(child);
+                    let start = self
+                        .comments
+                        .leading_comments(first.id())
+                        .iter()
+                        .map(|c| c.span.start)
+                        .chain(
+                            self.directives
+                                .leading_directives(first.id())
+                                .iter()
+                                .map(|d| d.span.start),
+                        )
+                        .fold(child.start_byte(), usize::min);
+                    let end = self
+                        .trailing_items(last)
+                        .iter()
+                        .map(|item| item.span.end)
+                        .fold(child.end_byte(), usize::max);
+                    parts.push(Doc::Hardline);
+                    parts.push(self.verbatim_doc(start, end));
+                    body_end = Some(end);
+                }
+                K::K_END => {
+                    match body_end {
+                        // Trivia between the body and `end` stays with the
+                        // verbatim body.
+                        Some(body_end) => {
+                            let leading = self
+                                .comments
+                                .leading_comments(child.id())
+                                .iter()
+                                .map(|c| c.span.end)
+                                .chain(
+                                    self.directives
+                                        .leading_directives(child.id())
+                                        .iter()
+                                        .map(|d| d.span.end),
+                                )
+                                .max();
+                            if let Some(leading_end) = leading {
+                                parts.push(self.verbatim_doc(body_end, leading_end));
+                            }
+                            parts.push(Doc::Hardline);
+                            parts.push(self.build_doc(child));
+                            parts.push(self.trailing_trivia_doc(child));
+                        }
+                        None => {
+                            let end = self.doc_for_node(child);
+                            if !starts_with_hardline(&end) {
+                                parts.push(Doc::Hardline);
+                            }
+                            parts.push(end);
+                        }
+                    }
+                }
+                _ => parts.push(self.doc_for_node(child)),
+            }
+        }
+        doc::concat(parts)
     }
 
     pub(crate) fn build_children_preserving_blank_lines(&self, node: Node<'a>) -> Doc {

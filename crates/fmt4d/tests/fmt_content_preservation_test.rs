@@ -1041,3 +1041,39 @@ end.
 ",
     );
 }
+
+/// An `asm` routine body after a `var` section was glued to its last
+/// declaration (`QMask: Int64;asm`).
+#[test]
+fn asm_routine_body_after_a_var_section_starts_its_line() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+implementation
+procedure P;
+var
+  QMask: Int64;
+asm
+  mov eax, 1
+end;
+end.
+",
+        "\
+unit T;
+
+interface
+
+implementation
+
+procedure P;
+var
+  QMask: Int64;
+asm
+  mov eax, 1
+end;
+
+end.
+",
+    );
+}

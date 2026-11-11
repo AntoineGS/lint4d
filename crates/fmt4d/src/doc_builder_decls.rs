@@ -322,6 +322,7 @@ impl<'a> DocBuilder<'a> {
                         | K::DECL_CONSTS
                         | K::DECL_TYPES
                         | K::BLOCK
+                        | K::ASM
                         | K::STATEMENTS
                         | K::DEF_PROC
                 )

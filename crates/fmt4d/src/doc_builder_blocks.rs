@@ -20,7 +20,8 @@ impl<'a> DocBuilder<'a> {
     /// directives around it up to `end`; `asm` and `end` start their own
     /// lines.
     pub(crate) fn build_asm(&self, node: Node<'a>) -> Doc {
-        let mut parts = Vec::new();
+        // `asm` starts its line, also as a routine body after a section.
+        let mut parts = vec![Doc::Hardline];
         let mut body_end: Option<usize> = None;
         for child in self.code_children(node) {
             match child.kind() {

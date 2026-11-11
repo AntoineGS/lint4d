@@ -771,3 +771,42 @@ end.
 ",
     );
 }
+
+/// A call whose sole argument is a bracket list (`Polyline([...])`) put
+/// new commas between the list items, dropping the comments attached to
+/// the source commas (RTL CaptionedDockTree.pas).
+#[test]
+fn comments_after_commas_of_a_hugged_bracket_argument_are_kept() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  Canvas.Polyline([Point(Left + 2, Top),
+    Point(Right - 2, Top), { Top line }
+    Point(Left + 3, Top)]); { Top left curve }
+end;
+end.
+",
+        "\
+unit T;
+
+interface
+
+implementation
+
+procedure P;
+begin
+  Canvas.Polyline([
+    Point(Left + 2, Top),
+    Point(Right - 2, Top), { Top line }
+    Point(Left + 3, Top)
+  ]); { Top left curve }
+end;
+
+end.
+",
+    );
+}

@@ -85,6 +85,12 @@ impl<'a> DocBuilder<'a> {
         }
 
         let groups = Self::split_children_at(b_inner, K::COMMA);
+        // The source commas carry the comments attached to them.
+        let commas: Vec<Node<'a>> = b_inner
+            .iter()
+            .copied()
+            .filter(|c| c.kind() == K::COMMA)
+            .collect();
         let group_docs: Vec<Doc> = groups
             .iter()
             .map(|g| {
@@ -96,7 +102,10 @@ impl<'a> DocBuilder<'a> {
         let mut inner_parts = Vec::new();
         for (i, gdoc) in group_docs.into_iter().enumerate() {
             if i > 0 {
-                inner_parts.push(doc::token(",", K::COMMA, ""));
+                inner_parts.push(match commas.get(i - 1) {
+                    Some(comma) => self.doc_for_node(*comma),
+                    None => doc::token(",", K::COMMA, ""),
+                });
                 inner_parts.push(Doc::Line);
             }
             inner_parts.push(gdoc);

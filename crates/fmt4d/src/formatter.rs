@@ -36,6 +36,17 @@ pub fn format_source(
     external_units: &HashSet<String>,
 ) -> crate::error::Result<String> {
     let has_bom = source.starts_with(&[0xEF, 0xBB, 0xBF]);
+    // An 8-bit source is decoded as a whole: every builder decodes node
+    // slices, and a slice of an 8-bit file can happen to be valid UTF-8
+    // (GBK text), which would decode it differently from the file. (A
+    // UTF-8 byte-order mark before an 8-bit body is left to the parser.)
+    let transcoded;
+    let source = if !has_bom && detect_encoding(source) == SourceEncoding::Latin1 {
+        transcoded = pascal_core::decode_bytes(source).into_owned().into_bytes();
+        &transcoded[..]
+    } else {
+        source
+    };
 
     let (tree, diagnostics, patches) = pascal_core::parser::parse_file_with_patches(info, source)
         .map_err(|e| crate::error::FmtError::Parse {

@@ -859,3 +859,27 @@ end.
 ",
     );
 }
+
+/// A non-UTF-8 (8-bit) source was decoded node by node: a string whose
+/// bytes happen to form valid UTF-8 (GBK `'\xce\xb4\xd6\xaa'`) was decoded
+/// as UTF-8 while the file is 8-bit, changing its text (FastMM4 Chinese
+/// messages, SmExport resources).
+#[test]
+fn eight_bit_sources_are_decoded_as_a_whole() {
+    let source: &[u8] =
+        b"unit T;\ninterface\nconst\n  A = '\xce\xb4\xd6\xaa'; // caf\xe9\nimplementation\nend.\n";
+    let expected: &[u8] =
+        b"unit T;\n\ninterface\n\nconst\n  A = '\xce\xb4\xd6\xaa'; // caf\xe9\n\nimplementation\n\nend.\n";
+    let format = |bytes: &[u8]| {
+        fmt4d::format_bytes(
+            bytes,
+            &FileInfo::new(PathBuf::from("T.pas")),
+            &fmt4d::FmtConfig::default(),
+            &HashSet::new(),
+        )
+        .unwrap_or_else(|error| panic!("formatting failed: {error}"))
+    };
+    let output = format(source);
+    assert_eq!(output, expected, "{}", String::from_utf8_lossy(&output));
+    assert_eq!(format(&output), output, "not idempotent");
+}

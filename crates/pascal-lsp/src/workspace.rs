@@ -133,6 +133,8 @@ pub(crate) mod hydration;
 pub(crate) mod indexing;
 #[cfg(all(test, unix))]
 mod isolation;
+#[cfg(test)]
+mod lazy_assistance_tests;
 pub(crate) mod lexical;
 #[cfg(test)]
 mod navigation_walk_tests;
@@ -439,6 +441,21 @@ thread_local! {
     /// Expanding a unit whose file name this is fails.
     static TEST_FAIL_EXPANSION_OF: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
+    /// Every source a workspace indexed as a dependency or document.
+    static TEST_INDEXED_DEPENDENCIES: std::cell::RefCell<Vec<Url>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Snapshots parse every import of their document (l4d-fpyu tests).
+    static TEST_EAGER_SNAPSHOT_IMPORTS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Tests compare a lazy walk with the eager one (l4d-fpyu).
+fn eager_imports_for_test() -> bool {
+    #[cfg(test)]
+    if TEST_EAGER_SNAPSHOT_IMPORTS.with(std::cell::Cell::get) {
+        return true;
+    }
+    false
 }
 
 fn navigation_walk_byte_limit() -> usize {
@@ -3319,6 +3336,13 @@ pub struct Workspace {
     /// loads only the units interface sections import, which snapshots bind
     /// through (D51 #4).
     interface_imports_only: bool,
+    /// Set by the navigation walk for the next import load only (l4d-ucux):
+    /// that load takes it, parses only the imports its demand needs and
+    /// returns it, with whether it left a unit unparsed.
+    lazy_import_load: Option<LazyImportLoad>,
+    /// The files lazy loads proved absent, for a snapshot's freshness
+    /// baseline (its loader keeps no analysis records; l4d-fpyu).
+    lazy_absences: Vec<LazyAbsence>,
     /// Set when the crawl met a context built from unsaved project input:
     /// it publishes nothing, and the warmer interleaves extraction.
     crawl_private: Arc<AtomicBool>,
@@ -3453,6 +3477,62 @@ fn interface_bindings(
             })
         })
         .collect()
+}
+
+/// One lazy import load of the navigation walk (l4d-ucux).
+#[derive(Default)]
+struct LazyImportLoad {
+    /// What the walk's queries needed from the document's imports.
+    demand: crate::navigation::ImportDemand,
+    /// Include proofs shared by the walk's loads.
+    absence: indexing::ImportAbsence,
+    input: Option<rename::WorkspaceInput>,
+    /// Out: the load left an import it bound unparsed.
+    skipped: bool,
+}
+
+/// How `Workspace::walk_imports_with_probe` walks.
+#[derive(Clone, Copy)]
+pub(super) struct ImportWalk {
+    /// Parse only the imports that can matter to the demand (D54).
+    pub(super) lazy: bool,
+    /// Without demand, widen level by level.
+    pub(super) widen: bool,
+    /// A dependency whose imports fail to load is skipped with a note.
+    pub(super) skip_failed_dependencies: bool,
+    /// An answer stands only once its lookups demand nothing more: a
+    /// listing (completion) or a rendering (hover) reads more than the
+    /// first declaration it finds.
+    pub(super) settle: bool,
+}
+
+#[derive(Default)]
+pub(super) struct ImportWalkOutcome {
+    pub(super) answered: bool,
+    pub(super) exhausted: bool,
+    pub(super) loaded: Vec<Url>,
+    /// Documents whose imports failed to load and were skipped, with why.
+    pub(super) failed: Vec<(Url, String)>,
+}
+
+/// A file a lazy load's absence proof read: a skipped unit or an include it
+/// followed, with the stamp taken before the read and, for an include, the
+/// hash of the bytes read.
+pub(super) struct LazyAbsence {
+    pub(super) path: PathBuf,
+    pub(super) stamp: Option<PathStamp>,
+    pub(super) include_hash: Option<u64>,
+}
+
+/// What a lazy load does with one resolved import (l4d-ucux).
+enum LazyImport {
+    Parse,
+    /// No query looked through it.
+    Unneeded,
+    /// It cannot spell what the queries looked up through it: the includes
+    /// that proves it, each with the stamp taken before reading it and the
+    /// hash of the bytes read.
+    Absent(Vec<(PathBuf, Option<PathStamp>, u64)>),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -7603,6 +7683,66 @@ impl Workspace {
                 }
             }
         }
+        let mut found = Vec::new();
+        let walk = self.walk_imports_with_probe(
+            uri,
+            context_key,
+            pinned,
+            cancel,
+            ImportWalk {
+                lazy: self.best_effort_navigation && !eager_imports_for_test(),
+                widen: true,
+                skip_failed_dependencies: self.best_effort_navigation,
+                settle: false,
+            },
+            &mut |workspace| {
+                found = workspace.resolve_virtual_navigation(uri, position, target, cancel)?;
+                Ok(!found.is_empty())
+            },
+        )?;
+        if walk.answered {
+            self.validate_compiled_navigation_locations(&found)?;
+            return Ok(found);
+        }
+        if walk.exhausted {
+            self.warn(format!(
+                "navigation walk limit ({MAX_NAVIGATION_WALK_WORK} units or {} source bytes) reached while resolving {uri}; result is incomplete",
+                navigation_walk_byte_limit()
+            ));
+        }
+
+        check_workspace_cancel(cancel)?;
+        let locations = self.resolve_virtual_navigation(uri, position, target, cancel)?;
+        self.validate_compiled_navigation_locations(&locations)?;
+        Ok(locations)
+    }
+
+    /// The import walk of a query on `uri` (l4d-4nbs D44, l4d-ucux D54):
+    /// `probe` answers the query over what is loaded so far and records the
+    /// binding demand of its lookups; the walk loads what that demand names
+    /// until `probe` answers with nothing demanded that a lazy load left
+    /// unparsed. With `walk.lazy`, a demanded document's imports are parsed
+    /// only where a lookup went through them and they can spell what it
+    /// looked up. Without demand the walk widens level by level when
+    /// `walk.widen`, after loading lazily loaded documents whole; otherwise
+    /// it stops there. Returns whether `probe` answered, whether the walk
+    /// limits stopped it, and the dependencies it loaded.
+    /// The absences lazy loads proved since the last call.
+    pub(super) fn take_lazy_absences(&mut self) -> Vec<LazyAbsence> {
+        std::mem::take(&mut self.lazy_absences)
+    }
+
+    pub(super) fn walk_imports_with_probe(
+        &mut self,
+        uri: &Url,
+        context_key: &ContextKey,
+        pinned: &mut HashSet<Url>,
+        cancel: Option<&AtomicBool>,
+        walk: ImportWalk,
+        probe: &mut dyn FnMut(&Self) -> Result<bool, String>,
+    ) -> Result<ImportWalkOutcome, String> {
+        // Only this walk's absences reach its caller.
+        self.lazy_absences.clear();
         let mut frontier = vec![uri.clone()];
         let mut visited = HashSet::new();
         let mut initialized = HashSet::from([uri.clone()]);
@@ -7614,15 +7754,20 @@ impl Workspace {
         let mut walk_exhausted = false;
         let walk_byte_limit = navigation_walk_byte_limit();
         let resolver_session_cache = ResolverSessionCache::default();
+        // l4d-ucux: best effort, a document's imports are loaded for what its
+        // queries looked up through them (`requested`), and only the imports
+        // that can declare it are parsed. `lazy` holds the documents whose
+        // last load left a bound import unparsed, with the demand it served.
+        let lazy_walk = walk.lazy;
+        let mut outcome = ImportWalkOutcome::default();
+        let mut requested = HashMap::<Url, crate::navigation::ImportDemand>::new();
+        let mut lazy = HashMap::<Url, crate::navigation::ImportDemand>::new();
+        let mut lazy_state = LazyImportLoad::default();
 
         loop {
             check_workspace_cancel(cancel)?;
-            let _ = self.index.take_binding_demand();
-            let locations = self.resolve_virtual_navigation(uri, position, target, cancel)?;
-            if !locations.is_empty() {
-                self.validate_compiled_navigation_locations(&locations)?;
-                return Ok(locations);
-            }
+            let _ = self.index.take_import_demand();
+            let answered = probe(self)?;
             // Load the imports the failed query looked through, not those of
             // every unit loaded so far (l4d-4nbs D44): a name binds only
             // through its document's own imports, so the units along a type's
@@ -7630,45 +7775,186 @@ impl Workspace {
             // widens level by level as before. Strict navigation (the
             // implementation lens) keeps the whole walk, so a dependency that
             // fails to load still fails it.
-            let demand = self
+            let raw_demand = self
                 .index
-                .take_binding_demand()
+                .take_import_demand()
                 .into_iter()
-                .filter(|dependency| self.best_effort_navigation && !visited.contains(dependency))
+                .filter(|(document, _)| {
+                    lazy_walk && (!visited.contains(document) || lazy.contains_key(document))
+                })
                 .collect::<Vec<_>>();
+            // The lazily loaded documents a lookup needs more of: what is
+            // requested of them exceeds what their last load served (review
+            // I2 compares the two, so a merged but unserved demand stays
+            // pending).
+            for (document, needed) in &raw_demand {
+                if lazy.contains_key(document) {
+                    requested
+                        .entry(document.clone())
+                        .or_insert_with(|| crate::navigation::ImportDemand::Units(HashMap::new()))
+                        .merge(needed);
+                }
+            }
+            let mut pending = lazy
+                .iter()
+                .filter(|(document, served)| {
+                    requested
+                        .get(*document)
+                        .is_some_and(|wanted| wanted != *served)
+                })
+                .map(|(document, _)| document.clone())
+                .collect::<Vec<_>>();
+            // A settled answer (snapshots) also waits for every other new
+            // demand its lookups made.
+            let unsettled = walk.settle
+                && raw_demand.iter().any(|(document, needed)| {
+                    !lazy.contains_key(document)
+                        && requested.get(document).is_none_or(|wanted| {
+                            let mut wanted = wanted.clone();
+                            wanted.merge(needed)
+                        })
+                });
+            if crate::trace::enabled() {
+                let named = raw_demand
+                    .iter()
+                    .map(|(document, needed)| {
+                        format!(
+                            "{} {needed:?}",
+                            document
+                                .path_segments()
+                                .and_then(|mut s| s.next_back())
+                                .unwrap_or("?")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                crate::trace::trace!(
+                    "  import walk: answered {answered}, {} pending, demand [{}]",
+                    pending.len(),
+                    named.chars().take(2000).collect::<String>()
+                );
+            }
+            if answered && pending.is_empty() && !unsettled {
+                if walk.settle && !visited.contains(uri) {
+                    // A snapshot proves its document's imports resolved:
+                    // bind them, parsing none (nothing looked through them).
+                    self.lazy_import_load = Some(LazyImportLoad {
+                        demand: crate::navigation::ImportDemand::Units(HashMap::new()),
+                        ..std::mem::take(&mut lazy_state)
+                    });
+                    let loaded = self.load_imports_with_session_cache(
+                        uri,
+                        context_key,
+                        pinned,
+                        cancel,
+                        &resolver_session_cache,
+                    );
+                    self.lazy_import_load = None;
+                    outcome.loaded.extend(loaded?);
+                }
+                outcome.answered = true;
+                return Ok(outcome);
+            }
+            let mut demand = Vec::new();
+            if !answered || walk.settle {
+                for (document, needed) in raw_demand {
+                    if lazy.contains_key(&document) {
+                        continue;
+                    }
+                    let changed = match requested.entry(document.clone()) {
+                        Entry::Vacant(entry) => {
+                            entry.insert(needed);
+                            true
+                        }
+                        Entry::Occupied(mut entry) => entry.get_mut().merge(&needed),
+                    };
+                    if changed {
+                        demand.push(document);
+                    }
+                }
+            }
+            // An answer that looked through an import a lazy load left
+            // unparsed is resolved again once that import is handled; only
+            // those documents are loaded for it (review I3).
+            demand.append(&mut pending);
+            if demand.is_empty() && !lazy.is_empty() {
+                // Before the walk widens past what the queries named, the
+                // lazily loaded documents are loaded whole, as without
+                // laziness.
+                for document in lazy.keys() {
+                    requested.insert(document.clone(), crate::navigation::ImportDemand::All);
+                    demand.push(document.clone());
+                }
+            }
             let mut deferred = Vec::new();
             if !demand.is_empty() {
-                let mut demand = demand;
                 demand.sort_by(|left, right| left.as_str().cmp(right.as_str()));
                 // The rest of the level waits until the demand is resolved.
                 deferred = std::mem::take(&mut frontier);
                 deferred.retain(|dependency| !demand.contains(dependency));
                 frontier = demand;
             }
-            if frontier.is_empty() || walk_exhausted {
+            // A lazily loaded document is loaded again past the walk limit:
+            // that costs no new unit of work (review I2).
+            if frontier.is_empty()
+                || (walk_exhausted && !frontier.iter().any(|document| lazy.contains_key(document)))
+            {
+                outcome.exhausted = walk_exhausted;
                 break;
             }
 
             let mut next = deferred;
             for current in frontier.drain(..) {
                 check_workspace_cancel(cancel)?;
-                if visited.contains(&current) {
+                let reload = lazy.get(&current).is_some_and(|served| {
+                    requested
+                        .get(&current)
+                        .is_some_and(|wanted| wanted != served)
+                });
+                if visited.contains(&current) && !reload {
                     continue;
                 }
-                if work > 0 && (work >= MAX_NAVIGATION_WALK_WORK || walked_bytes >= walk_byte_limit)
-                {
-                    walk_exhausted = true;
-                    break;
+                if !reload {
+                    if walk_exhausted
+                        || work > 0
+                            && (work >= MAX_NAVIGATION_WALK_WORK || walked_bytes >= walk_byte_limit)
+                    {
+                        // Past the limit only reloads proceed (review I2).
+                        walk_exhausted = true;
+                        continue;
+                    }
+                    visited.insert(current.clone());
+                    work += 1;
                 }
-                visited.insert(current.clone());
-                work += 1;
-                let dependencies = match self.load_imports_with_session_cache(
+                let partial = requested
+                    .get(&current)
+                    .filter(|wanted| **wanted != crate::navigation::ImportDemand::All)
+                    .cloned();
+                if let Some(wanted) = &partial {
+                    lazy_state.demand = wanted.clone();
+                    lazy_state.skipped = false;
+                    self.lazy_import_load = Some(std::mem::take(&mut lazy_state));
+                }
+                let loaded = self.load_imports_with_session_cache(
                     &current,
                     context_key,
                     pinned,
                     cancel,
                     &resolver_session_cache,
-                ) {
+                );
+                lazy.remove(&current);
+                if partial.is_some() {
+                    match self.lazy_import_load.take() {
+                        Some(state) => {
+                            if state.skipped {
+                                lazy.insert(current.clone(), state.demand.clone());
+                            }
+                            lazy_state = state;
+                        }
+                        None => lazy_state = LazyImportLoad::default(),
+                    }
+                }
+                let dependencies = match loaded {
                     Ok(dependencies) => dependencies,
                     Err(error)
                         if error == CANCELLATION_MESSAGE
@@ -7679,7 +7965,8 @@ impl Workspace {
                     // D16: a dependency that cannot be loaded only hides what
                     // binds through it; navigation returns what still binds.
                     // Each request rebuilds the walk, so log it once.
-                    Err(error) if self.best_effort_navigation && &current != uri => {
+                    Err(error) if walk.skip_failed_dependencies && &current != uri => {
+                        outcome.failed.push((current.clone(), error.clone()));
                         self.warn_project(format!(
                             "navigation skipped the imports of {current} while resolving {uri}; the result may be incomplete: {error}"
                         ));
@@ -7695,25 +7982,18 @@ impl Workspace {
                             self.index.source_text(&dependency).map_or(0, str::len),
                         );
                     }
+                    if !outcome.loaded.contains(&dependency) {
+                        outcome.loaded.push(dependency.clone());
+                    }
                     next.push(dependency);
                 }
             }
             next.retain(|dependency| !visited.contains(dependency));
             next.sort_by(|left, right| left.as_str().cmp(right.as_str()));
             next.dedup();
-            frontier = next;
+            frontier = if walk.widen { next } else { Vec::new() };
         }
-
-        if walk_exhausted {
-            self.warn(format!(
-                "navigation walk limit ({MAX_NAVIGATION_WALK_WORK} units or {walk_byte_limit} source bytes) reached while resolving {uri}; result is incomplete"
-            ));
-        }
-
-        check_workspace_cancel(cancel)?;
-        let locations = self.resolve_virtual_navigation(uri, position, target, cancel)?;
-        self.validate_compiled_navigation_locations(&locations)?;
-        Ok(locations)
+        Ok(outcome)
     }
 
     /// Dependencies only supply declarations. They cannot make a cursor
@@ -7825,6 +8105,7 @@ impl Workspace {
         // Only this load is limited to interface imports: a load nested in
         // it starts unlimited.
         let interface_imports_only = std::mem::take(&mut self.interface_imports_only);
+        let mut lazy = self.lazy_import_load.take();
         check_workspace_cancel(cancel)?;
         #[cfg(test)]
         if TEST_FAIL_IMPORTS_OF.with(|name| {
@@ -7845,12 +8126,14 @@ impl Workspace {
             .get(&effective_context_key)
             .map(|state| (state.context.clone(), state.context_observations.clone()))
         else {
+            self.lazy_import_load = lazy;
             return Ok(Vec::new());
         };
         let mut bindings = HashMap::new();
         if imports.is_empty() {
             self.index.bind_imports(uri, bindings);
             self.store_interface_imports(uri, &context, Vec::new(), true, Vec::new());
+            self.lazy_import_load = lazy;
             return Ok(Vec::new());
         }
         if context.project_file().is_none() {
@@ -8150,6 +8433,18 @@ impl Workspace {
             dependency_units
                 .sort_by_key(|unit| !roots.iter().any(|root| unit.source.path.starts_with(root)));
         }
+        // The canonical import names each resolved unit is bound to, for a
+        // lazy load to match its demand against (l4d-ucux).
+        let mut lazy_names = HashMap::<&pascal_core::SourceId, Vec<String>>::new();
+        if lazy.is_some() {
+            for binding in &resolved.bindings {
+                if let ResolutionTarget::Found(source_id) = &binding.target {
+                    lazy_names.entry(source_id).or_default().push(
+                        crate::navigation::canonical_name(&binding.site.requested_name),
+                    );
+                }
+            }
+        }
         let total = dependency_units.len();
         if total > 0
             && let Some(hook) = &self.dependency_hook
@@ -8218,6 +8513,90 @@ impl Workspace {
                         &effective_context_key,
                         &dependency_text,
                     );
+                let lazy_import = match lazy.as_mut() {
+                    // Only a unit the index does not hold is skipped: a lookup
+                    // through an indexed copy (older text, another context)
+                    // would read it (l4d-ucux review C1).
+                    Some(lazy) if !self.index.contains(&dependency_uri) && !released => self
+                        .lazy_import(
+                            lazy,
+                            dependency,
+                            lazy_names
+                                .get(&dependency.source.id)
+                                .map_or(&[][..], Vec::as_slice),
+                            &effective_context_key,
+                            cancel.unwrap_or(&no_cancel),
+                        ),
+                    _ => LazyImport::Parse,
+                };
+                if lazy.is_some() {
+                    crate::trace::trace!(
+                        "  lazy import {}: {}",
+                        dependency.source.path.display(),
+                        match &lazy_import {
+                            LazyImport::Parse => "parse",
+                            LazyImport::Unneeded => "unneeded",
+                            LazyImport::Absent(_) => "absent",
+                        }
+                    );
+                }
+                if !matches!(lazy_import, LazyImport::Parse) {
+                    // Bound like a parsed unit, so a lookup through it
+                    // demands it again (`bind_imports_lazily`).
+                    resolved_urls.insert(dependency.source.id.clone(), dependency_uri.clone());
+                    resolved_revisions
+                        .insert(dependency_uri.clone(), dependency.source.revision.clone());
+                    if let LazyImport::Absent(includes) = &lazy_import {
+                        if let pascal_core::SourceRevision::Disk { stamp, .. } =
+                            &dependency.source.revision
+                        {
+                            self.lazy_absences.push(LazyAbsence {
+                                path: dependency.source.path.clone(),
+                                stamp: Some(path_stamp_from_project_read(stamp)),
+                                include_hash: None,
+                            });
+                        }
+                        for (path, stamp, hash) in includes {
+                            self.lazy_absences.push(LazyAbsence {
+                                path: path.clone(),
+                                stamp: stamp.clone(),
+                                include_hash: Some(*hash),
+                            });
+                        }
+                    }
+                    if let LazyImport::Absent(includes) = lazy_import {
+                        // The answer relies on its bytes and its includes.
+                        self.record_resolved_source(
+                            &context,
+                            &dependency.source,
+                            dependency_uri.clone(),
+                            false,
+                        )?;
+                        for (path, stamp, content_hash) in includes {
+                            let path_entry = context.path_entry_for(&path);
+                            if let Some(record) = rename::path_record_at(
+                                path,
+                                stamp,
+                                Some(content_hash),
+                                None,
+                                None,
+                                Some(context.read_policy().clone()),
+                                path_entry,
+                                true,
+                            ) && let Some(records) = self.analysis_records.as_mut()
+                            {
+                                resolver::merge_source_record(records, record);
+                            }
+                        }
+                    }
+                    if let Some(lazy) = lazy.as_mut() {
+                        lazy.skipped = true;
+                    }
+                    if let Some(hook) = &self.dependency_hook {
+                        hook(&dependency_uri, index + 1, total)?;
+                    }
+                    continue;
+                }
                 // A crawl keeps the text of a unit it releases, to index it
                 // again when its walk reaches it.
                 let release_text = (!already_indexed && !released && self.crawl_deferred.is_some())
@@ -8391,8 +8770,77 @@ impl Workspace {
                 resolver::merge_source_record(records, record);
             }
         }
-        self.index.bind_imports(uri, bindings);
+        if let Some(lazy) = lazy.as_ref().filter(|lazy| lazy.skipped) {
+            self.index
+                .bind_imports_lazily(uri, bindings, lazy.demand.clone());
+        } else {
+            self.index.bind_imports(uri, bindings);
+        }
+        self.lazy_import_load = lazy;
         Ok(dependencies)
+    }
+
+    /// Whether a lazy load parses `dependency`, bound to the canonical import
+    /// names `names` (l4d-ucux). Only a unit read from disk, outside the
+    /// session's private paths, is proven absent.
+    fn lazy_import(
+        &self,
+        lazy: &mut LazyImportLoad,
+        dependency: &pascal_core::ResolvedUnit,
+        names: &[String],
+        context_key: &ContextKey,
+        cancel: &AtomicBool,
+    ) -> LazyImport {
+        use crate::navigation::{ImportDemand, ImportNeed};
+        let ImportDemand::Units(units) = &lazy.demand else {
+            return LazyImport::Parse;
+        };
+        let mut needles = BTreeSet::new();
+        let mut prefix_needles = BTreeSet::new();
+        let mut needed = false;
+        for name in names {
+            match units.get(name) {
+                None => {}
+                Some(ImportNeed::Unit) => return LazyImport::Parse,
+                Some(ImportNeed::Spelled { names, prefixes }) => {
+                    needed = true;
+                    needles.extend(names.iter().cloned());
+                    prefix_needles.extend(prefixes.iter().cloned());
+                }
+            }
+        }
+        if !needed {
+            return LazyImport::Unneeded;
+        }
+        if !matches!(
+            dependency.source.revision,
+            pascal_core::SourceRevision::Disk { .. }
+        ) || self
+            .session_private_paths
+            .contains(&rename::path_key(&dependency.source.path))
+        {
+            return LazyImport::Parse;
+        }
+        let input = lazy.input.get_or_insert_with(|| self.analysis_input());
+        let mut includes = Vec::new();
+        for (needles, prefixes) in [(needles, false), (prefix_needles, true)] {
+            if needles.is_empty() {
+                continue;
+            }
+            match lazy.absence.prove(
+                self,
+                input,
+                context_key,
+                (&dependency.source.path, &dependency.source.bytes),
+                needles.into_iter().collect(),
+                prefixes,
+                cancel,
+            ) {
+                Some(proven) => includes.extend(proven),
+                None => return LazyImport::Parse,
+            }
+        }
+        LazyImport::Absent(includes)
     }
 
     fn store_interface_imports(
@@ -9105,6 +9553,8 @@ impl Workspace {
         budget: Option<&ReconciliationBudget>,
     ) -> Result<bool, String> {
         check_workspace_cancel(cancel)?;
+        #[cfg(test)]
+        TEST_INDEXED_DEPENDENCIES.with(|indexed| indexed.borrow_mut().push(uri.clone()));
         let size = disk_size.unwrap_or(source.len());
         if !self.make_room_for_with_control(uri, size, pinned, 0, cancel, budget)? {
             if !self.open_documents.contains_key(uri) {

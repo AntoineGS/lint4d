@@ -6079,7 +6079,7 @@ function FreeMake: TReturnType;
 begin
   Result := nil;
 end;
-function LocalMake: TReturnType;
+procedure LocalMake;
 var
   Result: TFieldType;
 begin
@@ -6158,6 +6158,8 @@ end.
         result_position,
         NavigationTarget::Declaration,
     );
+    // `{$X}` is unknown here, so no implicit `Result` is claimed: the
+    // lookup binds the imported global, as dcc does under `{$X-}`.
     assert_eq!(definition.len(), 1);
     assert_location_start(
         &definition[0],
@@ -18154,4 +18156,112 @@ fn completion_past_the_item_cap_keeps_the_first_items_in_name_order() {
         names
     );
     assert!(list.is_incomplete);
+}
+
+/// `ImportedProvider` with a global `var Result`, and the declaration that
+/// `Result` at its `nth` occurrence in `consumer` binds to (l4d-fpyu review
+/// F4, dcc 37.0 programs R1-R10).
+fn result_binding(consumer: &str, nth: usize) -> Vec<lsp_types::Location> {
+    let provider =
+        "unit ImportedProvider;\ninterface\nvar\n  Result: Integer;\nimplementation\nend.\n";
+    let provider_uri = uri("ImportedProvider");
+    let consumer_uri = uri("ImportedConsumer");
+    let mut index = NavigationIndex::new();
+    index
+        .update(provider_uri.clone(), provider.to_owned())
+        .expect("provider parses");
+    index
+        .update(consumer_uri.clone(), consumer.to_owned())
+        .expect("consumer parses");
+    index.bind_imports(
+        &consumer_uri,
+        [("ImportedProvider".to_owned(), provider_uri)],
+    );
+    index.navigate(
+        &consumer_uri,
+        position_of(consumer, "Result", nth),
+        NavigationTarget::Declaration,
+    )
+}
+
+fn binds_imported_global(locations: &[lsp_types::Location]) -> bool {
+    locations
+        .iter()
+        .any(|location| location.uri == uri("ImportedProvider"))
+}
+
+#[test]
+fn under_x_plus_a_functions_result_is_implicit_not_the_imported_global() {
+    // R1: function.
+    let consumer = "unit ImportedConsumer;\n{$X+}\ninterface\nuses ImportedProvider;\nfunction F: Integer;\nimplementation\nfunction F: Integer;\nbegin\n  Result := 1;\nend;\nend.\n";
+    assert!(!binds_imported_global(&result_binding(consumer, 0)));
+}
+
+#[test]
+fn under_x_plus_a_procedures_result_is_the_imported_global() {
+    // R1: procedure.
+    let consumer = "unit ImportedConsumer;\n{$X+}\ninterface\nuses ImportedProvider;\nprocedure P;\nimplementation\nprocedure P;\nbegin\n  Result := 1;\nend;\nend.\n";
+    assert!(binds_imported_global(&result_binding(consumer, 0)));
+}
+
+#[test]
+fn under_x_plus_a_procedure_nested_in_a_function_sees_the_outer_result() {
+    // R1/R7: nested procedure inside a function.
+    let consumer = "unit ImportedConsumer;\n{$X+}\ninterface\nuses ImportedProvider;\nfunction F: Integer;\nimplementation\nfunction F: Integer;\n  procedure Inner;\n  begin\n    Result := 2;\n  end;\nbegin\n  Inner;\nend;\nend.\n";
+    assert!(!binds_imported_global(&result_binding(consumer, 0)));
+}
+
+#[test]
+fn under_x_minus_a_functions_result_is_the_imported_global() {
+    // R2: {$X-} function.
+    let consumer = "unit ImportedConsumer;\n{$X-}\ninterface\nuses ImportedProvider;\nfunction F: Integer;\nimplementation\nfunction F: Integer;\nbegin\n  Result := 7;\n  F := 3;\nend;\nend.\n";
+    assert!(binds_imported_global(&result_binding(consumer, 0)));
+}
+
+#[test]
+fn under_x_minus_a_procedure_nested_in_a_function_binds_the_imported_global() {
+    // R8: {$X-} nested procedure.
+    let consumer = "unit ImportedConsumer;\n{$X-}\ninterface\nuses ImportedProvider;\nfunction F: Integer;\nimplementation\nfunction F: Integer;\n  procedure Inner;\n  begin\n    Result := 2;\n  end;\nbegin\n  Inner;\n  F := 1;\nend;\nend.\n";
+    assert!(binds_imported_global(&result_binding(consumer, 0)));
+}
+
+#[test]
+fn under_x_plus_a_method_functions_result_shadows_a_field_named_result() {
+    // R5: method function, class field `Result`.
+    let consumer = "unit ImportedConsumer;\n{$X+}\ninterface\nuses ImportedProvider;\ntype\n  TC = class\n    Result: Integer;\n    function F: Integer;\n  end;\nimplementation\nfunction TC.F: Integer;\nbegin\n  Result := 1;\nend;\nend.\n";
+    let locations = result_binding(consumer, 1);
+    assert!(!binds_imported_global(&locations), "{locations:?}");
+    assert!(
+        !locations
+            .iter()
+            .any(|location| location.range.start == position_of(consumer, "Result", 0)),
+        "the field is shadowed: {locations:?}"
+    );
+}
+
+#[test]
+fn under_x_plus_with_beats_the_implicit_result() {
+    // R9: `with c do Result := ..` in a function binds `c.Result`.
+    let consumer = "unit ImportedConsumer;\n{$X+}\ninterface\nuses ImportedProvider;\ntype\n  TC = class\n    Result: Integer;\n  end;\nfunction F(C: TC): Integer;\nimplementation\nfunction F(C: TC): Integer;\nbegin\n  with C do\n    Result := 1;\nend;\nend.\n";
+    let locations = result_binding(consumer, 1);
+    assert_eq!(locations.len(), 1, "{locations:?}");
+    assert_eq!(locations[0].range.start, position_of(consumer, "Result", 0));
+}
+
+#[test]
+fn under_x_plus_a_nested_procedures_own_local_result_shadows_the_outer_one() {
+    // R11: `procedure N; var Result: Integer;` nested in a function.
+    let consumer = "unit ImportedConsumer;\n{$X+}\ninterface\nuses ImportedProvider;\nfunction G: Integer;\nimplementation\nfunction G: Integer;\n  procedure N;\n  var\n    Result: Integer;\n  begin\n    Result := 42;\n  end;\nbegin\n  Result := 1;\n  N;\nend;\nend.\n";
+    let locations = result_binding(consumer, 1);
+    assert_eq!(locations.len(), 1, "{locations:?}");
+    assert_eq!(locations[0].range.start, position_of(consumer, "Result", 0));
+}
+
+#[test]
+fn under_x_plus_a_nested_procedures_result_parameter_shadows_the_outer_one() {
+    // R11: `procedure M(Result: Integer);` nested in a function.
+    let consumer = "unit ImportedConsumer;\n{$X+}\ninterface\nuses ImportedProvider;\nfunction G: Integer;\nimplementation\nfunction G: Integer;\n  procedure M(Result: Integer);\n  begin\n    Result := 43;\n  end;\nbegin\n  Result := 1;\n  M(0);\nend;\nend.\n";
+    let locations = result_binding(consumer, 1);
+    assert_eq!(locations.len(), 1, "{locations:?}");
+    assert_eq!(locations[0].range.start, position_of(consumer, "Result", 0));
 }

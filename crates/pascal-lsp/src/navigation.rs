@@ -536,10 +536,157 @@ pub struct NavigationIndex {
     binding_demand: BindingDemand,
 }
 
-/// Documents whose unresolved imports a query consulted. A clone starts
-/// empty, like `RelaxedBindings`.
+/// Documents whose unresolved imports a query consulted, with what it
+/// consulted them for (l4d-ucux). A clone starts empty, like
+/// `RelaxedBindings`.
 #[derive(Default)]
-struct BindingDemand(std::sync::Mutex<Vec<Url>>);
+struct BindingDemand(std::sync::Mutex<Vec<(Url, ImportDemand)>>);
+
+/// What a query needed from one document's imports.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ImportDemand {
+    /// Every import, as each one may matter.
+    #[default]
+    All,
+    /// Per canonical import name, what was looked up through it.
+    Units(HashMap<String, ImportNeed>),
+}
+
+/// What a lookup needed from one import.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ImportNeed {
+    /// The unit itself, whatever it declares.
+    Unit,
+    /// Only declarations spelled by one of these canonical identifiers
+    /// (`names`), or by an identifier starting with one of `prefixes`
+    /// (completion, l4d-fpyu): a unit whose text cannot spell any of them
+    /// cannot change the answer.
+    Spelled {
+        names: std::collections::BTreeSet<String>,
+        prefixes: std::collections::BTreeSet<String>,
+    },
+}
+
+impl ImportNeed {
+    /// A lookup that reads which unit the import binds, not what it
+    /// declares.
+    pub(crate) fn binding_only() -> Self {
+        ImportNeed::Spelled {
+            names: std::collections::BTreeSet::new(),
+            prefixes: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// Adds `other`; whether anything was added.
+    fn merge(&mut self, other: &ImportNeed) -> bool {
+        match (&mut *self, other) {
+            (ImportNeed::Unit, _) => false,
+            (_, ImportNeed::Unit) => {
+                *self = ImportNeed::Unit;
+                true
+            }
+            (
+                ImportNeed::Spelled { names, prefixes },
+                ImportNeed::Spelled {
+                    names: other_names,
+                    prefixes: other_prefixes,
+                },
+            ) => {
+                let mut changed = false;
+                for name in other_names {
+                    changed |= names.insert(name.clone());
+                }
+                for prefix in other_prefixes {
+                    changed |= prefixes.insert(prefix.clone());
+                }
+                changed
+            }
+        }
+    }
+
+    /// Whether everything `other` needs is in `self`.
+    fn covers(&self, other: &ImportNeed) -> bool {
+        match (self, other) {
+            (ImportNeed::Unit, _) => true,
+            (_, ImportNeed::Unit) => false,
+            (
+                ImportNeed::Spelled { names, prefixes },
+                ImportNeed::Spelled {
+                    names: other_names,
+                    prefixes: other_prefixes,
+                },
+            ) => other_names.is_subset(names) && other_prefixes.is_subset(prefixes),
+        }
+    }
+}
+
+impl ImportDemand {
+    /// Adds `other`; whether anything was added.
+    pub(crate) fn merge(&mut self, other: &ImportDemand) -> bool {
+        match (&mut *self, other) {
+            (ImportDemand::All, _) => false,
+            (_, ImportDemand::All) => {
+                *self = ImportDemand::All;
+                true
+            }
+            (ImportDemand::Units(units), ImportDemand::Units(others)) => {
+                let mut changed = false;
+                for (unit, need) in others {
+                    match units.get_mut(unit) {
+                        None => {
+                            units.insert(unit.clone(), need.clone());
+                            changed = true;
+                        }
+                        Some(current) => changed |= current.merge(need),
+                    }
+                }
+                changed
+            }
+        }
+    }
+
+    /// Whether a load that served `self` already handled `need` through the
+    /// import `name`.
+    fn covers(&self, name: &str, need: &ImportNeed) -> bool {
+        match self {
+            ImportDemand::All => true,
+            ImportDemand::Units(units) => units.get(name).is_some_and(|held| held.covers(need)),
+        }
+    }
+}
+
+/// Only a plain ASCII identifier (or identifier prefix) can be proven absent
+/// from a unit's bytes (R9-5, A2).
+fn is_provable_needle(needle: &str) -> bool {
+    !needle.is_empty()
+        && needle
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// The need of a lookup for `key` through an import.
+fn import_need_for(key: Option<&str>) -> ImportNeed {
+    match key {
+        Some(key) if is_provable_needle(key) => ImportNeed::Spelled {
+            names: std::collections::BTreeSet::from([key.to_ascii_lowercase()]),
+            prefixes: std::collections::BTreeSet::new(),
+        },
+        _ => ImportNeed::Unit,
+    }
+}
+
+/// The need of a completion listing the names starting with `prefix`
+/// through an import (l4d-fpyu); an empty prefix needs every name.
+fn import_need_for_prefix(prefix: &str) -> ImportNeed {
+    if is_provable_needle(prefix) {
+        ImportNeed::Spelled {
+            names: std::collections::BTreeSet::new(),
+            prefixes: std::collections::BTreeSet::from([prefix.to_ascii_lowercase()]),
+        }
+    } else {
+        ImportNeed::Unit
+    }
+}
 
 impl Clone for BindingDemand {
     fn clone(&self) -> Self {
@@ -548,17 +695,19 @@ impl Clone for BindingDemand {
 }
 
 impl BindingDemand {
-    fn record(&self, uri: &Url) {
-        let mut demand = self
+    fn record(&self, uri: &Url, demand: ImportDemand) {
+        let mut demands = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !demand.contains(uri) {
-            demand.push(uri.clone());
+        if let Some((_, current)) = demands.iter_mut().find(|(known, _)| known == uri) {
+            current.merge(&demand);
+        } else {
+            demands.push((uri.clone(), demand));
         }
     }
 
-    fn take(&self) -> Vec<Url> {
+    fn take(&self) -> Vec<(Url, ImportDemand)> {
         std::mem::take(
             &mut *self
                 .0
@@ -566,6 +715,18 @@ impl BindingDemand {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
     }
+}
+
+/// Helper selections nested in one another on this thread (review F1).
+const MAX_HELPER_SELECTION_DEPTH: usize = 8;
+
+/// Type-reference resolutions nested in one another on this thread (F1).
+const MAX_TYPE_REF_NESTING: usize = 32;
+
+thread_local! {
+    static TYPE_REF_NESTING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static HELPER_SELECTIONS: std::cell::RefCell<Vec<(Url, usize, Url, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Distinct relaxed binding decisions retained for one answer.
@@ -1209,6 +1370,7 @@ impl NavigationIndex {
                 import_bindings: None,
                 import_binding_fingerprint: None,
                 unbound: None,
+                lazy_imports: None,
             },
         );
         let urls = self.units.entry(unit).or_default();
@@ -1283,6 +1445,7 @@ impl NavigationIndex {
                     import_bindings,
                     import_binding_fingerprint: document.import_binding_fingerprint,
                     unbound: document.unbound.clone(),
+                    lazy_imports: document.lazy_imports.clone(),
                 },
             );
         }
@@ -2146,6 +2309,22 @@ impl NavigationIndex {
     where
         I: IntoIterator<Item = (String, Url)>,
     {
+        self.bind_imports_with_laziness(uri, bindings, None);
+    }
+
+    /// `bind_imports` for imports some of whose units a lazy load left
+    /// unparsed (l4d-ucux): a lookup through one of them demands it again.
+    pub(crate) fn bind_imports_lazily<I>(&mut self, uri: &Url, bindings: I, served: ImportDemand)
+    where
+        I: IntoIterator<Item = (String, Url)>,
+    {
+        self.bind_imports_with_laziness(uri, bindings, Some(served));
+    }
+
+    fn bind_imports_with_laziness<I>(&mut self, uri: &Url, bindings: I, lazy: Option<ImportDemand>)
+    where
+        I: IntoIterator<Item = (String, Url)>,
+    {
         use pascal_project::analysis_metrics::{self, Metric};
         analysis_metrics::record(Metric::ImportBindingCalls, 1);
         let bindings = bindings
@@ -2162,6 +2341,7 @@ impl NavigationIndex {
             ));
             document.import_bindings = Some(bindings);
             document.unbound = None;
+            document.lazy_imports = lazy.map(|served| (uri.clone(), served));
         }
     }
 
@@ -2177,6 +2357,7 @@ impl NavigationIndex {
             document.unbound = (!document.interface_uses.is_empty()
                 || !document.implementation_uses.is_empty())
             .then(|| uri.clone());
+            document.lazy_imports = None;
         }
     }
 
@@ -2184,13 +2365,53 @@ impl NavigationIndex {
     /// last call: resolving their imports is what could change its answer
     /// (l4d-4nbs D44).
     pub(crate) fn take_binding_demand(&self) -> Vec<Url> {
+        self.binding_demand
+            .take()
+            .into_iter()
+            .map(|(uri, _)| uri)
+            .collect()
+    }
+
+    /// `take_binding_demand` with what each document's imports were
+    /// consulted for (l4d-ucux).
+    pub(crate) fn take_import_demand(&self) -> Vec<(Url, ImportDemand)> {
         self.binding_demand.take()
     }
 
     fn demand_bindings(&self, document: &Document) {
         if let Some(uri) = &document.unbound {
-            self.binding_demand.record(uri);
+            self.binding_demand.record(uri, ImportDemand::All);
         }
+    }
+
+    /// A lookup through `document`'s import `name` for `key` (`None`: the
+    /// unit itself). Recorded while the imports are fenced, and while the
+    /// import is bound to a unit a lazy load left unparsed.
+    fn demand_import(&self, document: &Document, name: &str, key: Option<&str>) {
+        self.demand_import_need(document, name, import_need_for(key));
+    }
+
+    /// `demand_import` for any need. A lazily bound import is demanded only
+    /// when the load that left it unparsed did not already serve `need`.
+    fn demand_import_need(&self, document: &Document, name: &str, need: ImportNeed) {
+        let owner = match (&document.unbound, &document.lazy_imports) {
+            (Some(uri), _) => uri,
+            (None, Some((uri, served)))
+                if document
+                    .import_bindings
+                    .as_ref()
+                    .and_then(|bindings| bindings.get(name))
+                    .is_some_and(|target| !self.documents.contains_key(target))
+                    && !served.covers(name, &need) =>
+            {
+                uri
+            }
+            _ => return,
+        };
+        self.binding_demand.record(
+            owner,
+            ImportDemand::Units(HashMap::from([(name.to_owned(), need)])),
+        );
     }
 
     /// Whether `uri`'s imports are bound or fenced rather than resolved by name.
@@ -7558,6 +7779,12 @@ impl NavigationIndex {
                 return Ok(local);
             }
         }
+        // Below the locals (a nested routine's own `Result` local or
+        // parameter wins, dcc R11; a function's cannot exist, E2004) and
+        // above the class members.
+        if key == "result" && document.implicit_result_at(offset, scope) {
+            return Ok(Vec::new());
+        }
 
         if let Some(owner_type) = owner_type.as_deref() {
             let helper_target = if document.offset_is_in_helper_declaration(offset) {
@@ -7720,7 +7947,13 @@ impl NavigationIndex {
             if document.unknown_imports.contains(unit.as_str()) {
                 return Ok(Vec::new());
             }
-            for unit_uri in self.unit_urls_for_import_with_budget(document, unit, cancel, budget)? {
+            for unit_uri in self.unit_urls_for_import_lookup_with_budget(
+                document,
+                unit,
+                Some(key),
+                cancel,
+                budget,
+            )? {
                 imported.extend(
                     self.exported_references_for_key_with_budget(&unit_uri, key, cancel, budget)?,
                 );
@@ -8288,10 +8521,31 @@ impl NavigationIndex {
     }
 
     fn unit_urls_for_import(&self, current_document: &Document, name: &str) -> Vec<Url> {
+        self.unit_urls_for_import_lookup(current_document, name, None)
+    }
+
+    /// `unit_urls_for_import` for a lookup of the canonical identifier `key`
+    /// only (`unit_urls_for_import_lookup_with_budget`).
+    fn unit_urls_for_import_lookup(
+        &self,
+        current_document: &Document,
+        name: &str,
+        key: Option<&str>,
+    ) -> Vec<Url> {
+        self.unit_urls_for_import_need(current_document, name, import_need_for(key))
+    }
+
+    /// `unit_urls_for_import` for what `need` reads from the unit.
+    fn unit_urls_for_import_need(
+        &self,
+        current_document: &Document,
+        name: &str,
+        need: ImportNeed,
+    ) -> Vec<Url> {
         if current_document.unknown_imports.contains(name) {
             return Vec::new();
         }
-        self.demand_bindings(current_document);
+        self.demand_import_need(current_document, name, need);
         if let Some(bindings) = &current_document.import_bindings {
             return bindings.get(name).cloned().into_iter().collect();
         }
@@ -8305,10 +8559,25 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Url>, String> {
+        self.unit_urls_for_import_lookup_with_budget(current_document, name, None, cancel, budget)
+    }
+
+    /// `unit_urls_for_import_with_budget` for a lookup of the canonical
+    /// identifier `key` only (l4d-ucux): what the caller reads from the unit
+    /// is spelled by `key` in its text, so a unit that cannot spell it need
+    /// not be parsed.
+    fn unit_urls_for_import_lookup_with_budget(
+        &self,
+        current_document: &Document,
+        name: &str,
+        key: Option<&str>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Url>, String> {
         if current_document.unknown_imports.contains(name) {
             return Ok(Vec::new());
         }
-        self.demand_bindings(current_document);
+        self.demand_import(current_document, name, key);
         if let Some(bindings) = &current_document.import_bindings {
             let Some(uri) = bindings.get(name) else {
                 return Ok(Vec::new());
@@ -9121,6 +9390,10 @@ impl NavigationIndex {
                 return local;
             }
         }
+        // Below the locals (dcc R11) and above the class members.
+        if key == "result" && document.implicit_result_at(offset, scope) {
+            return Vec::new();
+        }
 
         // Class members are the next lexical scope in Delphi. They must be
         // considered before unit globals and imported declarations, and the
@@ -9221,7 +9494,7 @@ impl NavigationIndex {
         }
         let mut imported = Vec::new();
         for unit in active_uses {
-            for unit_uri in self.unit_urls_for_import(document, unit) {
+            for unit_uri in self.unit_urls_for_import_lookup(document, unit, Some(&key)) {
                 imported.extend(
                     self.exported_references_for_document(&unit_uri)
                         .into_iter()
@@ -10289,6 +10562,26 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Receiver>, String> {
+        // Each entry here restarts the type-ref depth at 0, so a cycle back
+        // through it (a member lookup resolving a type reference resolving a
+        // member lookup ...) is bounded by its nesting on this thread
+        // instead (l4d-fpyu review F1).
+        let nested = TYPE_REF_NESTING.with(|nesting| {
+            let depth = nesting.get();
+            nesting.set(depth + 1);
+            depth
+        });
+        struct Leave;
+        impl Drop for Leave {
+            fn drop(&mut self) {
+                TYPE_REF_NESTING.with(|nesting| nesting.set(nesting.get().saturating_sub(1)));
+            }
+        }
+        let _leave = Leave;
+        if nested >= MAX_TYPE_REF_NESTING {
+            state.mark_receiver_uncertain();
+            return Ok(Vec::new());
+        }
         self.type_receivers_for_type_ref_with_budget_at_depth(
             current_uri,
             current_document,
@@ -11571,20 +11864,23 @@ impl NavigationIndex {
 
         let region = current_document.region_at(offset);
         let mut best = None;
-        let mut consider = |unit_name: &str, unit_uris: Vec<Url>| {
+        let prefixes = |unit_name: &str| {
             let unit_parts = unit_name.split('.').collect::<Vec<_>>();
-            if unit_parts.len() >= parts.len()
-                || !unit_parts.iter().enumerate().all(|(index, unit_part)| {
+            unit_parts.len() < parts.len()
+                && unit_parts.iter().enumerate().all(|(index, unit_part)| {
                     canonical_name(unit_part) == canonical_name(&parts[index])
                 })
-            {
+        };
+        let mut consider = |unit_name: &str, unit_uris: Vec<Url>| {
+            if !prefixes(unit_name) {
                 return;
             }
+            let unit_parts = unit_name.split('.').count();
             if best
                 .as_ref()
-                .is_none_or(|(prefix_len, _)| *prefix_len < unit_parts.len())
+                .is_none_or(|(prefix_len, _)| *prefix_len < unit_parts)
             {
-                best = Some((unit_parts.len(), unit_uris));
+                best = Some((unit_parts, unit_uris));
             }
         };
 
@@ -11593,6 +11889,10 @@ impl NavigationIndex {
             vec![current_uri.clone()],
         );
         for used in current_document.active_uses(region) {
+            // Only a unit naming a prefix is looked up (l4d-ucux).
+            if !prefixes(used) {
+                continue;
+            }
             let unit_uris = self.unit_urls_for_import(current_document, used);
             if !unit_uris.is_empty() {
                 consider(used, unit_uris);
@@ -11903,6 +12203,12 @@ impl NavigationIndex {
         Ok(result)
     }
 
+    /// Helper selection re-enters itself when matching a helper's target
+    /// resolves a type reference that selects helpers again (a method's
+    /// parent type looked up as a member of its owner). Each such turn starts
+    /// a fresh resolution state, so depth limits do not see it: a selection
+    /// already in progress for the same target and position, or one nested
+    /// past `MAX_HELPER_SELECTION_DEPTH`, is `Unknown` (l4d-fpyu review F1).
     fn active_helper_for_type_with_budget(
         &self,
         current_uri: &Url,
@@ -11915,7 +12221,51 @@ impl NavigationIndex {
         if !matches!(target.kind, TypeKind::Class | TypeKind::Record) {
             return Ok(HelperSelection::None);
         }
+        let key = (
+            current_uri.clone(),
+            offset,
+            target.uri.clone(),
+            target.key.clone(),
+        );
+        let entered = HELPER_SELECTIONS.with(|active| {
+            let mut active = active.borrow_mut();
+            if active.len() >= MAX_HELPER_SELECTION_DEPTH || active.contains(&key) {
+                return false;
+            }
+            active.push(key);
+            true
+        });
+        if !entered {
+            return Ok(HelperSelection::Unknown);
+        }
+        struct Leave;
+        impl Drop for Leave {
+            fn drop(&mut self) {
+                HELPER_SELECTIONS.with(|active| {
+                    active.borrow_mut().pop();
+                });
+            }
+        }
+        let _leave = Leave;
+        self.active_helper_for_type_with_budget_entered(
+            current_uri,
+            current_document,
+            offset,
+            target,
+            cancel,
+            budget,
+        )
+    }
 
+    fn active_helper_for_type_with_budget_entered(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        target: &TypeInstance,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<HelperSelection, String> {
         let region = current_document.region_at(offset);
         let active_uses = current_document.active_uses_with_budget(region, cancel, budget)?;
         let mut visible = Vec::new();
@@ -11952,9 +12302,14 @@ impl NavigationIndex {
                 });
                 continue;
             }
-            for unit_uri in
-                self.unit_urls_for_import_with_budget(current_document, unit, cancel, budget)?
-            {
+            // A helper declaration spells `helper` (l4d-ucux).
+            for unit_uri in self.unit_urls_for_import_lookup_with_budget(
+                current_document,
+                unit,
+                Some("helper"),
+                cancel,
+                budget,
+            )? {
                 let Some(unit_document) = self.documents.get(&unit_uri) else {
                     continue;
                 };
@@ -13509,7 +13864,7 @@ impl NavigationIndex {
                 active_uses
                     .into_iter()
                     .flat_map(|unit| {
-                        self.unit_urls_for_import(current_document, unit)
+                        self.unit_urls_for_import_lookup(current_document, unit, Some(first))
                             .into_iter()
                             .flat_map(|unit_uri| {
                                 self.type_candidates_in_unit(&unit_uri, first, false)
@@ -13870,9 +14225,13 @@ impl NavigationIndex {
             }
             let mut imported = Vec::new();
             for unit in active_uses {
-                for unit_uri in
-                    self.unit_urls_for_import_with_budget(current_document, unit, cancel, budget)?
-                {
+                for unit_uri in self.unit_urls_for_import_lookup_with_budget(
+                    current_document,
+                    unit,
+                    Some(first),
+                    cancel,
+                    budget,
+                )? {
                     imported.extend(self.type_candidates_in_unit_with_budget(
                         &unit_uri, first, false, cancel, budget,
                     )?);
@@ -16614,6 +16973,9 @@ struct Document {
     /// empty map without resolving them: a lookup through them records the
     /// document as a binding demand (l4d-4nbs D44).
     unbound: Option<Url>,
+    /// Set while some bound imports are units a lazy load left unparsed: a
+    /// lookup through one of them records a demand for it (l4d-ucux).
+    lazy_imports: Option<(Url, ImportDemand)>,
 }
 
 impl Deref for Document {
@@ -16667,6 +17029,7 @@ impl Document {
                 import_bindings: None,
                 import_binding_fingerprint: None,
                 unbound: None,
+                lazy_imports: None,
             });
         }
         #[cfg(test)]
@@ -17158,6 +17521,7 @@ impl Document {
             import_bindings: None,
             import_binding_fingerprint: None,
             unbound: None,
+            lazy_imports: None,
         })
     }
 
@@ -17326,6 +17690,26 @@ impl Document {
                     .iter()
                     .any(|span| span.contains_offset(offset))
         })
+    }
+
+    /// Whether an unqualified `Result` at `offset` (in `scope`) is the
+    /// implicit result of an enclosing function: under `{$X+}` known in
+    /// effect there, the implicit `Result` shadows the function's class
+    /// members and every unit-level and imported name, below `with` (dcc
+    /// 37.0, l4d-fpyu review F4: R1-R10). With `{$X}` off or unknown no such
+    /// claim is made.
+    fn implicit_result_at(&self, offset: usize, scope: usize) -> bool {
+        if self.result_type_annotation_for_body_scope(scope).is_none() {
+            return false;
+        }
+        let initial = self
+            .conditional_context
+            .options
+            .get("X")
+            .copied()
+            .unwrap_or(conditional::Truth::Unknown);
+        conditional::ExtendedSyntax::new(initial, &self.conditionals.directives).at(offset)
+            == conditional::Truth::True
     }
 
     fn result_type_annotation_for_body_scope(&self, scope: usize) -> Option<ResultTypeAnnotation> {

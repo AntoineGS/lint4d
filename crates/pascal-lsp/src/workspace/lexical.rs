@@ -69,6 +69,18 @@ pub(crate) fn holds_identifier(text: &[u8], needles: &[String]) -> bool {
     })
 }
 
+/// Whether some identifier run of `text` (as `holds_identifier` splits it)
+/// starts with a prefix, ASCII case-insensitively (l4d-fpyu).
+pub(crate) fn holds_identifier_prefix(text: &[u8], prefixes: &[String]) -> bool {
+    identifier_runs(text).any(|run| {
+        let run = &text[run];
+        prefixes.iter().any(|prefix| {
+            run.get(..prefix.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(prefix.as_bytes()))
+        })
+    })
+}
+
 /// An include directive of a member's raw text: its byte range and the file
 /// name the resolver looks up (`pascal_core::resolver::include_name`).
 #[derive(Debug, Clone)]

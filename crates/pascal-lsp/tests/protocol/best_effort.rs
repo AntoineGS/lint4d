@@ -11,7 +11,8 @@ const MAIN: &str = concat!(
 
 /// Without a selected installation `CompilerVersion` is unknown; past the
 /// branch-state limit the compile-time session of `Broken` stops, so its
-/// include has no proven occurrence and its analysis is incomplete.
+/// include has no proven occurrence and its analysis is incomplete. It
+/// spells `DepValue`, so it could shadow it and is parsed (D54, l4d-fpyu).
 const BROKEN: &str = concat!(
     "unit Broken;\ninterface\n",
     "{$IF CompilerVersion >= 20}{$DEFINE V20}{$IFEND}\n",
@@ -23,7 +24,7 @@ const BROKEN: &str = concat!(
     "{$IF CompilerVersion >= 26}{$DEFINE V26}{$IFEND}\n",
     "{$IF CompilerVersion >= 27}{$DEFINE V27}{$IFEND}\n",
     "{$I BrokenInc.inc}\n",
-    "const BrokenValue = 1;\nimplementation\nend.\n",
+    "const BrokenValue = 1; { DepValue }\nimplementation\nend.\n",
 );
 
 fn write_fixture(root: &Path) -> PathBuf {

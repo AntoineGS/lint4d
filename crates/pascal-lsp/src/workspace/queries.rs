@@ -100,7 +100,19 @@ pub(crate) fn hover_from_input(
         );
     }
 
-    let snapshot = match binding_snapshot(&input, &uri, position, true, classification, cancel) {
+    let snapshot = match binding_snapshot_scoped(
+        &input,
+        &uri,
+        position,
+        true,
+        classification,
+        SnapshotScope::Walk,
+        Some(super::rename::LazyProbe::Hover {
+            position,
+            format: format.clone(),
+        }),
+        cancel,
+    ) {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -327,7 +339,17 @@ fn completion_from_input_rounds(
     let demand_cap = assistance_demand_cap();
     let mut demand_capped = false;
     let (snapshot, mut value) = loop {
-        let snapshot = match assistance_snapshot(&input, &uri, Some(position), &demanded, cancel) {
+        let snapshot = match assistance_snapshot_with_probe(
+            &input,
+            &uri,
+            Some(position),
+            &demanded,
+            Some(super::rename::LazyProbe::Completion {
+                position,
+                options: options.clone(),
+            }),
+            cancel,
+        ) {
             Ok(snapshot) => snapshot,
             Err(error) => return failed(source_generation, configuration_generation, error),
         };
@@ -446,8 +468,25 @@ pub(crate) fn completion_metadata_from_input(
     let candidate_uri = super::canonical_file_uri(candidate_uri);
     // Rebuild the snapshot the completion answered from, demand rounds
     // included, so its observations match (l4d-4nbs re-review).
-    let snapshot = match assistance_snapshot(&input, &source_uri, Some(position), demanded, cancel)
-    {
+    // The probe renders everything, so the walk loads at least what the
+    // completion's own walk loaded (its observations must match).
+    let probe = super::rename::LazyProbe::Completion {
+        position,
+        options: CompletionOptions {
+            format: format.clone(),
+            defer_documentation: false,
+            defer_detail: false,
+            snippet_support,
+        },
+    };
+    let snapshot = match assistance_snapshot_with_probe(
+        &input,
+        &source_uri,
+        Some(position),
+        demanded,
+        Some(probe),
+        cancel,
+    ) {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
@@ -1401,7 +1440,16 @@ fn indexed_reference_snapshot(
             return Ok(snapshot);
         }
     };
-    binding_snapshot_scoped(input, uri, position, false, classification, scope, cancel)
+    binding_snapshot_scoped(
+        input,
+        uri,
+        position,
+        false,
+        classification,
+        scope,
+        None,
+        cancel,
+    )
 }
 
 const SYMBOLS_INDEX_UNAVAILABLE_GAP: &str =
@@ -1525,10 +1573,12 @@ fn binding_snapshot(
         document_local,
         classification,
         SnapshotScope::Walk,
+        None,
         cancel,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn binding_snapshot_scoped(
     input: &WorkspaceInput,
     uri: &Url,
@@ -1536,6 +1586,7 @@ fn binding_snapshot_scoped(
     document_local: bool,
     classification: BindingClassification,
     scope: SnapshotScope,
+    lazy_probe: Option<super::rename::LazyProbe>,
     cancel: &AtomicBool,
 ) -> Result<RenameSnapshot, String> {
     let uri = super::canonical_file_uri(uri);
@@ -1576,6 +1627,7 @@ fn binding_snapshot_scoped(
         mode,
         skip_imports_for,
         scope,
+        lazy_probe,
         cancel,
     )
 }
@@ -1627,6 +1679,18 @@ fn assistance_snapshot(
     demanded: &[Url],
     cancel: &AtomicBool,
 ) -> Result<RenameSnapshot, String> {
+    assistance_snapshot_with_probe(input, uri, completion_position, demanded, None, cancel)
+}
+
+/// `assistance_snapshot` whose imports load lazily for `probe` (l4d-fpyu).
+fn assistance_snapshot_with_probe(
+    input: &WorkspaceInput,
+    uri: &Url,
+    completion_position: Option<Position>,
+    demanded: &[Url],
+    probe: Option<super::rename::LazyProbe>,
+    cancel: &AtomicBool,
+) -> Result<RenameSnapshot, String> {
     let (source, record) = source_for_input_with_cancel(input, uri, Some(cancel))?;
     let candidate_names = completion_position
         .and_then(|position| completion_prefix_at_position(&source, position))
@@ -1646,6 +1710,7 @@ fn assistance_snapshot(
                 .with_consumed_configuration(&consumed_configuration)
                 .with_completion_position(completion_position)
                 .with_demanded(demanded)
+                .with_lazy_probe(probe)
                 .best_effort(),
         ),
         &[],
@@ -1702,6 +1767,7 @@ fn build_binding_snapshot(
         mode,
         skip_imports_for,
         SnapshotScope::Walk,
+        None,
         cancel,
     )
 }
@@ -1717,6 +1783,7 @@ fn build_binding_snapshot_scoped(
     mode: SnapshotMode,
     skip_imports_for: &[Url],
     scope: SnapshotScope,
+    lazy_probe: Option<super::rename::LazyProbe>,
     cancel: &AtomicBool,
 ) -> Result<RenameSnapshot, String> {
     let candidate_names = binding_candidate_names(
@@ -1730,7 +1797,7 @@ fn build_binding_snapshot_scoped(
     // Only the document-local read-only features (hover, highlights, type
     // definition) bind in `LocalWithImports`; they answer best effort (D16).
     let seed = if mode == SnapshotMode::LocalWithImports {
-        seed.best_effort()
+        seed.best_effort().with_lazy_probe(lazy_probe)
     } else {
         seed
     };
@@ -3692,7 +3759,7 @@ fn completion_observation_is_superseded_by_irrelevant_overlay(
         })
 }
 
-fn completion_observations_equal(
+pub(super) fn completion_observations_equal(
     left: &super::rename::SourceRecord,
     right: &super::rename::SourceRecord,
 ) -> bool {

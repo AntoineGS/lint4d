@@ -173,11 +173,10 @@ export function mainSourceConfirmed(sourceContext: ProjectContext, targetUri: st
   return sourceContext.selectedProjectUri === targetUri;
 }
 
-export function activeDocumentMatches(
-  capturedUri: string | undefined,
-  activeUri: string | undefined,
-): boolean {
-  return capturedUri !== undefined && activeUri === capturedUri;
+export function createBrowseNavigationGuard(
+  documentUri: string,
+): (activeDocumentUri: string | undefined) => boolean {
+  return (activeDocumentUri) => activeDocumentUri === documentUri;
 }
 
 export function buildSelectionMessage(field: BuildField, ctx: BuildContext): string {

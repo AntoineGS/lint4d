@@ -1,10 +1,10 @@
 import * as vscode from 'vscode';
 import type { ClientHost } from './clientHost';
 import {
-  activeDocumentMatches,
   browseDestination,
   buildItems,
   buildSelectionMessage,
+  createBrowseNavigationGuard,
   Generation,
   installationItems,
   installationSelectionMessage,
@@ -81,6 +81,13 @@ export function registerPickers(host: ClientHost): vscode.Disposable {
       void vscode.window.showWarningMessage('Pascal LSP is not running.');
       return undefined;
     }
+    return client.code2ProtocolConverter.asUri(document.uri);
+  };
+
+  const activeDocumentProtocolUri = (): string | undefined => {
+    const document = vscode.window.activeTextEditor?.document;
+    const client = host.client;
+    if (!document || !client) return undefined;
     return client.code2ProtocolConverter.asUri(document.uri);
   };
 
@@ -162,12 +169,9 @@ export function registerPickers(host: ClientHost): vscode.Disposable {
     previousContext: ProjectContext | undefined,
     gen: number,
   ): Promise<void> => {
-    const capturedDocumentUri = vscode.window.activeTextEditor?.document.uri.toString();
+    const navigationGuard = createBrowseNavigationGuard(uri);
     const canNavigate = (): boolean => generation.isCurrent(gen)
-      && activeDocumentMatches(
-        capturedDocumentUri,
-        vscode.window.activeTextEditor?.document.uri.toString(),
-      );
+      && navigationGuard(activeDocumentProtocolUri());
 
     if (!requireFlag('projectCatalogue', 'repository project browsing')) return;
     const context = previousContext ?? await request<ProjectContext>(

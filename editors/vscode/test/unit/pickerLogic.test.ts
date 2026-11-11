@@ -12,10 +12,10 @@ import type {
   ProjectContext,
 } from '../../src/protocol';
 import {
-  activeDocumentMatches,
   browseDestination,
   buildItems,
   buildSelectionMessage,
+  createBrowseNavigationGuard,
   directoryKey,
   Generation,
   installationItems,
@@ -282,11 +282,12 @@ describe('project candidate and browse decisions', () => {
     expect(mainSourceConfirmed(selected, 'file:///c%3A/src/Other/Other.dproj')).toBe(false);
   });
 
-  it('permits browse navigation only while the originating document is active', () => {
+  it('keeps browse navigation bound to the document URI passed from the command', () => {
     const origin = 'file:///home/u/src/App/Unit.pas';
-    expect(activeDocumentMatches(origin, origin)).toBe(true);
-    expect(activeDocumentMatches(origin, 'file:///home/u/src/Other/Other.pas')).toBe(false);
-    expect(activeDocumentMatches(origin, undefined)).toBe(false);
+    const canNavigate = createBrowseNavigationGuard(origin);
+    expect(canNavigate(origin)).toBe(true);
+    expect(canNavigate('file:///home/u/src/Other/Other.pas')).toBe(false);
+    expect(canNavigate(undefined)).toBe(false);
   });
 });
 

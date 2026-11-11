@@ -470,3 +470,39 @@ end.
 ",
     );
 }
+
+/// `1do` is the number `1` then `do`: separating them is not a content
+/// change (the net compared `1do` as one word).
+#[test]
+fn a_number_glued_to_a_keyword_is_separated() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  for I := 0 to 1do X;
+  if A = -1then B;
+end;
+end.
+",
+        "\
+unit T;
+
+interface
+
+implementation
+
+procedure P;
+begin
+  for I := 0 to 1 do
+    X;
+  if A = -1 then
+    B;
+end;
+
+end.
+",
+    );
+}

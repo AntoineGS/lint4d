@@ -94,6 +94,30 @@ fn char_literal_len(rest: &str) -> usize {
     if digits == 0 { 0 } else { start + digits }
 }
 
+/// The byte length of the decimal number at the start of `rest` (which
+/// starts with a digit): its digits, and an exponent letter with the digits
+/// after it. The compiler ends the number there, so `1do` is `1` then `do`,
+/// which the formatter may separate. (Hexadecimal digits after `$` stay one
+/// word with the letters after them.)
+fn number_len(rest: &str) -> usize {
+    let bytes = rest.as_bytes();
+    let digits = |from: usize| {
+        bytes[from.min(bytes.len())..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count()
+    };
+    let len = digits(0);
+    match bytes.get(len) {
+        Some(b'e' | b'E') => match bytes.get(len + 1) {
+            Some(b) if b.is_ascii_digit() => len + 1 + digits(len + 1),
+            Some(b'+' | b'-') => len + 1,
+            _ => len,
+        },
+        _ => len,
+    }
+}
+
 /// Calls `visit(token, line)` for every token of `text`, with 1-based lines
 /// of the token's start.
 fn for_each_token<'a>(text: &'a str, mut visit: impl FnMut(Token<'a>, usize)) {
@@ -117,6 +141,9 @@ fn for_each_token<'a>(text: &'a str, mut visit: impl FnMut(Token<'a>, usize)) {
         } else if c == '#' && char_literal_len(rest) > 0 {
             let len = char_literal_len(rest);
             (Some(Token::Str(&rest[..len])), len)
+        } else if c.is_ascii_digit() && !text[..offset].ends_with('$') {
+            let len = number_len(rest);
+            (Some(Token::Word(&rest[..len])), len)
         } else if is_word_char(c) {
             let len = rest
                 .char_indices()
@@ -438,6 +465,17 @@ mod tests {
             "would drop `then` (line 2), `// c` (line 1); would add `// c then` (line 1)"
         );
         assert!(check("X := A // c\n;\n", "X := A // c;\n").is_err());
+    }
+
+    #[test]
+    fn a_number_glued_to_a_keyword_may_be_separated() {
+        // `1do` is the number `1` then `do` to the compiler.
+        assert_eq!(check("for I := 0 to 1do X;", "for I := 0 to 1 do X;"), Ok(()));
+        assert_eq!(check("if A = 1then B;", "if A = 1 then B;"), Ok(()));
+        assert_eq!(check("X := 1e5;", "X := 1e5;"), Ok(()));
+        assert!(check("X := 1e5;", "X := 1 e5;").is_err());
+        assert!(check("X := $1F;", "X := $1 F;").is_err());
+        assert!(check("X := 12;", "X := 1 2;").is_err());
     }
 
     #[test]

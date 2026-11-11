@@ -258,6 +258,15 @@ impl<'a> DocBuilder<'a> {
         let (bare_type_doc, bare_value_doc) = self.without_trivia(build_docs);
 
         let before_colon = &children[..colon_idx];
+        self.allow_var_list_expansion(
+            node,
+            before_colon,
+            idents.len(),
+            &doc::concat(vec![
+                bare_type_doc.clone(),
+                bare_value_doc.clone().unwrap_or(Doc::Empty),
+            ]),
+        );
         let mut rows = Vec::with_capacity(idents.len());
         // Trivia after a `//` moved from the previous comma: own lines
         // above this row.

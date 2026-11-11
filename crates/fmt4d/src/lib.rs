@@ -33,6 +33,7 @@
 // ── Internal modules (not part of the public API) ────────────────────
 pub(crate) mod blank_lines;
 pub(crate) mod comments;
+pub(crate) mod content_check;
 pub(crate) mod directive_map;
 pub(crate) mod doc;
 pub(crate) mod doc_builder;

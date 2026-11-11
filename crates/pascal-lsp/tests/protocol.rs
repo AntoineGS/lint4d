@@ -27778,6 +27778,56 @@ fn formatting_rejects_include_sources_without_editing_them() {
 }
 
 #[test]
+fn formatting_refuses_output_that_would_drop_source_content() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let path = temp.path().join("Lossy.pas");
+    // fmt4d drops the conditional inside the ancestor list (l4d-um8g); the
+    // content safety net must turn that into a refusal, not an edit.
+    let source = "unit Lossy;\ninterface\ntype\n  TFoo = class(TForm{$IFDEF X}, ISkinable{$ENDIF})\n  end;\nimplementation\nend.\n";
+    write_file(&path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&path), "languageId": "pascal", "version": 1, "text": source}}),
+    );
+    for (id, method, params) in [
+        (
+            "lossy-format",
+            "textDocument/formatting",
+            json!({"textDocument": {"uri": uri(&path)}, "options": {"tabSize": 2, "insertSpaces": true}}),
+        ),
+        (
+            "lossy-range-format",
+            "textDocument/rangeFormatting",
+            json!({
+                "textDocument": {"uri": uri(&path)},
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 6, "character": 0}},
+                "options": {"tabSize": 2, "insertSpaces": true}
+            }),
+        ),
+    ] {
+        let request_id = RequestId::from(id.to_string());
+        server.send_request(request_id.clone(), method, params);
+        let response = server.response(&request_id);
+        let Some(error) = response.error else {
+            panic!(
+                "{method} must refuse lossy output, got {:?}",
+                response.result
+            );
+        };
+        assert!(
+            error.message.contains("IFDEF"),
+            "{method} error does not name the lost content: {}",
+            error.message
+        );
+    }
+    assert_eq!(fs::read_to_string(&path).expect("source"), source);
+    server.shutdown();
+}
+
+#[test]
 fn unopened_formatting_rejects_oversized_and_non_regular_disk_sources() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("workspace");

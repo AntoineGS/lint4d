@@ -59,8 +59,8 @@ end;
         (identifier)
         (identifier)
         (identifier)
-        (kNil)
-        (kNil)
+        (identifier)
+        (identifier)
         (identifier)
         (identifier)
         (kMod)
@@ -82,7 +82,45 @@ end;
 
 (root
   (defProc
-    (declProc (kProcedure) (identifier))
-    (asm (kAsm)
-      (asmBody (identifier) (identifier))
+    (declProc
+      (kProcedure)
+      (identifier))
+    (asm
+      (kAsm)
+      (asmBody
+        (identifier)
+        (identifier))
       (kEnd))))
+
+===
+Asm local labels named like reserved words
+===
+
+procedure P;
+asm
+        JS    @@END
+@@1:    DEC   ECX
+        JNZ   @@1
+@@END:
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (asm
+      (kAsm)
+      (asmBody
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier))
+      (kEnd))))
+

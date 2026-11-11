@@ -193,3 +193,53 @@ end;
             (namedArgument (identifier) (kAssign) (identifier)))))
       (kEnd))))
 
+
+===
+Subrange upper bound starting with a parenthesis
+===
+
+type
+  jTOctet = 0..(MaxInt div SizeOf(JOCTET))-1;
+
+---
+
+(root
+  (declTypes (kType)
+    (declType (identifier) (kEq)
+      (type (declSubRange
+        (literalNumber)
+        (exprBinary
+          (exprParens
+            (exprBinary (identifier) (kDiv) (exprCall (identifier) (exprArgs (identifier)))))
+          (kSub)
+          (literalNumber)))))))
+
+===
+Routine directives without a final semicolon
+===
+
+unit U;
+interface
+function F(i: Integer): Integer; inline
+function G(i: Integer): Integer; stdcall
+procedure P;
+implementation
+end.
+
+---
+
+(root
+  (unit (kUnit) (moduleName (identifier))
+    (interface (kInterface)
+      (declProc (kFunction) (identifier)
+        (declArgs (declArg (identifier) (type (typeref (identifier)))))
+        (typeref (identifier))
+        (procAttribute (kInline)))
+      (declProc (kFunction) (identifier)
+        (declArgs (declArg (identifier) (type (typeref (identifier)))))
+        (typeref (identifier))
+        (procAttribute (kStdcall)))
+      (declProc (kProcedure) (identifier)))
+    (implementation (kImplementation))
+    (kEnd)
+    (kEndDot)))

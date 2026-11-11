@@ -632,7 +632,7 @@ module.exports = grammar({
 		declContains:       $ => seq($.kContains, repeat1($._usesClauseEntry), ';'),
 
 		unit:               $ => seq(
-			$.kUnit, $.moduleName, ';',
+			$.kUnit, $.moduleName, repeat($._declHint), ';',
 			repeat(choice(
 				$.interface,
 				seq(
@@ -1014,10 +1014,10 @@ module.exports = grammar({
 		genericArgs:     $ => delimited1($.genericArg, ';'),
 		genericArg:      $ => seq(
 			field('name', delimited1($.identifier)),
-			field('type', optional(seq(':', choice(
+			field('type', optional(seq(':', delimited1(choice(
 				$.typeref,
 				alias($._genericKeywordConstraintTyperef, $.typeref),
-			)))),
+			))))),
 			field('defaultValue', optional($.defaultValue))
 		),
 		// The combined grammar historically accepts these constraint keywords
@@ -1226,6 +1226,8 @@ module.exports = grammar({
 			field('type', $.type),
 			choice(
 				seq(
+					// `F: function: Integer cdecl = nil;`
+					repeat($._declHint),
 					optional(choice(
 						seq($.kAbsolute, $._ref),
 						field('defaultValue', $.defaultValue)
@@ -1243,11 +1245,21 @@ module.exports = grammar({
 		declConst:       $ => seq(
 			...enable_if(rtti, optional($.rttiAttributes)),
 			field('name', $.identifier),
-			optional(seq(':', field('type', $.type))),
-			field('defaultValue', $.defaultValue),
-			repeat($._declHint),
-			';',
-			repeat($._procAttribute)
+			choice(
+				seq(
+					optional(seq(':', field('type', $.type))),
+					repeat($._declHint),
+					field('defaultValue', $.defaultValue),
+					repeat($._declHint),
+					';',
+					repeat($._procAttribute)
+				),
+				// A typed procedural constant: `C: procedure; cdecl = nil;`
+				seq(
+					':', field('type', $.type), ';', repeat1($._declHint),
+					field('defaultValue', $.defaultValue), ';'
+				),
+			)
 		),
 
 		declLabels:      $ => seq($.kLabel, delimited1($.declLabel), ';'),
@@ -1334,6 +1346,7 @@ module.exports = grammar({
 
 		_declClass:      $ => seq(
 			optional($._declFields),
+			optional(alias($._declFieldLast, $.declField)),
 			optional($._classDeclarations),
 			repeat(choice($.declSection, $.ppDeclSection)),
 			optional($.declVariant),
@@ -1344,6 +1357,7 @@ module.exports = grammar({
 			optional($.kStrict),
 			choice($._visibility, ...enable_if(objc, $.kRequired, $.kOptional)),
 			optional($._declFields),
+			optional(alias($._declFieldLast, $.declField)),
 			optional($._classDeclarations)
 		),
 
@@ -1370,6 +1384,16 @@ module.exports = grammar({
 			repeat(seq(repeat1($._declHint), ';'))
 		),
 
+		// dcc accepts the last field before `end` without its `;`.
+		_declFieldLast:  $ => seq(
+			...enable_if(rtti, optional($.rttiAttributes)),
+			field('name', delimited1(varName($))),
+			':',
+			field('type', $.type),
+			field('defaultValue', optional($.defaultValue)),
+			repeat($._declHint),
+		),
+
 		declProp:        $ => seq(
 			...enable_if(rtti, optional($.rttiAttributes)),
 			optional($.kClass),
@@ -1381,8 +1405,8 @@ module.exports = grammar({
 				seq($.kIndex, field('index', $._expr)),
 				...enable_if(delphi, seq($.kDispId, field('dispid', $._expr))),
 				// A field of a record field: `read FState.Mode`.
-				seq($.kRead, field('getter', choice($.identifier, $.exprDot))),
-				seq($.kWrite, field('setter', choice($.identifier, $.exprDot))),
+				seq($.kRead, field('getter', choice($.identifier, $.exprDot, $.exprSubscript))),
+				seq($.kWrite, field('setter', choice($.identifier, $.exprDot, $.exprSubscript))),
 				// Type-library dispinterface properties.
 				$.kReadonly, $.kWriteonly,
 				seq($.kImplements, field('implements', delimited($._expr))),
@@ -1624,7 +1648,8 @@ module.exports = grammar({
 		kFalse:            $ => /false/i,
 		labelNumber:       $ => token(prec(1, /[0-9]+/)),
 
-	  	_space:            $ => /[\s\r\n\t]+/,
+	  	// \x1a is the DOS end-of-file marker some old sources end with.
+	  	_space:            $ => /[\s\r\n\t\x1a]+/,
 		ppDirective:       $ => token(prec(-1, choice(
 			/\{\$[^}]*\}/,
 			/\(\*\$[^*]*(\*+[^*)][^*]*)*\*+\)/

@@ -2627,6 +2627,10 @@
             "named": true
           },
           {
+            "type": "exprSubscript",
+            "named": true
+          },
+          {
             "type": "identifier",
             "named": true
           }
@@ -2816,6 +2820,10 @@
         "types": [
           {
             "type": "exprDot",
+            "named": true
+          },
+          {
+            "type": "exprSubscript",
             "named": true
           },
           {
@@ -6181,6 +6189,10 @@
         "multiple": true,
         "required": false,
         "types": [
+          {
+            "type": ",",
+            "named": false
+          },
           {
             "type": ":",
             "named": false
@@ -9767,7 +9779,18 @@
   {
     "type": "unit",
     "named": true,
-    "fields": {},
+    "fields": {
+      "attribute": {
+        "multiple": true,
+        "required": false,
+        "types": [
+          {
+            "type": "procAttribute",
+            "named": true
+          }
+        ]
+      }
+    },
     "children": {
       "multiple": true,
       "required": true,

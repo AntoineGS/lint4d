@@ -81,6 +81,190 @@ pub(crate) fn holds_identifier_prefix(text: &[u8], prefixes: &[String]) -> bool 
     })
 }
 
+/// One token of `may_declare`'s scan.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Token {
+    Identifier(usize, usize),
+    /// A number, string or character literal.
+    Literal,
+    /// A symbol: one byte, or `:=` / `..` as `b'='` / `b'.'` with `true`.
+    Symbol(u8, bool),
+    /// A compiler directive (`{$...}`, `(*$...*)`), a non-ASCII byte run, or
+    /// the start of the text: what precedes or follows is unknown (an
+    /// include, a conditional branch, a Unicode identifier).
+    Barrier,
+}
+
+/// Whether `text` may declare one of `needles` (lowercase ASCII
+/// identifiers) at unit scope (l4d-yz96): `true` unless every whole
+/// identifier occurrence outside comments and strings stands where no
+/// declaration can name it. Such a place is a heritage list
+/// (`class(N, ..)`, `interface(N)`), after `:`, `:=`, `=`, `.`, `..`, `^`,
+/// `@`, `of`, `is` or `as` (a type, value or member reference), or before
+/// `.` (a qualifier) unless after `,`, a unit header or a uses-like
+/// clause. Everything else may declare (`N =`, `N:`, `N,`, `(N`, after a
+/// routine keyword, `var`, `;` ...). A compiler directive separates what
+/// it may change (an include, a conditional branch), so an occurrence next
+/// to one, or next to non-ASCII bytes, may declare. A string spanning a
+/// line (a multi-line literal, or one the scan misreads) or an unterminated
+/// comment makes the whole text a possible declaration. Comments and
+/// strings hold no declaration; their text is not read.
+pub(crate) fn may_declare(text: &[u8], needles: &[String]) -> bool {
+    match declaration_tokens(text) {
+        Some(tokens) => tokens_may_declare(text, &tokens, needles),
+        None => true,
+    }
+}
+
+fn declaration_tokens(text: &[u8]) -> Option<Vec<Token>> {
+    let mut tokens = Vec::new();
+    let mut at = 0;
+    while at < text.len() {
+        let byte = text[at];
+        match byte {
+            b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\x0b' => at += 1,
+            b'{' => {
+                let end = at + 1 + text[at + 1..].iter().position(|byte| *byte == b'}')?;
+                if text.get(at + 1) == Some(&b'$') {
+                    tokens.push(Token::Barrier);
+                }
+                at = end + 1;
+            }
+            b'(' if text.get(at + 1) == Some(&b'*') => {
+                let body = at + 2;
+                let end = body + text[body..].windows(2).position(|pair| pair == b"*)")?;
+                if text.get(body) == Some(&b'$') {
+                    tokens.push(Token::Barrier);
+                }
+                at = end + 2;
+            }
+            b'/' if text.get(at + 1) == Some(&b'/') => {
+                at = text[at..]
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map_or(text.len(), |offset| at + offset);
+            }
+            // `"` quotes an assembler string.
+            quote @ (b'\'' | b'"') => {
+                at += 1;
+                loop {
+                    match *text.get(at)? {
+                        byte if byte == quote && text.get(at + 1) == Some(&quote) => at += 2,
+                        byte if byte == quote => {
+                            at += 1;
+                            break;
+                        }
+                        b'\r' | b'\n' => return None,
+                        _ => at += 1,
+                    }
+                }
+                tokens.push(Token::Literal);
+            }
+            b'#' | b'$' | b'0'..=b'9' => {
+                at += 1;
+                while text
+                    .get(at)
+                    .is_some_and(|byte| is_identifier_byte(*byte) || *byte == b'$')
+                {
+                    at += 1;
+                }
+                tokens.push(Token::Literal);
+            }
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
+                let start = at;
+                while text.get(at).is_some_and(|byte| is_identifier_byte(*byte)) {
+                    at += 1;
+                }
+                tokens.push(Token::Identifier(start, at));
+            }
+            b':' if text.get(at + 1) == Some(&b'=') => {
+                tokens.push(Token::Symbol(b'=', true));
+                at += 2;
+            }
+            b'.' if text.get(at + 1) == Some(&b'.') => {
+                tokens.push(Token::Symbol(b'.', true));
+                at += 2;
+            }
+            0x80.. => {
+                while text.get(at).is_some_and(|byte| *byte >= 0x80) {
+                    at += 1;
+                }
+                tokens.push(Token::Barrier);
+            }
+            _ => {
+                tokens.push(Token::Symbol(byte, false));
+                at += 1;
+            }
+        }
+    }
+    Some(tokens)
+}
+
+fn tokens_may_declare(text: &[u8], tokens: &[Token], needles: &[String]) -> bool {
+    let keyword = |token: Option<&Token>, words: &[&str]| match token {
+        Some(Token::Identifier(start, end)) => words
+            .iter()
+            .any(|word| text[*start..*end].eq_ignore_ascii_case(word.as_bytes())),
+        _ => false,
+    };
+    // The parenthesis depth inside a heritage list.
+    let mut heritage = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        let previous = index.checked_sub(1).and_then(|at| tokens.get(at));
+        match *token {
+            Token::Symbol(b'(', false) => {
+                if heritage > 0 {
+                    heritage += 1;
+                } else if keyword(previous, &["class", "interface"]) {
+                    heritage = 1;
+                }
+            }
+            Token::Symbol(b')', false) => heritage = heritage.saturating_sub(1),
+            // None of them belongs in a heritage list: a list left open
+            // ends there, as a recovering parser may end it.
+            Token::Symbol(b';' | b'=' | b':', _) | Token::Barrier => heritage = 0,
+            Token::Identifier(start, end) => {
+                if !needles
+                    .iter()
+                    .any(|needle| text[start..end].eq_ignore_ascii_case(needle.as_bytes()))
+                {
+                    continue;
+                }
+                // A heritage list entry continues the list.
+                if heritage > 0
+                    && matches!(
+                        tokens.get(index + 1),
+                        Some(Token::Symbol(b',' | b')' | b'.' | b'<' | b'>', false))
+                    )
+                {
+                    continue;
+                }
+                let referenced = match previous {
+                    Some(Token::Symbol(b':' | b'=' | b'.' | b'^' | b'@', _)) => true,
+                    Some(Token::Identifier(..)) => keyword(previous, &["of", "is", "as"]),
+                    _ => false,
+                };
+                let qualifier = matches!(tokens.get(index + 1), Some(Token::Symbol(b'.', false)))
+                    && !matches!(
+                        previous,
+                        None | Some(Token::Barrier | Token::Symbol(b',', _))
+                    )
+                    && !keyword(
+                        previous,
+                        &[
+                            "unit", "program", "library", "package", "uses", "contains", "requires",
+                        ],
+                    );
+                if !referenced && !qualifier {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// An include directive of a member's raw text: its byte range and the file
 /// name the resolver looks up (`pascal_core::resolver::include_name`).
 #[derive(Debug, Clone)]
@@ -681,6 +865,73 @@ mod tests {
             b"unit A;\n{$I Defs.inc}\ninterface\nimplementation\nend.\n",
             &pieces,
             true
+        ));
+    }
+
+    /// l4d-yz96: an identifier only referenced (a parent class, a type, a
+    /// qualifier, in comments or strings) is not declared.
+    #[test]
+    fn references_to_a_name_do_not_declare_it() {
+        let needles = vec!["tinterfacedobject".to_owned()];
+        for text in [
+            "type TA = class(TInterfacedObject) end;",
+            "type TA = class(TInterfacedObject, IA) end;",
+            "type TA = class(TBase, TInterfacedObject) end;",
+            "type TA = class(Sys.TInterfacedObject) end;",
+            "type TA = class(TList<TInterfacedObject>) end;",
+            "type IA = interface(TInterfacedObject) end;",
+            "type TC = class of TInterfacedObject;",
+            "type TP = ^TInterfacedObject; TS = set of TInterfacedObject;",
+            "var X: TInterfacedObject;",
+            "type TA = TInterfacedObject;",
+            "begin X := TInterfacedObject.Create; end;",
+            "begin if X is TInterfacedObject then (X as TInterfacedObject).Free; end;",
+            "begin Y := @TInterfacedObject; Z := A.TInterfacedObject; end;",
+            "procedure TInterfacedObject.Free; begin end;",
+            "{ TInterfacedObject = class } // TInterfacedObject = class\n(* TInterfacedObject *)",
+            "s := 'TInterfacedObject = class'; t := '''TInterfacedObject''';",
+            "const A = 1..TInterfacedObject;",
+        ] {
+            assert!(!may_declare(text.as_bytes(), &needles), "{text}");
+        }
+    }
+
+    /// Anything else may declare: a declaration's own shapes, a place a
+    /// directive or non-ASCII bytes border, and text the scan cannot read.
+    #[test]
+    fn a_name_where_a_declaration_may_stand_may_declare() {
+        let needles = vec!["tinterfacedobject".to_owned()];
+        for text in [
+            "type TInterfacedObject = class end;",
+            "type tinterfacedobject<T> = class end;",
+            "var A, TInterfacedObject: Integer;",
+            "var TInterfacedObject: Integer;",
+            "const TInterfacedObject: Integer = 1;",
+            "type TE = (TInterfacedObject, B);",
+            "type TE = (A, TInterfacedObject = 2);",
+            "procedure TInterfacedObject;",
+            "function TInterfacedObject(A: Integer): Integer;",
+            "type TA = class end; TInterfacedObject = class end;",
+            "&TInterfacedObject = 1;",
+            "TInterfacedObject",
+            "type TA = class({$IFDEF A}TInterfacedObject{$ENDIF}) end;",
+            "type TA = {$I x.inc} TInterfacedObject = class end;",
+            "x: \u{e9}TInterfacedObject = 1;",
+            "unit TInterfacedObject.Sub;",
+            "uses A, TInterfacedObject.Sub;",
+            "type TA = class(TBase\nTInterfacedObject = class end;",
+            "type TA = class(TBase; TInterfacedObject = class end;",
+            "s := '''\nabc\n'''; TInterfacedObject: Integer;",
+            "{ unterminated TInterfacedObject",
+            "type TH = class helper(TBase) for TInterfacedObject end;",
+            "[TInterfacedObject] procedure P;",
+        ] {
+            assert!(may_declare(text.as_bytes(), &needles), "{text}");
+        }
+        // The multi-line literal makes even a referencing text uncertain.
+        assert!(may_declare(
+            b"s := '''\nx\n''';\nvar X: TInterfacedObject;",
+            &needles
         ));
     }
 

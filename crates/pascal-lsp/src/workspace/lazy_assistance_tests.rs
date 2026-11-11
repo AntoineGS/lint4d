@@ -433,6 +433,218 @@ fn a_call_hover_in_a_function_parses_no_unit_for_its_result() {
     );
 }
 
+/// `EndsStr('X', Uppercase(S))` where `Noise` and `SysU` both declare
+/// `Uppercase`, and `Late` may shadow `EndsStr` (l4d-yz96).
+fn call_fixture(root: &Path, late: &str) {
+    write_sources(
+        root,
+        &[
+            (
+                "Main.pas",
+                "unit Main;\ninterface\nimplementation\nuses StrU, Noise, SysU, Late;\nprocedure Run;\nvar S: string;\nbegin\n  if EndsStr('X', Uppercase(S)) then;\nend;\nend.\n",
+            ),
+            (
+                "StrU.pas",
+                "unit StrU;\ninterface\nfunction EndsStr(const S, T: string): Boolean;\nimplementation\nfunction EndsStr(const S, T: string): Boolean; begin Result := False; end;\nend.\n",
+            ),
+            (
+                "Noise.pas",
+                "unit Noise;\ninterface\nfunction Uppercase(const S: string): string;\nimplementation\nfunction Uppercase(const S: string): string; begin Result := S; end;\nend.\n",
+            ),
+            (
+                "SysU.pas",
+                "unit SysU;\ninterface\nfunction Uppercase(const S: string): string;\nimplementation\nfunction Uppercase(const S: string): string; begin Result := S; end;\nend.\n",
+            ),
+            ("Late.pas", late),
+        ],
+    );
+}
+
+/// The hover of a routine called with arguments shows the routine's
+/// declarations whatever its arguments are: a call to a global routine
+/// resolves no argument, so no import is parsed for `Uppercase` (l4d-yz96).
+#[test]
+fn a_call_hover_on_a_global_routine_parses_no_import_for_its_arguments() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    call_fixture(
+        root,
+        "unit Late;\ninterface\nconst LateValue = 1;\nimplementation\nend.\n",
+    );
+    let expected = eagerly(root, "Main.pas", |warmed| {
+        hover_in(warmed, root, "Main.pas", Position::new(7, 7))
+    });
+
+    let (answer, indexed) = indexed_while(|| hover(root, "Main.pas", Position::new(7, 7)));
+
+    assert!(
+        answer
+            .as_deref()
+            .is_some_and(|text| text.contains("EndsStr")),
+        "{answer:?}"
+    );
+    assert_eq!(answer, expected);
+    assert_eq!(indexed, vec!["StrU.pas".to_string()], "{indexed:?}");
+}
+
+/// A later import declaring the called routine is still parsed and shown,
+/// as with every import parsed (l4d-yz96).
+#[test]
+fn a_call_hover_still_parses_a_later_import_declaring_the_routine() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    call_fixture(
+        root,
+        "unit Late;\ninterface\nfunction EndsStr(const S: string; T: Integer): Boolean;\nimplementation\nfunction EndsStr(const S: string; T: Integer): Boolean; begin Result := False; end;\nend.\n",
+    );
+    let expected = eagerly(root, "Main.pas", |warmed| {
+        hover_in(warmed, root, "Main.pas", Position::new(7, 7))
+    });
+
+    let (answer, indexed) = indexed_while(|| hover(root, "Main.pas", Position::new(7, 7)));
+
+    assert!(
+        answer
+            .as_deref()
+            .is_some_and(|text| text.contains("T: Integer")),
+        "{answer:?}"
+    );
+    assert_eq!(answer, expected);
+    assert!(indexed.iter().any(|name| name == "Late.pas"), "{indexed:?}");
+    assert!(
+        !indexed
+            .iter()
+            .any(|name| name == "Noise.pas" || name == "SysU.pas"),
+        "{indexed:?}"
+    );
+}
+
+/// A call in a method of `TEnv = class(TInterfacedObject)`: the hover looks
+/// up the ancestor through every import, and `Noise` spells it (l4d-yz96).
+fn ancestor_fixture(root: &Path, noise: &str) {
+    write_sources(
+        root,
+        &[
+            (
+                "Main.pas",
+                "unit Main;\ninterface\nuses StrU, Noise;\ntype TEnv = class(TInterfacedObject)\n  procedure Run;\nend;\nimplementation\nprocedure TEnv.Run;\nbegin\n  if EndsStr('X', 'Y') then;\nend;\nend.\n",
+            ),
+            (
+                "StrU.pas",
+                "unit StrU;\ninterface\nfunction EndsStr(const S, T: string): Boolean;\nimplementation\nfunction EndsStr(const S, T: string): Boolean; begin Result := False; end;\nend.\n",
+            ),
+            ("Noise.pas", noise),
+        ],
+    );
+}
+
+/// An import naming the ancestor only as a parent class, a type or a
+/// qualifier cannot declare it: it is not parsed (l4d-yz96).
+#[test]
+fn an_import_only_referencing_a_looked_up_name_is_not_parsed() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    ancestor_fixture(
+        root,
+        "unit Noise;\ninterface\ntype\n  { A TInterfacedObject. }\n  TNoise = class(TInterfacedObject)\n    F: TInterfacedObject;\n  end;\n  TNoiseClass = class of TInterfacedObject;\nimplementation\nprocedure Make; begin TInterfacedObject.Create.Free; end;\nend.\n",
+    );
+    let expected = eagerly(root, "Main.pas", |warmed| {
+        hover_in(warmed, root, "Main.pas", Position::new(9, 7))
+    });
+
+    let (answer, indexed) = indexed_while(|| hover(root, "Main.pas", Position::new(9, 7)));
+
+    assert!(
+        answer
+            .as_deref()
+            .is_some_and(|text| text.contains("EndsStr")),
+        "{answer:?}"
+    );
+    assert_eq!(answer, expected);
+    assert_eq!(indexed, vec!["StrU.pas".to_string()], "{indexed:?}");
+}
+
+/// An import that may declare the looked-up name is parsed: as an
+/// enumeration value, or through an include (l4d-yz96).
+#[test]
+fn an_import_that_may_declare_a_looked_up_name_is_parsed() {
+    for (noise, include) in [
+        (
+            "unit Noise;\ninterface\ntype TKinds = (TInterfacedObject, TOther);\nimplementation\nend.\n",
+            None,
+        ),
+        (
+            "unit Noise;\ninterface\ntype TNoise = class(TInterfacedObject) end;\n{$I Noise.inc}\nimplementation\nend.\n",
+            Some("type TInterfacedObject = class end;\n"),
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        ancestor_fixture(root, noise);
+        if let Some(include) = include {
+            fs::write(root.join("Noise.inc"), include).expect("include");
+        }
+        let expected = eagerly(root, "Main.pas", |warmed| {
+            hover_in(warmed, root, "Main.pas", Position::new(9, 7))
+        });
+
+        let (answer, indexed) = indexed_while(|| hover(root, "Main.pas", Position::new(9, 7)));
+
+        assert_eq!(answer, expected, "{noise}");
+        assert!(
+            indexed.iter().any(|name| name == "Noise.pas"),
+            "{noise}: {indexed:?}"
+        );
+    }
+}
+
+/// A member's hover still resolves the arguments its overload selection
+/// specializes the display with: `Shadow<T>` shows `TOther`, which only an
+/// import declares (l4d-yz96).
+#[test]
+fn a_call_hover_on_a_generic_method_still_selects_from_its_arguments() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    write_sources(
+        root,
+        &[
+            (
+                "Main.pas",
+                "unit Main;\ninterface\nimplementation\nuses Box, Other, Noise;\nprocedure Run;\nvar B: TBox<Integer>; O: TOther;\nbegin\n  B.Shadow(O);\nend;\nend.\n",
+            ),
+            (
+                "Box.pas",
+                "unit Box;\ninterface\ntype TBox<T> = class\n  function Shadow<T>(Value: T): T;\nend;\nimplementation\nfunction TBox<T>.Shadow<T>(Value: T): T; begin Result := Value; end;\nend.\n",
+            ),
+            (
+                "Other.pas",
+                "unit Other;\ninterface\ntype TOther = class end;\nimplementation\nend.\n",
+            ),
+            (
+                "Noise.pas",
+                "unit Noise;\ninterface\ntype TNoise = class end;\nimplementation\nend.\n",
+            ),
+        ],
+    );
+    let expected = eagerly(root, "Main.pas", |warmed| {
+        hover_in(warmed, root, "Main.pas", Position::new(7, 5))
+    });
+
+    let (answer, indexed) = indexed_while(|| hover(root, "Main.pas", Position::new(7, 5)));
+
+    assert!(
+        answer
+            .as_deref()
+            .is_some_and(|text| text.contains("Shadow<T>(Value: TOther): TOther")),
+        "{answer:?}"
+    );
+    assert_eq!(answer, expected);
+    assert!(
+        !indexed.iter().any(|name| name == "Noise.pas"),
+        "{indexed:?}"
+    );
+}
+
 /// Review F1: completion inside a method of a class whose ancestor has a
 /// helper in an import. Resolving `TMy`'s parent type `TDep` as a member of
 /// `TMy` selected `TMy`'s helpers again, each turn at a fresh depth: only

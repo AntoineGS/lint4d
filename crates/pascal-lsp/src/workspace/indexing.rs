@@ -5613,6 +5613,9 @@ struct UnverifiedRanking {
     /// `names` are identifier prefixes (completion, l4d-fpyu): an include
     /// holds one when one of its identifiers starts with it.
     prefixes: bool,
+    /// An include holds a name only where it may declare it
+    /// (`lexical::may_declare`, import absence proofs, l4d-yz96).
+    declarations: bool,
     /// The content hash of every include an include proof read.
     include_hashes: HashMap<PathBuf, u64>,
 }
@@ -5907,6 +5910,7 @@ impl UnverifiedRanking {
             proven: Vec::new(),
             summaries_reused: 0,
             prefixes: false,
+            declarations: false,
             include_hashes: HashMap::new(),
         }
     }
@@ -6388,6 +6392,8 @@ impl UnverifiedRanking {
                         && super::lexical::is_byte_text(&bytes)
                         && !if self.prefixes {
                             super::lexical::holds_identifier_prefix(&bytes, &self.names)
+                        } else if self.declarations {
+                            super::lexical::may_declare(&bytes, &self.names)
                         } else {
                             super::lexical::holds_identifier(&bytes, &self.names)
                         })
@@ -6569,8 +6575,11 @@ pub(super) struct ImportAbsence {
 
 impl ImportAbsence {
     /// What proves that the unit at `path`, whose raw bytes the resolver read
-    /// as `text`, spells none of `names` as a whole identifier (or, with
-    /// `prefixes`, no identifier starting with one of them), in its text or
+    /// as `text`, declares none of `names` (`lexical::may_declare`: a unit
+    /// that spells a name only where it references it cannot declare it,
+    /// l4d-yz96; every lookup keyed by a name reads only the declarations
+    /// of that name) or, with `prefixes`, spells no identifier starting
+    /// with one of them, in its text or
     /// its includes resolved in context `key`: the includes it read, each
     /// with the stamp taken before the read and the hash of the bytes read.
     /// `None` proves nothing.
@@ -6590,7 +6599,9 @@ impl ImportAbsence {
                 && super::lexical::is_byte_text(text)
                 && !super::lexical::holds_identifier_prefix(text, &names)
         } else {
-            super::lexical::proves_absent(text, &names, false)
+            super::lexical::needles_are_provable(&names)
+                && super::lexical::is_byte_text(text)
+                && !super::lexical::may_declare(text, &names)
         };
         if !absent {
             return None;
@@ -6601,6 +6612,7 @@ impl ImportAbsence {
             .or_insert_with(|| {
                 let mut ranking = UnverifiedRanking::with(names, Vec::new(), false);
                 ranking.prefixes = prefixes;
+                ranking.declarations = !prefixes;
                 ranking
             });
         let scope = IncludeScope {

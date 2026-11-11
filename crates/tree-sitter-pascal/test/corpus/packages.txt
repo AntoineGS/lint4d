@@ -1,0 +1,75 @@
+===
+Package - requires and contains
+===
+
+package adsd40d;
+
+{$R *.RES}
+{$DESIGNONLY}
+
+requires
+  vcl40,
+  adsd40;
+
+contains
+  adsdesign in 'adsdesign.pas',
+  Other;
+
+end.
+
+---
+
+(root
+  (package (kPackage) (moduleName (identifier))
+    (ppDirective)
+    (ppDirective)
+    (declRequires (kRequires)
+      (moduleName (identifier)) (moduleName (identifier)))
+    (declContains (kContains)
+      (moduleName (identifier)) (kIn) (literalString)
+      (moduleName (identifier)))
+    (kEnd)
+    (kEndDot)))
+
+===
+Package - dotted names, no requires, conditional entries
+===
+
+package Vendor.Runtime;
+
+contains
+{$IFDEF DEBUG}
+  Vendor.Debug,
+{$ENDIF}
+  Vendor.Core;
+
+end.
+
+---
+
+(root
+  (package (kPackage) (moduleName (identifier) (kDot) (identifier))
+    (declContains (kContains)
+      (ppUsesBlock (ppIf) (moduleName (identifier) (kDot) (identifier)) (ppEndIf))
+      (moduleName (identifier) (kDot) (identifier)))
+    (kEnd)
+    (kEndDot)))
+
+===
+Package - requires only
+===
+
+package P;
+
+requires rtl, vcl;
+
+end.
+
+---
+
+(root
+  (package (kPackage) (moduleName (identifier))
+    (declRequires (kRequires)
+      (moduleName (identifier)) (moduleName (identifier)))
+    (kEnd)
+    (kEndDot)))

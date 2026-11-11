@@ -128,6 +128,258 @@
         {
           "type": "identifier",
           "named": true
+        },
+        {
+          "type": "kAnd",
+          "named": true
+        },
+        {
+          "type": "kArray",
+          "named": true
+        },
+        {
+          "type": "kAs",
+          "named": true
+        },
+        {
+          "type": "kAsm",
+          "named": true
+        },
+        {
+          "type": "kBegin",
+          "named": true
+        },
+        {
+          "type": "kCase",
+          "named": true
+        },
+        {
+          "type": "kClass",
+          "named": true
+        },
+        {
+          "type": "kConst",
+          "named": true
+        },
+        {
+          "type": "kConstructor",
+          "named": true
+        },
+        {
+          "type": "kDestructor",
+          "named": true
+        },
+        {
+          "type": "kDispInterface",
+          "named": true
+        },
+        {
+          "type": "kDiv",
+          "named": true
+        },
+        {
+          "type": "kDo",
+          "named": true
+        },
+        {
+          "type": "kDownto",
+          "named": true
+        },
+        {
+          "type": "kElse",
+          "named": true
+        },
+        {
+          "type": "kExcept",
+          "named": true
+        },
+        {
+          "type": "kExports",
+          "named": true
+        },
+        {
+          "type": "kFile",
+          "named": true
+        },
+        {
+          "type": "kFinalization",
+          "named": true
+        },
+        {
+          "type": "kFinally",
+          "named": true
+        },
+        {
+          "type": "kFor",
+          "named": true
+        },
+        {
+          "type": "kFunction",
+          "named": true
+        },
+        {
+          "type": "kGoto",
+          "named": true
+        },
+        {
+          "type": "kIf",
+          "named": true
+        },
+        {
+          "type": "kImplementation",
+          "named": true
+        },
+        {
+          "type": "kIn",
+          "named": true
+        },
+        {
+          "type": "kInherited",
+          "named": true
+        },
+        {
+          "type": "kInitialization",
+          "named": true
+        },
+        {
+          "type": "kInline",
+          "named": true
+        },
+        {
+          "type": "kInterface",
+          "named": true
+        },
+        {
+          "type": "kIs",
+          "named": true
+        },
+        {
+          "type": "kLabel",
+          "named": true
+        },
+        {
+          "type": "kLibrary",
+          "named": true
+        },
+        {
+          "type": "kMod",
+          "named": true
+        },
+        {
+          "type": "kNil",
+          "named": true
+        },
+        {
+          "type": "kNot",
+          "named": true
+        },
+        {
+          "type": "kObject",
+          "named": true
+        },
+        {
+          "type": "kOf",
+          "named": true
+        },
+        {
+          "type": "kOr",
+          "named": true
+        },
+        {
+          "type": "kPacked",
+          "named": true
+        },
+        {
+          "type": "kProcedure",
+          "named": true
+        },
+        {
+          "type": "kProgram",
+          "named": true
+        },
+        {
+          "type": "kProperty",
+          "named": true
+        },
+        {
+          "type": "kRaise",
+          "named": true
+        },
+        {
+          "type": "kRecord",
+          "named": true
+        },
+        {
+          "type": "kRepeat",
+          "named": true
+        },
+        {
+          "type": "kResourcestring",
+          "named": true
+        },
+        {
+          "type": "kSet",
+          "named": true
+        },
+        {
+          "type": "kShl",
+          "named": true
+        },
+        {
+          "type": "kShr",
+          "named": true
+        },
+        {
+          "type": "kString",
+          "named": true
+        },
+        {
+          "type": "kThen",
+          "named": true
+        },
+        {
+          "type": "kThreadvar",
+          "named": true
+        },
+        {
+          "type": "kTo",
+          "named": true
+        },
+        {
+          "type": "kTry",
+          "named": true
+        },
+        {
+          "type": "kType",
+          "named": true
+        },
+        {
+          "type": "kUnit",
+          "named": true
+        },
+        {
+          "type": "kUntil",
+          "named": true
+        },
+        {
+          "type": "kUses",
+          "named": true
+        },
+        {
+          "type": "kVar",
+          "named": true
+        },
+        {
+          "type": "kWhile",
+          "named": true
+        },
+        {
+          "type": "kWith",
+          "named": true
+        },
+        {
+          "type": "kXor",
+          "named": true
         }
       ]
     }
@@ -1434,6 +1686,37 @@
     }
   },
   {
+    "type": "declContains",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "kContains",
+          "named": true
+        },
+        {
+          "type": "kIn",
+          "named": true
+        },
+        {
+          "type": "literalString",
+          "named": true
+        },
+        {
+          "type": "moduleName",
+          "named": true
+        },
+        {
+          "type": "ppUsesBlock",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "declEnum",
     "named": true,
     "fields": {},
@@ -1482,6 +1765,10 @@
       "multiple": true,
       "required": true,
       "types": [
+        {
+          "type": "declArgs",
+          "named": true
+        },
         {
           "type": "exprBinary",
           "named": true
@@ -1600,6 +1887,16 @@
     "type": "declField",
     "named": true,
     "fields": {
+      "attribute": {
+        "multiple": true,
+        "required": false,
+        "types": [
+          {
+            "type": "procAttribute",
+            "named": true
+          }
+        ]
+      },
       "defaultValue": {
         "multiple": false,
         "required": false,
@@ -2330,6 +2627,14 @@
         "required": false,
         "types": [
           {
+            "type": "exprDot",
+            "named": true
+          },
+          {
+            "type": "exprSubscript",
+            "named": true
+          },
+          {
             "type": "identifier",
             "named": true
           }
@@ -2518,6 +2823,14 @@
         "required": false,
         "types": [
           {
+            "type": "exprDot",
+            "named": true
+          },
+          {
+            "type": "exprSubscript",
+            "named": true
+          },
+          {
             "type": "identifier",
             "named": true
           }
@@ -2653,11 +2966,19 @@
           "named": true
         },
         {
+          "type": "kReadonly",
+          "named": true
+        },
+        {
           "type": "kStored",
           "named": true
         },
         {
           "type": "kWrite",
+          "named": true
+        },
+        {
+          "type": "kWriteonly",
           "named": true
         },
         {
@@ -2677,6 +2998,37 @@
       "types": [
         {
           "type": "declArg",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "declRequires",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "kIn",
+          "named": true
+        },
+        {
+          "type": "kRequires",
+          "named": true
+        },
+        {
+          "type": "literalString",
+          "named": true
+        },
+        {
+          "type": "moduleName",
+          "named": true
+        },
+        {
+          "type": "ppUsesBlock",
           "named": true
         }
       ]
@@ -2968,6 +3320,10 @@
         },
         {
           "type": "exprCall",
+          "named": true
+        },
+        {
+          "type": "exprParens",
           "named": true
         },
         {
@@ -3883,6 +4239,10 @@
         },
         {
           "type": "literalString",
+          "named": true
+        },
+        {
+          "type": "namedArgument",
           "named": true
         },
         {
@@ -5842,6 +6202,10 @@
         "required": false,
         "types": [
           {
+            "type": ",",
+            "named": false
+          },
+          {
             "type": ":",
             "named": false
           },
@@ -7167,6 +7531,114 @@
     }
   },
   {
+    "type": "namedArgument",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "argumentName",
+            "named": true
+          }
+        ]
+      },
+      "value": {
+        "multiple": true,
+        "required": true,
+        "types": [
+          {
+            "type": "exprBinary",
+            "named": true
+          },
+          {
+            "type": "exprBrackets",
+            "named": true
+          },
+          {
+            "type": "exprCall",
+            "named": true
+          },
+          {
+            "type": "exprConditional",
+            "named": true
+          },
+          {
+            "type": "exprDot",
+            "named": true
+          },
+          {
+            "type": "exprParens",
+            "named": true
+          },
+          {
+            "type": "exprSubscript",
+            "named": true
+          },
+          {
+            "type": "exprTpl",
+            "named": true
+          },
+          {
+            "type": "exprUnary",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "inherited",
+            "named": true
+          },
+          {
+            "type": "kFalse",
+            "named": true
+          },
+          {
+            "type": "kNil",
+            "named": true
+          },
+          {
+            "type": "kSpecialize",
+            "named": true
+          },
+          {
+            "type": "kTrue",
+            "named": true
+          },
+          {
+            "type": "lambda",
+            "named": true
+          },
+          {
+            "type": "literalNumber",
+            "named": true
+          },
+          {
+            "type": "literalString",
+            "named": true
+          },
+          {
+            "type": "ppFragmentExpr",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "kAssign",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "operatorName",
     "named": true,
     "fields": {},
@@ -7256,6 +7728,41 @@
         },
         {
           "type": "kXor",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "package",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "declContains",
+          "named": true
+        },
+        {
+          "type": "declRequires",
+          "named": true
+        },
+        {
+          "type": "kEnd",
+          "named": true
+        },
+        {
+          "type": "kEndDot",
+          "named": true
+        },
+        {
+          "type": "kPackage",
+          "named": true
+        },
+        {
+          "type": "moduleName",
           "named": true
         }
       ]
@@ -7789,6 +8296,10 @@
         },
         {
           "type": "kIocheck",
+          "named": true
+        },
+        {
+          "type": "kLibrary",
           "named": true
         },
         {
@@ -8662,6 +9173,10 @@
           "named": true
         },
         {
+          "type": "package",
+          "named": true
+        },
+        {
           "type": "ppBlock",
           "named": true
         },
@@ -9384,7 +9899,18 @@
   {
     "type": "unit",
     "named": true,
-    "fields": {},
+    "fields": {
+      "attribute": {
+        "multiple": true,
+        "required": false,
+        "types": [
+          {
+            "type": "procAttribute",
+            "named": true
+          }
+        ]
+      }
+    },
     "children": {
       "multiple": true,
       "required": true,
@@ -9893,6 +10419,10 @@
     "named": false
   },
   {
+    "type": "argumentName",
+    "named": true
+  },
+  {
     "type": "comment",
     "named": true
   },
@@ -9986,6 +10516,10 @@
   },
   {
     "type": "kConstructor",
+    "named": true
+  },
+  {
+    "type": "kContains",
     "named": true
   },
   {
@@ -10309,6 +10843,10 @@
     "named": true
   },
   {
+    "type": "kPackage",
+    "named": true
+  },
+  {
     "type": "kPacked",
     "named": true
   },
@@ -10361,6 +10899,10 @@
     "named": true
   },
   {
+    "type": "kReadonly",
+    "named": true
+  },
+  {
     "type": "kRecord",
     "named": true
   },
@@ -10382,6 +10924,10 @@
   },
   {
     "type": "kRequired",
+    "named": true
+  },
+  {
+    "type": "kRequires",
     "named": true
   },
   {
@@ -10522,6 +11068,10 @@
   },
   {
     "type": "kWrite",
+    "named": true
+  },
+  {
+    "type": "kWriteonly",
     "named": true
   },
   {

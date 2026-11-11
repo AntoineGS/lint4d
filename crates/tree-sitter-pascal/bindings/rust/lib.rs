@@ -815,7 +815,7 @@ mod tests {
             .filter_map(|symbol| symbol.strip_prefix("$."))
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        assert_eq!(external_symbols.len(), 144);
+        assert_eq!(external_symbols.len(), 149);
 
         let enum_start = scanner.find("typedef enum {").unwrap() + "typedef enum {".len();
         let enum_end = enum_start + scanner[enum_start..].find("} TokenType;").unwrap();
@@ -861,7 +861,7 @@ mod tests {
                 Some((spelling, token))
             })
             .collect::<Vec<_>>();
-        assert_eq!(contextual_words.len(), 76);
+        assert_eq!(contextual_words.len(), 81);
 
         for (index, (spelling, token)) in contextual_words.iter().enumerate() {
             let external = &external_symbols[index + 4];
@@ -909,7 +909,7 @@ mod tests {
         assert_eq!(dcc_words.len(), DCC_RESERVED_WORDS.len());
 
         for (index, (spelling, token)) in dcc_words.iter().enumerate() {
-            let external = &external_symbols[80 + index];
+            let external = &external_symbols[85 + index];
             assert_eq!(
                 spelling,
                 &DCC_RESERVED_WORDS[index].to_ascii_lowercase(),

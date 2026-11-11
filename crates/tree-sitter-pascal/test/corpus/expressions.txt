@@ -349,3 +349,37 @@ end;
             (exprBinary (identifier) (kGt) (identifier))
             (identifier))))
       (kEnd))))
+
+===
+Reserved words as member names after a dot
+===
+
+procedure Main;
+begin
+  excel.Goto(1);
+  PVF.Function := xlSum;
+  Parallel.For(1, 10).Execute;
+  x := a.Type + b.Begin;
+end;
+
+---
+
+(root
+  (defProc
+    (declProc (kProcedure) (identifier))
+    (block (kBegin)
+      (statement
+        (exprCall (exprDot (identifier) (kDot) (identifier)) (exprArgs (literalNumber))))
+      (assignment
+        (exprDot (identifier) (kDot) (identifier)) (kAssign) (identifier))
+      (statement
+        (exprDot
+          (exprCall (exprDot (identifier) (kDot) (identifier))
+            (exprArgs (literalNumber) (literalNumber)))
+          (kDot) (identifier)))
+      (assignment (identifier) (kAssign)
+        (exprBinary
+          (exprDot (identifier) (kDot) (identifier))
+          (kAdd)
+          (exprDot (identifier) (kDot) (identifier))))
+      (kEnd))))

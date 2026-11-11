@@ -1,0 +1,287 @@
+===
+Last field before end without a semicolon
+===
+
+type
+  TFoo = class
+  public
+    progcaller: string
+  end;
+  TR = record
+    a: Integer;
+    b: Integer
+  end;
+
+---
+
+(root
+  (declTypes (kType)
+    (declType (identifier) (kEq)
+      (declClass (kClass)
+        (declSection (kPublic)
+          (declField (identifier) (type (declString (kString)))))
+        (kEnd)))
+    (declType (identifier) (kEq)
+      (declClass (kRecord)
+        (declField (identifier) (type (typeref (identifier))))
+        (declField (identifier) (type (typeref (identifier))))
+        (kEnd)))))
+
+===
+Generic constraint lists
+===
+
+type
+  TGen<T: class, constructor> = class end;
+  TGen2<K; V: TObject, IInterface, constructor> = class end;
+
+---
+
+(root
+  (declTypes (kType)
+    (declType
+      (genericTpl (identifier) (kLt)
+        (genericArgs
+          (genericArg (identifier) (typeref (identifier)) (typeref (identifier))))
+        (kGt))
+      (kEq)
+      (declClass (kClass) (kEnd)))
+    (declType
+      (genericTpl (identifier) (kLt)
+        (genericArgs
+          (genericArg (identifier))
+          (genericArg (identifier)
+            (typeref (identifier)) (typeref (identifier)) (typeref (identifier))))
+        (kGt))
+      (kEq)
+      (declClass (kClass) (kEnd)))))
+
+===
+Hint directives on a unit
+===
+
+unit T6 deprecated 'Use T7';
+interface
+implementation
+end.
+
+---
+
+(root
+  (unit (kUnit) (moduleName (identifier))
+    (procAttribute (kDeprecated) (literalString))
+    (interface (kInterface))
+    (implementation (kImplementation))
+    (kEnd)
+    (kEndDot)))
+
+===
+Procedural variable directives before an initializer
+===
+
+var
+  V1: function(a: Integer): Integer cdecl = nil;
+const
+  C1: function(a: Integer): Integer; cdecl = nil;
+
+---
+
+(root
+  (declVars (kVar)
+    (declVar (identifier)
+      (type (declProcRef (kFunction)
+        (declArgs (declArg (identifier) (type (typeref (identifier)))))
+        (typeref (identifier))))
+      (procAttribute (kCdecl))
+      (defaultValue (kEq) (kNil))))
+  (declConsts (kConst)
+    (declConst (identifier)
+      (type (declProcRef (kFunction)
+        (declArgs (declArg (identifier) (type (typeref (identifier)))))
+        (typeref (identifier))))
+      (procAttribute (kCdecl))
+      (defaultValue (kEq) (kNil)))))
+
+===
+Indexed property accessor
+===
+
+type
+  TFoo = class
+    property MajorPattern: Integer index 0 read FPattern[0] write SetPattern;
+  end;
+
+---
+
+(root
+  (declTypes (kType)
+    (declType (identifier) (kEq)
+      (declClass (kClass)
+        (declProp (kProperty) (identifier) (type (typeref (identifier)))
+          (kIndex) (literalNumber)
+          (kRead) (exprSubscript (identifier) (exprArgs (literalNumber)))
+          (kWrite) (identifier))
+        (kEnd)))))
+
+===
+DOS end-of-file marker
+===
+
+unit U;
+interface
+implementation
+end.
+
+---
+
+(root
+  (unit (kUnit) (moduleName (identifier))
+    (interface (kInterface))
+    (implementation (kImplementation))
+    (kEnd)
+    (kEndDot)))
+
+===
+Directive words as field and type names
+===
+
+type
+  TFoo = class
+  public
+    required: Boolean;
+    optional: Integer;
+  end;
+  PF = ^FILE;
+  TP = procedure(const Reference: Reference);
+
+---
+
+(root
+  (declTypes (kType)
+    (declType (identifier) (kEq)
+      (declClass (kClass)
+        (declSection (kPublic)
+          (declField (identifier) (type (typeref (identifier))))
+          (declField (identifier) (type (typeref (identifier)))))
+        (kEnd)))
+    (declType (identifier) (kEq)
+      (type (typeref (typerefPtr (kHat) (identifier)))))
+    (declType (identifier) (kEq)
+      (type (declProcRef (kProcedure)
+        (declArgs (declArg (kConst) (identifier) (type (typeref (identifier))))))))))
+
+===
+Named arguments of automation calls
+===
+
+procedure P;
+begin
+  o.Names.Add(Name := 'a', RefersToR1C1 := Liste);
+end;
+
+---
+
+(root
+  (defProc
+    (declProc (kProcedure) (identifier))
+    (block (kBegin)
+      (statement
+        (exprCall
+          (exprDot (exprDot (identifier) (kDot) (identifier)) (kDot) (identifier))
+          (exprArgs
+            (namedArgument (argumentName) (kAssign) (literalString))
+            (namedArgument (argumentName) (kAssign) (identifier)))))
+      (kEnd))))
+
+
+===
+Subrange upper bound starting with a parenthesis
+===
+
+type
+  jTOctet = 0..(MaxInt div SizeOf(JOCTET))-1;
+
+---
+
+(root
+  (declTypes (kType)
+    (declType (identifier) (kEq)
+      (type (declSubRange
+        (literalNumber)
+        (exprBinary
+          (exprParens
+            (exprBinary (identifier) (kDiv) (exprCall (identifier) (exprArgs (identifier)))))
+          (kSub)
+          (literalNumber)))))))
+
+===
+Routine directives without a final semicolon
+===
+
+unit U;
+interface
+function F(i: Integer): Integer; inline
+function G(i: Integer): Integer; stdcall
+procedure P;
+implementation
+end.
+
+---
+
+(root
+  (unit (kUnit) (moduleName (identifier))
+    (interface (kInterface)
+      (declProc (kFunction) (identifier)
+        (declArgs (declArg (identifier) (type (typeref (identifier)))))
+        (typeref (identifier))
+        (procAttribute (kInline)))
+      (declProc (kFunction) (identifier)
+        (declArgs (declArg (identifier) (type (typeref (identifier)))))
+        (typeref (identifier))
+        (procAttribute (kStdcall)))
+      (declProc (kProcedure) (identifier)))
+    (implementation (kImplementation))
+    (kEnd)
+    (kEndDot)))
+
+===
+Exports with a parameter list
+===
+
+library L1;
+exports
+  Q(a: Pointer) name 'QQ',
+  R;
+begin
+end.
+
+---
+
+(root
+  (library (kLibrary) (moduleName (identifier))
+    (declExports (kExports)
+      (declExport (identifier)
+        (declArgs (declArg (identifier) (type (typeref (identifier)))))
+        (kName) (literalString))
+      (declExport (identifier)))
+    (block (kBegin) (kEnd))
+    (kEndDot)))
+
+===
+Control characters are whitespace
+===
+
+procedure P;
+begin
+  x :=1;x := x+ 1;
+end;
+
+---
+
+(root
+  (defProc
+    (declProc (kProcedure) (identifier))
+    (block (kBegin)
+      (assignment (identifier) (kAssign) (literalNumber))
+      (assignment (identifier) (kAssign) (exprBinary (identifier) (kAdd) (literalNumber)))
+      (kEnd))))

@@ -2,6 +2,9 @@
 [
 	(kProgram)
 	(kLibrary)
+	(kPackage)
+	(kRequires)
+	(kContains)
 	(kUnit)
 	(kUses)
 
@@ -27,6 +30,8 @@
 	(kImplements)
 	(kDefault)
 	(kNodefault)
+	(kReadonly)
+	(kWriteonly)
 	(kStored)
 	(kIndex)
 	(kDispId)

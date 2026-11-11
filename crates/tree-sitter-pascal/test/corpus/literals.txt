@@ -319,3 +319,59 @@ const
           (literalNumber)
           (kAdd)
           (literalNumber))))))
+
+===
+Control characters
+===
+
+const
+  CRLF = ^M^J;
+  S = 'select a'^M^J'from b';
+  T = #13^J;
+
+procedure P;
+begin
+  case C of
+    ^H, ^V, #32..#255: P^.X := Q^[0];
+  end;
+end;
+
+---
+
+(root
+  (declConsts (kConst)
+    (declConst (identifier) (defaultValue (kEq) (literalString)))
+    (declConst (identifier) (defaultValue (kEq) (literalString)))
+    (declConst (identifier) (defaultValue (kEq) (literalString (literalChar)))))
+  (defProc
+    (declProc (kProcedure) (identifier))
+    (block (kBegin)
+      (case (kCase) (identifier) (kOf)
+        (caseCase
+          (caseLabel (literalString) (literalString)
+            (range (literalString (literalChar)) (literalString (literalChar))))
+          (assignment
+            (exprDot (exprUnary (identifier) (kHat)) (kDot) (identifier))
+            (kAssign)
+            (exprSubscript (exprUnary (identifier) (kHat)) (exprArgs (literalNumber)))))
+        (kEnd))
+      (kEnd))))
+
+===
+Pointer types are not control characters
+===
+
+type
+  PPoint = ^TPoint;
+  TDigit = 'a'..'z';
+var
+  FIndex: ^Integer;
+
+---
+
+(root
+  (declTypes (kType)
+    (declType (identifier) (kEq) (type (typeref (typerefPtr (kHat) (identifier)))))
+    (declType (identifier) (kEq) (type (declSubRange (literalString) (literalString)))))
+  (declVars (kVar)
+    (declVar (identifier) (type (typeref (typerefPtr (kHat) (identifier)))))))

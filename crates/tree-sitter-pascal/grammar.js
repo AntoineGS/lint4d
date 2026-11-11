@@ -69,6 +69,7 @@ function varName($) {
 			$.kNoreturn, $.kLocal, $.kFar, $.kNear,
 			$.kDefault, $.kNodefault, $.kDeprecated, $.kExperimental,
 			$.kMessage,
+			...enable_if(objc, $.kRequired, $.kOptional),
 			...enable_if(fpc,
 				$.kAlias,
 				$.kPlatform, $.kUnimplemented,
@@ -446,6 +447,11 @@ module.exports = grammar({
 		$.kWinapi,
 		$.kAlias,
 		$.kDelayed,
+		$.kPackage,
+		$.kRequires,
+		$.kContains,
+		$.kReadonly,
+		$.kWriteonly,
 		$.kTrue,
 		$.kFalse,
 		$.kAnd,
@@ -578,6 +584,14 @@ module.exports = grammar({
 		[$.varDef, $.type],
 		[$.declVar, $.declField],
 		[$._declClass],
+		// After `= class` a directive word is a hint on a forward declaration
+		// or names the first field.
+		[$.declClass], [$.declIntf],
+		// `F: procedure; cdecl = nil;` against `F: procedure; cdecl;`.
+		[$._hintAttribute, $.procAttribute],
+		[$.declField],
+		// `procedure P; inline` (no final `;`) against `procedure P; inline;`.
+		[$._bareAttribute, $.procAttribute],
 		[$.declVar, $.declConst, $.declField],
 		[$.declVar, $.declConst],
 		[$.declSection],
@@ -588,6 +602,7 @@ module.exports = grammar({
 		root:               $ => optional(choice(
 			$.program,
 			$.library,
+			$.package,
 			$.unit,
 			$._definitions // For include files
 		)),
@@ -608,8 +623,19 @@ module.exports = grammar({
 			$.kEndDot
 		),
 
+		// Delphi package source (.dpk).
+		package:            $ => seq(
+			$.kPackage, $.moduleName, ';',
+			optional($.declRequires),
+			optional($.declContains),
+			$.kEnd, $.kEndDot
+		),
+
+		declRequires:       $ => seq($.kRequires, repeat1($._usesClauseEntry), ';'),
+		declContains:       $ => seq($.kContains, repeat1($._usesClauseEntry), ';'),
+
 		unit:               $ => seq(
-			$.kUnit, $.moduleName, ';',
+			$.kUnit, $.moduleName, repeat($._declHint), ';',
 			repeat(choice(
 				$.interface,
 				seq(
@@ -697,9 +723,26 @@ module.exports = grammar({
 		asmBody: $ => repeat1(choice(
 			///([a-zA-Z0-9_]+([eE][nN][dD])|[eE][nN][dD][a-zA-Z0-9_]+|([^eE]|[eE][^nN]|[eE][nN][^dD]))+/,
 			$.identifier,       // Identifiers
+			// Reserved words are operands and operators here (`XOR EAX,EAX`,
+			// `TYPE TFoo`, `@Nil`); only `end` closes the block.
+			$.kAnd, $.kArray, $.kAs, $.kAsm, $.kBegin, $.kCase, $.kClass,
+			$.kConst, $.kConstructor, $.kDestructor, $.kDispInterface, $.kDiv,
+			$.kDo, $.kDownto, $.kElse, $.kExcept, $.kExports, $.kFile,
+			$.kFinalization, $.kFinally, $.kFor, $.kFunction, $.kGoto, $.kIf,
+			$.kImplementation, $.kIn, $.kInherited, $.kInitialization,
+			$.kInline, $.kInterface, $.kIs, $.kLabel, $.kLibrary, $.kMod,
+			$.kNil, $.kNot, $.kObject, $.kOf, $.kOr, $.kPacked, $.kProcedure,
+			$.kProgram, $.kProperty, $.kRaise, $.kRecord, $.kRepeat,
+			$.kResourcestring, $.kSet, $.kShl, $.kShr, $.kString, $.kThen,
+			$.kThreadvar, $.kTo, $.kTry, $.kType, $.kUnit, $.kUntil, $.kUses,
+			$.kVar, $.kWhile, $.kWith, $.kXor,
 			/[0-9a-fA-F]/,      // Numbers
-			/[.,:;+\-*\[\]<>&%$@]/, // Punctuation, including local labels
-			/\([^*]|\)/         // Parentheses that are not comments
+			// Local labels, including ones named like reserved words (`@@END`).
+			alias(/@@?[A-Za-z0-9_]+/, $.identifier),
+			/[.,:;+\-*\/\[\]<>=&%$@#^!|?~]/, // Punctuation
+			/'[^'\r\n]*'/,      // Character and string operands
+			/"[^"\r\n]*"/,
+			'(', ')',           // `(*` still starts a comment (longest match)
 		)),
 
 		// EXPRESSIONS ---------------------------------------------------------
@@ -757,7 +800,25 @@ module.exports = grammar({
 
 		inherited:       $ => prec.right(seq($.kInherited, optional($.identifier))),
 
-		exprDot:         $ => op.infix(5, $._ref, $.kDot, $._ref),
+		exprDot:         $ => op.infix(5, $._ref, $.kDot, choice(
+			$._ref, $._memberKeyword
+		)),
+		// After a dot a reserved word is a member name: `Parallel.For`,
+		// `Excel.Goto`. `end` is left out so that an unfinished `x.` before
+		// `end` keeps the block's end.
+		_memberKeyword:  $ => prec(1, choice(...[
+			$.kAnd, $.kArray, $.kAs, $.kAsm, $.kBegin, $.kCase, $.kClass,
+			$.kConst, $.kConstructor, $.kDestructor, $.kDispInterface, $.kDiv,
+			$.kDo, $.kDownto, $.kElse, $.kExcept, $.kExports, $.kFile,
+			$.kFinalization, $.kFinally, $.kFor, $.kFunction, $.kGoto, $.kIf,
+			$.kImplementation, $.kIn, $.kInherited, $.kInitialization,
+			$.kInline, $.kInterface, $.kIs, $.kLabel, $.kLibrary, $.kMod,
+			$.kNil, $.kNot, $.kObject, $.kOf, $.kOr, $.kPacked, $.kProcedure,
+			$.kProgram, $.kProperty, $.kRaise, $.kRecord, $.kRepeat,
+			$.kResourcestring, $.kSet, $.kShl, $.kShr, $.kString, $.kThen,
+			$.kThreadvar, $.kTo, $.kTry, $.kType, $.kUnit, $.kUntil, $.kUses,
+			$.kVar, $.kWhile, $.kWith, $.kXor,
+		].map(keyword => alias(keyword, $.identifier)))),
 		exprDeref:       $ => op.postfix(4, $._expr, $.kHat),
 
 		exprAs:          $ => op.infix(3, $._expr, $.kAs,  $._expr),
@@ -818,8 +879,15 @@ module.exports = grammar({
 		// Default(String), TypeInfo(String).
 		exprArgs:        $ => delimited1(choice(
 			seq($._expr, optional($.legacyFormat)),
+			$.namedArgument,
 			prec(-1, alias($.kString, $.identifier)),
 		)),
+		// Automation calls name their arguments: `Add(Name := 'a')`. The name
+		// is not an `identifier`: it never refers to a Pascal declaration.
+		namedArgument:   $ => seq(
+			field('name', alias($.identifier, $.argumentName)),
+			$.kAssign, field('value', $._expr)
+		),
 		// A separate reduction distinguishes `is not T` from `is (not T)`.
 		_exprIsNot:      $ => prec(5, seq($.kIs, $.kNot)),
 
@@ -894,11 +962,26 @@ module.exports = grammar({
 		// `Low(Word)` or `BitsPerInt - 1`, but never comparisons, so that
 		// `const X: 0..9 = 5;` keeps `= 5` as its value.
 		declSubRange:    $ => prec(1, seq(
-			$._subRangeBound, '..', $._subRangeBound
+			$._subRangeBound, '..', $._subRangeUpper
 		)),
+		// After `..` a parenthesis cannot start an enumeration:
+		// `0..(MaxInt div SizeOf(T))-1`.
+		_subRangeUpper:  $ => choice(
+			$._subRangeBound,
+			alias($._subRangeParens, $.exprParens),
+			alias($._subRangeParensBinary, $.exprBinary),
+		),
+		_subRangeParens: $ => seq('(', $._expr, ')'),
+		_subRangeParensBinary: $ => choice(
+			op.infix(2, alias($._subRangeParens, $.exprParens),
+				choice($.kAdd, $.kSub), $._subRangeBound),
+			op.infix(3, alias($._subRangeParens, $.exprParens),
+				choice($.kMul, $.kDiv, $.kMod, $.kShl, $.kShr), $._subRangeBound),
+		),
 		_subRangeBound:  $ => choice(
 			$.literalNumber,
-			$.literalString,
+			// No `^M` control characters: `= ^TFoo` is a pointer type.
+			alias($._subRangeString, $.literalString),
 			$._typeref,
 			alias($._subRangeCall,   $.exprCall),
 			alias($._subRangeUnary,  $.exprUnary),
@@ -912,14 +995,19 @@ module.exports = grammar({
 				choice($.kMul, $.kDiv, $.kMod, $.kShl, $.kShr), $._subRangeBound),
 		),
 
-		typeref:         $ => seq(
+		// A hint right after a type reference stays in it (`fA: Integer
+		// deprecated;`) rather than becoming a declaration hint.
+		typeref:         $ => prec.right(seq(
 			...enable_if(fpc, field('_dummy', optional($.kSpecialize))),
 			$._typeref,
 			...enable_if(delphi, optional(prec.right(seq($.kDeprecated, optional($._expr))))),
-		),
+		)),
 
 		_typeref:        $ => choice(
 			$.identifier,
+			// A type named `Reference` (type libraries): `reference to` is
+			// only a procedure reference when `to` follows.
+			alias($.kReference, $.identifier),
 			// Keep `string` usable as a typeref in signatures/generic arguments,
 			// but prefer `declString` where the full string-type rule is available.
 			prec(-1, alias($.kString, $.identifier)),
@@ -931,7 +1019,9 @@ module.exports = grammar({
 
 		typerefDot:      $ => op.infix(1,$._typeref, $.kDot, $._typeref),
 		typerefTpl:      $ => op.args(1, $._typeref, $.kLt, $.typerefArgs, $.kGt),
-		typerefPtr:      $ => op.prefix(1,$.kHat, $._typeref),
+		typerefPtr:      $ => op.prefix(1,$.kHat, choice(
+			$._typeref, alias($.kFile, $.identifier)
+		)),
 		typerefArgs:     $ => delimited1($._typeref),
 
 		// GENERIC TYPE DECLARATION --------------------------------------------
@@ -955,10 +1045,10 @@ module.exports = grammar({
 		genericArgs:     $ => delimited1($.genericArg, ';'),
 		genericArg:      $ => seq(
 			field('name', delimited1($.identifier)),
-			field('type', optional(seq(':', choice(
+			field('type', optional(seq(':', delimited1(choice(
 				$.typeref,
 				alias($._genericKeywordConstraintTyperef, $.typeref),
-			)))),
+			))))),
 			field('defaultValue', optional($.defaultValue))
 		),
 		// The combined grammar historically accepts these constraint keywords
@@ -979,7 +1069,10 @@ module.exports = grammar({
 			$.kNil, $.kTrue, $.kFalse
 		),
 		literalString:   $ => repeat1($._literalString),
-		_literalString:  $ => choice(/'[^']*'/, $.literalChar, $._literalStringMultiline),
+		_subRangeString: $ => repeat1(choice(/'[^']*'/, $.literalChar, $._literalStringMultiline)),
+		_literalString:  $ => choice(/'[^']*'/, $.literalChar, $._literalStringMultiline, $._controlChar),
+		// `^M` is the control character #13.
+		_controlChar:    $ => token(/\^[A-Za-z@\[\\\]^_]/),
 		literalChar:     $ => seq('#', $._literalInt),
 		literalNumber:   $ => choice($._literalInt, $._literalFloat),
 		// Delphi 11 allows `_` as a digit separator after the first digit.
@@ -1147,6 +1240,7 @@ module.exports = grammar({
 					$.declHelper,
 				)
 			),
+			repeat($._declHint),
 			';',
 			repeat($._procAttribute)
 		),
@@ -1161,27 +1255,52 @@ module.exports = grammar({
 			field('name', delimited1(varName($))),
 			':',
 			field('type', $.type),
-			optional(choice(
-				seq($.kAbsolute, $._ref),
-				field('defaultValue', $.defaultValue)
-			)),
-			';',
-			repeat(choice($._procAttribute, $.procExternal))
+			choice(
+				seq(
+					// `F: function: Integer cdecl = nil;`
+					repeat($._declHint),
+					optional(choice(
+						seq($.kAbsolute, $._ref),
+						field('defaultValue', $.defaultValue)
+					)),
+					repeat($._declHint),
+					';',
+					repeat(choice($._procAttribute, $.procExternal))
+				),
+				// A procedural variable's directives come before its
+				// initializer: `F: procedure; cdecl = nil;`.
+				seq(';', repeat1($._declHint), field('defaultValue', $.defaultValue), ';'),
+			)
 		),
 
 		declConst:       $ => seq(
 			...enable_if(rtti, optional($.rttiAttributes)),
 			field('name', $.identifier),
-			optional(seq(':', field('type', $.type))),
-			field('defaultValue', $.defaultValue),
-			';',
-			repeat($._procAttribute)
+			choice(
+				seq(
+					optional(seq(':', field('type', $.type))),
+					repeat($._declHint),
+					field('defaultValue', $.defaultValue),
+					repeat($._declHint),
+					';',
+					repeat($._procAttribute)
+				),
+				// A typed procedural constant: `C: procedure; cdecl = nil;`
+				seq(
+					':', field('type', $.type), ';', repeat1($._declHint),
+					field('defaultValue', $.defaultValue), ';'
+				),
+			)
 		),
 
 		declLabels:      $ => seq($.kLabel, delimited1($.declLabel), ';'),
 		declLabel:       $ => field('name', choice($.identifier, $.labelNumber)),
 
-		declExport:      $ => seq($._genericName, repeat(seq(choice($.kName, $.kIndex), $._expr))),
+		// `exports Q(a: Pointer) name 'QQ'` selects one overload.
+		declExport:      $ => seq(
+			$._genericName, optional($.declArgs),
+			repeat(seq(choice($.kName, $.kIndex), $._expr))
+		),
 
 		// Type declarations
 
@@ -1197,7 +1316,7 @@ module.exports = grammar({
 		arrayOfConstType: $ => seq(alias($.arrayOfConstTyperef, $.typeref)),
 		arrayOfConstTyperef: $ => seq(alias($.kConst, $.identifier)),
 		declFile:        $ => seq($.kFile, optional(seq($.kOf, $.type))),
-		declString:      $ => prec.left(seq(
+		declString:      $ => prec.right(seq(
 			$.kString,
 			optional(seq('[', choice($._expr), ']')),
 			...enable_if(delphi, optional(prec.right(seq($.kDeprecated, optional($._expr))))),
@@ -1262,6 +1381,7 @@ module.exports = grammar({
 
 		_declClass:      $ => seq(
 			optional($._declFields),
+			optional(alias($._declFieldLast, $.declField)),
 			optional($._classDeclarations),
 			repeat(choice($.declSection, $.ppDeclSection)),
 			optional($.declVariant),
@@ -1272,6 +1392,7 @@ module.exports = grammar({
 			optional($.kStrict),
 			choice($._visibility, ...enable_if(objc, $.kRequired, $.kOptional)),
 			optional($._declFields),
+			optional(alias($._declFieldLast, $.declField)),
 			optional($._classDeclarations)
 		),
 
@@ -1288,11 +1409,24 @@ module.exports = grammar({
 
 		declField:       $ =>  seq(
 			...enable_if(rtti, optional($.rttiAttributes)),
-			field('name', delimited1($.identifier)),
+			field('name', delimited1(varName($))),
 			':',
 			field('type', $.type),
 			field('defaultValue', optional($.defaultValue)),
-			';'
+			repeat($._declHint),
+			';',
+			// `f: function(a: Integer): Integer; cdecl;`
+			repeat(seq(repeat1($._declHint), ';'))
+		),
+
+		// dcc accepts the last field before `end` without its `;`.
+		_declFieldLast:  $ => seq(
+			...enable_if(rtti, optional($.rttiAttributes)),
+			field('name', delimited1(varName($))),
+			':',
+			field('type', $.type),
+			field('defaultValue', optional($.defaultValue)),
+			repeat($._declHint),
 		),
 
 		declProp:        $ => seq(
@@ -1305,8 +1439,11 @@ module.exports = grammar({
 			repeat(choice(
 				seq($.kIndex, field('index', $._expr)),
 				...enable_if(delphi, seq($.kDispId, field('dispid', $._expr))),
-				seq($.kRead, field('getter', $.identifier)),
-				seq($.kWrite, field('setter', $.identifier)),
+				// A field of a record field: `read FState.Mode`.
+				seq($.kRead, field('getter', choice($.identifier, $.exprDot, $.exprSubscript))),
+				seq($.kWrite, field('setter', choice($.identifier, $.exprDot, $.exprSubscript))),
+				// Type-library dispinterface properties.
+				$.kReadonly, $.kWriteonly,
 				seq($.kImplements, field('implements', delimited($._expr))),
 				seq($.kDefault, field('defaultValue', $._expr)),
 				seq($.kStored, field('stored', $._expr)),
@@ -1359,8 +1496,14 @@ module.exports = grammar({
 				field('type', $.typeref),
 			)),
 			field('assign', optional($.defaultValue)),
+			repeat($._declHint),
 			';',
-			repeat($._procAttributeNoExt)
+			repeat($._procAttributeNoExt),
+			// dcc accepts the last directives without their `;`:
+			// `function F: Integer; inline` before the next declaration.
+			optional(prec.dynamic(-1, repeat1(
+				field('attribute', alias($._bareAttribute, $.procAttribute))
+			))),
 		),
 
 		_declOperator:   $ => seq(
@@ -1415,7 +1558,7 @@ module.exports = grammar({
 		// Attributes & declaration hints
 
 		_procAttribute:  $ => /*pp($,*/choice(
-			seq(field('attribute', $.procAttribute), ';'),
+			seq(repeat1(field('attribute', $.procAttribute)), ';'),
 			// FPC-specific syntax, e.g. procedure myproc; [public; alias:'bla'; cdecl];
 			...enable_if(fpc, seq(
 				'[',
@@ -1424,7 +1567,7 @@ module.exports = grammar({
 			))
 		)/*)*/,
 		_procAttributeNoExt: $ => choice(
-			seq(ppAttribute($, field('attribute', $.procAttribute)), ';'),
+			seq(repeat1(ppAttribute($, field('attribute', $.procAttribute))), ';'),
 			...enable_if(use_pp, $._procAttributesPp),
 			// FPC-specific syntax, e.g. procedure myproc; [public; alias:'bla'; cdecl];
 			...enable_if(fpc, seq('[', delimited(field('attribute', choice($.procAttribute)), ';'), ']', ';'))
@@ -1437,12 +1580,31 @@ module.exports = grammar({
 			$._procAttributesPp
 		)),
 
+		// Directives written without a separating `;`: calling conventions
+		// after a return type (`): BOOL stdcall;`) and hints on constants,
+		// types and variables (`fmShareCompat = $0000 platform;`).
+		_declHint:       $ => field('attribute', alias($._hintAttribute, $.procAttribute)),
+		_hintAttribute:  $ => choice(
+			$.kStdcall, $.kCdecl, $.kPascal, $.kRegister, $.kSafecall,
+			...enable_if(fpc, $.kWinapi),
+			$.kPlatform, $.kExperimental, $.kLibrary,
+			prec.right(2, seq($.kDeprecated, optional($.literalString))),
+		),
+
+		_bareAttribute:  $ => choice(
+			$.kStatic, $.kVirtual, $.kDynamic, $.kAbstract, $.kOverride,
+			$.kOverload, $.kReintroduce, $.kInline, $.kStdcall, $.kCdecl,
+			$.kPascal, $.kRegister, $.kSafecall, $.kAssembler,
+			$.kPlatform, $.kExperimental, $.kLibrary, $.kDeprecated,
+		),
+
 		procAttribute:   $ => choice(
 			$.kStatic, $.kVirtual, $.kDynamic, $.kAbstract, $.kOverride,
 			$.kOverload, $.kReintroduce, $.kInline, $.kStdcall,
 			$.kCdecl, $.kPascal, $.kRegister, $.kSafecall, $.kAssembler,
 			$.kNoreturn, $.kLocal,  $.kFar, $.kNear,
 			$.kDefault, $.kNodefault, $.kDeprecated, $.kExperimental,
+			$.kLibrary,
 
 			seq(
 				choice(
@@ -1533,7 +1695,9 @@ module.exports = grammar({
 		kFalse:            $ => /false/i,
 		labelNumber:       $ => token(prec(1, /[0-9]+/)),
 
-	  	_space:            $ => /[\s\r\n\t]+/,
+	  	// dcc treats every control character as a blank, including \x1a,
+	  	// the DOS end-of-file marker some old sources end with.
+	  	_space:            $ => /[\s\x01-\x1f]+/,
 		ppDirective:       $ => token(prec(-1, choice(
 			/\{\$[^}]*\}/,
 			/\(\*\$[^*]*(\*+[^*)][^*]*)*\*+\)/

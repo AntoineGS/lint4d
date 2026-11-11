@@ -1,0 +1,126 @@
+===
+Asm block with reserved-word operators, strings and type operators
+===
+
+procedure P; assembler;
+asm
+        XOR     EAX,EAX
+        OR      EDX,EDX
+        SHR     ECX,2
+        shl     eax, 2
+        AND     ECX, NOT (PtrSize - 1)
+        MOV     EAX,TYPE TObject
+        CMP     AL,'0'
+        CMP     AL,"S"
+        MOV     EAX, [EAX].TFoo.Field
+        jz      @Nil
+@Nil:
+        MOV     EAX, 10 MOD 3
+        MOV     EAX, 10 DIV 3
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier)
+      (procAttribute
+        (kAssembler)))
+    (asm
+      (kAsm)
+      (asmBody
+        (kXor)
+        (identifier)
+        (identifier)
+        (kOr)
+        (identifier)
+        (identifier)
+        (kShr)
+        (identifier)
+        (kShl)
+        (identifier)
+        (kAnd)
+        (identifier)
+        (kNot)
+        (identifier)
+        (identifier)
+        (identifier)
+        (kType)
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier)
+        (kMod)
+        (identifier)
+        (identifier)
+        (kDiv))
+      (kEnd))))
+
+===
+Asm parenthesised character operands
+===
+
+procedure P;
+asm
+  ADD     DX,('A'-'0')-10
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (asm
+      (kAsm)
+      (asmBody
+        (identifier)
+        (identifier))
+      (kEnd))))
+
+===
+Asm local labels named like reserved words
+===
+
+procedure P;
+asm
+        JS    @@END
+@@1:    DEC   ECX
+        JNZ   @@1
+@@END:
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (asm
+      (kAsm)
+      (asmBody
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier)
+        (identifier))
+      (kEnd))))
+

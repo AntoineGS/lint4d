@@ -38,11 +38,9 @@ pub(crate) struct InteractiveGate {
     warm_busy: std::sync::atomic::AtomicUsize,
     idle: Condvar,
     /// Queued Interactive and Bulk client requests, which wait for a worker
-    /// and could take a lent slot (queued pull diagnostics are not counted).
+    /// (queued pull diagnostics are not counted).
     waiting_clients: std::sync::atomic::AtomicUsize,
-    /// Background jobs paused in `yield_to_interactive_work`. Their workers
-    /// use no CPU meanwhile, so the dispatcher lends their slots to client
-    /// requests.
+    /// Background jobs paused in `yield_to_interactive_work`.
     paused: std::sync::atomic::AtomicUsize,
     /// Running Bulk client requests; index batches wait for them (D33).
     running_bulk: std::sync::atomic::AtomicUsize,
@@ -219,7 +217,7 @@ impl InteractiveGate {
     }
 
     /// Records how many client requests wait for a worker. Background work
-    /// pauses for them as for interactive work, and lends them its slot.
+    /// pauses for them as for interactive work.
     pub(crate) fn set_waiting_clients(&self, waiting: usize) {
         self.waiting_clients.store(waiting, Ordering::Relaxed);
         if waiting == 0 {
@@ -446,16 +444,12 @@ impl InteractiveGate {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_paused_background_for_tests(&self, paused: usize) {
-        self.paused.store(paused, Ordering::Relaxed);
-    }
-
-    #[cfg(test)]
     pub(crate) fn waiting_clients_for_tests(&self) -> usize {
         self.waiting_clients.load(Ordering::Relaxed)
     }
 
     /// The number of background jobs paused for interactive work.
+    #[cfg(test)]
     pub(crate) fn paused_background(&self) -> usize {
         self.paused.load(Ordering::Relaxed)
     }
@@ -2821,7 +2815,7 @@ mod tests {
                 .send(yield_to_interactive_work(&AtomicBool::new(false)))
                 .unwrap();
         });
-        // The pause is reported to the dispatcher, which lends its slot.
+        // The pause is counted.
         let deadline = Instant::now() + Duration::from_secs(5);
         while gate.paused_background() == 0 {
             assert!(Instant::now() < deadline, "the work pauses");

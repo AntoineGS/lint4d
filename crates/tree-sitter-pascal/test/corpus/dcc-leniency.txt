@@ -189,8 +189,8 @@ end;
         (exprCall
           (exprDot (exprDot (identifier) (kDot) (identifier)) (kDot) (identifier))
           (exprArgs
-            (namedArgument (identifier) (kAssign) (literalString))
-            (namedArgument (identifier) (kAssign) (identifier)))))
+            (namedArgument (argumentName) (kAssign) (literalString))
+            (namedArgument (argumentName) (kAssign) (identifier)))))
       (kEnd))))
 
 
@@ -242,4 +242,27 @@ end.
       (declProc (kProcedure) (identifier)))
     (implementation (kImplementation))
     (kEnd)
+    (kEndDot)))
+
+===
+Exports with a parameter list
+===
+
+library L1;
+exports
+  Q(a: Pointer) name 'QQ',
+  R;
+begin
+end.
+
+---
+
+(root
+  (library (kLibrary) (moduleName (identifier))
+    (declExports (kExports)
+      (declExport (identifier)
+        (declArgs (declArg (identifier) (type (typeref (identifier)))))
+        (kName) (literalString))
+      (declExport (identifier)))
+    (block (kBegin) (kEnd))
     (kEndDot)))

@@ -882,8 +882,12 @@ module.exports = grammar({
 			$.namedArgument,
 			prec(-1, alias($.kString, $.identifier)),
 		)),
-		// Automation calls name their arguments: `Add(Name := 'a')`.
-		namedArgument:   $ => seq(field('name', $.identifier), $.kAssign, field('value', $._expr)),
+		// Automation calls name their arguments: `Add(Name := 'a')`. The name
+		// is not an `identifier`: it never refers to a Pascal declaration.
+		namedArgument:   $ => seq(
+			field('name', alias($.identifier, $.argumentName)),
+			$.kAssign, field('value', $._expr)
+		),
 		// A separate reduction distinguishes `is not T` from `is (not T)`.
 		_exprIsNot:      $ => prec(5, seq($.kIs, $.kNot)),
 
@@ -1292,7 +1296,11 @@ module.exports = grammar({
 		declLabels:      $ => seq($.kLabel, delimited1($.declLabel), ';'),
 		declLabel:       $ => field('name', choice($.identifier, $.labelNumber)),
 
-		declExport:      $ => seq($._genericName, repeat(seq(choice($.kName, $.kIndex), $._expr))),
+		// `exports Q(a: Pointer) name 'QQ'` selects one overload.
+		declExport:      $ => seq(
+			$._genericName, optional($.declArgs),
+			repeat(seq(choice($.kName, $.kIndex), $._expr))
+		),
 
 		// Type declarations
 

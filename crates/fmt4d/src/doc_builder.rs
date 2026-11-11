@@ -323,12 +323,11 @@ impl<'a> DocBuilder<'a> {
             return self.format_off_doc(node, true, true);
         }
 
-        let leading_comments = self.leading_comments_doc(node);
-        let leading_directives = self.leading_directives_doc(node);
+        let leading = self.leading_trivia_doc(node);
         let body = self.build_doc(node);
         let trailing = self.trailing_trivia_doc(node);
 
-        doc::concat(vec![leading_comments, leading_directives, body, trailing])
+        doc::concat(vec![leading, body, trailing])
     }
 
     /// Like `doc_for_node` but omits leading comments and directives.
@@ -359,17 +358,11 @@ impl<'a> DocBuilder<'a> {
             return self.format_off_doc(node, true, false);
         }
 
-        let leading_comments = self.leading_comments_doc(node);
-        let leading_directives = self.leading_directives_doc(node);
+        let leading = self.leading_trivia_doc(node);
         let body = self.build_doc(node);
         let trailing_directives = self.trailing_directives_before_comments_doc(node);
 
-        doc::concat(vec![
-            leading_comments,
-            leading_directives,
-            body,
-            trailing_directives,
-        ])
+        doc::concat(vec![leading, body, trailing_directives])
     }
 
     /// Only the node's own body: no leading or trailing comments or
@@ -594,6 +587,34 @@ impl<'a> DocBuilder<'a> {
         parts.push(Doc::Hardline);
 
         doc::concat(parts)
+    }
+
+    /// The leading comments and directives of `node`, in source order, each
+    /// on its own line, then a line break. With only one kind, as
+    /// [`Self::leading_comments_doc`] or [`Self::leading_directives_doc`];
+    /// with both, they are laid out as in the source (see
+    /// [`Self::trivia_run_doc`]), and so is a blank line before `node`.
+    pub(crate) fn leading_trivia_doc(&self, node: Node<'a>) -> Doc {
+        let comments = self.comments.leading_comments(node.id());
+        let directives = self.directives.leading_directives(node.id());
+        if directives.is_empty() {
+            return self.leading_comments_doc(node);
+        }
+        if comments.is_empty() {
+            return self.leading_directives_doc(node);
+        }
+        if self.trivia_suppressed.get() {
+            return Doc::Empty;
+        }
+        let (run, last_end) = self.trivia_run_doc(self.trivia_items(comments, directives), None);
+        let last_end = last_end.unwrap_or(node.start_byte());
+        let gap = &self.source[last_end.min(node.start_byte())..node.start_byte()];
+        let line_break = if gap.iter().filter(|&&b| b == b'\n').count() >= 2 {
+            Doc::BlankLine
+        } else {
+            Doc::Hardline
+        };
+        doc::concat(vec![Doc::Hardline, run, line_break])
     }
 
     /// Trailing comments and directives of `node`, in source order. Empty

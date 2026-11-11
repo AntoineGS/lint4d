@@ -168,3 +168,102 @@ end.
 ",
     );
 }
+
+/// Directives before `end`, `finally` and `except` lead those keywords,
+/// whose block builder emitted only their comments (`{$Warnings On}` before
+/// `end;` in many payment hooks, `{$ENDIF}` before `End;`).
+#[test]
+fn directives_before_block_keywords_are_kept() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  try
+    {$WARNINGS OFF}
+    X;
+    {$WARNINGS ON} // on
+  finally
+    {$IFDEF A}
+    Y;
+    {$ENDIF}
+  end {$IFDEF B} {B} {$ENDIF};
+  try
+    // before except
+    {$I x.inc}
+  except
+    {$R-}
+  end;
+end;
+end.
+",
+        "\
+unit T;
+
+interface
+
+implementation
+
+procedure P;
+begin
+  try
+    {$WARNINGS OFF}
+    X;
+    {$WARNINGS ON} // on
+  finally
+    {$IFDEF A}
+    Y;
+    {$ENDIF}
+  end {$IFDEF B} {B} {$ENDIF};
+  try
+    // before except
+    {$I x.inc}
+  except
+    {$R-}
+  end;
+end;
+
+end.
+",
+    );
+}
+
+/// Comments and directives leading the same token keep their relative
+/// order: a comment after a switch directive stays after it.
+#[test]
+fn interleaved_leading_comments_and_directives_keep_their_order() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  // before
+  {$R-}
+  // after
+  X;
+end;
+end.
+",
+        "\
+unit T;
+
+interface
+
+implementation
+
+procedure P;
+begin
+  // before
+  {$R-}
+  // after
+  X;
+end;
+
+end.
+",
+    );
+}

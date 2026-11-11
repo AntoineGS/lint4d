@@ -45,10 +45,10 @@ impl<'a> DocBuilder<'a> {
                     prev_kind = kind;
                 }
                 K::K_END => {
-                    // If kEnd has leading comments, they belong inside the body.
+                    // If kEnd has leading comments or directives, they belong inside the body.
                     // Strip trailing Hardline — the handler adds its own before
                     // the keyword, so keeping it would create a blank line.
-                    let leading = self.leading_comments_doc(*child);
+                    let leading = self.leading_trivia_doc(*child);
                     if !matches!(leading, Doc::Empty) {
                         body.push(strip_trailing_hardline(leading));
                     }
@@ -62,18 +62,18 @@ impl<'a> DocBuilder<'a> {
                         });
                     }
                     parts.push(Doc::Hardline);
-                    // Build the kEnd node WITHOUT its leading comments (already emitted above)
+                    // Build the kEnd node WITHOUT its leading trivia (already emitted above)
                     let end_body = self.build_doc(*child);
-                    let end_trailing = self.trailing_comments_doc(*child);
+                    let end_trailing = self.trailing_trivia_doc(*child);
                     parts.push(doc::concat(vec![end_body, end_trailing]));
                     in_block = false;
                     prev_end_row = Some(child.end_position().row);
                     prev_kind = kind;
                 }
                 K::K_EXCEPT | K::K_FINALLY => {
-                    // If except/finally has leading comments, they belong inside
+                    // If except/finally has leading comments or directives, they belong inside
                     // the body. Strip trailing Hardline — same reason as kEnd.
-                    let leading = self.leading_comments_doc(*child);
+                    let leading = self.leading_trivia_doc(*child);
                     if !matches!(leading, Doc::Empty) {
                         body.push(strip_trailing_hardline(leading));
                     }
@@ -87,9 +87,9 @@ impl<'a> DocBuilder<'a> {
                         });
                     }
                     parts.push(Doc::Hardline);
-                    // Build except/finally WITHOUT its leading comments (already emitted above)
+                    // Build except/finally WITHOUT its leading trivia (already emitted above)
                     let kw_body = self.build_doc(*child);
-                    let kw_trailing = self.trailing_comments_doc(*child);
+                    let kw_trailing = self.trailing_trivia_doc(*child);
                     parts.push(doc::concat(vec![kw_body, kw_trailing]));
                     // Start new body for except/finally section
                     in_block = true;

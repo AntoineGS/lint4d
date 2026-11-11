@@ -206,7 +206,7 @@ fn stamps_bytes(stamps: &[MemberStamp]) -> usize {
 
 /// Last dotted segment after `canonical_name`, or `None` when the name is
 /// not ASCII or the segment is empty: postings prove nothing then (A2).
-fn posting_key(name: &str) -> Option<String> {
+pub(crate) fn posting_key(name: &str) -> Option<String> {
     let name = canonical_name(name);
     let key = name.rsplit('.').next().unwrap_or_default();
     if !name.is_ascii() || key.is_empty() {
@@ -291,6 +291,10 @@ struct Member {
     /// The session's evidence names an input no capture recorded: the
     /// record lists the member without an artifact (13c-1).
     unprovable: bool,
+    /// The store refused the Fresh member's publication for a reason no
+    /// batch of this process retries: the record lists the member without
+    /// an artifact (l4d-8fz9).
+    store_refused: bool,
     /// The Limited member's extraction passed its deadline (13b-5, A4).
     over_deadline: bool,
     /// The Limited member's compile-time session was refused by this fixed
@@ -334,6 +338,10 @@ pub(crate) struct IndexCounts {
     /// their records have no artifact, so the next process extracts them
     /// again.
     pub(crate) unprovable: usize,
+    /// Fresh members whose publication the store refused for a reason no
+    /// batch of this process retries: recorded artifact-less, not
+    /// persisted, extracted again by the next start (l4d-8fz9).
+    pub(crate) store_refused: usize,
     /// Of `limited`, members whose extraction passed its deadline.
     pub(crate) over_deadline: usize,
     /// Of `limited`, members refused by a fixed compile-time admission
@@ -618,6 +626,7 @@ impl ContextIndex {
         member.reused = false;
         member.over_limit = false;
         member.unprovable = false;
+        member.store_refused = false;
         member.over_deadline = false;
         member.admission_limit = None;
         member.record = None;
@@ -697,6 +706,22 @@ impl ContextIndex {
         self.pending_members()
             .filter(|member| !member.reuse_tried)
             .take(limit)
+            .map(|member| member.path.clone())
+            .collect()
+    }
+
+    /// Members never indexed by this index and not asked of the store yet,
+    /// nor deferred, in path order: what the reuse pass has still to
+    /// validate from the stored facts (l4d-c8l2). Whether one changed since
+    /// the process started is the project cache's record
+    /// (`ProjectCache::changed_since_start`), which survives an eviction.
+    pub(crate) fn awaiting_first_reuse(&self) -> Vec<PathBuf> {
+        self.pending_members()
+            .filter(|member| {
+                matches!(member.state(), MemberState::Unindexed)
+                    && !member.reuse_tried
+                    && member.deferred == 0
+            })
             .map(|member| member.path.clone())
             .collect()
     }
@@ -783,6 +808,17 @@ impl ContextIndex {
         }
     }
 
+    /// The store refused the Fresh member's publication for good in this
+    /// process (`IndexCounts::store_refused`).
+    pub(crate) fn mark_store_refused(&mut self, path: &Path) {
+        if let Some(id) = self.id_of(path) {
+            let member = &mut self.members[id.0 as usize];
+            if matches!(member.state(), MemberState::Fresh) {
+                member.store_refused = true;
+            }
+        }
+    }
+
     /// Only a Fresh, Refused or Limited member holds a record.
     pub(crate) fn set_record(&mut self, path: &Path, record: Digest) -> bool {
         let Some(id) = self.id_of(path) else {
@@ -833,13 +869,14 @@ impl ContextIndex {
             match member.state() {
                 MemberState::Fresh => {
                     counts.persisted += usize::from(if member.record.is_some() {
-                        !member.over_limit && !member.unprovable
+                        !member.over_limit && !member.unprovable && !member.store_refused
                     } else {
                         crawl_published(&member.path, member.hash)
                     });
                     counts.fresh += 1;
                     counts.over_limit += usize::from(member.over_limit);
                     counts.unprovable += usize::from(member.unprovable);
+                    counts.store_refused += usize::from(member.store_refused);
                     if member.reused {
                         counts.reused += 1;
                     } else {
@@ -1109,6 +1146,7 @@ impl ContextIndex {
                 member.reused = false;
                 member.over_limit = false;
                 member.unprovable = false;
+                member.store_refused = false;
                 member.over_deadline = false;
                 member.admission_limit = None;
                 true
@@ -1609,6 +1647,7 @@ mod tests {
                 retrying: 1,
                 over_limit: 0,
                 unprovable: 0,
+                store_refused: 0,
                 over_deadline: 0,
                 over_admission: 0,
                 first_admission_limit: None,

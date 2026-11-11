@@ -365,17 +365,20 @@ impl Workspace {
         Ok((discovery_scope(&directories), captured))
     }
 
-    /// No member is pending except those retrying a previous refusal.
+    /// No member is pending except those retrying a previous refusal, and
+    /// no record waits for room (those members are proven again first).
     fn index_settled(&self, key: &ContextKey) -> bool {
-        self.project_cache
-            .read_index(key, |index, _| {
-                index
-                    .pending(usize::MAX)
-                    .into_iter()
-                    .filter(|path| !index.retrying(path))
-                    .collect::<Vec<_>>()
-            })
-            .is_some_and(|pending| pending.iter().all(|path| self.is_open_member(path)))
+        self.project_cache.index_awaiting_room(key) == 0
+            && self
+                .project_cache
+                .read_index(key, |index, _| {
+                    index
+                        .pending(usize::MAX)
+                        .into_iter()
+                        .filter(|path| !index.retrying(path))
+                        .collect::<Vec<_>>()
+                })
+                .is_some_and(|pending| pending.iter().all(|path| self.is_open_member(path)))
     }
 
     /// Seal when due (§6.3 amendment); `check` runs between store batches
@@ -1811,6 +1814,206 @@ mod tests {
             "complete with the refused member unrecorded: {batches:?}"
         );
         assert_eq!(seal(&view, &key), SealOutcome::Sealed);
+        cache.shutdown();
+    }
+
+    /// l4d-8fz9: while a member's record waits for room, `pascal/indexStatus`
+    /// does not report the index complete: the seal cannot run yet, so a
+    /// client that stops at `complete` would leave the cold index unsealed.
+    /// Once the record lands the status is complete and the seal lists the
+    /// member as a gap.
+    #[test]
+    fn a_record_awaiting_room_keeps_the_index_status_incomplete_until_it_lands() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = private_dir();
+        let mut options = WorkspaceOptions::default();
+        options.limits.max_file_bytes = 300;
+        let (session, key, anchor) = indexed_project(temp.path(), 3, options);
+        let big = temp.path().join("lib/U0.pas");
+        named_unit(&big, &"Long".repeat(60));
+        pascal_project::backdate_tree_for_test(temp.path());
+        let (mut view, cache) = persisting_view(&session, store.path());
+        let refused = big.clone();
+        let mut once = false;
+        cache.set_record_fault_for_test(Some(Box::new(move |path| {
+            (path == refused && !std::mem::replace(&mut once, true))
+                .then_some(pascal_cache::Bypass::WalPressure)
+        })));
+        // The first batch's wait finds no room; later looks find it cleared.
+        cache.set_pressure_for_test(Some(Box::new(|waits| {
+            if waits >= 1 {
+                pascal_cache::Pressure::None
+            } else {
+                pascal_cache::Pressure::WalPressure
+            }
+        })));
+        let first = advance(&mut view, &anchor, IndexBound::all());
+        assert_eq!(first.awaiting_room, 1, "{first:?}");
+        let status = view.project_cache.index_status(&|_| false);
+        assert!(!status[0].complete, "awaiting room: {:?}", status[0]);
+        assert!(
+            status[0].gaps.iter().any(|gap| gap
+                == "1 members wait for room in the store; the snapshot is sealed once they are stored"),
+            "{:?}",
+            status[0]
+        );
+        assert_eq!(
+            seal(&view, &key),
+            SealOutcome::NotDue,
+            "the seal waits for the record"
+        );
+        let mut last = first;
+        for _ in 0..5 {
+            if last.complete {
+                break;
+            }
+            last = advance(&mut view, &anchor, IndexBound::all());
+        }
+        assert!(last.complete, "{last:?}");
+        let status = view.project_cache.index_status(&|_| false);
+        assert!(status[0].complete, "{:?}", status[0]);
+        assert_eq!(status[0].counts.refused, 1, "{:?}", status[0]);
+        assert_eq!(seal(&view, &key), SealOutcome::Sealed);
+        cache.shutdown();
+    }
+
+    /// l4d-8fz9: an extracted member whose publication the store refused
+    /// for a reason no later batch of this process retries (here low disk
+    /// space) is no longer left without a record, which withheld the seal
+    /// for good (`Unproven`): it is recorded artifact-less and reported as
+    /// a member that could not be stored this session (not as unprovable,
+    /// not as persisted), so the context seals with it as a gap.
+    #[test]
+    fn a_publication_refused_for_good_seals_as_a_gap_that_could_not_be_stored() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = private_dir();
+        let (workspace, key, anchor) = indexed_project(temp.path(), 3, WorkspaceOptions::default());
+        let target = temp.path().join("lib/U1.pas");
+        let (mut view, cache) = persisting_view(&workspace, store.path());
+        let refused = target.clone();
+        let mut once = false;
+        cache.set_publish_fault_for_test(Some(Box::new(move |path| {
+            (path == refused && !std::mem::replace(&mut once, true))
+                .then_some(pascal_cache::Bypass::LowDiskSpace)
+        })));
+        let progress = advance(&mut view, &anchor, IndexBound::all());
+        assert!(progress.complete, "{progress:?}");
+        assert!(
+            view.project_cache.index_member_has_record(&key, &target),
+            "{progress:?}"
+        );
+        let status = view.project_cache.index_status(&|_| false);
+        assert_eq!(
+            (
+                status[0].counts.store_refused,
+                status[0].counts.unprovable,
+                status[0].counts.persisted,
+                status[0].counts.fresh
+            ),
+            (1, 0, 2, 3),
+            "{:?}",
+            status[0]
+        );
+        assert!(
+            status[0].gaps.iter().any(|gap| gap
+                == "1 members could not be stored this session (first: low disk space) and are extracted again by the next start"),
+            "{:?}",
+            status[0]
+        );
+        assert_eq!(seal(&view, &key), SealOutcome::Sealed);
+        cache.shutdown();
+    }
+
+    /// l4d-8fz9 fix round 1 (M4): a publication refused because the store
+    /// was fenced is not a refusal for good: the member is neither recorded
+    /// artifact-less nor reported as a gap that could not be stored (the
+    /// reopened store's memory-only reprove path proves it).
+    #[test]
+    fn a_publication_refused_by_a_fenced_store_is_no_stored_gap() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = private_dir();
+        let (workspace, key, anchor) = indexed_project(temp.path(), 3, WorkspaceOptions::default());
+        let target = temp.path().join("lib/U1.pas");
+        let (mut view, cache) = persisting_view(&workspace, store.path());
+        let refused = target.clone();
+        let mut once = false;
+        cache.set_publish_fault_for_test(Some(Box::new(move |path| {
+            (path == refused && !std::mem::replace(&mut once, true))
+                .then_some(pascal_cache::Bypass::Fenced)
+        })));
+        advance(&mut view, &anchor, IndexBound::all());
+        assert!(!view.project_cache.index_member_has_record(&key, &target));
+        let status = view.project_cache.index_status(&|_| false);
+        assert_eq!(
+            (status[0].counts.store_refused, status[0].counts.unprovable),
+            (0, 0),
+            "{:?}",
+            status[0]
+        );
+        cache.shutdown();
+    }
+
+    /// l4d-8fz9: a sealed snapshot lists gap members by their artifact-less
+    /// records: here one refused for the per-file limit and one whose
+    /// publication the store refused for good (low disk space). A process
+    /// that adopts the snapshot treats both as not indexed: a candidate
+    /// search keeps them as unverified candidates, never excludes them as
+    /// proven absent, while the members proven through the snapshot are
+    /// not candidates.
+    #[test]
+    fn an_adopted_snapshot_s_gap_members_stay_unverified_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = private_dir();
+        let mut options = WorkspaceOptions::default();
+        options.limits.max_file_bytes = 300;
+        let (session, key, anchor) = indexed_project(temp.path(), 4, options.clone());
+        let big = temp.path().join("lib/U1.pas");
+        named_unit(&big, &"Long".repeat(60));
+        let unstored = temp.path().join("lib/U2.pas");
+        pascal_project::backdate_tree_for_test(temp.path());
+        let (mut first, cache) = persisting_view(&session, store.path());
+        let refused = unstored.clone();
+        cache.set_publish_fault_for_test(Some(Box::new(move |path| {
+            (path == refused).then_some(pascal_cache::Bypass::LowDiskSpace)
+        })));
+        let progress = advance(&mut first, &anchor, IndexBound::all());
+        assert_eq!(progress.refused, 1, "{progress:?}");
+        let status = first.project_cache.index_status(&|_| false);
+        assert_eq!(status[0].counts.store_refused, 1, "{:?}", status[0]);
+        assert_eq!(seal(&first, &key), SealOutcome::Sealed);
+        cache.shutdown();
+
+        let (mut second, cache) = persisting_view(&workspace(temp.path(), options), store.path());
+        let reuse = advance(
+            &mut second,
+            &anchor,
+            IndexBound::all().with_mode(IndexMode::Reuse),
+        );
+        assert_eq!((reuse.reused, reuse.retrying), (2, 2), "{reuse:?}");
+        assert!(second.project_cache.baseline_hint(&key).is_some());
+        let candidates = second
+            .project_cache
+            .read_index(&key, |index, _| {
+                index.candidates(&crate::workspace_index::CandidateQuery {
+                    names: vec!["NoSuchName".to_owned()],
+                    top_level_units: None,
+                    aliases: Vec::new(),
+                })
+            })
+            .unwrap();
+        assert!(candidates.selected.is_empty(), "{candidates:?}");
+        assert_eq!(
+            candidates.unverified,
+            vec![big.clone(), unstored.clone()],
+            "{candidates:?}"
+        );
+        for proven in [
+            temp.path().join("lib/U0.pas"),
+            temp.path().join("lib/U3.pas"),
+        ] {
+            assert!(!candidates.unverified.contains(&proven), "{candidates:?}");
+            assert!(!candidates.selected.contains(&proven), "{candidates:?}");
+        }
         cache.shutdown();
     }
 

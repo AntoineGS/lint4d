@@ -8869,10 +8869,9 @@ struct StoredIndex {
     awaiting_room: HashSet<PathBuf>,
     /// A batch's wait for maintenance found no room; cleared by room.
     room_wait_failed: bool,
-    /// Extracted members whose publication found no memory for its
-    /// transient buffers in this process: they stay memory-only, without a
-    /// record, and the next start extracts them again (13b-3).
-    publications_refused: u64,
+    /// Why the store refused the first publication this process could
+    /// not store (`IndexCounts::store_refused`, l4d-8fz9).
+    store_refused_reason: Option<&'static str>,
     /// The kind of input the first `unprovable` member of this process
     /// read without a capture (`Workspace::uncaptured_input`).
     unprovable_kind: Option<&'static str>,
@@ -8969,7 +8968,8 @@ pub(crate) struct IndexStatusEntry {
     /// no baseline hint.
     pub(crate) snapshot: &'static str,
     pub(crate) validation_reads: u64,
-    /// `StoredIndex::publications_refused`.
+    /// `IndexCounts::store_refused` (members that could not be stored
+    /// this session).
     pub(crate) publications_refused: u64,
     pub(crate) gaps: Vec<String>,
 }
@@ -9065,10 +9065,17 @@ impl IndexStatusEntry {
                 stored.unprovable_kind.unwrap_or("unknown")
             ));
         }
-        if stored.publications_refused > 0 {
+        if counts.store_refused > 0 {
             gaps.push(format!(
-                "{} members found no memory to publish and are extracted again by the next start",
-                stored.publications_refused
+                "{} members could not be stored this session (first: {}) and are extracted again by the next start",
+                counts.store_refused,
+                stored.store_refused_reason.unwrap_or("store error")
+            ));
+        }
+        let awaiting_room = stored.unrecorded_among(&stored.awaiting_room).len();
+        if awaiting_room > 0 {
+            gaps.push(format!(
+                "{awaiting_room} members wait for room in the store; the snapshot is sealed once they are stored"
             ));
         }
         if counts.deferred > 0 {
@@ -9098,14 +9105,16 @@ impl IndexStatusEntry {
             anchor_truncated,
             counts,
             membership_complete,
-            complete: membership_complete && eligible_pending == 0,
+            // A member whose record waits for room is not done either:
+            // the batches prove it again and only then seal (l4d-8fz9).
+            complete: membership_complete && eligible_pending == 0 && awaiting_room == 0,
             snapshot: match stored.baseline.as_ref() {
                 None => "none",
                 Some(hint) if hint.sealed() => "sealed",
                 Some(_) => "held",
             },
             validation_reads: stored.validation_reads,
-            publications_refused: stored.publications_refused,
+            publications_refused: counts.store_refused as u64,
             gaps,
         }
     }
@@ -9232,6 +9241,55 @@ struct IndexStore {
     /// The paths the warm crawl published, in publication order.
     #[cfg(test)]
     published_by_crawl: Vec<PathBuf>,
+    /// Every path a watcher or edit event invalidated since the process
+    /// started, by `path_key` (l4d-c8l2): stored facts never answer for
+    /// them, nor for the members whose stored evidence read them. Kept
+    /// across evictions; past `MAX_CHANGED_SINCE_START` paths, or after an
+    /// overflow that lost which paths changed, it is `None`.
+    changed_since_start: Option<HashMap<String, PathBuf>>,
+    /// What sealed snapshots' stored rows answered (l4d-c8l2). Garbage
+    /// collection never retires a record an unretired sealed snapshot lists,
+    /// nor the artifacts and evidence such a record references (spec
+    /// zf1b.10 reachability), but an unheld snapshot may itself be retired:
+    /// entries are kept and used only while a context holds the snapshot as
+    /// its baseline, and dropped when it stops doing so.
+    stored_rows: StoredRows,
+}
+
+/// Paths `changed_since_start` records before it gives up.
+const MAX_CHANGED_SINCE_START: usize = 32_768;
+
+/// Entries of each `StoredRows` map before it is cleared.
+const MAX_STORED_ROWS_ENTRIES: usize = 256;
+
+/// A stored-rows selection: the snapshot, the row kind and the needles.
+pub(crate) type StoredRowsQuery = (pascal_cache::SnapshotId, u8, Vec<Vec<u8>>);
+
+/// Store answers about sealed snapshots, by snapshot id (l4d-c8l2).
+#[derive(Default)]
+struct StoredRows {
+    /// The members whose rows match a query; `None` when over the limit.
+    selected: HashMap<StoredRowsQuery, Option<Arc<HashSet<Vec<u8>>>>>,
+    /// The members with a live stored artifact.
+    with_artifacts: HashMap<pascal_cache::SnapshotId, Arc<HashSet<Vec<u8>>>>,
+    /// The members whose stored evidence observed a path (`path_key`).
+    observing: HashMap<(pascal_cache::SnapshotId, String), Arc<HashSet<Vec<u8>>>>,
+}
+
+impl StoredRows {
+    /// Forget everything answered about `snapshot`.
+    fn forget(&mut self, snapshot: pascal_cache::SnapshotId) {
+        self.selected.retain(|(id, _, _), _| *id != snapshot);
+        self.with_artifacts.remove(&snapshot);
+        self.observing.retain(|(id, _), _| *id != snapshot);
+    }
+}
+
+fn bounded_insert<K: std::hash::Hash + Eq, V>(map: &mut HashMap<K, V>, key: K, value: V) {
+    if map.len() >= MAX_STORED_ROWS_ENTRIES {
+        map.clear();
+    }
+    map.insert(key, value);
 }
 
 impl Default for IndexStore {
@@ -9252,6 +9310,8 @@ impl Default for IndexStore {
             crawl_deferred_count: 0,
             #[cfg(test)]
             published_by_crawl: Vec::new(),
+            changed_since_start: Some(HashMap::new()),
+            stored_rows: StoredRows::default(),
         }
     }
 }
@@ -9280,6 +9340,9 @@ impl IndexStore {
             .map(|(key, _)| key.clone())?;
         let stored = self.contexts.remove(&victim)?;
         self.owners.retain(|_, owner| *owner != victim);
+        if let Some(hint) = stored.baseline.as_ref() {
+            self.stored_rows.forget(hint.header().id());
+        }
         if let Some(hint) = stored.baseline.as_ref().filter(|hint| hint.held()) {
             self.released.push(hint.header().id());
         }
@@ -9456,7 +9519,7 @@ impl ProjectCache {
                     memory_only: HashSet::new(),
                     awaiting_room: HashSet::new(),
                     room_wait_failed: false,
-                    publications_refused: 0,
+                    store_refused_reason: None,
                     unprovable_kind: None,
                     summaries: Default::default(),
                 });
@@ -9910,10 +9973,18 @@ impl ProjectCache {
         }
     }
 
-    /// An extracted member of `key` found no memory to publish (13b-3).
-    pub(crate) fn note_index_publication_refused(&self, key: &ContextKey) {
+    /// The store refused the publication of `key`'s Fresh member `path`
+    /// for a reason no batch of this process retries (`reason`, a short
+    /// label): it could not be stored this session (l4d-8fz9).
+    pub(crate) fn mark_index_store_refused(
+        &self,
+        key: &ContextKey,
+        path: &Path,
+        reason: &'static str,
+    ) {
         if let Some(stored) = self.index().contexts.get_mut(key) {
-            stored.publications_refused = stored.publications_refused.saturating_add(1);
+            stored.index.mark_store_refused(path);
+            stored.store_refused_reason.get_or_insert(reason);
         }
     }
 
@@ -9980,6 +10051,140 @@ impl ProjectCache {
         }
     }
 
+    /// The paths invalidated since the process started (l4d-c8l2); `None`
+    /// when that is unknown (a watcher overflow, too many paths).
+    pub(crate) fn changed_since_start(&self) -> Option<Vec<PathBuf>> {
+        self.index()
+            .changed_since_start
+            .as_ref()
+            .map(|changed| changed.values().cloned().collect())
+    }
+
+    /// A stored-rows selection answered before: `Some(None)` when it was
+    /// over the limit.
+    pub(crate) fn stored_rows_selected(
+        &self,
+        query: &StoredRowsQuery,
+    ) -> Option<Option<Arc<HashSet<Vec<u8>>>>> {
+        self.index().stored_rows.selected.get(query).cloned()
+    }
+
+    /// The smallest answered selection of `snapshot`'s rows of `row_kind`
+    /// containing one needle that `needle` contains, if it holds at most
+    /// `limit` members: a superset of `needle`'s answer.
+    pub(crate) fn stored_rows_containing(
+        &self,
+        snapshot: pascal_cache::SnapshotId,
+        row_kind: u8,
+        needle: &[u8],
+        limit: usize,
+    ) -> Option<Arc<HashSet<Vec<u8>>>> {
+        self.index()
+            .stored_rows
+            .selected
+            .iter()
+            .filter(|((id, kind, needles), _)| {
+                *id == snapshot
+                    && *kind == row_kind
+                    && needles.len() == 1
+                    && needle
+                        .windows(needles[0].len().max(1))
+                        .any(|window| window == needles[0].as_slice())
+            })
+            .filter_map(|(_, found)| found.clone())
+            .filter(|found| found.len() <= limit)
+            .min_by_key(|found| found.len())
+    }
+
+    pub(crate) fn remember_stored_rows_selected(
+        &self,
+        query: StoredRowsQuery,
+        found: Option<Arc<HashSet<Vec<u8>>>>,
+    ) {
+        bounded_insert(&mut self.index().stored_rows.selected, query, found);
+    }
+
+    pub(crate) fn stored_rows_with_artifacts(
+        &self,
+        snapshot: pascal_cache::SnapshotId,
+    ) -> Option<Arc<HashSet<Vec<u8>>>> {
+        self.index()
+            .stored_rows
+            .with_artifacts
+            .get(&snapshot)
+            .cloned()
+    }
+
+    /// Whether anything about `snapshot` is cached.
+    #[cfg(test)]
+    pub(crate) fn caches_stored_rows_of(&self, snapshot: pascal_cache::SnapshotId) -> bool {
+        let store = self.index();
+        store.stored_rows.with_artifacts.contains_key(&snapshot)
+            || store
+                .stored_rows
+                .selected
+                .keys()
+                .any(|(id, _, _)| *id == snapshot)
+            || store
+                .stored_rows
+                .observing
+                .keys()
+                .any(|(id, _)| *id == snapshot)
+    }
+
+    pub(crate) fn remember_stored_rows_with_artifacts(
+        &self,
+        snapshot: pascal_cache::SnapshotId,
+        found: Arc<HashSet<Vec<u8>>>,
+    ) {
+        bounded_insert(
+            &mut self.index().stored_rows.with_artifacts,
+            snapshot,
+            found,
+        );
+    }
+
+    pub(crate) fn stored_rows_observing(
+        &self,
+        snapshot: pascal_cache::SnapshotId,
+        path_key: &str,
+    ) -> Option<Arc<HashSet<Vec<u8>>>> {
+        self.index()
+            .stored_rows
+            .observing
+            .get(&(snapshot, path_key.to_owned()))
+            .cloned()
+    }
+
+    pub(crate) fn remember_stored_rows_observing(
+        &self,
+        snapshot: pascal_cache::SnapshotId,
+        path_key: String,
+        found: Arc<HashSet<Vec<u8>>>,
+    ) {
+        bounded_insert(
+            &mut self.index().stored_rows.observing,
+            (snapshot, path_key),
+            found,
+        );
+    }
+
+    /// Evict `key`'s context index as `evict_lru` would.
+    #[cfg(test)]
+    pub(crate) fn evict_index_for_test(&self, key: &ContextKey) {
+        let mut store = self.index();
+        let removed = store.contexts.remove(key);
+        if let Some(hint) = removed.as_ref().and_then(|stored| stored.baseline.as_ref()) {
+            store.stored_rows.forget(hint.header().id());
+        }
+        let charge = removed.map(|stored| stored.total_charge());
+        store.owners.retain(|_, owner| owner != key);
+        drop(store);
+        if let Some(charge) = charge {
+            self.release_index(charge);
+        }
+    }
+
     pub(crate) fn baseline_hint(
         &self,
         key: &ContextKey,
@@ -9998,10 +10203,15 @@ impl ProjectCache {
         key: &ContextKey,
         hint: crate::workspace::baseline::BaselineHint,
     ) -> Option<Option<crate::workspace::baseline::BaselineHint>> {
-        self.index()
+        let mut store = self.index();
+        let replaced = store
             .contexts
             .get_mut(key)
-            .map(|stored| stored.baseline.replace(hint))
+            .map(|stored| stored.baseline.replace(hint))?;
+        if let Some(old) = replaced.as_ref() {
+            store.stored_rows.forget(old.header().id());
+        }
+        Some(replaced)
     }
 
     /// Drop `key`'s baseline if it is still snapshot `id`; returns it.
@@ -10017,7 +10227,9 @@ impl ProjectCache {
             .as_ref()
             .is_some_and(|hint| hint.header().id() == id)
         {
-            stored.baseline.take()
+            let dropped = stored.baseline.take();
+            store.stored_rows.forget(id);
+            dropped
         } else {
             None
         }
@@ -10298,6 +10510,27 @@ impl ProjectCache {
     /// the memberships whose listing it may have changed dirty.
     fn invalidate_index(&self, path: &Path, include_parent: bool) {
         let mut store = self.index();
+        // D43's synthetic child names no file.
+        let synthetic = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with('\u{0}'));
+        if !synthetic && let Some(changed) = store.changed_since_start.as_mut() {
+            // A creation, deletion or rename changes the parent's listing too:
+            // a member whose stored evidence holds that listing (a missing
+            // include, one a new file may now shadow) is reached through it.
+            let paths = std::iter::once(path).chain(path.parent().filter(|_| include_parent));
+            for changed_path in paths {
+                if changed.len() < MAX_CHANGED_SINCE_START {
+                    changed.insert(
+                        crate::workspace::rename::path_key(changed_path),
+                        changed_path.to_path_buf(),
+                    );
+                } else {
+                    store.changed_since_start = None;
+                    break;
+                }
+            }
+        }
         let parent = path.parent();
         let mut touched = Vec::new();
         for stored in store.contexts.values_mut() {
@@ -10346,6 +10579,7 @@ impl ProjectCache {
     fn invalidate_index_all(&self) {
         let mut store = self.index();
         // Overflow lost which paths changed: nothing is known published.
+        store.changed_since_start = None;
         store.crawl_published.clear();
         store.crawl_dependents.clear();
         store.over_limit.clear();

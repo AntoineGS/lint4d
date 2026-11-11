@@ -1528,7 +1528,7 @@ Each context has:
 | `anchor` | `{"document": uri}` or `{"project": uri}`, at most 512 bytes; `anchorTruncated` says if it was cut |
 | `members`, `fresh` | Members of the project and those whose index entry is current |
 | `reused`, `extracted` | Members reused from the store and parsed in this process |
-| `persisted` | Members whose artifact and record this process knows are published, each counted once: indexed members with a record it proved (reused members included), and members the open-file crawl published under this context's cache key from the current bytes (so it rises while the crawl runs, before any index batch reaches them). `overLimit` and `unprovable` members are not counted (their record has no artifact), nor are refused and limited members. Computed in memory, without reading the store |
+| `persisted` | Members whose artifact and record this process knows are published, each counted once: indexed members with a record it proved (reused members included), and members the open-file crawl published under this context's cache key from the current bytes (so it rises while the crawl runs, before any index batch reaches them). `overLimit`, `unprovable` and `publicationsRefused` members are not counted (their record has no artifact), nor are refused and limited members. Computed in memory, without reading the store |
 | `pending`, `reusePending` | Members not indexed yet, and those still to try for reuse |
 | `refused`, `limited`, `deferred`, `retrying` | Members that could not be indexed, that exceed the index limits, that failed to load (retried later), and that are retried after a previous refusal |
 | `overLimit` | Fresh members whose facts are too large to store (more distinct reads than a capture holds, or a store size limit): indexed in this process, recorded without an artifact, and extracted again by the next start |
@@ -1536,10 +1536,10 @@ Each context has:
 | `overDeadline` | Of `limited`, members whose extraction took longer than 10 seconds and was stopped: recorded without an artifact (not as a refusal), so the snapshot can still be sealed, and retried last by the next start |
 | `overAdmission` | Of `limited`, members whose compile-time session (or a provider interface it compiles) was refused by a fixed admission bound, such as `max_pending_bytes`, that refuses again with the same inputs: limited after one attempt instead of deferred, recorded without an artifact (not as a refusal), so the context completes and the snapshot can be sealed, and retried last by the next start. A gap names the bound of the first such member. A member limited by a provider's content stays limited until its own file changes or the next start, even if the provider is edited meanwhile |
 | `membershipComplete` | The member list is complete and current |
-| `complete` | `membershipComplete` and no member that can be indexed now is pending (`retrying` members and open members still answered from buffers do not count) |
+| `complete` | `membershipComplete`, no member that can be indexed now is pending (`retrying` members and open members still answered from buffers do not count), and no record waits for room in the store (a gap says so; the snapshot is sealed once they are stored) |
 | `snapshot` | `sealed` (this process sealed it), `held` (adopted from an earlier process) or `none` |
 | `validationReads` | Files read and hashed to validate the baseline |
-| `publicationsRefused` | Extracted members whose publication found no memory for its transient buffers in this process: they stay memory-only, without a record, and the next start extracts them again |
+| `publicationsRefused` | Extracted members the store could not store this session (no memory for the publication, low disk space, scratch exhausted, an artifact retiring, a store error): their facts stay in memory, an artifact-less record lists them so the snapshot still seals, they are not counted in `persisted`, and the next start extracts them again |
 | `gaps` | At most 4 texts of at most 160 bytes explaining what is not indexed |
 
 When the document would exceed 8 KiB, gaps of the least recently used contexts

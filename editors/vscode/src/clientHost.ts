@@ -21,7 +21,12 @@ import {
 } from './settings';
 import { resolutionMessage, resolveServerBinary } from './server';
 import { capabilityFlags, EXPERIMENTAL_FLAGS, type ExperimentalFlag } from './protocol';
-import { announceClientStarted, CrashWindow, SerialQueue } from './clientHostLogic';
+import {
+  announceClientStarted,
+  CrashWindow,
+  SerialQueue,
+  shouldRetryClosedClient,
+} from './clientHostLogic';
 
 export type ClientStatus = 'stopped' | 'starting' | 'running' | 'failed';
 
@@ -79,11 +84,16 @@ class ClientHostImpl implements ClientHost {
   private currentBinaryPath: string | undefined;
   private successfulStarts = 0;
   private activeRunStarted = false;
+  private activeRunAnnounced = false;
+  private activeRunGeneration = 0;
+  private activeClientReady = false;
+  private closedBeforeStartResolved = false;
   private stopRequested = false;
   private disposed = false;
   private desiredRunning = false;
   private readonly crashWindow = new CrashWindow();
   private readonly lifecycleQueue = new SerialQueue();
+  private readonly contextQueue = new SerialQueue();
 
   constructor(context: vscode.ExtensionContext) {
     this.output = vscode.window.createOutputChannel('Pascal LSP', { log: true });
@@ -259,25 +269,45 @@ class ClientHostImpl implements ClientHost {
     clientRef.current = client;
     this.activeClient = client;
     this.activeRunStarted = false;
+    this.activeRunAnnounced = false;
+    this.activeClientReady = false;
+    this.closedBeforeStartResolved = false;
+    this.activeRunGeneration += 1;
     this.stateListener?.dispose();
-    this.stateListener = client.onDidChangeState(({ newState }) => this.onStateChange(client, newState));
+    this.stateListener = client.onDidChangeState(({ newState }) => {
+      void this.onStateChange(client, newState).catch((error: unknown) => {
+        this.output.error(`Failed to update Pascal LSP state: ${errorMessage(error)}`);
+      });
+    });
 
     try {
       await client.start();
-      this.onStateChange(client, State.Running);
     } catch (error) {
       this.output.error(`Pascal LSP failed to start: ${errorMessage(error)}`);
       this.stateListener?.dispose();
       this.stateListener = undefined;
       if (this.activeClient === client) this.activeClient = undefined;
+      this.activeClientReady = false;
+      this.closedBeforeStartResolved = false;
       this.activeRunStarted = false;
+      this.activeRunAnnounced = false;
+      this.activeRunGeneration += 1;
       this.setStatus('failed');
-      this.setCapabilityContexts(undefined);
+      await this.setCapabilityContexts(undefined);
       const choice = await vscode.window.showErrorMessage(
         `Pascal LSP failed to start: ${errorMessage(error)}`,
         'Show Output',
       );
       if (choice === 'Show Output') this.output.show();
+      return;
+    }
+
+    this.activeClientReady = true;
+    this.successfulStarts += 1;
+    if (this.closedBeforeStartResolved) {
+      await this.handleUnexpectedClose(client);
+    } else {
+      await this.onStateChange(client, client.state);
     }
   }
 
@@ -295,54 +325,109 @@ class ClientHostImpl implements ClientHost {
     this.stateListener?.dispose();
     this.stateListener = undefined;
     if (this.activeClient === client) this.activeClient = undefined;
+    this.activeClientReady = false;
+    this.closedBeforeStartResolved = false;
     this.activeRunStarted = false;
+    this.activeRunAnnounced = false;
+    this.activeRunGeneration += 1;
     this.setStatus('stopped');
-    this.setCapabilityContexts(undefined);
+    await this.setCapabilityContexts(undefined);
     this.stopRequested = false;
   }
 
-  private onStateChange(client: LanguageClient, state: State): void {
+  private async onStateChange(client: LanguageClient, state: State): Promise<void> {
     if (this.activeClient !== client) return;
 
     switch (state) {
       case State.Starting:
+        this.activeRunGeneration += 1;
         this.activeRunStarted = false;
+        this.activeRunAnnounced = false;
         this.setStatus('starting');
         break;
       case State.Running:
         if (!this.activeRunStarted) {
           this.activeRunStarted = true;
-          this.successfulStarts += 1;
-          announceClientStarted(
+          this.activeRunAnnounced = false;
+          this.activeRunGeneration += 1;
+        }
+        {
+          const generation = this.activeRunGeneration;
+          await announceClientStarted(
             client,
             () => this.setStatus('running'),
             () => this.setCapabilityContexts(capabilityFlags(this.experimental())),
-            (startedClient) => this.didStartEmitter.fire(startedClient),
+            (startedClient) => {
+              if (
+                this.activeClient === client
+                && this.activeRunStarted
+                && this.activeRunGeneration === generation
+                && this.activeClientReady
+                && this.desiredRunning
+                && !this.stopRequested
+                && !this.activeRunAnnounced
+              ) {
+                this.activeRunAnnounced = true;
+                this.didStartEmitter.fire(startedClient);
+              }
+            },
           );
-        } else {
-          this.setStatus('running');
-          this.setCapabilityContexts(capabilityFlags(this.experimental()));
         }
         break;
       case State.Stopped:
       case State.StartFailed:
+        this.activeRunGeneration += 1;
         this.activeRunStarted = false;
+        this.activeRunAnnounced = false;
         this.setStatus(this.stopRequested ? 'stopped' : 'failed');
-        this.setCapabilityContexts(undefined);
+        await this.setCapabilityContexts(undefined);
         break;
     }
   }
 
   private async onClosed(client: LanguageClient): Promise<CloseHandlerResult> {
-    if (this.stopRequested || !this.desiredRunning || this.activeClient !== client) {
+    if (this.activeClient === client && !this.activeClientReady && this.desiredRunning && !this.stopRequested) {
+      // A close before start() resolves is handled by the single start-failure path if it rejects.
+      this.closedBeforeStartResolved = true;
       return { action: CloseAction.DoNotRestart };
     }
 
+    if (!shouldRetryClosedClient({
+      startResolved: this.activeClientReady,
+      desiredRunning: this.desiredRunning,
+      stopRequested: this.stopRequested,
+      isActive: this.activeClient === client,
+    })) {
+      return { action: CloseAction.DoNotRestart };
+    }
+
+    await this.handleUnexpectedClose(client);
+    return { action: CloseAction.DoNotRestart };
+  }
+
+  private async handleUnexpectedClose(client: LanguageClient): Promise<void> {
+    if (!shouldRetryClosedClient({
+      startResolved: this.activeClientReady,
+      desiredRunning: this.desiredRunning,
+      stopRequested: this.stopRequested,
+      isActive: this.activeClient === client,
+    })) return;
+
+    this.activeRunStarted = false;
+    this.activeRunAnnounced = false;
+    this.activeRunGeneration += 1;
     this.setStatus('failed');
-    this.setCapabilityContexts(undefined);
+    await this.setCapabilityContexts(undefined);
+    if (!shouldRetryClosedClient({
+      startResolved: this.activeClientReady,
+      desiredRunning: this.desiredRunning,
+      stopRequested: this.stopRequested,
+      isActive: this.activeClient === client,
+    })) return;
+
     if (this.crashWindow.record(Date.now())) {
       this.scheduleClosedRestart(client);
-      return { action: CloseAction.DoNotRestart };
+      return;
     }
 
     const choice = await vscode.window.showErrorMessage(
@@ -355,18 +440,22 @@ class ClientHostImpl implements ClientHost {
     } else if (choice === 'Show Output') {
       this.output.show();
     }
-    return { action: CloseAction.DoNotRestart };
   }
 
   private scheduleClosedRestart(client: LanguageClient): void {
     setTimeout(() => {
       void this.enqueue(async () => {
+        // Stale retries are no-ops, including timers left behind by a failed start.
         if (this.disposed || !this.desiredRunning || this.activeClient !== client) return;
 
         this.stateListener?.dispose();
         this.stateListener = undefined;
         this.activeClient = undefined;
+        this.activeClientReady = false;
+        this.closedBeforeStartResolved = false;
         this.activeRunStarted = false;
+        this.activeRunAnnounced = false;
+        this.activeRunGeneration += 1;
         await this.startInternal();
       });
     }, 0);
@@ -378,16 +467,20 @@ class ClientHostImpl implements ClientHost {
     this.didChangeStatusEmitter.fire(status);
   }
 
-  private setCapabilityContexts(flags: Record<ExperimentalFlag, boolean> | undefined): void {
-    for (const flag of EXPERIMENTAL_FLAGS) {
-      void Promise.resolve(vscode.commands.executeCommand(
-        'setContext',
-        CAPABILITY_CONTEXT_KEYS[flag],
-        flags?.[flag] ?? false,
-      )).catch((error: unknown) => {
-        this.output.warn(`Failed to update Pascal LSP capability context: ${errorMessage(error)}`);
-      });
-    }
+  private setCapabilityContexts(flags: Record<ExperimentalFlag, boolean> | undefined): Promise<void> {
+    return this.contextQueue.run(async () => {
+      await Promise.all(EXPERIMENTAL_FLAGS.map(async (flag) => {
+        try {
+          await vscode.commands.executeCommand(
+            'setContext',
+            CAPABILITY_CONTEXT_KEYS[flag],
+            flags?.[flag] ?? false,
+          );
+        } catch (error) {
+          this.output.warn(`Failed to update Pascal LSP capability context: ${errorMessage(error)}`);
+        }
+      }));
+    });
   }
 }
 

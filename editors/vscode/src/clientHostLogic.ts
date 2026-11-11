@@ -21,13 +21,21 @@ export class SerialQueue {
   }
 }
 
+export function shouldRetryClosedClient(state: {
+  startResolved: boolean;
+  desiredRunning: boolean;
+  stopRequested: boolean;
+  isActive: boolean;
+}): boolean {
+  return state.startResolved && state.desiredRunning && !state.stopRequested && state.isActive;
+}
+
 export function announceClientStarted<T>(
   client: T,
   setRunning: () => void,
-  queueContexts: () => void,
+  updateContexts: () => Promise<void>,
   fireStarted: (client: T) => void,
-): void {
+): Promise<void> {
   setRunning();
-  queueContexts();
-  fireStarted(client);
+  return updateContexts().then(() => fireStarted(client));
 }

@@ -1,22 +1,29 @@
 import { describe, expect, it } from 'vitest';
-import { announceClientStarted, CrashWindow, SerialQueue } from '../../src/clientHostLogic';
+import {
+  announceClientStarted,
+  CrashWindow,
+  SerialQueue,
+  shouldRetryClosedClient,
+} from '../../src/clientHostLogic';
 
 describe('announceClientStarted', () => {
-  it('sets running and queues capability contexts before firing the start event', () => {
+  it('awaits capability updates before firing the start event', async () => {
     let status = 'starting';
     let contextsReady = false;
     const order: string[] = [];
     const getClient = () => status === 'running' ? 'client' : undefined;
+    let finishContexts!: () => void;
+    const contextsUpdated = new Promise<void>((resolve) => { finishContexts = resolve; });
 
-    announceClientStarted(
+    const announcement = announceClientStarted(
       'client',
       () => {
         status = 'running';
         order.push('status');
       },
       () => {
-        contextsReady = true;
         order.push('contexts');
+        return contextsUpdated.then(() => { contextsReady = true; });
       },
       (client) => {
         expect(client).toBe('client');
@@ -26,7 +33,24 @@ describe('announceClientStarted', () => {
       },
     );
 
+    expect(order).toEqual(['status', 'contexts']);
+    finishContexts();
+    await announcement;
     expect(order).toEqual(['status', 'contexts', 'event']);
+  });
+});
+
+describe('shouldRetryClosedClient', () => {
+  it('does not retry a close before start resolves or after a manual stop', () => {
+    const readyClient = {
+      startResolved: true,
+      desiredRunning: true,
+      stopRequested: false,
+      isActive: true,
+    };
+    expect(shouldRetryClosedClient({ ...readyClient, startResolved: false })).toBe(false);
+    expect(shouldRetryClosedClient({ ...readyClient, stopRequested: true })).toBe(false);
+    expect(shouldRetryClosedClient(readyClient)).toBe(true);
   });
 });
 

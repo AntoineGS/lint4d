@@ -512,6 +512,9 @@ module.exports = grammar({
 		$.kWhile,
 		$.kWith,
 		$.kXor,
+		$.kPackage,
+		$.kRequires,
+		$.kContains,
 	],
 
 	extras: $ => [$._space, $.comment, $.ppDirective],
@@ -588,6 +591,7 @@ module.exports = grammar({
 		root:               $ => optional(choice(
 			$.program,
 			$.library,
+			$.package,
 			$.unit,
 			$._definitions // For include files
 		)),
@@ -607,6 +611,17 @@ module.exports = grammar({
 			choice(tr($,'block'), $.kEnd),
 			$.kEndDot
 		),
+
+		// Delphi package source (.dpk).
+		package:            $ => seq(
+			$.kPackage, $.moduleName, ';',
+			optional($.declRequires),
+			optional($.declContains),
+			$.kEnd, $.kEndDot
+		),
+
+		declRequires:       $ => seq($.kRequires, repeat1($._usesClauseEntry), ';'),
+		declContains:       $ => seq($.kContains, repeat1($._usesClauseEntry), ';'),
 
 		unit:               $ => seq(
 			$.kUnit, $.moduleName, ';',

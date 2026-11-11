@@ -19,6 +19,10 @@
             },
             {
               "type": "SYMBOL",
+              "name": "package"
+            },
+            {
+              "type": "SYMBOL",
               "name": "unit"
             },
             {
@@ -122,6 +126,95 @@
         {
           "type": "SYMBOL",
           "name": "kEndDot"
+        }
+      ]
+    },
+    "package": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "kPackage"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "moduleName"
+        },
+        {
+          "type": "STRING",
+          "value": ";"
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "declRequires"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "declContains"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
+          "type": "SYMBOL",
+          "name": "kEnd"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "kEndDot"
+        }
+      ]
+    },
+    "declRequires": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "kRequires"
+        },
+        {
+          "type": "REPEAT1",
+          "content": {
+            "type": "SYMBOL",
+            "name": "_usesClauseEntry"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": ";"
+        }
+      ]
+    },
+    "declContains": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "kContains"
+        },
+        {
+          "type": "REPEAT1",
+          "content": {
+            "type": "SYMBOL",
+            "name": "_usesClauseEntry"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": ";"
         }
       ]
     },
@@ -12779,6 +12872,18 @@
     {
       "type": "SYMBOL",
       "name": "kXor"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kPackage"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kRequires"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "kContains"
     }
   ],
   "inline": [],

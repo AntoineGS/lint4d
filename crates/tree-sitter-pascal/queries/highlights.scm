@@ -2,6 +2,9 @@
 [
 	(kProgram)
 	(kLibrary)
+	(kPackage)
+	(kRequires)
+	(kContains)
 	(kUnit)
 	(kUses)
 

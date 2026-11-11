@@ -1434,6 +1434,37 @@
     }
   },
   {
+    "type": "declContains",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "kContains",
+          "named": true
+        },
+        {
+          "type": "kIn",
+          "named": true
+        },
+        {
+          "type": "literalString",
+          "named": true
+        },
+        {
+          "type": "moduleName",
+          "named": true
+        },
+        {
+          "type": "ppUsesBlock",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "declEnum",
     "named": true,
     "fields": {},
@@ -2677,6 +2708,37 @@
       "types": [
         {
           "type": "declArg",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "declRequires",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "kIn",
+          "named": true
+        },
+        {
+          "type": "kRequires",
+          "named": true
+        },
+        {
+          "type": "literalString",
+          "named": true
+        },
+        {
+          "type": "moduleName",
+          "named": true
+        },
+        {
+          "type": "ppUsesBlock",
           "named": true
         }
       ]
@@ -7262,6 +7324,41 @@
     }
   },
   {
+    "type": "package",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "declContains",
+          "named": true
+        },
+        {
+          "type": "declRequires",
+          "named": true
+        },
+        {
+          "type": "kEnd",
+          "named": true
+        },
+        {
+          "type": "kEndDot",
+          "named": true
+        },
+        {
+          "type": "kPackage",
+          "named": true
+        },
+        {
+          "type": "moduleName",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "ppBlock",
     "named": true,
     "fields": {},
@@ -8662,6 +8759,10 @@
           "named": true
         },
         {
+          "type": "package",
+          "named": true
+        },
+        {
           "type": "ppBlock",
           "named": true
         },
@@ -9989,6 +10090,10 @@
     "named": true
   },
   {
+    "type": "kContains",
+    "named": true
+  },
+  {
     "type": "kCppdecl",
     "named": true
   },
@@ -10309,6 +10414,10 @@
     "named": true
   },
   {
+    "type": "kPackage",
+    "named": true
+  },
+  {
     "type": "kPacked",
     "named": true
   },
@@ -10382,6 +10491,10 @@
   },
   {
     "type": "kRequired",
+    "named": true
+  },
+  {
+    "type": "kRequires",
     "named": true
   },
   {

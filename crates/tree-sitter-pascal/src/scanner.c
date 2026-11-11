@@ -165,6 +165,9 @@ typedef enum {
     KWHILE,
     KWITH,
     KXOR,
+    KPACKAGE,
+    KREQUIRES,
+    KCONTAINS,
 } TokenType;
 
 static inline bool is_ascii_letter(int32_t c) {
@@ -256,6 +259,9 @@ static const ContextualWord CONTEXTUAL_WORDS[] = {
     {"winapi", KWINAPI},
     {"alias", KALIAS},
     {"delayed", KDELAYED},
+    {"package", KPACKAGE},
+    {"requires", KREQUIRES},
+    {"contains", KCONTAINS},
     {"true", KTRUE},
     {"false", KFALSE},
 };

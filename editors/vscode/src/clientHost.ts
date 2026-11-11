@@ -8,6 +8,7 @@ import {
   LanguageClient,
   State,
   TransportKind,
+  type CloseHandlerResult,
   type LanguageClientOptions,
   type ServerOptions,
 } from 'vscode-languageclient/node';
@@ -20,6 +21,7 @@ import {
 } from './settings';
 import { resolutionMessage, resolveServerBinary } from './server';
 import { capabilityFlags, EXPERIMENTAL_FLAGS, type ExperimentalFlag } from './protocol';
+import { announceClientStarted, CrashWindow, SerialQueue } from './clientHostLogic';
 
 export type ClientStatus = 'stopped' | 'starting' | 'running' | 'failed';
 
@@ -42,8 +44,6 @@ export const CAPABILITY_CONTEXT_KEYS: Record<string, string> = Object.fromEntrie
 );
 
 const STOP_TIMEOUT_MS = 6000;
-const CRASH_WINDOW_MS = 3 * 60 * 1000;
-const MAX_CRASHES_IN_WINDOW = 5;
 
 export function configReader(): ConfigReader {
   const configuration = vscode.workspace.getConfiguration('pascalLsp');
@@ -81,8 +81,9 @@ class ClientHostImpl implements ClientHost {
   private activeRunStarted = false;
   private stopRequested = false;
   private disposed = false;
-  private closeTimes: number[] = [];
-  private operation: Promise<void> = Promise.resolve();
+  private desiredRunning = false;
+  private readonly crashWindow = new CrashWindow();
+  private readonly lifecycleQueue = new SerialQueue();
 
   constructor(context: vscode.ExtensionContext) {
     this.output = vscode.window.createOutputChannel('Pascal LSP', { log: true });
@@ -142,10 +143,12 @@ class ClientHostImpl implements ClientHost {
   }
 
   start(): Promise<void> {
+    this.desiredRunning = true;
     return this.enqueue(() => this.startInternal());
   }
 
   restart(): Promise<void> {
+    this.desiredRunning = true;
     return this.enqueue(async () => {
       await this.stopInternal();
       await this.startInternal();
@@ -153,6 +156,7 @@ class ClientHostImpl implements ClientHost {
   }
 
   stop(): Promise<void> {
+    this.desiredRunning = false;
     return this.enqueue(() => this.stopInternal());
   }
 
@@ -168,8 +172,8 @@ class ClientHostImpl implements ClientHost {
   }
 
   private enqueue(action: () => Promise<void>): Promise<void> {
-    const pending = this.operation.then(action, action);
-    this.operation = pending.catch((error: unknown) => {
+    const pending = this.lifecycleQueue.run(action);
+    void pending.catch((error: unknown) => {
       this.output.error(`Pascal LSP lifecycle operation failed: ${errorMessage(error)}`);
     });
     return pending;
@@ -215,6 +219,7 @@ class ClientHostImpl implements ClientHost {
     const configuration = vscode.workspace.getConfiguration('pascalLsp');
     const args = stringArray(configuration.get<unknown>('serverArgs', []));
     const env = stringEnvironment(configuration.get<unknown>('serverEnv', {}));
+    const clientRef: { current?: LanguageClient } = {};
     const serverOptions: ServerOptions = {
       command: resolution.path,
       args: ['--stdio', ...args],
@@ -243,11 +248,15 @@ class ClientHostImpl implements ClientHost {
         error: (_error, _message, count) => ({
           action: (count ?? 0) <= 3 ? ErrorAction.Continue : ErrorAction.Shutdown,
         }),
-        closed: () => this.onClosed(),
+        closed: () => {
+          const client = clientRef.current;
+          return client ? this.onClosed(client) : { action: CloseAction.DoNotRestart };
+        },
       },
     };
 
     const client = new LanguageClient('pascalLsp', 'Pascal LSP', serverOptions, clientOptions);
+    clientRef.current = client;
     this.activeClient = client;
     this.activeRunStarted = false;
     this.stateListener?.dispose();
@@ -275,7 +284,7 @@ class ClientHostImpl implements ClientHost {
   private async stopInternal(): Promise<void> {
     this.stopRequested = true;
     const client = this.activeClient;
-    if (client) {
+    if (client && this.currentStatus !== 'failed') {
       try {
         await client.stop(STOP_TIMEOUT_MS);
       } catch (error) {
@@ -304,10 +313,16 @@ class ClientHostImpl implements ClientHost {
         if (!this.activeRunStarted) {
           this.activeRunStarted = true;
           this.successfulStarts += 1;
-          this.didStartEmitter.fire(client);
+          announceClientStarted(
+            client,
+            () => this.setStatus('running'),
+            () => this.setCapabilityContexts(capabilityFlags(this.experimental())),
+            (startedClient) => this.didStartEmitter.fire(startedClient),
+          );
+        } else {
+          this.setStatus('running');
+          this.setCapabilityContexts(capabilityFlags(this.experimental()));
         }
-        this.setStatus('running');
-        this.setCapabilityContexts(capabilityFlags(this.experimental()));
         break;
       case State.Stopped:
       case State.StartFailed:
@@ -318,30 +333,43 @@ class ClientHostImpl implements ClientHost {
     }
   }
 
-  private async onClosed(): Promise<{ action: CloseAction }> {
-    if (this.stopRequested) return { action: CloseAction.DoNotRestart };
-
-    const now = Date.now();
-    this.closeTimes = this.closeTimes.filter((closedAt) => now - closedAt <= CRASH_WINDOW_MS);
-    this.closeTimes.push(now);
-    if (this.closeTimes.length < MAX_CRASHES_IN_WINDOW) {
-      return { action: CloseAction.Restart };
+  private async onClosed(client: LanguageClient): Promise<CloseHandlerResult> {
+    if (this.stopRequested || !this.desiredRunning || this.activeClient !== client) {
+      return { action: CloseAction.DoNotRestart };
     }
 
     this.setStatus('failed');
+    this.setCapabilityContexts(undefined);
+    if (this.crashWindow.record(Date.now())) {
+      this.scheduleClosedRestart(client);
+      return { action: CloseAction.DoNotRestart };
+    }
+
     const choice = await vscode.window.showErrorMessage(
       'Pascal LSP stopped after repeated crashes.',
       'Restart',
       'Show Output',
     );
     if (choice === 'Restart') {
-      void this.restart().catch((error: unknown) => {
-        this.output.error(`Failed to restart Pascal LSP: ${errorMessage(error)}`);
-      });
+      this.scheduleClosedRestart(client);
     } else if (choice === 'Show Output') {
       this.output.show();
     }
     return { action: CloseAction.DoNotRestart };
+  }
+
+  private scheduleClosedRestart(client: LanguageClient): void {
+    setTimeout(() => {
+      void this.enqueue(async () => {
+        if (this.disposed || !this.desiredRunning || this.activeClient !== client) return;
+
+        this.stateListener?.dispose();
+        this.stateListener = undefined;
+        this.activeClient = undefined;
+        this.activeRunStarted = false;
+        await this.startInternal();
+      });
+    }, 0);
   }
 
   private setStatus(status: ClientStatus): void {

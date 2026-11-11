@@ -927,3 +927,55 @@ end.
 ",
     );
 }
+
+/// Directives the parser rewrote around a conditional that crosses
+/// statements (`if X then {$ENDIF} {$IFDEF POSIX} ...`) are attached after
+/// the real ones, so a token led by both emitted them out of source order
+/// (FireDAC PGWrapper, OverbyteIcsCsc).
+#[test]
+fn rewritten_and_real_directives_keep_their_source_order() {
+    assert_formats_to(
+        "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+{$IFDEF MSWINDOWS}
+  X := 1;
+  if Result then
+{$ENDIF}
+{$IFDEF POSIX}
+  Sleep(5);
+  Result := True;
+{$ENDIF}
+    if A = 0 then
+      Check;
+end;
+end.
+",
+        "\
+unit T;
+
+interface
+
+implementation
+
+procedure P;
+begin
+  {$IFDEF MSWINDOWS}
+  X := 1;
+  if Result then
+    {$ENDIF}
+    {$IFDEF POSIX}
+    Sleep(5);
+  Result := True;
+  {$ENDIF}
+  if A = 0 then
+    Check;
+end;
+
+end.
+",
+    );
+}

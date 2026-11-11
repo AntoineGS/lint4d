@@ -4199,11 +4199,15 @@ fn directive_after_uses_clause_on_its_line_is_kept() {
         ),
         // With sorting the directive stays at the clause's end.
         ("uses B, A; {$I d.inc}", "uses\n  A,\n  B; {$I d.inc}\n"),
-        // A `//` comment of the unit ending the clause goes after it.
-        ("uses A // c\n; {$I d.inc}", "uses\n  A; {$I d.inc} // c\n"),
+        // A `//` comment of the unit ending the clause stays before the
+        // directive: the `;` starts the next line (l4d-um8g).
+        (
+            "uses A // c\n; {$I d.inc}",
+            "uses\n  A // c\n  ; {$I d.inc}\n",
+        ),
         (
             "uses Zeta, // z\n  Alpha; {$I d.inc}",
-            "uses\n  Alpha,\n  Zeta; {$I d.inc} // z\n",
+            "uses\n  Alpha,\n  Zeta // z\n  ; {$I d.inc}\n",
         ),
     ] {
         let src = uses_source(clause);
@@ -4353,11 +4357,11 @@ fn uses_clause_with_an_include_keeps_its_order_and_punctuation() {
 }
 
 #[test]
-fn uses_sorting_around_other_directives_keeps_the_clause_valid() {
-    // Other directives list nothing, so they leave the punctuation alone.
+fn uses_clause_with_other_directives_keeps_its_source_order() {
+    // Sorting would move units across the directive (l4d-um8g).
     for (clause, expected) in [
-        ("uses B, {$R+} A;", "uses\n  A,\n  B\n  {$R+};\n"),
-        ("uses C, {$R+} A, B;", "uses\n  A,\n  B,\n  C\n  {$R+};\n"),
+        ("uses B, {$R+} A;", "uses\n  B,\n  {$R+}\n  A;\n"),
+        ("uses C, {$R+} A, B;", "uses\n  C,\n  {$R+}\n  A,\n  B;\n"),
     ] {
         let src = uses_source(clause);
         let result = format_source(&src);
@@ -4377,10 +4381,11 @@ fn paren_star_directives_in_a_uses_clause_are_directives() {
             "uses B, A, (*$I u.inc*), C;",
             "uses\n  B,\n  A,\n  (*$I u.inc*),\n  C;\n",
         ),
-        // A conditional is a block: its units stay inside it.
+        // A conditional is a block: its units stay inside it, and the
+        // clause keeps its source order.
         (
             "uses C, (*$IFDEF X*) B, (*$ELSE*) D, (*$ENDIF*) A;",
-            "uses\n  A,\n  (*$IFDEF X*)\n  B,\n  (*$ELSE*)\n  D,\n  (*$ENDIF*)\n  C;\n",
+            "uses\n  C,\n  (*$IFDEF X*)\n  B,\n  (*$ELSE*)\n  D,\n  (*$ENDIF*)\n  A;\n",
         ),
     ] {
         let src = uses_source(clause);
@@ -4392,13 +4397,12 @@ fn paren_star_directives_in_a_uses_clause_are_directives() {
 }
 
 #[test]
-fn uses_sorting_never_leaves_a_conditional_block_last() {
+fn uses_clause_with_a_conditional_block_keeps_its_source_order() {
     let src = "unit T;\ninterface\nuses B, {$IFDEF X} C, {$ENDIF} A;\nimplementation\nend.\n";
     let result = format_source(src);
-    // A plain unit ends the clause, so it reads `A, C, B;` with X defined
-    // and `A, B;` without.
+    // It reads `B, C, A;` with X defined and `B, A;` without.
     assert!(
-        result.contains("uses\n  A,\n  {$IFDEF X}\n  C,\n  {$ENDIF}\n  B;\n"),
+        result.contains("uses\n  B,\n  {$IFDEF X}\n  C,\n  {$ENDIF}\n  A;\n"),
         "a configuration of the clause has a dangling comma:\n{result}"
     );
     assert_parses_cleanly(&result);
@@ -4611,26 +4615,12 @@ fn line_comment_after_identifier_does_not_swallow_the_next_field() {
 
 #[test]
 fn var_list_comma_trivia_keeps_source_order_and_spacing() {
+    // A list holding a directive is not expanded (l4d-um8g): a copy of the
+    // type would leave the directive's reach.
     let src = var_list_source("  A, {$R+} // c\n  B: Integer;\n  C, {x} {$R-} {y} D: Byte;\n");
-    let [plain, aligned, no_cells] = format_three_modes_idempotent(&src);
-    assert!(
-        plain.contains(
-            "  A: Integer; {$R+} // c\n  B: Integer;\n  C: Byte; {x} {$R-} {y}\n  D: Byte;\n"
-        ),
-        "{plain}"
-    );
-    for result in [aligned, no_cells] {
-        let lines = trimmed_lines(&result);
+    for result in format_three_modes_idempotent(&src) {
         assert!(
-            lines
-                .iter()
-                .any(|l| l.starts_with("A") && l.ends_with("{$R+} // c")),
-            "{result}"
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.starts_with("C") && l.ends_with("{x} {$R-} {y}")),
+            result.contains("  A, {$R+} // c\n  B: Integer;\n  C, {x} {$R-} {y} D: Byte;\n"),
             "{result}"
         );
     }

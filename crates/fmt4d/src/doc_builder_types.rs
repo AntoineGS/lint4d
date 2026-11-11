@@ -30,7 +30,10 @@ impl<'a> DocBuilder<'a> {
                     in_ancestor_list = true;
                 }
                 K::OPEN_PAREN if in_ancestor_list => {
-                    parts.push(Doc::Raw("(".into()));
+                    parts.push(self.with_outer_trivia(*child, Doc::Raw("(".into())));
+                    if !self.trailing_items(*child).is_empty() {
+                        parts.push(Doc::Raw(" ".into()));
+                    }
                 }
                 K::CLOSE_PAREN if in_ancestor_list => {
                     // Route through doc_for_node so any trailing `// ...`
@@ -47,10 +50,12 @@ impl<'a> DocBuilder<'a> {
                     }
                 }
                 K::COMMA if in_ancestor_list => {
-                    parts.push(Doc::Raw(", ".into()));
+                    parts.push(self.with_outer_trivia(*child, Doc::Raw(",".into())));
+                    parts.push(Doc::Raw(" ".into()));
                 }
                 K::TYPEREF if in_ancestor_list => {
-                    parts.push(Doc::Raw(self.node_text(*child)));
+                    let text = Doc::Raw(self.node_text(*child));
+                    parts.push(self.with_outer_trivia(*child, text));
                 }
                 K::K_END => {
                     if in_ancestor_list {

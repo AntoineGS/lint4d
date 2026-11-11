@@ -25,6 +25,48 @@ impl DocBuilder<'_> {
         doc::concat(parts)
     }
 
+    /// A package source (`.dpk`): the header, then its `requires` and
+    /// `contains` clauses and `end.`, each after a blank line.
+    pub(crate) fn build_package(&self, node: Node) -> Doc {
+        let mut parts = Vec::new();
+        let mut in_header = true;
+        self.for_each_code_child(node, |child| {
+            let kind = child.kind();
+            if matches!(kind, K::DECL_REQUIRES | K::DECL_CONTAINS | K::K_END) {
+                parts.push(Doc::BlankLine);
+                in_header = false;
+            }
+            let child_doc = self.doc_for_node(child);
+            if in_header || kind == K::K_END_DOT {
+                parts.push(child_doc);
+            } else {
+                parts.push(crate::doc_builder::strip_leading_hardline(child_doc));
+            }
+        });
+        doc::concat(parts)
+    }
+
+    /// A `requires` or `contains` clause: the keyword, then one item per
+    /// line, indented, each with its separator and comments.
+    pub(crate) fn build_package_list(&self, node: Node) -> Doc {
+        let mut parts = Vec::new();
+        let mut items = Vec::new();
+        let mut item_start = true;
+        self.for_each_code_child(node, |child| match child.kind() {
+            K::K_REQUIRES | K::K_CONTAINS => parts.push(self.doc_for_node(child)),
+            _ => {
+                let child_doc = self.doc_for_node(child);
+                if item_start && !crate::doc_builder::starts_with_hardline(&child_doc) {
+                    items.push(Doc::Hardline);
+                }
+                items.push(child_doc);
+                item_start = matches!(child.kind(), K::COMMA | K::SEMICOLON);
+            }
+        });
+        parts.push(doc::indent(doc::concat(items)));
+        doc::concat(parts)
+    }
+
     pub(crate) fn build_interface_section(&self, node: Node) -> Doc {
         let mut parts = Vec::new();
         let mut after_header = false;
@@ -39,8 +81,8 @@ impl DocBuilder<'_> {
             }
             _ => {
                 let kind = child.kind();
-                let single_line = child.start_position().row == child.end_position().row;
-                let child_doc = self.doc_for_node(child);
+                let (child_doc, several_lines) = self.doc_for_node_and_extent(child);
+                let single_line = !several_lines;
                 if after_header {
                     parts.push(Doc::Hardline);
                     after_header = false;
@@ -85,8 +127,8 @@ impl DocBuilder<'_> {
             }
             _ => {
                 let kind = child.kind();
-                let single_line = child.start_position().row == child.end_position().row;
-                let child_doc = self.doc_for_node(child);
+                let (child_doc, several_lines) = self.doc_for_node_and_extent(child);
+                let single_line = !several_lines;
                 if after_header {
                     parts.push(Doc::Hardline);
                     after_header = false;

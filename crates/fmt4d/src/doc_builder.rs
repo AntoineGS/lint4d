@@ -1,6 +1,6 @@
 use crate::comments::CommentMap;
 use crate::config::FmtConfig;
-use crate::content_check::{ContentAllowance, code_separators};
+use crate::content_check::{AllowanceEntry, ContentAllowance, code_separators};
 use crate::directive_map::DirectiveMap;
 use crate::doc::{self, Doc};
 use pascal_core::FormatOffRegion;
@@ -143,6 +143,12 @@ impl<'a> DocBuilder<'a> {
         Doc::ContentMark(node.id())
     }
 
+    /// Whether the source text of `node` holds a compiler directive.
+    pub(crate) fn holds_directive(&self, node: Node<'a>) -> bool {
+        let text = &self.source[node.byte_range()];
+        text.windows(2).any(|w| w == b"{$") || text.windows(3).any(|w| w == b"(*$")
+    }
+
     /// Record the parent kind of every node under `root` in one walk.
     fn index_parent_kinds(&self, root: Node<'a>) {
         let mut kinds = self.parent_kinds.borrow_mut();
@@ -244,7 +250,7 @@ impl<'a> DocBuilder<'a> {
     /// Source text between two byte offsets, emitted as written. Text that
     /// starts a line in the source starts one in the output, with its
     /// source indentation.
-    fn verbatim_doc(&self, start: usize, end: usize) -> Doc {
+    pub(crate) fn verbatim_doc(&self, start: usize, end: usize) -> Doc {
         let line_start = self.source[..start]
             .iter()
             .rposition(|&b| b == b'\n')
@@ -323,12 +329,28 @@ impl<'a> DocBuilder<'a> {
             return self.format_off_doc(node, true, true);
         }
 
-        let leading_comments = self.leading_comments_doc(node);
-        let leading_directives = self.leading_directives_doc(node);
+        let leading = self.leading_trivia_doc(node);
         let body = self.build_doc(node);
         let trailing = self.trailing_trivia_doc(node);
 
-        doc::concat(vec![leading_comments, leading_directives, body, trailing])
+        doc::concat(vec![leading, body, trailing])
+    }
+
+    /// [`Self::doc_for_node`], and whether the layout of `node` itself,
+    /// without its leading and trailing comments and directives, always
+    /// spans several lines (see [`doc::has_forced_break`]). Unlike the
+    /// node's source rows, this does not change when the output is
+    /// formatted again.
+    pub(crate) fn doc_for_node_and_extent(&self, node: Node<'a>) -> (Doc, bool) {
+        if self.is_in_format_off_region(node) {
+            let several = node.start_position().row != node.end_position().row;
+            return (self.format_off_doc(node, true, true), several);
+        }
+        let leading = self.leading_trivia_doc(node);
+        let body = self.build_doc(node);
+        let several = doc::has_forced_break(&body);
+        let trailing = self.trailing_trivia_doc(node);
+        (doc::concat(vec![leading, body, trailing]), several)
     }
 
     /// Like `doc_for_node` but omits leading comments and directives.
@@ -359,17 +381,11 @@ impl<'a> DocBuilder<'a> {
             return self.format_off_doc(node, true, false);
         }
 
-        let leading_comments = self.leading_comments_doc(node);
-        let leading_directives = self.leading_directives_doc(node);
+        let leading = self.leading_trivia_doc(node);
         let body = self.build_doc(node);
         let trailing_directives = self.trailing_directives_before_comments_doc(node);
 
-        doc::concat(vec![
-            leading_comments,
-            leading_directives,
-            body,
-            trailing_directives,
-        ])
+        doc::concat(vec![leading, body, trailing_directives])
     }
 
     /// Only the node's own body: no leading or trailing comments or
@@ -447,11 +463,14 @@ impl<'a> DocBuilder<'a> {
     pub(crate) fn build_doc(&self, node: Node<'a>) -> Doc {
         match node.kind() {
             K::UNIT => self.build_unit(node),
+            K::PACKAGE => self.build_package(node),
+            K::DECL_REQUIRES | K::DECL_CONTAINS => self.build_package_list(node),
             K::INTERFACE => self.build_interface_section(node),
             K::IMPLEMENTATION => self.build_implementation_section(node),
             K::INITIALIZATION | K::FINALIZATION => self.build_init_final_section(node),
             K::DECL_USES => self.build_uses(node),
             K::BLOCK | K::STATEMENTS => self.build_block(node),
+            K::ASM => self.build_asm(node),
             K::DECL_CLASS | K::DECL_RECORD | K::DECL_INTF => self.build_type_body(node),
             K::DECL_SECTION => self.build_decl_section(node),
             K::PP_DECL_SECTION => self.build_pp_decl_section(node),
@@ -483,7 +502,7 @@ impl<'a> DocBuilder<'a> {
                 let parent_kind = self.parent_kind(node);
                 doc::token(text, kind, parent_kind)
             }
-            _ if node.child_count() == 0 && !node.is_extra() => self.build_leaf(node),
+            _ if crate::trivia::is_text_leaf(node) => self.build_leaf(node),
             _ => {
                 if node.child_count() > 0 && self.has_breakable_operators(node) {
                     self.build_expression_breaking(node)
@@ -506,11 +525,35 @@ impl<'a> DocBuilder<'a> {
 
     /// Emit a leaf token as verbatim text — used for `literalChar` /
     /// `literalString` where child nodes don't cover the full source span.
+    /// The comments and directives attached before its first part and after
+    /// its last one lie outside that text and are emitted around it.
     fn build_verbatim_leaf(&self, node: Node<'a>) -> Doc {
         let text = self.node_text(node);
         let kind = node.kind();
         let parent_kind = self.parent_kind(node);
-        doc::token(text, kind, parent_kind)
+        let token = doc::token(text, kind, parent_kind);
+        if crate::trivia::is_text_leaf(node) {
+            return token;
+        }
+        self.with_outer_trivia(node, token)
+    }
+
+    /// `body`, laid out for `node` from its text, with the comments and
+    /// directives attached before its first leaf and after its last one
+    /// (the ones inside its text are part of `body`).
+    pub(crate) fn with_outer_trivia(&self, node: Node<'a>, body: Doc) -> Doc {
+        let trailing = self.trailing_items(last_leaf(node));
+        // The leaf may end before the node's text does (`#13#10` ends after
+        // its last `#` leaf): the first item keeps its distance from the
+        // text.
+        let first_gap = trailing
+            .first()
+            .map(|item| item.span.start.saturating_sub(node.end_byte()));
+        doc::concat(vec![
+            self.leading_trivia_doc(first_leaf(node)),
+            body,
+            self.trailing_run_doc(&trailing, first_gap),
+        ])
     }
 
     // ── Recursion helpers ────────────────────────────────────────────
@@ -594,6 +637,34 @@ impl<'a> DocBuilder<'a> {
         parts.push(Doc::Hardline);
 
         doc::concat(parts)
+    }
+
+    /// The leading comments and directives of `node`, in source order, each
+    /// on its own line, then a line break. With only one kind, as
+    /// [`Self::leading_comments_doc`] or [`Self::leading_directives_doc`];
+    /// with both, they are laid out as in the source (see
+    /// [`Self::trivia_run_doc`]), and so is a blank line before `node`.
+    pub(crate) fn leading_trivia_doc(&self, node: Node<'a>) -> Doc {
+        let comments = self.comments.leading_comments(node.id());
+        let directives = self.directives.leading_directives(node.id());
+        if directives.is_empty() {
+            return self.leading_comments_doc(node);
+        }
+        if comments.is_empty() {
+            return self.leading_directives_doc(node);
+        }
+        if self.trivia_suppressed.get() {
+            return Doc::Empty;
+        }
+        let (run, last_end) = self.trivia_run_doc(self.trivia_items(comments, directives), None);
+        let last_end = last_end.unwrap_or(node.start_byte());
+        let gap = &self.source[last_end.min(node.start_byte())..node.start_byte()];
+        let line_break = if gap.iter().filter(|&&b| b == b'\n').count() >= 2 {
+            Doc::BlankLine
+        } else {
+            Doc::Hardline
+        };
+        doc::concat(vec![Doc::Hardline, run, line_break])
     }
 
     /// Trailing comments and directives of `node`, in source order. Empty
@@ -833,7 +904,10 @@ impl<'a> DocBuilder<'a> {
             &self.source[node.start_byte()..node.end_byte()],
         ));
         let laid_out_separators = code_separators(&lines.join("\n"));
-        let mut allowance = ContentAllowance::default();
+        let mut allowance = AllowanceEntry {
+            at: node.start_byte(),
+            ..AllowanceEntry::default()
+        };
         for (c, source, laid_out) in [
             (',', source_separators.0, laid_out_separators.0),
             (';', source_separators.1, laid_out_separators.1),
@@ -845,12 +919,17 @@ impl<'a> DocBuilder<'a> {
             };
             target.extend(std::iter::repeat_n(c, source.abs_diff(laid_out)));
         }
-        let mark = self.allow_content_change(node, allowance);
+        let mark = self.allow_content_change(
+            node,
+            ContentAllowance {
+                entries: vec![allowance],
+            },
+        );
 
         let mut parts = Vec::new();
         parts.push(Doc::Hardline);
         let keyword = first_leaf(node);
-        parts.push(self.uses_leading_trivia_doc(keyword));
+        parts.push(self.leading_trivia_lines_doc(keyword));
         parts.push(doc::token("uses", K::K_USES, ""));
         parts.push(mark);
         parts.push(self.trailing_comments_doc(keyword));
@@ -878,10 +957,14 @@ impl<'a> DocBuilder<'a> {
         doc::concat(parts)
     }
 
-    /// Comments and directives leading the `uses` keyword, laid out as in
-    /// the source, then a line break. `build_uses` does not descend into
-    /// the clause, so nothing else emits them.
-    fn uses_leading_trivia_doc(&self, keyword: Node<'a>) -> Doc {
+    /// Comments and directives leading the leaf `keyword`, laid out as in
+    /// the source, then a line break. For leaves their builder emits as
+    /// text, such as the `uses` keyword (`build_uses` does not descend into
+    /// the clause) and conditional-block directives.
+    fn leading_trivia_lines_doc(&self, keyword: Node<'a>) -> Doc {
+        if self.trivia_suppressed.get() {
+            return Doc::Empty;
+        }
         let trivia = self.trivia_items(
             self.comments.leading_comments(keyword.id()),
             self.directives.leading_directives(keyword.id()),
@@ -899,9 +982,30 @@ impl<'a> DocBuilder<'a> {
         doc::concat(vec![run, line_break])
     }
 
+    /// A `{$IF…}` / `{$ELSE}` / `{$ENDIF}` leaf of a conditional block, laid
+    /// out by `marker` from its text, with the comments and directives
+    /// attached to it: the leading ones on the lines before it, as in the
+    /// source, and the trailing ones after it on its line. Expects to start
+    /// a line.
+    pub(crate) fn pp_marker_doc(
+        &self,
+        marker: Node<'a>,
+        layout: impl FnOnce(String) -> Doc,
+    ) -> Doc {
+        doc::concat(vec![
+            self.leading_trivia_lines_doc(marker),
+            layout(self.node_text(marker)),
+            self.trailing_trivia_doc(marker),
+        ])
+    }
+
     fn build_pp_block(&self, node: Node<'a>) -> Doc {
         let mut parts = Vec::new();
         let mut prev_end_row: Option<usize> = None;
+        // The kind of declaration a section opened in this block holds: the
+        // grammar leaves the declarations after the first outside the
+        // section, as items of the block, and they stay indented under it.
+        let mut open_section: Option<&'static str> = None;
 
         for child in node.children(&mut node.walk()) {
             if child.is_extra() {
@@ -909,13 +1013,15 @@ impl<'a> DocBuilder<'a> {
             }
             match child.kind() {
                 K::PP_IF | K::PP_ELSE | K::PP_END_IF => {
+                    open_section = None;
                     if let Some(prev) = prev_end_row
                         && self.has_blank_line_between(prev, child.start_position().row)
                     {
                         parts.push(Doc::BlankLine);
                     }
                     parts.push(Doc::Hardline);
-                    parts.push(doc::token(self.node_text(child), child.kind(), ""));
+                    parts
+                        .push(self.pp_marker_doc(child, |text| doc::token(text, child.kind(), "")));
                     prev_end_row = Some(child.end_position().row);
                 }
                 _ => {
@@ -924,11 +1030,23 @@ impl<'a> DocBuilder<'a> {
                     {
                         parts.push(Doc::BlankLine);
                     }
-                    let child_doc = self.doc_for_node(child);
+                    let mut child_doc = self.doc_for_node(child);
+                    let item_of_section = open_section == Some(child.kind());
+                    open_section = match child.kind() {
+                        K::DECL_VARS => Some(K::DECL_VAR),
+                        K::DECL_CONSTS => Some(K::DECL_CONST),
+                        K::DECL_TYPES => Some(K::DECL_TYPE),
+                        kind if item_of_section => Some(kind),
+                        _ => None,
+                    };
                     if !starts_with_hardline(&child_doc) {
-                        parts.push(Doc::Hardline);
+                        child_doc = doc::concat(vec![Doc::Hardline, child_doc]);
                     }
-                    parts.push(child_doc);
+                    parts.push(if item_of_section {
+                        doc::indent(child_doc)
+                    } else {
+                        child_doc
+                    });
                     prev_end_row = Some(child.end_position().row);
                 }
             }
@@ -1000,6 +1118,23 @@ pub(crate) fn strip_trailing_hardline(doc: Doc) -> Doc {
             doc::concat(docs)
         }
         Doc::Indent(inner) => doc::indent(strip_trailing_hardline(*inner)),
+        Doc::Hardline => Doc::Empty,
+        other => other,
+    }
+}
+
+/// Remove a leading `Hardline` from a Doc tree (see
+/// [`strip_trailing_hardline`]).
+pub(crate) fn strip_leading_hardline(doc: Doc) -> Doc {
+    match doc {
+        Doc::Concat(mut docs) => {
+            if let Some(index) = docs.iter().position(|d| !matches!(d, Doc::Empty)) {
+                let first = std::mem::replace(&mut docs[index], Doc::Empty);
+                docs[index] = strip_leading_hardline(first);
+            }
+            doc::concat(docs)
+        }
+        Doc::Indent(inner) => doc::indent(strip_leading_hardline(*inner)),
         Doc::Hardline => Doc::Empty,
         other => other,
     }
@@ -1140,19 +1275,23 @@ mod tests {
         let builder = make_builder(&bytes, &config, &comments, &directives, &external_units);
         let doc = builder.build(tree.root_node());
         let emitted = builder.content_allowance(&doc);
-        assert_eq!(emitted.dropped.trim(), ",");
-        assert!(emitted.added.contains("Integer"));
+        assert_eq!(emitted.entries.len(), 1);
+        assert_eq!(emitted.entries[0].dropped, ",");
+        assert!(emitted.entries[0].added.contains("Integer"));
         // A record whose doc is discarded (never emitted) does not apply.
         let discarded = builder.allow_content_change(
             tree.root_node(),
             crate::content_check::ContentAllowance {
-                dropped: ";".into(),
-                added: String::new(),
+                entries: vec![AllowanceEntry {
+                    dropped: ";".into(),
+                    ..AllowanceEntry::default()
+                }],
             },
         );
         drop(discarded);
         let after = builder.content_allowance(&doc);
-        assert_eq!(after.dropped.trim(), ",");
+        assert_eq!(after.entries.len(), 1);
+        assert_eq!(after.entries[0].dropped, ",");
     }
 
     #[test]

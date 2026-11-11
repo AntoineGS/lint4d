@@ -80,34 +80,11 @@ impl UsesItem {
     }
 }
 
-/// An `{$I file}` or `{$INCLUDE file}` directive (not the `{$I+}` switch),
-/// also spelled `(*$I file*)`, whose file is read in its place.
-fn is_include_directive(text: &str) -> bool {
-    let Some(body) = text.strip_prefix("{$").or_else(|| text.strip_prefix("(*$")) else {
-        return false;
-    };
-    let name_end = body
-        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .unwrap_or(body.len());
-    let (name, rest) = body.split_at(name_end);
-    (name.eq_ignore_ascii_case("I") || name.eq_ignore_ascii_case("INCLUDE"))
-        && rest.starts_with(|c: char| c.is_whitespace() || c == '\'' || c == '"')
-}
-
-/// Whether `items` hold an include, in any branch.
-fn has_include(items: &[UsesItem]) -> bool {
-    items.iter().any(|item| match item {
-        UsesItem::Directive { text, .. } => is_include_directive(text),
-        UsesItem::IfDefBlock(block) => {
-            has_include(&block.if_branch.items)
-                || block
-                    .else_if_branches
-                    .iter()
-                    .any(|branch| has_include(&branch.items))
-                || block.else_branch.as_deref().is_some_and(has_include)
-        }
-        UsesItem::Unit { .. } | UsesItem::Comment(_) => false,
-    })
+/// Whether `items` hold a directive or a conditional block.
+fn has_directive(items: &[UsesItem]) -> bool {
+    items
+        .iter()
+        .any(|item| matches!(item, UsesItem::Directive { .. } | UsesItem::IfDefBlock(_)))
 }
 
 /// Records where the `,` of a list were in the source while its children
@@ -276,50 +253,6 @@ fn legacy_namespace(name: &str) -> Option<&'static str> {
         | "ibcustomdataset" | "ibstoredproc" | "ibdatabaseinfo" => Some("IBX"),
 
         _ => None,
-    }
-}
-
-/// Recursively collect all unit names from a list of items.
-fn collect_items_units(items: &[UsesItem], out: &mut Vec<String>) {
-    for item in items {
-        match item {
-            UsesItem::Unit { name, .. } => out.push(name.clone()),
-            UsesItem::IfDefBlock(block) => collect_ifdef_units(block, out),
-            UsesItem::Directive { .. } | UsesItem::Comment(_) => {}
-        }
-    }
-}
-
-/// Recursively collect all unit names from an IfDefBlock.
-fn collect_ifdef_units(block: &IfDefBlock, out: &mut Vec<String>) {
-    collect_items_units(&block.if_branch.items, out);
-    for branch in &block.else_if_branches {
-        collect_items_units(&branch.items, out);
-    }
-    if let Some(else_items) = &block.else_branch {
-        collect_items_units(else_items, out);
-    }
-}
-
-/// If every unit in the block belongs to the same section, return that section.
-fn classify_ifdef_block(
-    block: &IfDefBlock,
-    config: &UsesConfig,
-    external_units: &HashSet<String>,
-) -> Option<UnitSection> {
-    let mut units = Vec::new();
-    collect_ifdef_units(block, &mut units);
-    if units.is_empty() {
-        return None;
-    }
-    let section = classify_unit(&units[0], config, external_units);
-    if units[1..]
-        .iter()
-        .all(|u| classify_unit(u, config, external_units) == section)
-    {
-        Some(section)
-    } else {
-        None
     }
 }
 
@@ -640,7 +573,31 @@ pub(crate) fn extract_uses_items(
     };
     let mut items = Vec::new();
     let mut commas = SourceCommas::default();
+    // Directives the parser masked (see `DirectivePatch`) inside the clause
+    // are not nodes: they only lead or trail a leaf in the directive map.
+    let real_directives: Vec<usize> = node
+        .children(&mut node.walk())
+        .filter(|c| c.kind() == K::PP_DIRECTIVE)
+        .map(|c| c.start_byte())
+        .collect();
+    let virtual_directives = |attached: &[crate::directive_map::AttachedDirective]| {
+        attached
+            .iter()
+            .filter(|d| {
+                (node.start_byte()..node.end_byte()).contains(&d.span.start)
+                    && !real_directives.contains(&d.span.start)
+            })
+            .map(|d| UsesItem::directive(d.text.clone()))
+            .collect::<Vec<_>>()
+    };
     for child in node.children(&mut node.walk()) {
+        if !child.is_extra() {
+            let masked = virtual_directives(directives.leading_directives(first_leaf(child).id()));
+            if !masked.is_empty() {
+                items.extend(masked);
+                commas.pushed(&items);
+            }
+        }
         commas.read(child.kind(), &mut items);
         match child.kind() {
             K::MODULE_NAME => {
@@ -683,6 +640,13 @@ pub(crate) fn extract_uses_items(
                 attach_after(&mut items, texts);
             }
             _ => {} // skip kUses keyword, comments, etc.
+        }
+        if !child.is_extra() && last_leaf(child).id() != end.id() {
+            let masked = virtual_directives(directives.trailing_directives(last_leaf(child).id()));
+            if !masked.is_empty() {
+                items.extend(masked);
+                commas.pushed(&items);
+            }
         }
     }
     UsesClause { items, after }
@@ -743,13 +707,15 @@ pub(crate) fn layout_uses_items(
     indent: &str,
     external_units: &HashSet<String>,
 ) -> Vec<String> {
-    if has_include(items) {
+    // Sorting would move units across a directive and change what it
+    // covers (a `{$WARNINGS OFF}` stretch, a `{$DEFINE}`), and pinned
+    // directives could end up reordered.
+    if has_directive(items) {
         return layout_uses_items_in_source_order(items, after, indent);
     }
     let mut lines = Vec::new();
-    // Separate plain units from pinned items, recording the anchor (preceding unit name).
-    // When grouping is enabled, ifdef blocks whose units all belong to one section
-    // are placed in that section rather than pinned.
+    // Separate plain units from pinned comments, recording the anchor
+    // (preceding unit name).
     let mut plain_units: Vec<String> = Vec::new();
     // Comments of each unit, queued per name in source order (sorting is
     // stable, so duplicates keep their relative order).
@@ -757,8 +723,6 @@ pub(crate) fn layout_uses_items(
     // pinned: (anchor: Option<String>, item)
     // anchor is None when the pinned item appears before any unit.
     let mut pinned: Vec<(Option<String>, UsesItem)> = Vec::new();
-    // section_blocks: ifdef blocks placed into a specific section.
-    let mut section_blocks: Vec<(UnitSection, UsesItem)> = Vec::new();
     let mut last_unit: Option<String> = None;
 
     for item in items {
@@ -775,13 +739,6 @@ pub(crate) fn layout_uses_items(
                     .or_default()
                     .push_back((leading, trailing));
                 last_unit = Some(name.clone());
-            }
-            UsesItem::IfDefBlock(block) if config.group => {
-                if let Some(section) = classify_ifdef_block(block, config, external_units) {
-                    section_blocks.push((section, item.clone()));
-                } else {
-                    pinned.push((last_unit.clone(), item.clone()));
-                }
             }
             UsesItem::IfDefBlock(_) | UsesItem::Directive { .. } | UsesItem::Comment(_) => {
                 pinned.push((last_unit.clone(), item.clone()));
@@ -811,28 +768,15 @@ pub(crate) fn layout_uses_items(
     let mut first_section = true;
 
     for &section in &section_order {
-        let group = tagged_groups.iter().find(|(s, _)| *s == section);
-        let blocks: Vec<_> = section_blocks
-            .iter()
-            .filter(|(s, _)| *s == section)
-            .collect();
-
-        if group.is_none() && blocks.is_empty() {
+        let Some((_, units)) = tagged_groups.iter().find(|(s, _)| *s == section) else {
             continue;
-        }
-
+        };
         if !first_section {
             slots.push(Slot::GroupSep);
         }
         first_section = false;
-
-        if let Some((_, units)) = group {
-            for name in units {
-                slots.push(Slot::Unit { name: name.clone() });
-            }
-        }
-        for (_, block_item) in &blocks {
-            slots.push(Slot::Pinned(Box::new(block_item.clone())));
+        for name in units {
+            slots.push(Slot::Unit { name: name.clone() });
         }
     }
 
@@ -877,25 +821,6 @@ pub(crate) fn layout_uses_items(
                 }
             }
         }
-    }
-
-    // Blocks after the last unit would have to be written comma-first (see
-    // `list_puncts`). When sorting already reorders the units, move the
-    // pinned items up to the last such block in front of that unit instead,
-    // keeping one unit per line; the sections they leave behind are empty.
-    // Without sorting the units keep their source order.
-    if config.sort
-        && let Some(last_unit) = slots.iter().rposition(|s| matches!(s, Slot::Unit { .. }))
-        && let Some(last_block) = slots.iter().rposition(
-            |s| matches!(s, Slot::Pinned(item) if matches!(**item, UsesItem::IfDefBlock(_))),
-        )
-        && last_block > last_unit
-    {
-        let moved: Vec<Slot> = slots
-            .drain(last_unit + 1..=last_block)
-            .filter(|s| !matches!(s, Slot::GroupSep))
-            .collect();
-        slots.splice(last_unit..last_unit, moved);
     }
 
     // Give the units back their comments; `None` separates groups.
@@ -1172,9 +1097,14 @@ fn emit_list(
                     trailing.push(comment.clone());
                     idx += 1;
                 }
-                let trailing = with_after(&trailing, after);
                 let lead = puncts[idx].lead_text();
-                push_with_trailing(format!("{indent}{lead}{text};"), &trailing, indent, lines);
+                if ends_in_line_comment(&trailing, after) {
+                    push_with_trailing(format!("{indent}{lead}{text}"), &trailing, indent, lines);
+                    push_with_trailing(format!("{indent};"), after, indent, lines);
+                } else {
+                    let trailing = with_after(&trailing, after);
+                    push_with_trailing(format!("{indent}{lead}{text};"), &trailing, indent, lines);
+                }
             }
             Some(UsesItem::Unit {
                 name,
@@ -1182,8 +1112,17 @@ fn emit_list(
                 trailing,
                 ..
             }) if ends_clause => {
-                let trailing = with_after(trailing, after);
-                emit_unit(name, leading, &trailing, indent, puncts[idx], lines);
+                if ends_in_line_comment(trailing, after) {
+                    let open = Punct {
+                        end: ItemEnd::Open,
+                        ..puncts[idx]
+                    };
+                    emit_unit(name, leading, trailing, indent, open, lines);
+                    push_with_trailing(format!("{indent};"), after, indent, lines);
+                } else {
+                    let trailing = with_after(trailing, after);
+                    emit_unit(name, leading, &trailing, indent, puncts[idx], lines);
+                }
             }
             Some(UsesItem::IfDefBlock(block)) if ends_clause => {
                 let block = IfDefBlock {
@@ -1202,14 +1141,17 @@ fn emit_list(
 }
 
 /// The comments of the item ending a clause, then `after`, the trivia
-/// after the clause's end; `after` goes first when a `//` comment among
-/// them would swallow it.
+/// after the clause's end, in that order: a directive among `after` must
+/// not change sides with a comment.
 fn with_after(trailing: &[String], after: &[String]) -> Vec<String> {
-    if trailing.iter().any(|c| c.starts_with("//")) {
-        after.iter().chain(trailing).cloned().collect()
-    } else {
-        trailing.iter().chain(after).cloned().collect()
-    }
+    trailing.iter().chain(after).cloned().collect()
+}
+
+/// Whether the item ending a clause has a `//` comment with trivia after
+/// the clause: the `;` then starts a line, followed by `after`, so each
+/// keeps its side of the other (as in `A // c` + newline + `; {$I d.inc}`).
+fn ends_in_line_comment(trailing: &[String], after: &[String]) -> bool {
+    !after.is_empty() && trailing.iter().any(|c| c.starts_with("//"))
 }
 
 /// Emit a unit line, its leading comments on their own lines above it.
@@ -1805,119 +1747,6 @@ mod tests {
     // ─── Task 7: format_uses_items() ─────────────────────────────────────────
 
     #[test]
-    fn format_items_ifdef_block_left_last_moves_before_last_unit() {
-        // SysUtils, {$IFDEF FOO} SpecialUnit {$ELSE} OtherUnit {$ENDIF}, Classes
-        // After sort (no grouping here): Classes, SysUtils
-        let config = UsesConfig {
-            sort: true,
-            group: false,
-            ..UsesConfig::default()
-        };
-
-        let block = IfDefBlock {
-            if_branch: CondBranch {
-                directive: "{$IFDEF FOO}".to_string(),
-                items: vec![UsesItem::unit("SpecialUnit")],
-                ..CondBranch::default()
-            },
-            else_if_branches: Vec::new(),
-            else_branch: Some(vec![UsesItem::unit("OtherUnit")]),
-            else_directive: "{$ELSE}".to_string(),
-            endif: "{$ENDIF}".to_string(),
-            ..IfDefBlock::default()
-        };
-
-        let items = vec![
-            UsesItem::unit("SysUtils"),
-            UsesItem::IfDefBlock(block),
-            UsesItem::unit("Classes"),
-        ];
-
-        let output = format_uses_items(&items, &config, "  ", &HashSet::new());
-        // The block would follow its anchor SysUtils and end the clause,
-        // leaving `SpecialUnit,` dangling; it moves in front of SysUtils.
-        assert_eq!(
-            output,
-            "  Classes,\n  {$IFDEF FOO}\n  SpecialUnit,\n  {$ELSE}\n  OtherUnit,\n  {$ENDIF}\n  SysUtils;\n"
-        );
-    }
-
-    #[test]
-    fn format_items_block_left_last_leaves_its_empty_section() {
-        // A Project-only block forms a section of its own after the Core units.
-        let mut config = default_config();
-        config.sort = true;
-        let block = IfDefBlock {
-            if_branch: CondBranch {
-                directive: "{$IFDEF X}".to_string(),
-                items: vec![UsesItem::unit("MyApp.Extra")],
-                ..CondBranch::default()
-            },
-            endif: "{$ENDIF}".to_string(),
-            ..IfDefBlock::default()
-        };
-        let items = vec![
-            UsesItem::unit("SysUtils"),
-            UsesItem::IfDefBlock(block),
-            UsesItem::unit("Classes"),
-        ];
-        let output = format_uses_items(&items, &config, "  ", &HashSet::new());
-        assert_eq!(
-            output,
-            "  Classes,\n  {$IFDEF X}\n  MyApp.Extra,\n  {$ENDIF}\n  SysUtils;\n"
-        );
-    }
-
-    #[test]
-    fn format_items_directive_at_start_stays_first() {
-        // Directive with anchor=None should stay at the very beginning.
-        let config = UsesConfig {
-            sort: true,
-            group: false,
-            ..UsesConfig::default()
-        };
-
-        let items = vec![
-            UsesItem::directive("{$HINTS OFF}"),
-            UsesItem::unit("SysUtils"),
-            UsesItem::unit("Classes"),
-        ];
-
-        let output = format_uses_items(&items, &config, "  ", &HashSet::new());
-        // Directive should be first
-        assert!(
-            output.starts_with("  {$HINTS OFF}\n"),
-            "directive should be first: {output:?}"
-        );
-        // Classes sorts before SysUtils
-        let classes_pos = output.find("  Classes,\n").unwrap();
-        let sysutils_pos = output.find("  SysUtils;\n").unwrap();
-        assert!(classes_pos < sysutils_pos);
-    }
-
-    #[test]
-    fn format_items_directive_between_units_follows_anchor() {
-        // SysUtils, {$HINTS OFF}, Classes
-        // After sort: Classes, SysUtils
-        // Directive anchor = SysUtils → inserted after SysUtils
-        let config = UsesConfig {
-            sort: true,
-            group: false,
-            ..UsesConfig::default()
-        };
-
-        let items = vec![
-            UsesItem::unit("SysUtils"),
-            UsesItem::directive("{$HINTS OFF}"),
-            UsesItem::unit("Classes"),
-        ];
-
-        let output = format_uses_items(&items, &config, "  ", &HashSet::new());
-        // The directive now ends the clause, so the `;` follows it.
-        assert_eq!(output, "  Classes,\n  SysUtils\n  {$HINTS OFF};\n");
-    }
-
-    #[test]
     fn format_items_with_an_include_keep_their_order() {
         // What the include lists is unknown, so nothing is sorted around it.
         let items = vec![
@@ -1938,28 +1767,6 @@ mod tests {
     }
 
     #[test]
-    fn include_directives_are_recognised() {
-        for text in [
-            "{$I a.inc}",
-            "{$i 'b c.inc'}",
-            "{$INCLUDE a.inc}",
-            "(*$I a.inc*)",
-        ] {
-            assert!(is_include_directive(text), "{text}");
-        }
-        for text in [
-            "{$I+}",
-            "{$I-}",
-            "{$IFDEF X}",
-            "{$HINTS OFF}",
-            "{$R *.res}",
-            "(*$I+*)",
-        ] {
-            assert!(!is_include_directive(text), "{text}");
-        }
-    }
-
-    #[test]
     fn format_items_multiple_directives_at_start_preserve_order() {
         let items = vec![
             UsesItem::directive("{$I a.inc}"),
@@ -1977,46 +1784,6 @@ mod tests {
     }
 
     // ─── Section-placement for IfDef blocks ───────────────────────────────
-
-    #[test]
-    fn ifdef_all_core_placed_in_core_section() {
-        // All units in the ifdef are Core → block goes to Core section,
-        // not pinned to the anchor (which is a Project unit).
-        let mut config = default_config();
-        config.sort = true;
-
-        let block = IfDefBlock {
-            if_branch: CondBranch {
-                directive: "{$IFDEF DELPHI_XE6_UP}".to_string(),
-                items: vec![
-                    UsesItem::unit("ibx.IBDatabase"),
-                    UsesItem::unit("ibx.IBSQL"),
-                ],
-                ..CondBranch::default()
-            },
-            else_if_branches: Vec::new(),
-            else_branch: Some(vec![UsesItem::unit("IBDatabase"), UsesItem::unit("IBSQL")]),
-            endif: "{$ENDIF}".to_string(),
-            ..IfDefBlock::default()
-        };
-
-        let items = vec![
-            UsesItem::unit("MDIBDatabase"),
-            UsesItem::IfDefBlock(block),
-            UsesItem::unit("Utils"),
-            UsesItem::unit("ibxUtils"),
-        ];
-
-        let output = format_uses_items(&items, &config, "  ", &HashSet::new());
-        // The ifdef block should be in the Core section (before the group separator),
-        // not pinned after MDIBDatabase in the Project section.
-        let endif_pos = output.find("{$ENDIF}").expect("ENDIF missing");
-        let group_sep = output.find("\n\n").expect("group separator missing");
-        assert!(
-            endif_pos < group_sep,
-            "ifdef block should be in Core section (before separator):\n{output}"
-        );
-    }
 
     #[test]
     fn ifdef_mixed_sections_stays_pinned() {
@@ -2051,78 +1818,6 @@ mod tests {
         assert!(
             main_pos < ifdef_pos,
             "ifdef should follow its anchor MyApp.Main:\n{output}"
-        );
-    }
-
-    #[test]
-    fn ifdef_creates_section_when_only_block_units() {
-        // No plain Core units, but the ifdef block is all-Core.
-        // A Core section should be created for it.
-        let mut config = default_config();
-        config.sort = true;
-
-        let block = IfDefBlock {
-            if_branch: CondBranch {
-                directive: "{$IFDEF XE6}".to_string(),
-                items: vec![UsesItem::unit("ibx.IBDatabase")],
-                ..CondBranch::default()
-            },
-            else_if_branches: Vec::new(),
-            else_branch: Some(vec![UsesItem::unit("IBDatabase")]),
-            endif: "{$ENDIF}".to_string(),
-            ..IfDefBlock::default()
-        };
-
-        let items = vec![UsesItem::unit("MyApp.Main"), UsesItem::IfDefBlock(block)];
-
-        let output = format_uses_items(&items, &config, "  ", &HashSet::new());
-        // Core section (ifdef block) should come before Project section (MyApp.Main).
-        let ifdef_pos = output.find("{$IFDEF XE6}").expect("IFDEF missing");
-        let main_pos = output.find("MyApp.Main").expect("MyApp.Main missing");
-        assert!(
-            ifdef_pos < main_pos,
-            "ifdef Core section should precede Project section:\n{output}"
-        );
-    }
-
-    #[test]
-    fn ifdef_no_section_placement_without_grouping() {
-        // Grouping disabled → ifdef block stays pinned (no section placement).
-        let config = UsesConfig {
-            sort: true,
-            group: false,
-            ..UsesConfig::default()
-        };
-
-        let block = IfDefBlock {
-            if_branch: CondBranch {
-                directive: "{$IFDEF FOO}".to_string(),
-                items: vec![UsesItem::unit("System.SysUtils")],
-                ..CondBranch::default()
-            },
-            else_if_branches: Vec::new(),
-            else_branch: Some(vec![UsesItem::unit("Classes")]),
-            endif: "{$ENDIF}".to_string(),
-            ..IfDefBlock::default()
-        };
-
-        let items = vec![
-            UsesItem::unit("Zebra"),
-            UsesItem::IfDefBlock(block),
-            UsesItem::unit("Alpha"),
-            // Keeps a unit after the block (a block is never left last).
-            UsesItem::unit("Zulu"),
-        ];
-
-        let output = format_uses_items(&items, &config, "  ", &HashSet::new());
-        // Without grouping: Alpha sorts first, Zebra second, block pinned after Zebra.
-        let alpha_pos = output.find("Alpha").expect("Alpha missing");
-        let zebra_pos = output.find("Zebra").expect("Zebra missing");
-        let ifdef_pos = output.find("{$IFDEF FOO}").expect("IFDEF missing");
-        assert!(alpha_pos < zebra_pos, "Alpha before Zebra");
-        assert!(
-            zebra_pos < ifdef_pos,
-            "ifdef follows anchor Zebra:\n{output}"
         );
     }
 

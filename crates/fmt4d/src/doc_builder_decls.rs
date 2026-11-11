@@ -2,7 +2,7 @@
 //! procedure declarations and definitions, and comma-separated identifier decls.
 //! Extracted from doc_builder.rs during Phase F decomposition (review AH1 / BP-M5).
 
-use crate::content_check::ContentAllowance;
+use crate::content_check::{AllowanceEntry, ContentAllowance};
 use crate::doc::{self, Doc};
 use crate::doc_builder::{
     DocBuilder, ends_with_hardline, starts_with_hardline, strip_trailing_hardline,
@@ -57,7 +57,7 @@ impl<'a> DocBuilder<'a> {
             K::K_CLASS => {
                 pending_class_prefix = Some(child);
             }
-            K::K_VAR | K::K_CONST | K::K_TYPE => {
+            K::K_VAR | K::K_CONST | K::K_TYPE | K::K_THREADVAR | K::K_RESOURCESTRING => {
                 parts.push(Doc::Hardline);
                 if let Some(class_node) = pending_class_prefix.take() {
                     parts.push(self.doc_for_node(class_node));
@@ -86,8 +86,8 @@ impl<'a> DocBuilder<'a> {
 
             for child in &body_children {
                 let kind = child.kind();
-                let single_line = child.start_position().row == child.end_position().row;
-                let child_doc = self.doc_for_node(*child);
+                let (child_doc, several_lines) = self.doc_for_node_and_extent(*child);
+                let single_line = !several_lines;
                 let source_blank = !prev_child_kind.is_empty()
                     && prev_end_row.is_some_and(|prev_end| {
                         self.has_blank_line_between(prev_end, child.start_position().row)
@@ -128,7 +128,7 @@ impl<'a> DocBuilder<'a> {
 
                 if after_strict {
                     parts.push(Doc::Raw(" ".into()));
-                    parts.push(Doc::Raw(self.node_text(child)));
+                    parts.push(self.with_outer_trivia(child, Doc::Raw(self.node_text(child))));
                     parts.push(Doc::Hardline);
                     after_strict = false;
                 } else {
@@ -138,7 +138,7 @@ impl<'a> DocBuilder<'a> {
                         first = false;
                     } else {
                         parts.push(Doc::Raw(" ".into()));
-                        parts.push(Doc::Raw(self.node_text(child)));
+                        parts.push(self.with_outer_trivia(child, Doc::Raw(self.node_text(child))));
                     }
                     if is_strict {
                         after_strict = true;
@@ -217,7 +217,7 @@ impl<'a> DocBuilder<'a> {
         self.for_each_code_child(node, |child| match child.kind() {
             K::PP_IF => {
                 parts.push(Doc::Hardline);
-                parts.push(Doc::Raw(self.node_text(child)));
+                parts.push(self.pp_marker_doc(child, Doc::Raw));
             }
             K::K_STRICT => {
                 parts.push(Doc::Hardline);
@@ -228,7 +228,7 @@ impl<'a> DocBuilder<'a> {
             K::K_PUBLIC | K::K_PRIVATE | K::K_PROTECTED | K::K_PUBLISHED => {
                 if after_strict {
                     parts.push(Doc::Raw(" ".into()));
-                    parts.push(Doc::Raw(self.node_text(child)));
+                    parts.push(self.with_outer_trivia(child, Doc::Raw(self.node_text(child))));
                     after_strict = false;
                 } else {
                     parts.push(Doc::Hardline);
@@ -238,7 +238,7 @@ impl<'a> DocBuilder<'a> {
             }
             K::PP_END_IF => {
                 parts.push(Doc::Hardline);
-                parts.push(Doc::Raw(self.node_text(child)));
+                parts.push(self.pp_marker_doc(child, Doc::Raw));
             }
             _ => {
                 body_children.push(child);
@@ -322,6 +322,7 @@ impl<'a> DocBuilder<'a> {
                         | K::DECL_CONSTS
                         | K::DECL_TYPES
                         | K::BLOCK
+                        | K::ASM
                         | K::STATEMENTS
                         | K::DEF_PROC
                 )
@@ -399,8 +400,10 @@ impl<'a> DocBuilder<'a> {
             None => (&children[..], &[][..]),
         };
 
-        // ── DECL_VAR: always expand into separate declarations ──────
-        if node.kind() == K::DECL_VAR {
+        // ── DECL_VAR: expand into separate declarations ─────────────
+        // Not when the declaration holds a directive: a copy of its type
+        // or initializer would carry code out of the directive's reach.
+        if node.kind() == K::DECL_VAR && !self.holds_directive(node) {
             let idents: Vec<Node<'a>> = before_colon
                 .iter()
                 .copied()
@@ -532,11 +535,19 @@ impl<'a> DocBuilder<'a> {
     ) -> Doc {
         let commas = before_colon.iter().filter(|c| c.kind() == K::COMMA).count();
         let suffix = doc::text_of(bare_suffix);
+        let copies = count.saturating_sub(1);
+        let suffix_start = before_colon
+            .last()
+            .map_or(node.start_byte(), |n| n.end_byte());
         self.allow_content_change(
             node,
             ContentAllowance {
-                dropped: ",".repeat(commas),
-                added: suffix.repeat(count.saturating_sub(1)),
+                entries: vec![AllowanceEntry {
+                    at: node.start_byte(),
+                    dropped: ",".repeat(commas),
+                    added: suffix.repeat(copies),
+                    repeats: Some((suffix_start..node.end_byte(), copies)),
+                }],
             },
         )
     }

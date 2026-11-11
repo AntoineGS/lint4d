@@ -155,19 +155,28 @@ pub fn token(text: impl Into<String>, kind: &'static str, parent_kind: &'static 
 /// the rendered output, whatever its layout. Of an `IfBreak`, the broken
 /// branch.
 pub fn text_of(doc: &Doc) -> String {
-    fn collect(doc: &Doc, out: &mut String) {
+    text_joined(doc, ' ')
+}
+
+fn text_joined(doc: &Doc, separator: char) -> String {
+    fn collect(doc: &Doc, separator: char, out: &mut String) {
         match doc {
             Doc::Token { text, .. } | Doc::Raw(text) | Doc::LineStart(text) => {
-                out.push(' ');
+                out.push(separator);
                 out.push_str(text);
             }
             Doc::Concat(docs) | Doc::Fill(docs) | Doc::AlignGroup(docs) => {
-                docs.iter().for_each(|d| collect(d, out));
+                docs.iter().for_each(|d| collect(d, separator, out));
             }
-            Doc::Indent(inner) | Doc::Group(inner) => collect(inner, out),
-            Doc::IfBreak { broken, .. } => collect(broken, out),
-            Doc::FillRest(rest) => rest.as_slice().iter().for_each(|d| collect(d, out)),
-            Doc::AlignRow(cells) => cells.iter().for_each(|c| collect(&c.content, out)),
+            Doc::Indent(inner) | Doc::Group(inner) => collect(inner, separator, out),
+            Doc::IfBreak { broken, .. } => collect(broken, separator, out),
+            Doc::FillRest(rest) => rest
+                .as_slice()
+                .iter()
+                .for_each(|d| collect(d, separator, out)),
+            Doc::AlignRow(cells) => cells
+                .iter()
+                .for_each(|c| collect(&c.content, separator, out)),
             Doc::Hardline
             | Doc::BlankLine
             | Doc::Line
@@ -178,8 +187,58 @@ pub fn text_of(doc: &Doc) -> String {
         }
     }
     let mut out = String::new();
-    collect(doc, &mut out);
+    collect(doc, separator, &mut out);
     out
+}
+
+/// Whether `doc` always renders on more than one line: a forced line break
+/// between two of its texts, or text spanning lines (a multi-line comment or
+/// string). Breaks a group may or may not take do not count, so the answer
+/// does not depend on the line width; nor do breaks before its first text
+/// or after its last, or comments and directives laid out on their own
+/// lines.
+pub fn has_forced_break(doc: &Doc) -> bool {
+    /// Walks `doc` in order; `state` is 0 before any text, 1 after text,
+    /// 2 after text then a break. Returns true on text in state 2.
+    fn walk(doc: &Doc, state: &mut u8) -> bool {
+        match doc {
+            Doc::Hardline | Doc::BlankLine | Doc::LineStart(_) => {
+                if *state == 1 {
+                    *state = 2;
+                }
+                false
+            }
+            // A comment or directive on its own line (leading trivia) is not
+            // the declaration's own text.
+            Doc::Token { kind, .. }
+                if *kind == pascal_core::node_kind::COMMENT
+                    || *kind == pascal_core::node_kind::PP_DIRECTIVE =>
+            {
+                false
+            }
+            Doc::Token { text, .. } | Doc::Raw(text) => {
+                if text.trim().is_empty() {
+                    return false;
+                }
+                if *state == 2 || text.trim().contains('\n') {
+                    return true;
+                }
+                *state = if text.ends_with('\n') { 2 } else { 1 };
+                false
+            }
+            Doc::Concat(docs) | Doc::Fill(docs) | Doc::AlignGroup(docs) => {
+                docs.iter().any(|d| walk(d, state))
+            }
+            Doc::Indent(inner) | Doc::Group(inner) => walk(inner, state),
+            Doc::IfBreak { flat, .. } => walk(flat, state),
+            Doc::FillRest(rest) => rest.as_slice().iter().any(|d| walk(d, state)),
+            Doc::AlignRow(cells) => cells.iter().any(|c| walk(&c.content, state)),
+            Doc::Line | Doc::Softline | Doc::PreservedLine | Doc::ContentMark(_) | Doc::Empty => {
+                false
+            }
+        }
+    }
+    walk(doc, &mut 0)
 }
 
 /// The ids of every [`Doc::ContentMark`] in `doc`.

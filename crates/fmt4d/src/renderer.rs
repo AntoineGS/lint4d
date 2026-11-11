@@ -22,6 +22,31 @@ enum FitsResult {
     Continue,
 }
 
+/// Whether `text`, a token or raw piece of output, ends inside a `//`
+/// comment, i.e. its last line holds a `//` outside string literals and
+/// `{ }` / `(* *)` comments.
+fn ends_in_line_comment(text: &str) -> bool {
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        let skip = if rest.starts_with("//") {
+            match rest.find('\n') {
+                Some(end) => end + 1,
+                None => return true,
+            }
+        } else if let Some(body) = rest.strip_prefix("(*") {
+            body.find("*)").map_or(rest.len(), |end| end + 4)
+        } else if c == '{' {
+            rest.find('}').map_or(rest.len(), |end| end + 1)
+        } else if let Some(body) = rest.strip_prefix('\'') {
+            body.find('\'').map_or(rest.len(), |end| end + 2)
+        } else {
+            c.len_utf8()
+        };
+        rest = &rest[skip..];
+    }
+    false
+}
+
 /// Internal enum for merging alignment rows with non-row docs.
 enum MergedItem {
     Row(Vec<AlignCell>),
@@ -83,6 +108,9 @@ pub struct Renderer {
     last_token_parent_kind: &'static str,
     /// Output byte ranges of verbatim text spanning more than one line.
     protected_spans: Vec<Range<usize>>,
+    /// The current output line ends in a `//` comment: anything emitted
+    /// next on it would become part of the comment.
+    in_line_comment: bool,
 }
 
 impl Renderer {
@@ -96,6 +124,7 @@ impl Renderer {
             last_token_kind: "",
             last_token_parent_kind: "",
             protected_spans: Vec::new(),
+            in_line_comment: false,
         }
     }
 
@@ -145,6 +174,7 @@ impl Renderer {
                 }
 
                 Doc::Raw(text) => {
+                    let text = self.break_line_comment_before_raw(text, indent);
                     for ch in text.chars() {
                         if ch == '\n' {
                             self.current_column = 0;
@@ -577,6 +607,9 @@ impl Renderer {
         parent_kind: &'static str,
         indent: usize,
     ) {
+        if self.in_line_comment && !text.trim().is_empty() {
+            self.emit_newline();
+        }
         if self.at_line_start() {
             let indent_str = self.indent_string(indent);
             self.output.push_str(&indent_str);
@@ -601,12 +634,37 @@ impl Renderer {
         self.output.push_str(text);
         if text.contains('\n') {
             self.protected_spans.push(start..self.output.len());
+            self.in_line_comment = false;
         }
+        if ends_in_line_comment(text) {
+            self.in_line_comment = true;
+        }
+    }
+
+    /// When the current line ends in a `//` comment and raw `text` has
+    /// content, starts a new line at `indent` first, and returns `text`
+    /// without the whitespace that separated it from the comment.
+    fn break_line_comment_before_raw(&mut self, text: String, indent: usize) -> String {
+        if !self.in_line_comment || text.trim().is_empty() {
+            return text;
+        }
+        self.emit_newline();
+        let rest = text.trim_start_matches([' ', '\t']);
+        if let Some(next_line) = rest.strip_prefix('\n') {
+            return next_line.to_string();
+        }
+        let indent_str = self.indent_string(indent);
+        self.output.push_str(&indent_str);
+        self.current_column = indent_str.len();
+        self.last_token_kind = "";
+        self.last_token_parent_kind = "";
+        rest.to_string()
     }
 
     fn emit_newline(&mut self) {
         self.output.push('\n');
         self.current_column = 0;
+        self.in_line_comment = false;
     }
 
     fn indent_string(&self, level: usize) -> String {
@@ -965,6 +1023,28 @@ mod tests {
     use super::*;
     use crate::doc::*;
     use pascal_core::node_kind as K;
+
+    #[test]
+    fn line_comment_detection_skips_strings_and_block_comments() {
+        assert!(ends_in_line_comment("x // c"));
+        assert!(ends_in_line_comment("{a}\n// c"));
+        assert!(!ends_in_line_comment("// c\nx"));
+        assert!(!ends_in_line_comment("'http://x'"));
+        assert!(!ends_in_line_comment("{ // }"));
+        assert!(!ends_in_line_comment("(* // *)"));
+    }
+
+    #[test]
+    fn content_after_a_line_comment_starts_a_new_line() {
+        let doc = concat(vec![
+            token("A", K::IDENTIFIER, ""),
+            Doc::Raw(" // c".into()),
+            token("then", K::K_THEN, ""),
+            Doc::Raw(" B".into()),
+        ]);
+        let out = Renderer::new(&FmtConfig::default()).render(doc);
+        assert_eq!(out, "A // c\nthen B");
+    }
 
     fn default_renderer() -> Renderer {
         Renderer::new(&FmtConfig::default())

@@ -9,12 +9,17 @@
 pub const UNIT: &str = "unit";
 pub const PROGRAM: &str = "program";
 pub const LIBRARY: &str = "library";
+pub const PACKAGE: &str = "package";
+pub const DECL_REQUIRES: &str = "declRequires";
+pub const DECL_CONTAINS: &str = "declContains";
 pub const INTERFACE: &str = "interface";
 pub const IMPLEMENTATION: &str = "implementation";
 pub const INITIALIZATION: &str = "initialization";
 pub const FINALIZATION: &str = "finalization";
 pub const BLOCK: &str = "block";
 pub const STATEMENTS: &str = "statements";
+pub const ASM: &str = "asm";
+pub const ASM_BODY: &str = "asmBody";
 pub const COMMENT: &str = "comment";
 
 // ── Preprocessor nodes ─────────────────────────────────────────────
@@ -139,6 +144,11 @@ pub const K_GT: &str = "kGt";
 // Block / control-flow keywords
 pub const K_BEGIN: &str = "kBegin";
 pub const K_END: &str = "kEnd";
+pub const K_THREADVAR: &str = "kThreadvar";
+pub const K_RESOURCESTRING: &str = "kResourcestring";
+pub const K_END_DOT: &str = "kEndDot";
+pub const K_REQUIRES: &str = "kRequires";
+pub const K_CONTAINS: &str = "kContains";
 pub const K_TRY: &str = "kTry";
 pub const K_REPEAT: &str = "kRepeat";
 pub const K_ASM: &str = "kAsm";

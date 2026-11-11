@@ -78,6 +78,10 @@ impl DirectiveMap {
             map.attach(leaves, v.start_byte, v.end_byte, v.row, v.text.clone());
         }
 
+        // Virtual directives were attached after the real ones.
+        for attached in map.leading.values_mut().chain(map.trailing.values_mut()) {
+            attached.sort_by_key(|d| d.span.start);
+        }
         map.eof.sort_by_key(|d| d.span.start);
         map
     }

@@ -58,8 +58,13 @@ impl<'tree> TriviaIndex<'tree> {
 
         if is_extra {
             descend.leaves = false;
-        } else if collect.leaves && node.child_count() == 0 {
-            index.leaves.push(node);
+        } else if is_text_leaf(node) {
+            // Its builder emits its text, which holds the extras inside it
+            // (`'a' {$ELSE} 'b'` is one string literal).
+            if collect.leaves {
+                index.leaves.push(node);
+            }
+            return;
         }
 
         if !descend.comments && !descend.directives && !descend.leaves {
@@ -70,6 +75,12 @@ impl<'tree> TriviaIndex<'tree> {
             Self::collect(child, source, index, descend);
         }
     }
+}
+
+/// A code node without code children: a token, or a node whose only
+/// children are comments and directives inside its text.
+pub(crate) fn is_text_leaf(node: Node<'_>) -> bool {
+    !node.is_extra() && !node.children(&mut node.walk()).any(|c| !c.is_extra())
 }
 
 #[cfg(test)]

@@ -85,6 +85,12 @@ impl<'a> DocBuilder<'a> {
         }
 
         let groups = Self::split_children_at(b_inner, K::COMMA);
+        // The source commas carry the comments attached to them.
+        let commas: Vec<Node<'a>> = b_inner
+            .iter()
+            .copied()
+            .filter(|c| c.kind() == K::COMMA)
+            .collect();
         let group_docs: Vec<Doc> = groups
             .iter()
             .map(|g| {
@@ -96,7 +102,10 @@ impl<'a> DocBuilder<'a> {
         let mut inner_parts = Vec::new();
         for (i, gdoc) in group_docs.into_iter().enumerate() {
             if i > 0 {
-                inner_parts.push(doc::token(",", K::COMMA, ""));
+                inner_parts.push(match commas.get(i - 1) {
+                    Some(comma) => self.doc_for_node(*comma),
+                    None => doc::token(",", K::COMMA, ""),
+                });
                 inner_parts.push(Doc::Line);
             }
             inner_parts.push(gdoc);
@@ -288,18 +297,12 @@ impl<'a> DocBuilder<'a> {
     }
 
     pub(crate) fn build_expression_breaking(&self, node: Node<'a>) -> Doc {
-        let binary_node = if node.kind() == K::EXPR_BINARY {
-            node
-        } else {
-            let mut cursor = node.walk();
-            let found = node
-                .children(&mut cursor)
-                .find(|c| c.kind() == K::EXPR_BINARY);
-            match found {
-                Some(bin) => bin,
-                None => return self.build_children(node),
-            }
-        };
+        // Another node with an operator child (`-(B < C)`, an exprUnary)
+        // is laid out child by child; its binary operand breaks on its own.
+        if node.kind() != K::EXPR_BINARY {
+            return self.build_children(node);
+        }
+        let binary_node = node;
 
         let segments = flatten_binary_chain(binary_node, None);
         if segments.len() <= 1 {

@@ -422,3 +422,17 @@ end.
 ",
     );
 }
+
+/// A DOS end-of-file mark (Ctrl-Z) after `end.` is blank to the compiler
+/// but was dropped; it is kept at the end of the output.
+#[test]
+fn end_of_file_mark_is_kept() {
+    assert_formats_to(
+        "unit T;\ninterface\nimplementation\nend.\n\u{1a}",
+        "unit T;\n\ninterface\n\nimplementation\n\nend.\n\u{1a}",
+    );
+    assert_formats_to(
+        "unit T;\ninterface\nimplementation\nend.\u{1a}\n",
+        "unit T;\n\ninterface\n\nimplementation\n\nend.\n\u{1a}",
+    );
+}

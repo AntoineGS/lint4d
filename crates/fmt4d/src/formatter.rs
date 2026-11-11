@@ -90,6 +90,14 @@ pub fn format_source(
         final_output.insert(0, '\u{FEFF}');
     }
 
+    // A DOS end-of-file mark (Ctrl-Z) ending the source is blank to the
+    // parser, so no doc emits it.
+    if source.trim_ascii_end().ends_with(&[0x1A])
+        && !final_output.trim_end().ends_with('\u{1A}')
+    {
+        final_output.push('\u{1A}');
+    }
+
     verify_output(source, &final_output, info, &allowance)?;
 
     Ok(final_output)

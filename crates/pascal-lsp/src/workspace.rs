@@ -449,6 +449,15 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+/// Tests compare a lazy walk with the eager one (l4d-fpyu).
+fn eager_imports_for_test() -> bool {
+    #[cfg(test)]
+    if TEST_EAGER_SNAPSHOT_IMPORTS.with(std::cell::Cell::get) {
+        return true;
+    }
+    false
+}
+
 fn navigation_walk_byte_limit() -> usize {
     #[cfg(test)]
     if let Some(limit) = TEST_NAVIGATION_WALK_BYTES.with(std::cell::Cell::get) {
@@ -3331,6 +3340,9 @@ pub struct Workspace {
     /// that load takes it, parses only the imports its demand needs and
     /// returns it, with whether it left a unit unparsed.
     lazy_import_load: Option<LazyImportLoad>,
+    /// The files lazy loads proved absent, for a snapshot's freshness
+    /// baseline (its loader keeps no analysis records; l4d-fpyu).
+    lazy_absences: Vec<LazyAbsence>,
     /// Set when the crawl met a context built from unsaved project input:
     /// it publishes nothing, and the warmer interleaves extraction.
     crawl_private: Arc<AtomicBool>,
@@ -3501,6 +3513,15 @@ pub(super) struct ImportWalkOutcome {
     pub(super) loaded: Vec<Url>,
     /// Documents whose imports failed to load and were skipped, with why.
     pub(super) failed: Vec<(Url, String)>,
+}
+
+/// A file a lazy load's absence proof read: a skipped unit or an include it
+/// followed, with the stamp taken before the read and, for an include, the
+/// hash of the bytes read.
+pub(super) struct LazyAbsence {
+    pub(super) path: PathBuf,
+    pub(super) stamp: Option<PathStamp>,
+    pub(super) include_hash: Option<u64>,
 }
 
 /// What a lazy load does with one resolved import (l4d-ucux).
@@ -7669,7 +7690,7 @@ impl Workspace {
             pinned,
             cancel,
             ImportWalk {
-                lazy: self.best_effort_navigation,
+                lazy: self.best_effort_navigation && !eager_imports_for_test(),
                 widen: true,
                 skip_failed_dependencies: self.best_effort_navigation,
                 settle: false,
@@ -7706,6 +7727,11 @@ impl Workspace {
     /// `walk.widen`, after loading lazily loaded documents whole; otherwise
     /// it stops there. Returns whether `probe` answered, whether the walk
     /// limits stopped it, and the dependencies it loaded.
+    /// The absences lazy loads proved since the last call.
+    pub(super) fn take_lazy_absences(&mut self) -> Vec<LazyAbsence> {
+        std::mem::take(&mut self.lazy_absences)
+    }
+
     pub(super) fn walk_imports_with_probe(
         &mut self,
         uri: &Url,
@@ -8518,6 +8544,24 @@ impl Workspace {
                     resolved_urls.insert(dependency.source.id.clone(), dependency_uri.clone());
                     resolved_revisions
                         .insert(dependency_uri.clone(), dependency.source.revision.clone());
+                    if let LazyImport::Absent(includes) = &lazy_import {
+                        if let pascal_core::SourceRevision::Disk { stamp, .. } =
+                            &dependency.source.revision
+                        {
+                            self.lazy_absences.push(LazyAbsence {
+                                path: dependency.source.path.clone(),
+                                stamp: Some(path_stamp_from_project_read(stamp)),
+                                include_hash: None,
+                            });
+                        }
+                        for (path, stamp, hash) in includes {
+                            self.lazy_absences.push(LazyAbsence {
+                                path: path.clone(),
+                                stamp: stamp.clone(),
+                                include_hash: Some(*hash),
+                            });
+                        }
+                    }
                     if let LazyImport::Absent(includes) = lazy_import {
                         // The answer relies on its bytes and its includes.
                         self.record_resolved_source(

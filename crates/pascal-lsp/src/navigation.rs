@@ -717,6 +717,18 @@ impl BindingDemand {
     }
 }
 
+/// Helper selections nested in one another on this thread (review F1).
+const MAX_HELPER_SELECTION_DEPTH: usize = 8;
+
+/// Type-reference resolutions nested in one another on this thread (F1).
+const MAX_TYPE_REF_NESTING: usize = 32;
+
+thread_local! {
+    static TYPE_REF_NESTING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static HELPER_SELECTIONS: std::cell::RefCell<Vec<(Url, usize, Url, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Distinct relaxed binding decisions retained for one answer.
 const MAX_RELAXED_BINDINGS: usize = 8;
 
@@ -7725,6 +7737,9 @@ impl NavigationIndex {
                 WithLookup::NotFound => {}
             }
         }
+        if key == "result" && document.implicit_result_at(offset, scope) {
+            return Ok(Vec::new());
+        }
         let owner_type =
             document.owner_type_at_identifier_with_budget(identifier, scope, cancel, budget)?;
 
@@ -7844,15 +7859,6 @@ impl NavigationIndex {
             }
         }
 
-        // A function's implicit `Result` shadows every unit-level and
-        // imported name (l4d-fpyu): none of them is its binding.
-        if key == "result"
-            && document
-                .result_type_annotation_for_body_scope(scope)
-                .is_some()
-        {
-            return Ok(Vec::new());
-        }
         let region = document.region_at(offset);
         let Some(root_indices) = document
             .symbol_indices_by_scope_key
@@ -9351,6 +9357,9 @@ impl NavigationIndex {
             WithLookup::Unknown => return Vec::new(),
             WithLookup::NotFound => {}
         }
+        if key == "result" && document.implicit_result_at(offset, scope) {
+            return Vec::new();
+        }
 
         // Search lexical scopes from the innermost outward. A local symbol
         // shadows both the unit's declarations and imported declarations.
@@ -9440,15 +9449,6 @@ impl NavigationIndex {
         }
 
         let region = document.region_at(offset);
-        // A function's implicit `Result` shadows every unit-level and
-        // imported name (l4d-fpyu).
-        if key == "result"
-            && document
-                .result_type_annotation_for_body_scope(scope)
-                .is_some()
-        {
-            return Vec::new();
-        }
         let current = document
             .symbol_indices_by_scope_key
             .get(&(ROOT_SCOPE, key.clone()))
@@ -10558,6 +10558,26 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Receiver>, String> {
+        // Each entry here restarts the type-ref depth at 0, so a cycle back
+        // through it (a member lookup resolving a type reference resolving a
+        // member lookup ...) is bounded by its nesting on this thread
+        // instead (l4d-fpyu review F1).
+        let nested = TYPE_REF_NESTING.with(|nesting| {
+            let depth = nesting.get();
+            nesting.set(depth + 1);
+            depth
+        });
+        struct Leave;
+        impl Drop for Leave {
+            fn drop(&mut self) {
+                TYPE_REF_NESTING.with(|nesting| nesting.set(nesting.get().saturating_sub(1)));
+            }
+        }
+        let _leave = Leave;
+        if nested >= MAX_TYPE_REF_NESTING {
+            state.mark_receiver_uncertain();
+            return Ok(Vec::new());
+        }
         self.type_receivers_for_type_ref_with_budget_at_depth(
             current_uri,
             current_document,
@@ -12179,6 +12199,12 @@ impl NavigationIndex {
         Ok(result)
     }
 
+    /// Helper selection re-enters itself when matching a helper's target
+    /// resolves a type reference that selects helpers again (a method's
+    /// parent type looked up as a member of its owner). Each such turn starts
+    /// a fresh resolution state, so depth limits do not see it: a selection
+    /// already in progress for the same target and position, or one nested
+    /// past `MAX_HELPER_SELECTION_DEPTH`, is `Unknown` (l4d-fpyu review F1).
     fn active_helper_for_type_with_budget(
         &self,
         current_uri: &Url,
@@ -12191,7 +12217,51 @@ impl NavigationIndex {
         if !matches!(target.kind, TypeKind::Class | TypeKind::Record) {
             return Ok(HelperSelection::None);
         }
+        let key = (
+            current_uri.clone(),
+            offset,
+            target.uri.clone(),
+            target.key.clone(),
+        );
+        let entered = HELPER_SELECTIONS.with(|active| {
+            let mut active = active.borrow_mut();
+            if active.len() >= MAX_HELPER_SELECTION_DEPTH || active.contains(&key) {
+                return false;
+            }
+            active.push(key);
+            true
+        });
+        if !entered {
+            return Ok(HelperSelection::Unknown);
+        }
+        struct Leave;
+        impl Drop for Leave {
+            fn drop(&mut self) {
+                HELPER_SELECTIONS.with(|active| {
+                    active.borrow_mut().pop();
+                });
+            }
+        }
+        let _leave = Leave;
+        self.active_helper_for_type_with_budget_entered(
+            current_uri,
+            current_document,
+            offset,
+            target,
+            cancel,
+            budget,
+        )
+    }
 
+    fn active_helper_for_type_with_budget_entered(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        target: &TypeInstance,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<HelperSelection, String> {
         let region = current_document.region_at(offset);
         let active_uses = current_document.active_uses_with_budget(region, cancel, budget)?;
         let mut visible = Vec::new();
@@ -17616,6 +17686,26 @@ impl Document {
                     .iter()
                     .any(|span| span.contains_offset(offset))
         })
+    }
+
+    /// Whether an unqualified `Result` at `offset` (in `scope`) is the
+    /// implicit result of an enclosing function: under `{$X+}` known in
+    /// effect there, the implicit `Result` shadows the function's class
+    /// members and every unit-level and imported name, below `with` (dcc
+    /// 37.0, l4d-fpyu review F4: R1-R10). With `{$X}` off or unknown no such
+    /// claim is made.
+    fn implicit_result_at(&self, offset: usize, scope: usize) -> bool {
+        if self.result_type_annotation_for_body_scope(scope).is_none() {
+            return false;
+        }
+        let initial = self
+            .conditional_context
+            .options
+            .get("X")
+            .copied()
+            .unwrap_or(conditional::Truth::Unknown);
+        conditional::ExtendedSyntax::new(initial, &self.conditionals.directives).at(offset)
+            == conditional::Truth::True
     }
 
     fn result_type_annotation_for_body_scope(&self, scope: usize) -> Option<ResultTypeAnnotation> {

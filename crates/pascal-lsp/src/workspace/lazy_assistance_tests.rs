@@ -399,7 +399,7 @@ fn a_call_hover_in_a_function_parses_no_unit_for_its_result() {
         &[
             (
                 "Main.pas",
-                "unit Main;\ninterface\nuses Info;\ntype TEnv = class(TInterfacedObject)\n  function Get: IInfo;\nend;\nimplementation\nuses StrU, SysU, Noise;\nfunction TEnv.Get: IInfo;\nbegin\n  if EndsStr('X', Uppercase(result.Name)) then;\nend;\nend.\n",
+                "unit Main;\n{$X+}\ninterface\nuses Info;\ntype TEnv = class(TInterfacedObject)\n  function Get: IInfo;\nend;\nimplementation\nuses StrU, SysU, Noise;\nfunction TEnv.Get: IInfo;\nbegin\n  if EndsStr('X', Uppercase(result.Name)) then;\nend;\nend.\n",
             ),
             (
                 "Info.pas",
@@ -420,10 +420,10 @@ fn a_call_hover_in_a_function_parses_no_unit_for_its_result() {
         ],
     );
     let expected = eagerly(root, "Main.pas", |warmed| {
-        hover_in(warmed, root, "Main.pas", Position::new(10, 6))
+        hover_in(warmed, root, "Main.pas", Position::new(11, 6))
     });
 
-    let (answer, indexed) = indexed_while(|| hover(root, "Main.pas", Position::new(10, 6)));
+    let (answer, indexed) = indexed_while(|| hover(root, "Main.pas", Position::new(11, 6)));
 
     assert!(answer.is_some(), "EndsStr hovers");
     assert_eq!(answer, expected);
@@ -431,4 +431,209 @@ fn a_call_hover_in_a_function_parses_no_unit_for_its_result() {
         !indexed.iter().any(|name| name == "Noise.pas"),
         "{indexed:?}"
     );
+}
+
+/// Review F1: completion inside a method of a class whose ancestor has a
+/// helper in an import. Resolving `TMy`'s parent type `TDep` as a member of
+/// `TMy` selected `TMy`'s helpers again, each turn at a fresh depth: only
+/// the work budget stopped it, past a small thread stack. Runs on 1 MiB.
+#[test]
+fn helper_selection_through_a_methods_parent_type_is_bounded_on_a_small_stack() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().to_path_buf();
+    write_sources(
+        &root,
+        &[
+            (
+                "Main.pas",
+                "unit Main;\ninterface\nuses Dep, Helps;\ntype TMy = class(TDep)\n  procedure Run;\nend;\nimplementation\nprocedure TMy.Run;\nbegin\n  Ba\nend;\nend.\n",
+            ),
+            (
+                "Dep.pas",
+                "unit Dep;\ninterface\nuses Base;\ntype TDep = class(TBase)\n  procedure Own;\nend;\nimplementation\nprocedure TDep.Own; begin end;\nend.\n",
+            ),
+            (
+                "Base.pas",
+                "unit Base;\ninterface\ntype TBase = class\n  procedure BaseOwn;\nend;\nimplementation\nprocedure TBase.BaseOwn; begin end;\nend.\n",
+            ),
+            (
+                "Helps.pas",
+                "unit Helps;\ninterface\nuses Base;\ntype TBaseHelps = class helper for TBase\n  procedure BaseExtra;\nend;\nimplementation\nprocedure TBaseHelps.BaseExtra; begin end;\nend.\n",
+            ),
+        ],
+    );
+    let lazy_root = root.clone();
+    let lazy = std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(move || completion(&lazy_root, "Main.pas", Position::new(9, 4)))
+        .expect("thread")
+        .join()
+        .expect("completion returns");
+    let expected = eagerly(&root, "Main.pas", |warmed| {
+        completion_in(warmed, &root, "Main.pas", Position::new(9, 4))
+    });
+    assert_eq!(lazy, expected);
+}
+
+/// Review F2: resolving an item rebuilds the completion's snapshot and
+/// requires every record of the completion in it (equal per
+/// `completion_observations_equal`). A rebuild that renders more may parse
+/// an import the listing proved absent: the proof's records of the unit and
+/// of its include must then equal those the parse records. `Other` (with an
+/// include) is proven absent by the lazy completion and parsed by the eager
+/// one over the same input.
+#[test]
+fn an_absence_proofs_records_equal_those_of_a_parse() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    write_sources(
+        root,
+        &[
+            (
+                "Main.pas",
+                "unit Main;\ninterface\nuses Other, Dep;\nimplementation\nprocedure Run;\nvar X: TDep;\nbegin\n  X.\nend;\nend.\n",
+            ),
+            (
+                "Dep.pas",
+                "unit Dep;\ninterface\ntype TDep = class\n  procedure Use;\nend;\nimplementation\nprocedure TDep.Use; begin end;\nend.\n",
+            ),
+            (
+                "Other.pas",
+                "unit Other;\ninterface\n{$I Other.inc}\ntype TOther = class end;\nimplementation\nend.\n",
+            ),
+            ("Other.inc", "const OtherValue = 1;\n"),
+        ],
+    );
+    let records = |eager: bool| {
+        TEST_EAGER_SNAPSHOT_IMPORTS.with(|flag| flag.set(eager));
+        let workspace = workspace(root);
+        let (computed, indexed) = indexed_while(|| {
+            super::queries::completion_from_input_with_options(
+                workspace.analysis_input(),
+                &uri(&root.join("Main.pas")),
+                Position::new(7, 4),
+                CompletionOptions {
+                    format: MarkupKind::Markdown,
+                    defer_documentation: true,
+                    defer_detail: true,
+                    snippet_support: false,
+                },
+                &AtomicBool::new(false),
+            )
+        });
+        TEST_EAGER_SNAPSHOT_IMPORTS.with(|flag| flag.set(false));
+        assert_eq!(
+            indexed.iter().any(|name| name == "Other.pas"),
+            eager,
+            "{indexed:?}"
+        );
+        computed.records
+    };
+    let proven = records(false);
+    let parsed = records(true);
+
+    let of_other = |record: &&super::rename::SourceRecord| {
+        record
+            .uri
+            .path()
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name.starts_with("Other."))
+    };
+    let proof = proven.iter().filter(of_other).collect::<Vec<_>>();
+    assert!(
+        proof
+            .iter()
+            .any(|record| record.uri.path().ends_with("Other.inc")),
+        "the proof records the include: {proof:?}"
+    );
+    for record in proof {
+        assert!(
+            parsed
+                .iter()
+                .any(|other| super::queries::completion_observations_equal(record, other)),
+            "{record:?} has no equal record in the parse's: {:?}",
+            parsed.iter().filter(of_other).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// Review F2: an item of a lazy completion resolves; its rebuild walks with
+/// a probe rendering everything and holds every record of the completion,
+/// absence proofs included (`Other` through its include).
+#[test]
+fn completion_resolve_after_a_lazy_completion_resolves() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    write_sources(
+        root,
+        &[
+            (
+                "Main.pas",
+                "unit Main;\ninterface\nuses Other, Dep;\nimplementation\nprocedure Run;\nvar X: TDep;\nbegin\n  X.\nend;\nend.\n",
+            ),
+            (
+                "Dep.pas",
+                "unit Dep;\ninterface\nuses Other, Base;\ntype TDep = class(TBase)\n  /// Uses an other.\n  procedure Use(A: TOther);\nend;\nimplementation\nprocedure TDep.Use(A: TOther); begin end;\nend.\n",
+            ),
+            (
+                "Base.pas",
+                "unit Base;\ninterface\ntype TBase = class\n  procedure BaseOwn;\nend;\nimplementation\nprocedure TBase.BaseOwn; begin end;\nend.\n",
+            ),
+            (
+                "Other.pas",
+                "unit Other;\ninterface\n{$I Other.inc}\ntype TOther = class end;\nimplementation\nend.\n",
+            ),
+            ("Other.inc", "const OtherValue = 1;\n"),
+        ],
+    );
+    let workspace = workspace(root);
+    let input = workspace.analysis_input();
+    let main = uri(&root.join("Main.pas"));
+    let position = Position::new(7, 4);
+    let cancel = AtomicBool::new(false);
+    let (completion, listed) = indexed_while(|| {
+        super::queries::completion_from_input_with_options(
+            input.clone(),
+            &main,
+            position,
+            CompletionOptions {
+                format: MarkupKind::Markdown,
+                defer_documentation: true,
+                defer_detail: true,
+                snippet_support: false,
+            },
+            &cancel,
+        )
+    });
+    assert!(!listed.iter().any(|name| name == "Other.pas"), "{listed:?}");
+    let result = completion.value.as_ref().expect("completion answers");
+    let index = result
+        .list
+        .items
+        .iter()
+        .position(|item| item.label == "Use")
+        .unwrap_or_else(|| panic!("Use is listed: {:?}", result.list.items));
+    let seed = &result.seeds[index];
+
+    let metadata = super::queries::completion_metadata_from_input(
+        input.clone(),
+        &main,
+        position,
+        input.source_generation,
+        input.configuration_generation,
+        seed.candidate_uri(),
+        seed.candidate_index(),
+        MarkupKind::Markdown,
+        true,
+        true,
+        false,
+        &completion.records,
+        &result.demanded,
+        &cancel,
+    )
+    .value
+    .unwrap_or_else(|error| panic!("Use resolves: {error}"));
+
+    assert!(metadata.documentation.is_some(), "{metadata:?}");
 }

@@ -3927,6 +3927,87 @@ impl ScopedEnums {
     }
 }
 
+/// The `{$X}` (`{$EXTENDEDSYNTAX}`) value a switch directive sets, if it
+/// names it: `X+`/`X-`, also among comma-separated short switches, or
+/// `EXTENDEDSYNTAX ON`/`OFF`. Another spelling naming it is `Unknown`.
+pub fn extended_syntax_switch(body: &str) -> Option<Truth> {
+    let mut found = None;
+    for part in body.split(',') {
+        let part = part.trim();
+        if part.eq_ignore_ascii_case("x+") {
+            found = Some(Truth::True);
+        } else if part.eq_ignore_ascii_case("x-") {
+            found = Some(Truth::False);
+        } else if part.eq_ignore_ascii_case("x") {
+            found = Some(Truth::Unknown);
+        } else if part
+            .get(..14)
+            .is_some_and(|keyword| keyword.eq_ignore_ascii_case("extendedsyntax"))
+        {
+            let value = part[14..].trim();
+            found = Some(if value.eq_ignore_ascii_case("on") {
+                Truth::True
+            } else if value.eq_ignore_ascii_case("off") {
+                Truth::False
+            } else {
+                Truth::Unknown
+            });
+        }
+    }
+    found
+}
+
+/// Whether `{$X+}` (extended syntax: a function's implicit `Result`) is in
+/// effect at each offset of a source, from the project's default and the
+/// source's directives in order (l4d-fpyu review F4). As for
+/// `ScopedEnums`, a change under unknown activity, an include (its text is
+/// unknown here) and an options restore (`POPOPT`, `POP`) make it unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtendedSyntax {
+    initial: Truth,
+    changes: Vec<(usize, Truth)>,
+}
+
+impl ExtendedSyntax {
+    pub fn new(initial: Truth, directives: &[ConditionalDirective]) -> Self {
+        let mut state = initial;
+        let mut changes = Vec::new();
+        for directive in directives {
+            if directive.activity == Truth::False {
+                continue;
+            }
+            let next = if directive.kind == DirectiveKind::Include {
+                Truth::Unknown
+            } else if let Some(value) = extended_syntax_switch(&directive.body) {
+                if directive.activity == Truth::True || value == state {
+                    value
+                } else {
+                    Truth::Unknown
+                }
+            } else if directive_keyword(&directive.body).is_some_and(|keyword| {
+                keyword.eq_ignore_ascii_case("popopt") || keyword.eq_ignore_ascii_case("pop")
+            }) {
+                Truth::Unknown
+            } else {
+                continue;
+            };
+            if next != state {
+                state = next;
+                changes.push((directive.end, state));
+            }
+        }
+        Self { initial, changes }
+    }
+
+    /// The state in effect at `offset`.
+    pub fn at(&self, offset: usize) -> Truth {
+        let index = self.changes.partition_point(|(start, _)| *start <= offset);
+        index
+            .checked_sub(1)
+            .map_or(self.initial, |index| self.changes[index].1)
+    }
+}
+
 fn evaluate_condition(
     body: &str,
     environment: &ConditionalEnvironment,

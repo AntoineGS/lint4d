@@ -7631,6 +7631,36 @@ fn build_snapshot_with_policy(
                         },
                         &mut |workspace| probe.answers(&workspace.index, &uri, cancel),
                     )?;
+                    // What proved the skipped imports absent joins the
+                    // snapshot's baseline, as a parsed import's files do.
+                    for absence in loader.take_lazy_absences() {
+                        let key = path_key(&absence.path);
+                        baseline.add_path(absence.path.clone(), absence.stamp.clone());
+                        let Ok((read_policy, path_entry)) =
+                            snapshot_payload_dependency(&loader, &context_key, &absence.path)
+                        else {
+                            continue;
+                        };
+                        match absence.include_hash {
+                            Some(hash) => {
+                                baseline.set_include_payload_dependency(
+                                    &absence.path,
+                                    read_policy,
+                                    path_entry,
+                                );
+                                baseline_content_hashes.insert(key, hash);
+                            }
+                            None => add_baseline_content_hash(
+                                &absence.path,
+                                &mut baseline,
+                                &mut baseline_content_hashes,
+                                &read_policy,
+                                &path_entry,
+                                cancel,
+                                true,
+                            )?,
+                        }
+                    }
                     // The answer records its own relaxed bindings again.
                     let _ = loader.index.take_relaxed_bindings();
                     crate::trace::trace!(

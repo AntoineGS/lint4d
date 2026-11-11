@@ -925,3 +925,40 @@ fn the_demanded_unit_list_is_capped() {
     assert!(result.demanded.len() <= 1, "{:?}", result.demanded);
     assert!(result.list.is_incomplete);
 }
+
+/// l4d-fpyu review F3: an incomplete dependency that cannot spell the
+/// hovered name cannot shadow it, so the hover carries no note about it.
+#[test]
+fn an_unproven_dependency_that_cannot_spell_the_name_adds_no_note() {
+    let fixture = broken_fixture(&stopped_before_include());
+    let root = fixture
+        .main
+        .to_file_path()
+        .expect("main path")
+        .parent()
+        .expect("root")
+        .to_path_buf();
+    fs::write(
+        root.join("Broken.pas"),
+        format!(
+            "unit Broken;\ninterface\n{}const BrokenValue = 1;\nimplementation\nend.\n",
+            stopped_before_include()
+        ),
+    )
+    .expect("broken dependency that cannot spell DepValue");
+    let hover = hover_from_input(
+        fixture.input.clone(),
+        &fixture.main,
+        VALUE,
+        MarkupKind::PlainText,
+        &AtomicBool::new(false),
+    )
+    .value
+    .expect("hover answers")
+    .expect("hover binds DepValue");
+    let HoverContents::Markup(markup) = hover.contents else {
+        panic!("unexpected hover contents: {:?}", hover.contents);
+    };
+    assert!(markup.value.contains("procedure DepValue"), "{markup:?}");
+    assert!(!markup.value.contains("Broken.pas"), "{markup:?}");
+}

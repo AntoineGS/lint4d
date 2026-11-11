@@ -674,9 +674,9 @@ fn an_answer_waiting_on_a_lazy_import_loads_only_that_import() {
     );
 }
 
-/// The implicit `Result` of a function shadows every unit-level and
-/// imported name: an imported global `Result` is never its definition
-/// (l4d-fpyu).
+/// Under `{$X+}` the implicit `Result` of a function shadows every
+/// unit-level and imported name: an imported global `Result` is never its
+/// definition (l4d-fpyu, review F4).
 #[test]
 fn a_functions_result_never_binds_to_an_imported_global() {
     let temp = tempfile::tempdir().expect("temporary workspace");
@@ -686,7 +686,7 @@ fn a_functions_result_never_binds_to_an_imported_global() {
         &[
             (
                 "Main.pas",
-                "unit Main;\ninterface\nuses Globals;\nfunction Get: Integer;\nimplementation\nfunction Get: Integer;\nbegin\n  Result := 1;\nend;\nend.\n",
+                "unit Main;\n{$X+}\ninterface\nuses Globals;\nfunction Get: Integer;\nimplementation\nfunction Get: Integer;\nbegin\n  Result := 1;\nend;\nend.\n",
             ),
             (
                 "Globals.pas",
@@ -696,12 +696,61 @@ fn a_functions_result_never_binds_to_an_imported_global() {
     );
     let main = root.join("Main.pas");
 
-    let locations = definition(&mut workspace(root), &main, Position::new(7, 3));
+    let locations = definition(&mut workspace(root), &main, Position::new(8, 3));
 
     assert!(
         !locations
             .iter()
             .any(|location| location.uri == uri(&root.join("Globals.pas"))),
         "{locations:?}"
+    );
+}
+
+/// Review I3 (red on 2997f26: `Base.pas`): `Foo` binds best effort to the
+/// global in `Glob` (D16 fallback over `TMy`'s unknown members); waiting on
+/// a lazily skipped import must not load `Base`, whose member `Foo` the
+/// eager best-effort walk never sees.
+#[test]
+fn an_answer_waiting_on_a_lazy_import_equals_the_eager_best_effort_answer() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    write_sources(
+        root,
+        &[
+            (
+                "Main.pas",
+                "unit Main;\ninterface\nuses Dep, Glob, Args;\ntype TMy = class(TDep)\n  procedure Run;\nend;\nimplementation\nprocedure TMy.Run;\nbegin\n  Foo(ArgValue);\nend;\nend.\n",
+            ),
+            (
+                "Dep.pas",
+                "unit Dep;\ninterface\nuses Base;\ntype TDep = class(TBase) end;\nimplementation\nend.\n",
+            ),
+            (
+                "Base.pas",
+                "unit Base;\ninterface\ntype TBase = class\n  procedure Foo(A: Integer);\nend;\nimplementation\nprocedure TBase.Foo(A: Integer); begin end;\nend.\n",
+            ),
+            (
+                "Glob.pas",
+                "unit Glob;\ninterface\nprocedure Foo(A: Integer);\nimplementation\nprocedure Foo(A: Integer); begin end;\nend.\n",
+            ),
+            (
+                "Args.pas",
+                "unit Args;\ninterface\nconst ArgValue = 1;\nimplementation\nend.\n",
+            ),
+        ],
+    );
+    let main = root.join("Main.pas");
+    super::TEST_EAGER_SNAPSHOT_IMPORTS.with(|eager| eager.set(true));
+    let mut eager = workspace(root);
+    let expected = definition(&mut eager, &main, Position::new(9, 3));
+    super::TEST_EAGER_SNAPSHOT_IMPORTS.with(|eager| eager.set(false));
+    let mut lazy = workspace(root);
+
+    let locations = definition(&mut lazy, &main, Position::new(9, 3));
+
+    assert_eq!(locations, expected);
+    assert_eq!(
+        indexed(&lazy, root, "Base.pas"),
+        indexed(&eager, root, "Base.pas")
     );
 }

@@ -3759,7 +3759,7 @@ fn completion_observation_is_superseded_by_irrelevant_overlay(
         })
 }
 
-fn completion_observations_equal(
+pub(super) fn completion_observations_equal(
     left: &super::rename::SourceRecord,
     right: &super::rename::SourceRecord,
 ) -> bool {

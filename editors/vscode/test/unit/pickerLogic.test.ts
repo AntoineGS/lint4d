@@ -199,8 +199,18 @@ describe('context comparisons', () => {
     expect(sameProjectContext(ambiguous, { ...ambiguous, ...change })).toBe(false);
   });
 
-  it('ignores warning-only project context changes', () => {
-    expect(sameProjectContext(ambiguous, { ...ambiguous, warnings: ['warning'] })).toBe(true);
+  it.each([
+    ['selected installation', { selectedInstallationId: 'studio-23' }],
+    ['installation selection mode', { installationSelectionMode: 'configured' }],
+    ['installation candidates', { installationCandidates: ['studio-23'] }],
+    ['main source URI', { mainSourceUri: 'file:///home/u/src/App/App.dpr' }],
+    ['installation config URIs', { installationConfigUris: ['file:///home/u/src/App/App.dproj'] }],
+    ['lint config URI', { lintConfigUri: 'file:///home/u/src/App/.lint4d.toml' }],
+    ['format config URI', { fmtConfigUri: 'file:///home/u/src/App/.pasfmt.toml' }],
+    ['path issues', { pathIssues: [{ kind: 'missing' }] }],
+    ['warnings', { warnings: ['warning'] }],
+  ])('ignores changes to unrelated project context %s', (_field, change) => {
+    expect(sameProjectContext(ambiguous, { ...ambiguous, ...change })).toBe(true);
   });
 
   it.each([

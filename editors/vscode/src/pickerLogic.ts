@@ -114,17 +114,9 @@ function sameItems<T>(a: readonly T[], b: readonly T[]): boolean {
 
 export function sameProjectContext(a: ProjectContext, b: ProjectContext): boolean {
   return a.scopeUri === b.scopeUri
-    && sameItems(a.candidates, b.candidates)
     && a.selectedProjectUri === b.selectedProjectUri
     && a.selectionMode === b.selectionMode
-    && a.selectedInstallationId === b.selectedInstallationId
-    && a.installationSelectionMode === b.installationSelectionMode
-    && sameItems(a.installationCandidates, b.installationCandidates)
-    && a.mainSourceUri === b.mainSourceUri
-    && sameItems(a.installationConfigUris, b.installationConfigUris)
-    && JSON.stringify(a.pathIssues) === JSON.stringify(b.pathIssues)
-    && a.lintConfigUri === b.lintConfigUri
-    && a.fmtConfigUri === b.fmtConfigUri;
+    && sameItems(a.candidates, b.candidates);
 }
 
 export function sameBuildField(a: BuildSelectionInfo, b: BuildSelectionInfo): boolean {

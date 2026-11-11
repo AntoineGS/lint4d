@@ -34,7 +34,11 @@ const bypassedCache = fixture<CacheStatus>('cacheStatus.bypassed.json');
 const enabledCache = fixture<CacheStatus>('cacheStatus.enabled.json');
 
 function snapshot(overrides: Partial<StatusSnapshot> = {}): StatusSnapshot {
-  return { clientStatus: 'running', stale: false, ...overrides };
+  return {
+    clientStatus: 'running',
+    stale: { context: false, serverStatus: false },
+    ...overrides,
+  };
 }
 
 describe('status text', () => {
@@ -121,10 +125,21 @@ describe('status tooltip', () => {
   it('handles an empty index context list and marks previous values stale', () => {
     const tooltip = statusTooltip(snapshot({
       index: { ...completeIndex, contexts: [] },
-      stale: true,
+      stale: { context: true, serverStatus: false },
     }));
     expect(tooltip).toContain('Index: no contexts yet');
     expect(tooltip).toContain('_Last refresh failed; showing previous values._');
+  });
+
+  it('marks either failed data group stale, but not when both groups succeeded', () => {
+    const note = '_Last refresh failed; showing previous values._';
+
+    expect(statusTooltip(snapshot({ stale: { context: false, serverStatus: false } })))
+      .not.toContain(note);
+    expect(statusTooltip(snapshot({ stale: { context: true, serverStatus: false } })))
+      .toContain(note);
+    expect(statusTooltip(snapshot({ stale: { context: false, serverStatus: true } })))
+      .toContain(note);
   });
 
   it('includes non-zero index refused, limited, and retrying counts only', () => {

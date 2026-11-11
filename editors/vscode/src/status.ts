@@ -10,6 +10,7 @@ import {
   type ProjectContext,
 } from './protocol';
 import { onDidSelect } from './pickers';
+import { affectsServerSettings } from './settings';
 import {
   FAST_POLL_MS,
   pollInterval,
@@ -62,7 +63,8 @@ export function registerStatus(host: ClientHost): vscode.Disposable {
   let installationContext: InstallationContext | undefined;
   let indexStatus: IndexStatus | undefined;
   let cacheStatus: CacheStatus | undefined;
-  let stale = false;
+  let contextStale = false;
+  let serverStatusStale = false;
   let disposed = false;
   let inFlight = false;
   let requestTail: Promise<void> = Promise.resolve();
@@ -81,7 +83,7 @@ export function registerStatus(host: ClientHost): vscode.Disposable {
     ...(installationContext ? { installation: installationContext } : {}),
     ...(indexStatus ? { index: indexStatus } : {}),
     ...(cacheStatus ? { cache: cacheStatus } : {}),
-    stale,
+    stale: { context: contextStale, serverStatus: serverStatusStale },
   });
 
   const render = (): void => {
@@ -217,7 +219,8 @@ export function registerStatus(host: ClientHost): vscode.Disposable {
       indexStatus = result.indexStatus ?? undefined;
       cacheStatus = result.cacheStatus ?? undefined;
     }
-    stale = Object.keys(result.errors).length > 0;
+    if (fetchContext) contextStale = contextFailed;
+    if (fetchServer) serverStatusStale = serverFailed;
     render();
   };
 
@@ -240,7 +243,8 @@ export function registerStatus(host: ClientHost): vscode.Disposable {
             try {
               await applyRefresh(wantsContext, wantsServer);
             } catch (error) {
-              stale = true;
+              if (wantsContext) contextStale = true;
+              if (wantsServer) serverStatusStale = true;
               host.output.error(`Failed to refresh Pascal LSP status: ${errorMessage(error)}`);
               render();
             }
@@ -347,11 +351,12 @@ export function registerStatus(host: ClientHost): vscode.Disposable {
     changeEmitter.fire(STATUS_DOCUMENT_URI);
   };
 
-  const scheduleContextRefresh = (): void => {
+  const scheduleContextRefresh = (schedulePoll = false): void => {
     if (contextDebounce !== undefined) clearTimeout(contextDebounce);
     contextDebounce = setTimeout(() => {
       contextDebounce = undefined;
-      void refresh(true, false);
+      if (schedulePoll) refreshAndSchedule(true, false);
+      else void refresh(true, false);
     }, CONTEXT_DEBOUNCE_MS);
   };
 
@@ -385,6 +390,11 @@ export function registerStatus(host: ClientHost): vscode.Disposable {
     vscode.window.onDidChangeWindowState((state) => updatePollLoop(state.focused)),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration('pascalLsp.statusBar.enabled')) render();
+      if (affectsServerSettings((key) => event.affectsConfiguration(key))) {
+        forceFastPoll = true;
+        clearPollTimer();
+        scheduleContextRefresh(true);
+      }
     }),
   ];
 

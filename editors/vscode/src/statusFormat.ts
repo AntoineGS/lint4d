@@ -13,11 +13,18 @@ export interface StatusSnapshot {
   installation?: InstallationContext;
   index?: IndexStatus;
   cache?: CacheStatus;
-  stale: boolean;
+  stale: {
+    context: boolean;
+    serverStatus: boolean;
+  };
 }
 
 export const FAST_POLL_MS = 5000;
 export const SLOW_POLL_MS = 30000;
+
+export function hasStaleStatus(stale: StatusSnapshot['stale']): boolean {
+  return stale.context || stale.serverStatus;
+}
 
 export function shouldPollStatus(conditions: {
   focused: boolean;
@@ -92,7 +99,7 @@ export function statusTooltip(snapshot: StatusSnapshot): string {
 
   if (snapshot.index) lines.push(indexLine(snapshot.index));
   if (snapshot.cache) lines.push(cacheLine(snapshot.cache));
-  if (snapshot.stale) lines.push('_Last refresh failed; showing previous values._');
+  if (hasStaleStatus(snapshot.stale)) lines.push('_Last refresh failed; showing previous values._');
   return lines.join('\n');
 }
 

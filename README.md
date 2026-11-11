@@ -260,8 +260,9 @@ If RAD Studio is installed, lint4d can locate the BDS root automatically. You ca
 ## Native Language Server
 
 `pascal-lsp` provides native Linux declaration/definition navigation, live lint
-diagnostics, and explicit formatting for Neovim and other LSP clients. No Windows
-process is required. See the [setup guide and navigation limits](crates/pascal-lsp/README.md)
+diagnostics, and explicit formatting for Neovim, the [VS Code extension](editors/vscode/README.md),
+and other LSP clients. No Windows process
+is required. See the [setup guide and navigation limits](crates/pascal-lsp/README.md)
 and the [Neovim configuration](crates/pascal-lsp/examples/neovim.lua).
 
 ```sh

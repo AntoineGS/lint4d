@@ -1,0 +1,15 @@
+{
+  "scopeUri": "file:///c%3A/src/Shop/",
+  "candidates": ["file:///c%3A/src/Shop/Shop.dproj"],
+  "selectedProjectUri": "file:///c%3A/src/Shop/Shop.dproj",
+  "selectionMode": "manual",
+  "selectedInstallationId": "studio-23",
+  "installationSelectionMode": "configured",
+  "installationCandidates": ["studio-23", "studio-22"],
+  "mainSourceUri": "file:///c%3A/src/Shop/Shop.dpr",
+  "installationConfigUris": ["file:///c%3A/src/Shop/Shop.dproj"],
+  "pathIssues": [],
+  "lintConfigUri": null,
+  "fmtConfigUri": null,
+  "warnings": []
+}

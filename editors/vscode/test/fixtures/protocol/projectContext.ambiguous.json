@@ -1,0 +1,18 @@
+{
+  "scopeUri": "file:///home/u/src/App/",
+  "candidates": [
+    "file:///home/u/src/App/App.dproj",
+    "file:///home/u/src/App/AppTests.dproj"
+  ],
+  "selectedProjectUri": null,
+  "selectionMode": "ambiguous",
+  "selectedInstallationId": null,
+  "installationSelectionMode": "automatic",
+  "installationCandidates": [],
+  "mainSourceUri": null,
+  "installationConfigUris": [],
+  "pathIssues": [],
+  "lintConfigUri": null,
+  "fmtConfigUri": null,
+  "warnings": []
+}

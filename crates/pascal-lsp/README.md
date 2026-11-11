@@ -196,6 +196,23 @@ Ensure `~/.cargo/bin` is on your PATH, or provide Neovim the full executable
 path. `pascal-lsp --stdio` (also the default) speaks LSP over stdin/stdout;
 logs go to stderr. Do not use `cargo run` as your editor's server command.
 
+## VS Code
+
+The locally packaged [Pascal LSP VS Code extension](../../editors/vscode/README.md)
+provides the project, build configuration, platform, and Delphi installation
+pickers alongside the standard language-server features.
+
+| VS Code command | Neovim equivalent |
+| --- | --- |
+| Pascal: Select Project… | `:PascalProject` or `<leader>wp` |
+| Pascal: Browse Repository Projects | Browse repository from `:PascalProject` |
+| Pascal: Select Build Configuration | `:PascalBuildConfig` |
+| Pascal: Select Platform | `:PascalPlatform` |
+| Pascal: Select Delphi Installation | `:PascalDelphiVersion` |
+
+See the [extension guide](../../editors/vscode/README.md) for installation,
+settings, status views, and troubleshooting.
+
 ## Neovim 0.11+
 
 No third-party Neovim LSP plugin is required. The complete configuration is in

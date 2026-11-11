@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "crawlPublished": 0,
+  "crawlDeferred": 0,
+  "providerGraphsRefused": 0,
+  "contexts": [
+    {
+      "anchor": {"document": "file:///home/u/src/App/Unit1.pas"},
+      "anchorTruncated": false,
+      "members": 840,
+      "fresh": 840,
+      "reused": 0,
+      "extracted": 840,
+      "pending": 0,
+      "reusePending": 0,
+      "refused": 0,
+      "limited": 0,
+      "deferred": 0,
+      "persisted": 840,
+      "retrying": 0,
+      "overLimit": 0,
+      "unprovable": 0,
+      "overDeadline": 0,
+      "overAdmission": 0,
+      "membershipComplete": true,
+      "complete": true,
+      "snapshot": "sealed",
+      "validationReads": 0,
+      "publicationsRefused": 0,
+      "gaps": []
+    }
+  ]
+}

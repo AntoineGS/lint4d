@@ -1,0 +1,125 @@
+{
+  "name": "pascal-lsp",
+  "displayName": "Pascal LSP (lint4d)",
+  "description": "Delphi / Object Pascal language support backed by the lint4d pascal-lsp server",
+  "version": "0.1.0",
+  "publisher": "multidev",
+  "license": "MIT",
+  "private": true,
+  "repository": { "type": "git", "url": "https://github.com/AntoineGS/lint4d" },
+  "engines": { "vscode": "^1.106.0" },
+  "categories": ["Programming Languages", "Linters", "Formatters"],
+  "main": "./dist/extension.js",
+  "extensionKind": ["workspace"],
+  "activationEvents": [
+    "onLanguage:pascal",
+    "workspaceContains:**/*.dproj",
+    "workspaceContains:.lint4d.toml"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Workspace settings can select the server executable and arguments, while the server reads project files and source paths named by the workspace."
+    },
+    "virtualWorkspaces": false
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "pascal",
+        "aliases": ["Pascal", "Delphi", "Object Pascal"],
+        "extensions": [".pas", ".dpr", ".dpk", ".inc"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      { "language": "pascal", "scopeName": "source.pascal", "path": "./syntaxes/pascal.tmLanguage.json" }
+    ],
+    "commands": [
+      { "command": "pascal.restartServer", "title": "Restart Server", "category": "Pascal" },
+      { "command": "pascal.showOutput", "title": "Show Output", "category": "Pascal" },
+      { "command": "pascal.showStatus", "title": "Show Server Status", "category": "Pascal" },
+      { "command": "pascal.refreshStatus", "title": "Refresh Server Status", "category": "Pascal", "icon": "$(refresh)" },
+      { "command": "pascal.projectMenu", "title": "Select Project…", "category": "Pascal" },
+      { "command": "pascal.browseProjects", "title": "Browse Repository Projects", "category": "Pascal" },
+      { "command": "pascal.selectBuildConfig", "title": "Select Build Configuration", "category": "Pascal" },
+      { "command": "pascal.selectPlatform", "title": "Select Platform", "category": "Pascal" },
+      { "command": "pascal.selectInstallation", "title": "Select Delphi Installation", "category": "Pascal" }
+    ],
+    "menus": {
+      "commandPalette": [
+        { "command": "pascal.refreshStatus", "when": "resourceScheme == pascal-lsp-status" },
+        { "command": "pascal.projectMenu", "when": "pascalLsp.projectSelection" },
+        { "command": "pascal.browseProjects", "when": "pascalLsp.projectCatalogue" },
+        { "command": "pascal.selectBuildConfig", "when": "pascalLsp.buildSelection" },
+        { "command": "pascal.selectPlatform", "when": "pascalLsp.buildSelection" },
+        { "command": "pascal.selectInstallation", "when": "pascalLsp.installationSelection" }
+      ],
+      "editor/title": [
+        { "command": "pascal.refreshStatus", "when": "resourceScheme == pascal-lsp-status", "group": "navigation" }
+      ]
+    },
+    "configuration": {
+      "title": "Pascal LSP",
+      "properties": {
+        "pascalLsp.serverPath": { "type": "string", "scope": "machine-overridable", "markdownDescription": "Path to the `pascal-lsp` executable. Supports `~` and `${workspaceFolder}`. Unset: the `PASCAL_LSP_BIN` environment variable, then `pascal-lsp` on `PATH`. Changing it restarts the server." },
+        "pascalLsp.serverArgs": { "type": "array", "items": { "type": "string" }, "default": [], "scope": "machine-overridable", "markdownDescription": "Extra arguments after `--stdio`. Changing them restarts the server." },
+        "pascalLsp.serverEnv": { "type": "object", "additionalProperties": { "type": "string" }, "default": {}, "scope": "machine-overridable", "markdownDescription": "Extra environment variables for the server process, for example `PASCAL_LSP_TRACE`. Changing them restarts the server." },
+        "pascalLsp.trace.server": { "type": "string", "enum": ["off", "messages", "verbose"], "default": "off", "scope": "window", "description": "Trace LSP messages to the Pascal LSP output channel." },
+        "pascalLsp.statusBar.enabled": { "type": "boolean", "default": true, "scope": "window", "description": "Show the Pascal project status bar item." },
+        "pascalLsp.projectFile": { "type": "string", "scope": "window", "markdownDescription": "Delphi project (`.dproj`) to use, relative to the workspace. Unset = server default (nearest unambiguous project)." },
+        "pascalLsp.buildConfig": { "type": "string", "scope": "window", "markdownDescription": "Build configuration, e.g. `Debug`. Unset = server default." },
+        "pascalLsp.platform": { "type": "string", "scope": "window", "markdownDescription": "Target platform, e.g. `Win32`. Unset = server default." },
+        "pascalLsp.sourcePaths": { "type": "array", "items": { "type": "string" }, "scope": "window", "markdownDescription": "Additional source directories (Delphi RTL/VCL, third-party libraries). Relative paths are relative to the workspace. Unset = server default." },
+        "pascalLsp.exclude": { "type": "array", "items": { "type": "string" }, "scope": "window", "markdownDescription": "Glob patterns excluded from the workspace. Unset = server default." },
+        "pascalLsp.compilerVersion": { "type": "string", "scope": "window", "markdownDescription": "Compiler version for conditionals, e.g. `24.0`. Unset = server default." },
+        "pascalLsp.compilerOptions": { "type": "object", "scope": "window", "markdownDescription": "Compiler switch states for conditionals, e.g. `{\"R\": true, \"Q\": \"off\"}`. Unset = server default." },
+        "pascalLsp.conditionalDefines": { "type": "array", "items": { "type": "string" }, "scope": "window", "markdownDescription": "Extra conditional defines. Unset = server default." },
+        "pascalLsp.conditionalUndefines": { "type": "array", "items": { "type": "string" }, "scope": "window", "markdownDescription": "Conditional symbols known to be undefined. Unset = server default." },
+        "pascalLsp.conditionalConstants": { "type": "object", "scope": "window", "markdownDescription": "Constants for `{$IF}` expressions, e.g. `{\"BuildNumber\": 42}`. Unset = server default." },
+        "pascalLsp.maxFiles": { "type": "integer", "minimum": 1, "scope": "window", "markdownDescription": "Workspace file limit. Unset = server default; values above the server's cap are clamped." },
+        "pascalLsp.maxFileBytes": { "type": "integer", "minimum": 1, "scope": "window", "markdownDescription": "Per-file byte limit. Unset = server default." },
+        "pascalLsp.maxTotalBytes": { "type": "integer", "minimum": 1, "scope": "window", "markdownDescription": "Total workspace byte limit. Unset = server default." },
+        "pascalLsp.maxCacheBytes": { "type": "integer", "minimum": 1, "scope": "window", "markdownDescription": "Analysis memory budget in bytes. Unset = server default." },
+        "pascalLsp.maxWorkspaceUnits": { "type": "integer", "minimum": 1, "scope": "window", "markdownDescription": "Most units in one workspace snapshot. Unset = server default." },
+        "pascalLsp.persistentCacheEnabled": { "type": "boolean", "scope": "window", "markdownDescription": "Enable the persistent analysis cache. Unset = server default (enabled)." },
+        "pascalLsp.persistentCachePageBytes": { "type": "integer", "scope": "window", "markdownDescription": "SQLite page cache bytes. Unset = server default." },
+        "pascalLsp.persistentCacheScratchBytes": { "type": "integer", "scope": "window", "markdownDescription": "Transient encode/decode buffer bytes. Unset = server default." },
+        "pascalLsp.persistentCacheWaitMs": { "type": "integer", "scope": "window", "markdownDescription": "Longest lock wait per cache operation (ms). Unset = server default." },
+        "pascalLsp.persistentCacheDirectory": { "type": "string", "scope": "machine-overridable", "markdownDescription": "Absolute cache directory (`~` is not expanded). Startup only: changing it restarts the server. Unset = platform directory." },
+        "pascalLsp.persistentCacheMaxNamespaces": { "type": "integer", "minimum": 1, "scope": "window", "markdownDescription": "Builds whose cache entries are kept. Startup only: changing it restarts the server. Unset = server default." }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "lint": "eslint src test",
+    "test": "vitest run",
+    "test:grammar": "vscode-tmgrammar-test -g syntaxes/pascal.tmLanguage.json \"test/grammar/*.pas\"",
+    "vscode:prepublish": "npm run build -- --production",
+    "package": "vsce package --no-dependencies",
+    "pretest:integration": "npm run build && tsc -p tsconfig.test.json",
+    "test:integration": "vscode-test"
+  },
+  "dependencies": {
+    "vscode-languageclient": "11.0.0",
+    "vscode-uri": "^3.2.0"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^22.0.0",
+    "@types/vscode": "1.106.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^4.1.0",
+    "esbuild": "^0.28.2",
+    "eslint": "^10.14.0",
+    "mocha": "^12.0.3",
+    "typescript": "^5.9.0",
+    "typescript-eslint": "^8.72.2",
+    "vitest": "^5.1.0",
+    "vscode-tmgrammar-test": "^0.1.3"
+  }
+}

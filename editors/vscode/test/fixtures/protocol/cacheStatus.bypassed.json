@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "state": "bypassed",
+  "generation": 2,
+  "enabled": true,
+  "cause": {"kind": "lowDiskSpace", "location": null, "advice": "prune"},
+  "directory": "/home/u/.cache/lint4d/analysis",
+  "limits": {"pageBytes": 16777216, "scratchBytes": 16777216, "waitMs": 25, "maxNamespaces": 2},
+  "resetEpoch": null,
+  "reservedBytes": {"pages": 0, "scratch": 0, "facts": 0, "publication": 0, "queryTrees": 0},
+  "crawlBytes": {"leased": 0, "allowance": 0, "overBudget": 0, "maxOvershoot": 0},
+  "store": null,
+  "lockWaits": {"poolWaits": 0, "poolWaitMicros": 0, "lockWaits": 0, "lockWaitMicros": 0, "busy": 0},
+  "counters": {
+    "hits": 0,
+    "decodedBytes": 0,
+    "misses": {"input": 0, "version": 0, "freshness": 0, "budget": 0, "authorization": 0, "integrity": 0},
+    "bypasses": {"lowDiskSpace": 1},
+    "maintenance": {"steps": 0, "cycles": 0, "rows": 0, "skipped": 0}
+  }
+}

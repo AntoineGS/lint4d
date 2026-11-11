@@ -1,0 +1,21 @@
+{
+  "projectUri": "file:///c%3A/src/Shop/Shop.dproj",
+  "config": {
+    "selected": "Debug",
+    "candidates": ["Debug", "Release"],
+    "mode": "projectDefault",
+    "projectDefault": "Debug"
+  },
+  "platform": {
+    "selected": "Win32",
+    "candidates": ["Win32", "Win64"],
+    "mode": "configured",
+    "projectDefault": null
+  },
+  "conditionals": {
+    "closed": false,
+    "openReasons": ["compilerVersion unknown"],
+    "rtlVersionConstants": {"source": "unknown", "names": []}
+  },
+  "warnings": []
+}

@@ -82,8 +82,10 @@ fn map_verified_header_location(uri: &Url, range: Range) -> Location {
 mod assistance;
 mod call_hierarchy;
 pub mod compiled_dcu;
+mod dcc_message;
 #[cfg(test)]
 mod dcc_oracle_tests;
+pub(crate) use dcc_message::{DccMessage, DccSeverity};
 mod documentation;
 mod facts;
 mod folding;
@@ -795,6 +797,34 @@ pub(crate) enum SemanticDiagnosticKind {
     IncompatibleArgument,
     InvalidOverride,
     MissingInterfaceImplementation,
+    #[allow(dead_code)]
+    Dcc(DccMessage),
+}
+
+impl SemanticDiagnosticKind {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::UnresolvedIdentifier => "pascal-unresolved-identifier",
+            Self::MissingMember => "pascal-missing-member",
+            Self::TypeMismatch => "pascal-type-mismatch",
+            Self::IncompatibleArgument => "pascal-incompatible-argument",
+            Self::InvalidOverride => "pascal-invalid-override",
+            Self::MissingInterfaceImplementation => "pascal-missing-interface-implementation",
+            Self::Dcc(message) => message.code(),
+        }
+    }
+
+    pub(crate) fn severity(self) -> DccSeverity {
+        match self {
+            Self::Dcc(message) => message.severity(),
+            Self::UnresolvedIdentifier
+            | Self::MissingMember
+            | Self::TypeMismatch
+            | Self::IncompatibleArgument
+            | Self::InvalidOverride
+            | Self::MissingInterfaceImplementation => DccSeverity::Error,
+        }
+    }
 }
 
 /// Syntactic role required by an add-missing-unit use site.
@@ -834,6 +864,7 @@ fn semantic_diagnostic_kind_rank(kind: SemanticDiagnosticKind) -> u8 {
         SemanticDiagnosticKind::IncompatibleArgument => 3,
         SemanticDiagnosticKind::InvalidOverride => 4,
         SemanticDiagnosticKind::MissingInterfaceImplementation => 5,
+        SemanticDiagnosticKind::Dcc(_) => 6,
     }
 }
 
@@ -2974,7 +3005,8 @@ impl NavigationIndex {
                     SemanticDiagnosticKind::TypeMismatch
                     | SemanticDiagnosticKind::IncompatibleArgument
                     | SemanticDiagnosticKind::InvalidOverride
-                    | SemanticDiagnosticKind::MissingInterfaceImplementation => continue,
+                    | SemanticDiagnosticKind::MissingInterfaceImplementation
+                    | SemanticDiagnosticKind::Dcc(_) => continue,
                 };
                 report.diagnostics.push(SemanticDiagnostic {
                     kind,

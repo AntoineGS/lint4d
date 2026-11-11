@@ -74,19 +74,6 @@ fn line_of(source: &str, offset: usize) -> usize {
     source[..offset.min(source.len())].matches('\n').count() + 1
 }
 
-fn diagnostic_code(kind: SemanticDiagnosticKind) -> &'static str {
-    match kind {
-        SemanticDiagnosticKind::UnresolvedIdentifier => "pascal-unresolved-identifier",
-        SemanticDiagnosticKind::MissingMember => "pascal-missing-member",
-        SemanticDiagnosticKind::TypeMismatch => "pascal-type-mismatch",
-        SemanticDiagnosticKind::IncompatibleArgument => "pascal-incompatible-argument",
-        SemanticDiagnosticKind::InvalidOverride => "pascal-invalid-override",
-        SemanticDiagnosticKind::MissingInterfaceImplementation => {
-            "pascal-missing-interface-implementation"
-        }
-    }
-}
-
 fn actual_findings(case: &Case) -> Vec<Finding> {
     let mut index = NavigationIndex::new();
     let mut unit_uri = None;
@@ -120,7 +107,7 @@ fn actual_findings(case: &Case) -> Vec<Finding> {
         .map(|diagnostic| Finding {
             file: case.unit.clone(),
             line: line_of(source, diagnostic.span.start),
-            code: diagnostic_code(diagnostic.kind).to_owned(),
+            code: diagnostic.kind.code().to_owned(),
             message: diagnostic.message,
         })
         .collect()

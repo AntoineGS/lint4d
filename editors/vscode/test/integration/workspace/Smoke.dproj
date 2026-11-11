@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <ProjectVersion>19.5</ProjectVersion>
+    <MainSource>src\Main.pas</MainSource>
+  </PropertyGroup>
+  <ItemGroup>
+    <DCCReference Include="src\Main.pas"/>
+    <DCCReference Include="src\Helpers.pas"/>
+  </ItemGroup>
+</Project>

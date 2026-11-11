@@ -94,23 +94,29 @@
   "scripts": {
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "lint": "eslint src test",
     "test": "vitest run",
     "test:grammar": "vscode-tmgrammar-test -g syntaxes/pascal.tmLanguage.json \"test/grammar/*.pas\"",
     "vscode:prepublish": "npm run build -- --production",
-    "package": "vsce package --no-dependencies"
+    "package": "vsce package --no-dependencies",
+    "pretest:integration": "npm run build && tsc -p tsconfig.test.json",
+    "test:integration": "vscode-test"
   },
   "dependencies": {
     "vscode-languageclient": "11.0.0",
     "vscode-uri": "^3.2.0"
   },
   "devDependencies": {
+    "@types/mocha": "^10.0.10",
     "@types/node": "^22.0.0",
     "@types/vscode": "1.106.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^4.1.0",
     "esbuild": "^0.28.2",
     "eslint": "^10.14.0",
+    "mocha": "^12.0.3",
     "typescript": "^5.9.0",
     "typescript-eslint": "^8.72.2",
     "vitest": "^5.1.0",

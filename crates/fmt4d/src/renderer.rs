@@ -650,8 +650,8 @@ impl Renderer {
         }
         self.emit_newline();
         let rest = text.trim_start_matches([' ', '\t']);
-        if rest.starts_with('\n') {
-            return rest[1..].to_string();
+        if let Some(next_line) = rest.strip_prefix('\n') {
+            return next_line.to_string();
         }
         let indent_str = self.indent_string(indent);
         self.output.push_str(&indent_str);

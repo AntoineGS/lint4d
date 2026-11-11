@@ -96,6 +96,26 @@ pub fn select_installation(
         constraints.push(matches);
     }
 
+    // A project inside an installation's own BDS tree (a sample program
+    // shipped next to its VCL sources) is compiled by that installation.
+    let containing = ids
+        .iter()
+        .filter(|id| {
+            config.profile(id).ok().is_some_and(|profile| {
+                profile
+                    .overrides
+                    .properties
+                    .get("bds")
+                    .and_then(|bds| profile.overrides.resolve_path(bds, Path::new("/")).ok())
+                    .is_some_and(|bds| crate::assembly::path_starts_with_ci(project, &bds.path))
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !containing.is_empty() {
+        constraints.push(containing);
+    }
+
     if constraints.is_empty() {
         return InstallationSelection::NeedsChoice { candidates: ids };
     }

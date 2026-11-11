@@ -111,15 +111,16 @@ fn char_literal_len(rest: &str) -> usize {
 
 /// The byte length of the decimal number at the start of `rest` (which
 /// starts with a digit): its digits, and an exponent letter with the digits
-/// after it. The compiler ends the number there, so `1do` is `1` then `do`,
-/// which the formatter may separate. (Hexadecimal digits after `$` stay one
-/// word with the letters after them.)
+/// after it, each run possibly holding `_` digit separators (`1_000`,
+/// accepted by dcc 37.0). The compiler ends the number there, so `1do` is
+/// `1` then `do`, which the formatter may separate. (Hexadecimal digits
+/// after `$` stay one word with the letters after them.)
 fn number_len(rest: &str) -> usize {
     let bytes = rest.as_bytes();
     let digits = |from: usize| {
         bytes[from.min(bytes.len())..]
             .iter()
-            .take_while(|b| b.is_ascii_digit())
+            .take_while(|b| b.is_ascii_digit() || **b == b'_')
             .count()
     };
     let len = digits(0);
@@ -692,6 +693,16 @@ mod tests {
         assert!(check("X := 1; // a\u{16}b\n", "X := 1; // ab\n").is_err());
         assert!(check("X := 1; { a\u{16}b }", "X := 1; { ab }").is_err());
         assert!(check("X := 'a\u{16}b';", "X := 'ab';").is_err());
+    }
+
+    #[test]
+    fn digit_separators_are_part_of_the_number() {
+        // dcc 37.0 accepts `1_000`, `%1010_1010`, `1e1_0`, `1_e1`.
+        assert_eq!(check("X := 1_000;", "X := 1_000;"), Ok(()));
+        assert!(check("X := 1_000;", "X := 1 _000;").is_err());
+        assert!(check("X := %1010_1010;", "X := %1010 _1010;").is_err());
+        assert!(check("X := 1e1_0;", "X := 1e1 _0;").is_err());
+        assert_eq!(check("X := 1_000do", "X := 1_000 do"), Ok(()));
     }
 
     #[test]

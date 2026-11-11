@@ -186,6 +186,7 @@ crates/pascal-lsp/tests/dcc_oracle/e2065_external_implementation/ExternalImpleme
 crates/pascal-lsp/tests/dcc_oracle/e2065_forward_missing/ForwardMissing.pas d0aae64b9c303941 2
 crates/pascal-lsp/tests/dcc_oracle/e2065_generic_method/GenericMethod.pas f51752e0bb3d07f6 8
 crates/pascal-lsp/tests/dcc_oracle/e2065_method_missing/MethodMissing.pas 101c3b9ac024c4b6 5
+crates/pascal-lsp/tests/dcc_oracle/e2065_nested_forward/NestedForward.pas 9b9bb316797dbec1 5
 crates/pascal-lsp/tests/dcc_oracle/e2065_object_missing/ObjectMissing.pas 0579c65bcee39076 3
 crates/pascal-lsp/tests/dcc_oracle/e2065_standalone_missing/StandaloneMissing.pas eb755cdcb78aea91 2
 crates/pascal-lsp/tests/dcc_oracle/probe_basic/Probe.pas 2baab173c2f82413 14

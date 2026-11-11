@@ -106,7 +106,6 @@ impl NavigationIndex {
                     } else {
                         (declaration.region == Region::Interface && declaration.scope == ROOT_SCOPE)
                             || (declaration.region == Region::Implementation
-                                && declaration.scope == ROOT_SCOPE
                                 && declaration.routine_directives.forward)
                     };
                 if !declaration_is_e2065_candidate {

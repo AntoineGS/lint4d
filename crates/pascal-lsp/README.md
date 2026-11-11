@@ -1060,6 +1060,25 @@ only `.pas`, `.dpr`, and `.dpk` buffers are formatted.
 DCU-dependent lint rules are not enabled through a project context in this
 slice, and the CLI's baseline filtering is not applied.
 
+### Vendor sources and oversized reports
+
+A source inside a configured installation's own BDS tree (the RTL, VCL and
+other sources shipped with RAD Studio; the tree is the installation profile's
+`BDS` property in the delphi-tools configuration) is vendor code. Its lint4d
+findings are not published, whether a project claims the file or not. Parse
+errors (`parse-error`) and source-semantic diagnostics are still published.
+Set `lintInstallationSources: true` in `initializationOptions` (or in the
+runtime `pascalLsp` settings; `null` resets it) to publish its lint findings
+too.
+
+One document's report is bounded to 10,000 diagnostics and 64 KiB of encoded
+diagnostics. An open document over that bound gets a truncated report: errors
+first, then warnings, information and hints, each by position, while they fit.
+A warning at line 1 says how many more were not shown and which limit applied,
+for example `1234 more diagnostics were not shown (per-document limit: 64 KiB)`.
+A related document that is not open gets no partial report; a `window/showMessage`
+warning says the publication bound was reached.
+
 ### Per-project lint and formatter configuration
 
 Configuration is resolved independently for lint4d and fmt4d, for the effective
@@ -1139,6 +1158,7 @@ configuration schema:
     "maxFileBytes": 4194304,
     "maxTotalBytes": 268435456,
     "maxWorkspaceUnits": 100000,
+    "lintInstallationSources": false,
     "persistentCacheEnabled": true,
     "persistentCachePageBytes": 16777216,
     "persistentCacheScratchBytes": 16777216,

@@ -590,6 +590,10 @@ pub struct WorkspaceOptions {
     /// source analysis. Unknown values remain unknown.
     pub conditional_context: ConditionalContext,
     pub limits: ResourceLimits,
+    /// D57 (b): publish lint findings for sources inside an installation's
+    /// own BDS tree (vendor code). Off by default; parse errors and semantic
+    /// diagnostics are published either way.
+    pub lint_installation_sources: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -614,6 +618,7 @@ pub(crate) struct RuntimeOptionsUpdate {
     pub(crate) max_total_bytes: RuntimeOption<usize>,
     pub(crate) max_cache_bytes: RuntimeOption<usize>,
     pub(crate) max_workspace_units: RuntimeOption<usize>,
+    pub(crate) lint_installation_sources: RuntimeOption<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -629,6 +634,7 @@ pub(crate) struct RuntimeOptionsOverride {
     max_total_bytes: Option<usize>,
     max_cache_bytes: Option<usize>,
     max_workspace_units: Option<usize>,
+    lint_installation_sources: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -743,6 +749,7 @@ impl RuntimeOptionsUpdate {
             max_total_bytes: RuntimeOption::Reset,
             max_cache_bytes: RuntimeOption::Reset,
             max_workspace_units: RuntimeOption::Reset,
+            lint_installation_sources: RuntimeOption::Reset,
         }
     }
 }
@@ -782,6 +789,9 @@ impl RuntimeOptionsOverride {
                     .max_workspace_units
                     .unwrap_or(base.limits.max_workspace_units),
             },
+            lint_installation_sources: self
+                .lint_installation_sources
+                .unwrap_or(base.lint_installation_sources),
         }
     }
 
@@ -842,6 +852,12 @@ impl RuntimeOptionsOverride {
             &mut self.max_workspace_units,
             update.max_workspace_units,
             "maxWorkspaceUnits",
+            &mut warnings,
+        );
+        apply_runtime_field(
+            &mut self.lint_installation_sources,
+            update.lint_installation_sources,
+            "lintInstallationSources",
             &mut warnings,
         );
         warnings
@@ -921,7 +937,20 @@ pub(crate) fn parse_runtime_options(
             "maxWorkspaceUnits",
             DEFAULT_MAX_WORKSPACE_UNITS,
         ),
+        lint_installation_sources: parse_runtime_bool(object, "lintInstallationSources"),
     })
+}
+
+fn parse_runtime_bool(
+    object: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> RuntimeOption<bool> {
+    match object.get(name) {
+        None => RuntimeOption::Absent,
+        Some(serde_json::Value::Null) => RuntimeOption::Reset,
+        Some(serde_json::Value::Bool(value)) => RuntimeOption::Value(*value),
+        Some(_) => RuntimeOption::Invalid("must be a boolean or null".to_string()),
+    }
 }
 
 fn parse_runtime_compiler_version(
@@ -1199,6 +1228,8 @@ struct RawWorkspaceOptions {
     max_total_bytes: Option<usize>,
     max_cache_bytes: Option<usize>,
     max_workspace_units: Option<usize>,
+    #[serde(default)]
+    lint_installation_sources: bool,
 }
 
 fn parse_conditional_context_values(
@@ -1405,6 +1436,7 @@ impl WorkspaceOptions {
                 raw.conditional_constants.as_ref(),
             )?,
             limits,
+            lint_installation_sources: raw.lint_installation_sources,
         })
     }
 }
@@ -16086,6 +16118,9 @@ impl Workspace {
             self.include_expansion_limits().max_work,
         );
         let mut mapped = HashMap::<Url, Vec<LspDiagnostic>>::new();
+        // D57 (b): lint findings in vendor sources (an installation's own BDS
+        // tree) are not published unless asked for; parse errors are.
+        let mut vendor_sources = HashMap::<Url, bool>::new();
         for diagnostic in lint_result.diagnostics {
             check_workspace_cancel(Some(cancel))?;
             let Some(normalized_range) = line_index.byte_range(
@@ -16125,6 +16160,21 @@ impl Workspace {
                 crate::include_expansion::VirtualMapping::Many(_)
                 | crate::include_expansion::VirtualMapping::Unmapped => continue,
             };
+            if !self.options.lint_installation_sources
+                && !matches!(diagnostic.rule_id.as_str(), "parse-error" | "lint4d-error")
+                && *vendor_sources.entry(span.uri.clone()).or_insert_with(|| {
+                    span.uri.to_file_path().is_ok_and(|path| {
+                        pascal_project::installation_source(
+                            &absolute_path(path),
+                            &roots,
+                            &self.overrides,
+                        )
+                        .is_some()
+                    })
+                })
+            {
+                continue;
+            }
             let Some(source) = expansion.source_texts.get(&span.uri) else {
                 continue;
             };
@@ -27528,6 +27578,38 @@ BDS = '/fake/37'
             parse(0).unwrap_err(),
             "initializationOptions.maxWorkspaceUnits must be at least 1"
         );
+    }
+
+    #[test]
+    fn lint_installation_sources_option_parses_at_initialization_and_runtime() {
+        assert!(
+            !WorkspaceOptions::parse(None)
+                .unwrap()
+                .lint_installation_sources
+        );
+        assert!(
+            WorkspaceOptions::parse(Some(&json!({"lintInstallationSources": true})))
+                .unwrap()
+                .lint_installation_sources
+        );
+        let base = WorkspaceOptions::default();
+        let mut runtime = super::RuntimeOptionsOverride::default();
+        runtime.apply(
+            super::parse_runtime_options(&json!({"lintInstallationSources": true})).unwrap(),
+        );
+        assert!(runtime.effective(&base).lint_installation_sources);
+        let warnings = runtime.apply(
+            super::parse_runtime_options(&json!({"lintInstallationSources": "yes"})).unwrap(),
+        );
+        assert_eq!(
+            warnings,
+            ["ignoring runtime lintInstallationSources: must be a boolean or null"]
+        );
+        assert!(runtime.effective(&base).lint_installation_sources);
+        runtime.apply(
+            super::parse_runtime_options(&json!({"lintInstallationSources": null})).unwrap(),
+        );
+        assert!(!runtime.effective(&base).lint_installation_sources);
     }
 
     #[test]

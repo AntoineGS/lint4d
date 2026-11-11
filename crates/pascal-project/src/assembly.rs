@@ -72,6 +72,16 @@ pub(super) fn build_standalone_context_with_overrides(
     Ok(project)
 }
 
+/// The configured installation whose own `BDS` tree contains `file`, if
+/// exactly one does: the file is vendor source (D56/D57).
+pub fn installation_source(
+    file: &Path,
+    roots: &[PathBuf],
+    session: &OverrideSession,
+) -> Option<String> {
+    containing_installation(file, roots, session).map(|installation| installation.id)
+}
+
 /// A source inside exactly one configured installation's `BDS` tree (its RTL
 /// and VCL sources) is compiled by that installation, so a standalone context
 /// for it takes the installation's compiler and profile properties such as

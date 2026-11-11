@@ -189,6 +189,88 @@ fn an_oversized_report_is_published_truncated_with_a_note() {
     );
 }
 
+/// D57 (b) (l4d-zgyw): lint findings are not published for vendor sources
+/// (inside an installation's own BDS tree), claimed by a project or not,
+/// unless `lintInstallationSources` is set; parse errors still are.
+#[test]
+fn installation_sources_publish_parse_errors_but_not_lint_findings_by_default() {
+    let vendor_source = "unit Vendor;\ninterface\nconst\n  lowerCaseConstant = 1;\nimplementation\nprocedure P;\nbegin\n  P(;\nend;\nend.\n";
+    let codes = |publication: &Value| {
+        publication["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .filter(|diagnostic| diagnostic["source"] == "lint4d")
+            .map(|diagnostic| diagnostic["code"].as_str().unwrap_or("").to_string())
+            .collect::<Vec<_>>()
+    };
+    // (claimed by a project, lintInstallationSources)
+    for (claimed, lint_installation_sources) in [(false, None), (true, None), (false, Some(true))] {
+        let environment = tempfile::tempdir().expect("environment");
+        let root = tempfile::tempdir().expect("workspace");
+        let bds = environment.path().join("RAD Studio/7.0");
+        let vendor = bds.join("source/Win32/rtl/sys/Vendor.pas");
+        write_file(&vendor, vendor_source);
+        write_file(
+            &environment.path().join("config/delphi-tools/config.toml"),
+            &format!(
+                "[installations.\"7.0\".properties]\nBDS = '{}'\nPlatform = 'Win32'\n",
+                bds.display()
+            ),
+        );
+        let main = root.path().join("Main.pas");
+        let main_source = "unit Main;\ninterface\nuses Vendor;\nimplementation\nend.\n";
+        if claimed {
+            write_file(&main, main_source);
+            write_file(
+                &root.path().join("Main.dproj"),
+                &format!(
+                    "<Project><PropertyGroup><MainSource>Main.pas</MainSource>\
+                     <DCC_UnitSearchPath>{}</DCC_UnitSearchPath></PropertyGroup></Project>",
+                    vendor.parent().unwrap().display()
+                ),
+            );
+        }
+        let mut server = TestServer::launch_with_environment(environment);
+        let options = match lint_installation_sources {
+            Some(value) => json!({"lintInstallationSources": value}),
+            None => Value::Null,
+        };
+        server.initialize(root.path(), options);
+        if claimed {
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({"textDocument": {"uri": uri(&main), "languageId": "pascal", "version": 1, "text": main_source}}),
+            );
+            let _ = diagnostics_for_uri(&mut server, &uri(&main));
+        }
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument": {"uri": uri(&vendor), "languageId": "pascal", "version": 1, "text": vendor_source}}),
+        );
+        let publication = diagnostics_for_uri(&mut server, &uri(&vendor));
+        server.shutdown();
+        let codes = codes(&publication);
+        let case =
+            format!("claimed={claimed} lintInstallationSources={lint_installation_sources:?}");
+        assert!(
+            codes.iter().any(|code| code == "parse-error"),
+            "{case}: {publication}"
+        );
+        if lint_installation_sources == Some(true) {
+            assert!(
+                codes.iter().any(|code| code == "constant-naming"),
+                "{case}: {publication}"
+            );
+        } else {
+            assert!(
+                codes.iter().all(|code| code == "parse-error"),
+                "{case}: {publication}"
+            );
+        }
+    }
+}
+
 #[test]
 fn compiled_dcu_source_navigation_serves_read_only_virtual_type() {
     let temp = tempfile::tempdir().expect("isolated workspace");

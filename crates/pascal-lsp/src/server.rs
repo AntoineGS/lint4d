@@ -4036,6 +4036,7 @@ fn runtime_settings_section(settings: &Value) -> Result<Option<Value>, String> {
         "maxTotalBytes",
         "maxCacheBytes",
         "maxWorkspaceUnits",
+        "lintInstallationSources",
         "persistentCacheEnabled",
         "persistentCacheDirectory",
         "persistentCachePageBytes",

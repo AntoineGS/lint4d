@@ -621,3 +621,60 @@ end.
 ",
     );
 }
+
+#[track_caller]
+fn assert_package_formats_to(source: &str, expected: &str) {
+    let format = |text: &str| {
+        fmt4d::format_source(
+            text.as_bytes(),
+            &FileInfo::new(PathBuf::from("P.dpk")),
+            &fmt4d::FmtConfig::default(),
+            &HashSet::new(),
+        )
+        .unwrap_or_else(|error| panic!("formatting failed: {error}"))
+    };
+    let output = format(source);
+    assert_eq!(output, expected, "unexpected output:\n{output}");
+    assert_eq!(format(&output), output, "not idempotent");
+}
+
+/// A package source (`.dpk`) was formatted onto one line after its
+/// directives: `requires rtl, vcl;contains A in 'A.pas';end.`.
+#[test]
+fn package_sources_keep_one_unit_per_line() {
+    assert_package_formats_to(
+        "\
+package P;
+
+{$R *.res}
+{$IMPLICITBUILD OFF}
+
+requires
+  rtl,
+  vcl; // ui
+
+contains
+  A in 'A.pas', // first
+  // second
+  B in 'B.pas' {Form};
+
+end.
+",
+        "\
+package P;
+
+{$R *.res}
+{$IMPLICITBUILD OFF}
+requires
+  rtl,
+  vcl; // ui
+
+contains
+  A in 'A.pas', // first
+  // second
+  B in 'B.pas' {Form};
+
+end.
+",
+    );
+}

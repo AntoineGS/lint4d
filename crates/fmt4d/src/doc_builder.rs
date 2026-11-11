@@ -489,6 +489,8 @@ impl<'a> DocBuilder<'a> {
     pub(crate) fn build_doc(&self, node: Node<'a>) -> Doc {
         match node.kind() {
             K::UNIT => self.build_unit(node),
+            K::PACKAGE => self.build_package(node),
+            K::DECL_REQUIRES | K::DECL_CONTAINS => self.build_package_list(node),
             K::INTERFACE => self.build_interface_section(node),
             K::IMPLEMENTATION => self.build_implementation_section(node),
             K::INITIALIZATION | K::FINALIZATION => self.build_init_final_section(node),
@@ -1120,6 +1122,23 @@ pub(crate) fn strip_trailing_hardline(doc: Doc) -> Doc {
             doc::concat(docs)
         }
         Doc::Indent(inner) => doc::indent(strip_trailing_hardline(*inner)),
+        Doc::Hardline => Doc::Empty,
+        other => other,
+    }
+}
+
+/// Remove a leading `Hardline` from a Doc tree (see
+/// [`strip_trailing_hardline`]).
+pub(crate) fn strip_leading_hardline(doc: Doc) -> Doc {
+    match doc {
+        Doc::Concat(mut docs) => {
+            if let Some(index) = docs.iter().position(|d| !matches!(d, Doc::Empty)) {
+                let first = std::mem::replace(&mut docs[index], Doc::Empty);
+                docs[index] = strip_leading_hardline(first);
+            }
+            doc::concat(docs)
+        }
+        Doc::Indent(inner) => doc::indent(strip_leading_hardline(*inner)),
         Doc::Hardline => Doc::Empty,
         other => other,
     }

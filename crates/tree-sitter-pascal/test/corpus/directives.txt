@@ -1,0 +1,123 @@
+===
+Directive after a return type without a semicolon
+===
+
+unit U;
+interface
+function F(a: Integer): LongBool stdcall;
+procedure P(a: Integer) register;
+procedure Q; overload stdcall;
+implementation
+end.
+
+---
+
+(root
+  (unit (kUnit) (moduleName (identifier))
+    (interface (kInterface)
+      (declProc (kFunction) (identifier)
+        (declArgs (declArg (identifier) (type (typeref (identifier)))))
+        (typeref (identifier))
+        (procAttribute (kStdcall)))
+      (declProc (kProcedure) (identifier)
+        (declArgs (declArg (identifier) (type (typeref (identifier)))))
+        (procAttribute (kRegister)))
+      (declProc (kProcedure) (identifier)
+        (procAttribute (kOverload))
+        (procAttribute (kStdcall))))
+    (implementation (kImplementation))
+    (kEnd)
+    (kEndDot)))
+
+===
+Calling conventions on procedural types
+===
+
+type
+  TF = function(a: Integer): Integer cdecl;
+  TG = procedure(Data: Pointer); stdcall;
+  TR = record
+    f: function(a: Integer): Integer; cdecl;
+    Default: Integer;
+    g: procedure of object stdcall;
+  end;
+var
+  V1: function: THandle stdcall;
+  V2: procedure; cdecl = nil;
+
+---
+
+(root
+  (declTypes (kType)
+    (declType (identifier) (kEq)
+      (type (declProcRef (kFunction)
+        (declArgs (declArg (identifier) (type (typeref (identifier)))))
+        (typeref (identifier))))
+      (procAttribute (kCdecl)))
+    (declType (identifier) (kEq)
+      (type (declProcRef (kProcedure)
+        (declArgs (declArg (identifier) (type (typeref (identifier)))))))
+      (procAttribute (kStdcall)))
+    (declType (identifier) (kEq)
+      (declClass (kRecord)
+        (declField (identifier)
+          (type (declProcRef (kFunction)
+            (declArgs (declArg (identifier) (type (typeref (identifier)))))
+            (typeref (identifier))))
+          (procAttribute (kCdecl)))
+        (declField (identifier) (type (typeref (identifier))))
+        (declField (identifier)
+          (type (declProcRef (kProcedure) (kOf) (kObject)))
+          (procAttribute (kStdcall)))
+        (kEnd))))
+  (declVars (kVar)
+    (declVar (identifier)
+      (type (declProcRef (kFunction) (typeref (identifier))))
+      (procAttribute (kStdcall)))
+    (declVar (identifier)
+      (type (declProcRef (kProcedure)))
+      (procAttribute (kCdecl))
+      (defaultValue (kEq) (kNil)))))
+
+===
+Hint directives on declarations
+===
+
+const
+  fmShareCompat = $0000 platform;
+  C2 = 2 deprecated 'use C3';
+  C3: Integer = 3 platform deprecated;
+  C4 = 4 library;
+  C5 = 5 experimental;
+type
+  TOld = class
+  end deprecated 'gone';
+  TInt = Integer platform;
+var
+  V: Integer platform;
+
+---
+
+(root
+  (declConsts (kConst)
+    (declConst (identifier) (defaultValue (kEq) (literalNumber))
+      (procAttribute (kPlatform)))
+    (declConst (identifier) (defaultValue (kEq) (literalNumber))
+      (procAttribute (kDeprecated) (literalString)))
+    (declConst (identifier) (type (typeref (identifier))) (defaultValue (kEq) (literalNumber))
+      (procAttribute (kPlatform))
+      (procAttribute (kDeprecated)))
+    (declConst (identifier) (defaultValue (kEq) (literalNumber))
+      (procAttribute (kLibrary)))
+    (declConst (identifier) (defaultValue (kEq) (literalNumber))
+      (procAttribute (kExperimental))))
+  (declTypes (kType)
+    (declType (identifier) (kEq)
+      (declClass (kClass) (kEnd))
+      (procAttribute (kDeprecated) (literalString)))
+    (declType (identifier) (kEq)
+      (type (typeref (identifier)))
+      (procAttribute (kPlatform))))
+  (declVars (kVar)
+    (declVar (identifier) (type (typeref (identifier)))
+      (procAttribute (kPlatform)))))

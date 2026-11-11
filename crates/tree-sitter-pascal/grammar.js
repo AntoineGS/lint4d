@@ -581,6 +581,12 @@ module.exports = grammar({
 		[$.varDef, $.type],
 		[$.declVar, $.declField],
 		[$._declClass],
+		// After `= class` a directive word is a hint on a forward declaration
+		// or names the first field.
+		[$.declClass], [$.declIntf],
+		// `F: procedure; cdecl = nil;` against `F: procedure; cdecl;`.
+		[$._hintAttribute, $.procAttribute],
+		[$.declField],
 		[$.declVar, $.declConst, $.declField],
 		[$.declVar, $.declConst],
 		[$.declSection],
@@ -927,11 +933,13 @@ module.exports = grammar({
 				choice($.kMul, $.kDiv, $.kMod, $.kShl, $.kShr), $._subRangeBound),
 		),
 
-		typeref:         $ => seq(
+		// A hint right after a type reference stays in it (`fA: Integer
+		// deprecated;`) rather than becoming a declaration hint.
+		typeref:         $ => prec.right(seq(
 			...enable_if(fpc, field('_dummy', optional($.kSpecialize))),
 			$._typeref,
 			...enable_if(delphi, optional(prec.right(seq($.kDeprecated, optional($._expr))))),
-		),
+		)),
 
 		_typeref:        $ => choice(
 			$.identifier,
@@ -1162,6 +1170,7 @@ module.exports = grammar({
 					$.declHelper,
 				)
 			),
+			repeat($._declHint),
 			';',
 			repeat($._procAttribute)
 		),
@@ -1176,12 +1185,20 @@ module.exports = grammar({
 			field('name', delimited1(varName($))),
 			':',
 			field('type', $.type),
-			optional(choice(
-				seq($.kAbsolute, $._ref),
-				field('defaultValue', $.defaultValue)
-			)),
-			';',
-			repeat(choice($._procAttribute, $.procExternal))
+			choice(
+				seq(
+					optional(choice(
+						seq($.kAbsolute, $._ref),
+						field('defaultValue', $.defaultValue)
+					)),
+					repeat($._declHint),
+					';',
+					repeat(choice($._procAttribute, $.procExternal))
+				),
+				// A procedural variable's directives come before its
+				// initializer: `F: procedure; cdecl = nil;`.
+				seq(';', repeat1($._declHint), field('defaultValue', $.defaultValue), ';'),
+			)
 		),
 
 		declConst:       $ => seq(
@@ -1189,6 +1206,7 @@ module.exports = grammar({
 			field('name', $.identifier),
 			optional(seq(':', field('type', $.type))),
 			field('defaultValue', $.defaultValue),
+			repeat($._declHint),
 			';',
 			repeat($._procAttribute)
 		),
@@ -1212,7 +1230,7 @@ module.exports = grammar({
 		arrayOfConstType: $ => seq(alias($.arrayOfConstTyperef, $.typeref)),
 		arrayOfConstTyperef: $ => seq(alias($.kConst, $.identifier)),
 		declFile:        $ => seq($.kFile, optional(seq($.kOf, $.type))),
-		declString:      $ => prec.left(seq(
+		declString:      $ => prec.right(seq(
 			$.kString,
 			optional(seq('[', choice($._expr), ']')),
 			...enable_if(delphi, optional(prec.right(seq($.kDeprecated, optional($._expr))))),
@@ -1303,11 +1321,14 @@ module.exports = grammar({
 
 		declField:       $ =>  seq(
 			...enable_if(rtti, optional($.rttiAttributes)),
-			field('name', delimited1($.identifier)),
+			field('name', delimited1(varName($))),
 			':',
 			field('type', $.type),
 			field('defaultValue', optional($.defaultValue)),
-			';'
+			repeat($._declHint),
+			';',
+			// `f: function(a: Integer): Integer; cdecl;`
+			repeat(seq(repeat1($._declHint), ';'))
 		),
 
 		declProp:        $ => seq(
@@ -1374,6 +1395,7 @@ module.exports = grammar({
 				field('type', $.typeref),
 			)),
 			field('assign', optional($.defaultValue)),
+			repeat($._declHint),
 			';',
 			repeat($._procAttributeNoExt)
 		),
@@ -1430,7 +1452,7 @@ module.exports = grammar({
 		// Attributes & declaration hints
 
 		_procAttribute:  $ => /*pp($,*/choice(
-			seq(field('attribute', $.procAttribute), ';'),
+			seq(repeat1(field('attribute', $.procAttribute)), ';'),
 			// FPC-specific syntax, e.g. procedure myproc; [public; alias:'bla'; cdecl];
 			...enable_if(fpc, seq(
 				'[',
@@ -1439,7 +1461,7 @@ module.exports = grammar({
 			))
 		)/*)*/,
 		_procAttributeNoExt: $ => choice(
-			seq(ppAttribute($, field('attribute', $.procAttribute)), ';'),
+			seq(repeat1(ppAttribute($, field('attribute', $.procAttribute))), ';'),
 			...enable_if(use_pp, $._procAttributesPp),
 			// FPC-specific syntax, e.g. procedure myproc; [public; alias:'bla'; cdecl];
 			...enable_if(fpc, seq('[', delimited(field('attribute', choice($.procAttribute)), ';'), ']', ';'))
@@ -1452,12 +1474,24 @@ module.exports = grammar({
 			$._procAttributesPp
 		)),
 
+		// Directives written without a separating `;`: calling conventions
+		// after a return type (`): BOOL stdcall;`) and hints on constants,
+		// types and variables (`fmShareCompat = $0000 platform;`).
+		_declHint:       $ => field('attribute', alias($._hintAttribute, $.procAttribute)),
+		_hintAttribute:  $ => choice(
+			$.kStdcall, $.kCdecl, $.kPascal, $.kRegister, $.kSafecall,
+			...enable_if(fpc, $.kWinapi),
+			$.kPlatform, $.kExperimental, $.kLibrary,
+			prec.right(2, seq($.kDeprecated, optional($.literalString))),
+		),
+
 		procAttribute:   $ => choice(
 			$.kStatic, $.kVirtual, $.kDynamic, $.kAbstract, $.kOverride,
 			$.kOverload, $.kReintroduce, $.kInline, $.kStdcall,
 			$.kCdecl, $.kPascal, $.kRegister, $.kSafecall, $.kAssembler,
 			$.kNoreturn, $.kLocal,  $.kFar, $.kNear,
 			$.kDefault, $.kNodefault, $.kDeprecated, $.kExperimental,
+			$.kLibrary,
 
 			seq(
 				choice(

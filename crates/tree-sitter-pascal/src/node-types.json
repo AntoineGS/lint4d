@@ -1631,6 +1631,16 @@
     "type": "declField",
     "named": true,
     "fields": {
+      "attribute": {
+        "multiple": true,
+        "required": false,
+        "types": [
+          {
+            "type": "procAttribute",
+            "named": true
+          }
+        ]
+      },
       "defaultValue": {
         "multiple": false,
         "required": false,
@@ -7886,6 +7896,10 @@
         },
         {
           "type": "kIocheck",
+          "named": true
+        },
+        {
+          "type": "kLibrary",
           "named": true
         },
         {

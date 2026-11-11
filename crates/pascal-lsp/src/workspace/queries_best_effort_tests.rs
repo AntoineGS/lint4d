@@ -86,9 +86,10 @@ fn fixture(main: &str, dep: &str, broken_directives: &str, include: &str) -> Fix
     fs::write(root.join("DepInc.inc"), include).expect("dependency include");
     fs::write(
         root.join("Broken.pas"),
-        // Broken spells the names the features look up, so it could shadow
-        // them and is parsed (D54, l4d-fpyu): its unproven analysis is noted.
-        format!("unit Broken;\ninterface\n{broken_directives}const BrokenValue = 1; {{ DepValue DepCall }}\nimplementation\nend.\n"),
+        // Broken spells the names the features look up where it could
+        // declare them (record fields here), so it could shadow them and is
+        // parsed (D54, l4d-fpyu, l4d-yz96): its unproven analysis is noted.
+        format!("unit Broken;\ninterface\n{broken_directives}const BrokenValue = 1;\ntype TBrokenFields = record DepValue, DepCall: Integer; end;\nimplementation\nend.\n"),
     )
     .expect("broken dependency");
     fs::write(root.join("BrokenInc.inc"), include).expect("broken include");

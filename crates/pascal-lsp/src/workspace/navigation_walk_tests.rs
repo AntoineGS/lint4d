@@ -346,11 +346,12 @@ fn an_off_chain_dependency_that_fails_to_load_is_noted_and_the_answer_binds() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path();
     inherited_member_fixture(root);
-    // Bad is loaded with Dep's imports, as it spells TBase, the name Dep's
-    // lookup needs (l4d-ucux), and needs a compile-time session, which fails.
+    // Bad is loaded with Dep's imports, as it may declare TBase, the name
+    // Dep's lookup needs (l4d-ucux; in a conditional branch, l4d-yz96), and
+    // needs a compile-time session, which fails.
     fs::write(
         root.join("Bad.pas"),
-        "unit Bad;\ninterface\nuses Root;\n{$IFDEF X}{$ENDIF}\nconst BadValue = 1; { not TBase }\nimplementation\nend.\n",
+        "unit Bad;\ninterface\nuses Root;\n{$IFDEF X}{$ENDIF}\nconst BadValue = 1;\n{$IFDEF NEVER}\ntype TBase = class end;\n{$ENDIF}\nimplementation\nend.\n",
     )
     .expect("failing dependency");
     let mut workspace = workspace(root);

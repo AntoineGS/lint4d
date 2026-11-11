@@ -3310,25 +3310,34 @@ impl NavigationIndex {
             Vec::new()
         };
 
-        let (selected_group, selected_substitution) =
-            if let Some(call) = super::overload::call_for_identifier(identifier) {
-                let selection = super::overload::select(
-                    self,
-                    uri,
-                    document,
-                    call,
-                    &candidates,
-                    &GenericSubstitution::empty(),
-                    &owner_instances,
-                    &mut resolution_state,
-                    0,
-                    cancel,
-                    &mut budget,
-                )?;
-                (selection.selected_group, selection.generic_substitution)
-            } else {
-                (None, None)
-            };
+        // The selected overload only specializes a member's display: a call
+        // to global routines shows every candidate whatever its arguments,
+        // so their types are not resolved (each would be looked up through
+        // the imports, l4d-yz96).
+        let selection_shows = candidates.iter().any(|candidate| {
+            self.symbol(candidate)
+                .is_some_and(|symbol| symbol.owner_type.is_some())
+        });
+        let (selected_group, selected_substitution) = if let Some(call) =
+            super::overload::call_for_identifier(identifier).filter(|_| selection_shows)
+        {
+            let selection = super::overload::select(
+                self,
+                uri,
+                document,
+                call,
+                &candidates,
+                &GenericSubstitution::empty(),
+                &owner_instances,
+                &mut resolution_state,
+                0,
+                cancel,
+                &mut budget,
+            )?;
+            (selection.selected_group, selection.generic_substitution)
+        } else {
+            (None, None)
+        };
 
         let selected = self.select_display_candidates(candidates);
         let mut displays = Vec::with_capacity(selected.len());

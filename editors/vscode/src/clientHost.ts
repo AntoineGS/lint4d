@@ -25,6 +25,7 @@ import {
   announceClientStarted,
   CrashWindow,
   SerialQueue,
+  startOutcome,
   shouldRetryClosedClient,
 } from './clientHostLogic';
 
@@ -280,35 +281,45 @@ class ClientHostImpl implements ClientHost {
       });
     });
 
+    let startResolved = false;
+    let startError: unknown;
     try {
       await client.start();
+      startResolved = true;
     } catch (error) {
-      this.output.error(`Pascal LSP failed to start: ${errorMessage(error)}`);
-      this.stateListener?.dispose();
-      this.stateListener = undefined;
-      if (this.activeClient === client) this.activeClient = undefined;
-      this.activeClientReady = false;
-      this.closedBeforeStartResolved = false;
-      this.activeRunStarted = false;
-      this.activeRunAnnounced = false;
-      this.activeRunGeneration += 1;
-      this.setStatus('failed');
-      await this.setCapabilityContexts(undefined);
-      const choice = await vscode.window.showErrorMessage(
-        `Pascal LSP failed to start: ${errorMessage(error)}`,
-        'Show Output',
-      );
-      if (choice === 'Show Output') this.output.show();
+      startError = error;
+    }
+
+    if (startOutcome({ closedDuringStart: this.closedBeforeStartResolved, startResolved }) === 'failed') {
+      const error = startResolved
+        ? new Error('Language client closed before startup completed')
+        : startError;
+      await this.handleStartFailure(client, error);
       return;
     }
 
     this.activeClientReady = true;
     this.successfulStarts += 1;
-    if (this.closedBeforeStartResolved) {
-      await this.handleUnexpectedClose(client);
-    } else {
-      await this.onStateChange(client, client.state);
-    }
+    await this.onStateChange(client, client.state);
+  }
+
+  private async handleStartFailure(client: LanguageClient, error: unknown): Promise<void> {
+    this.output.error(`Pascal LSP failed to start: ${errorMessage(error)}`);
+    this.stateListener?.dispose();
+    this.stateListener = undefined;
+    if (this.activeClient === client) this.activeClient = undefined;
+    this.activeClientReady = false;
+    this.closedBeforeStartResolved = false;
+    this.activeRunStarted = false;
+    this.activeRunAnnounced = false;
+    this.activeRunGeneration += 1;
+    this.setStatus('failed');
+    await this.setCapabilityContexts(undefined);
+    const choice = await vscode.window.showErrorMessage(
+      `Pascal LSP failed to start: ${errorMessage(error)}`,
+      'Show Output',
+    );
+    if (choice === 'Show Output') this.output.show();
   }
 
   private async stopInternal(): Promise<void> {
@@ -387,7 +398,7 @@ class ClientHostImpl implements ClientHost {
 
   private async onClosed(client: LanguageClient): Promise<CloseHandlerResult> {
     if (this.activeClient === client && !this.activeClientReady && this.desiredRunning && !this.stopRequested) {
-      // A close before start() resolves is handled by the single start-failure path if it rejects.
+      // A close before start() settles is a start failure, whether it resolves or rejects.
       this.closedBeforeStartResolved = true;
       return { action: CloseAction.DoNotRestart };
     }

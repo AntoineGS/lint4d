@@ -30,6 +30,13 @@ export function shouldRetryClosedClient(state: {
   return state.startResolved && state.desiredRunning && !state.stopRequested && state.isActive;
 }
 
+export function startOutcome(state: {
+  closedDuringStart: boolean;
+  startResolved: boolean;
+}): 'running' | 'failed' {
+  return state.startResolved && !state.closedDuringStart ? 'running' : 'failed';
+}
+
 export function announceClientStarted<T>(
   client: T,
   setRunning: () => void,

@@ -3,6 +3,7 @@ import {
   announceClientStarted,
   CrashWindow,
   SerialQueue,
+  startOutcome,
   shouldRetryClosedClient,
 } from '../../src/clientHostLogic';
 
@@ -51,6 +52,14 @@ describe('shouldRetryClosedClient', () => {
     expect(shouldRetryClosedClient({ ...readyClient, startResolved: false })).toBe(false);
     expect(shouldRetryClosedClient({ ...readyClient, stopRequested: true })).toBe(false);
     expect(shouldRetryClosedClient(readyClient)).toBe(true);
+  });
+});
+
+describe('startOutcome', () => {
+  it('routes only resolved starts without an early close to running', () => {
+    expect(startOutcome({ closedDuringStart: false, startResolved: true })).toBe('running');
+    expect(startOutcome({ closedDuringStart: true, startResolved: true })).toBe('failed');
+    expect(startOutcome({ closedDuringStart: false, startResolved: false })).toBe('failed');
   });
 });
 

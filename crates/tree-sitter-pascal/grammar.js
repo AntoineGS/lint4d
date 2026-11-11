@@ -718,8 +718,23 @@ module.exports = grammar({
 		asmBody: $ => repeat1(choice(
 			///([a-zA-Z0-9_]+([eE][nN][dD])|[eE][nN][dD][a-zA-Z0-9_]+|([^eE]|[eE][^nN]|[eE][nN][^dD]))+/,
 			$.identifier,       // Identifiers
+			// Reserved words are operands and operators here (`XOR EAX,EAX`,
+			// `TYPE TFoo`, `@Nil`); only `end` closes the block.
+			$.kAnd, $.kArray, $.kAs, $.kAsm, $.kBegin, $.kCase, $.kClass,
+			$.kConst, $.kConstructor, $.kDestructor, $.kDispInterface, $.kDiv,
+			$.kDo, $.kDownto, $.kElse, $.kExcept, $.kExports, $.kFile,
+			$.kFinalization, $.kFinally, $.kFor, $.kFunction, $.kGoto, $.kIf,
+			$.kImplementation, $.kIn, $.kInherited, $.kInitialization,
+			$.kInline, $.kInterface, $.kIs, $.kLabel, $.kLibrary, $.kMod,
+			$.kNil, $.kNot, $.kObject, $.kOf, $.kOr, $.kPacked, $.kProcedure,
+			$.kProgram, $.kProperty, $.kRaise, $.kRecord, $.kRepeat,
+			$.kResourcestring, $.kSet, $.kShl, $.kShr, $.kString, $.kThen,
+			$.kThreadvar, $.kTo, $.kTry, $.kType, $.kUnit, $.kUntil, $.kUses,
+			$.kVar, $.kWhile, $.kWith, $.kXor,
 			/[0-9a-fA-F]/,      // Numbers
-			/[.,:;+\-*\[\]<>&%$@]/, // Punctuation, including local labels
+			/[.,:;+\-*\/\[\]<>=&%$@#^!|?~]/, // Punctuation, including local labels
+			/'[^'\r\n]*'/,      // Character and string operands
+			/"[^"\r\n]*"/,
 			/\([^*]|\)/         // Parentheses that are not comments
 		)),
 

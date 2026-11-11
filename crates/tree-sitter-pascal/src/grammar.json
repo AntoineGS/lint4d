@@ -3271,12 +3271,272 @@
             "name": "identifier"
           },
           {
+            "type": "SYMBOL",
+            "name": "kAnd"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kArray"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kAs"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kAsm"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kBegin"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kCase"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kClass"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kConst"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kConstructor"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kDestructor"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kDispInterface"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kDiv"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kDo"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kDownto"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kElse"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kExcept"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kExports"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kFile"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kFinalization"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kFinally"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kFor"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kFunction"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kGoto"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kIf"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kImplementation"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kIn"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kInherited"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kInitialization"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kInline"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kInterface"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kIs"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kLabel"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kLibrary"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kMod"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kNil"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kNot"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kObject"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kOf"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kOr"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kPacked"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kProcedure"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kProgram"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kProperty"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kRaise"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kRecord"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kRepeat"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kResourcestring"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kSet"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kShl"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kShr"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kString"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kThen"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kThreadvar"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kTo"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kTry"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kType"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kUnit"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kUntil"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kUses"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kVar"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kWhile"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kWith"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kXor"
+          },
+          {
             "type": "PATTERN",
             "value": "[0-9a-fA-F]"
           },
           {
             "type": "PATTERN",
-            "value": "[.,:;+\\-*\\[\\]<>&%$@]"
+            "value": "[.,:;+\\-*\\/\\[\\]<>=&%$@#^!|?~]"
+          },
+          {
+            "type": "PATTERN",
+            "value": "'[^'\\r\\n]*'"
+          },
+          {
+            "type": "PATTERN",
+            "value": "\"[^\"\\r\\n]*\""
           },
           {
             "type": "PATTERN",

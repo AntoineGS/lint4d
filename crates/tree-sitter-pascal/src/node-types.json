@@ -128,6 +128,258 @@
         {
           "type": "identifier",
           "named": true
+        },
+        {
+          "type": "kAnd",
+          "named": true
+        },
+        {
+          "type": "kArray",
+          "named": true
+        },
+        {
+          "type": "kAs",
+          "named": true
+        },
+        {
+          "type": "kAsm",
+          "named": true
+        },
+        {
+          "type": "kBegin",
+          "named": true
+        },
+        {
+          "type": "kCase",
+          "named": true
+        },
+        {
+          "type": "kClass",
+          "named": true
+        },
+        {
+          "type": "kConst",
+          "named": true
+        },
+        {
+          "type": "kConstructor",
+          "named": true
+        },
+        {
+          "type": "kDestructor",
+          "named": true
+        },
+        {
+          "type": "kDispInterface",
+          "named": true
+        },
+        {
+          "type": "kDiv",
+          "named": true
+        },
+        {
+          "type": "kDo",
+          "named": true
+        },
+        {
+          "type": "kDownto",
+          "named": true
+        },
+        {
+          "type": "kElse",
+          "named": true
+        },
+        {
+          "type": "kExcept",
+          "named": true
+        },
+        {
+          "type": "kExports",
+          "named": true
+        },
+        {
+          "type": "kFile",
+          "named": true
+        },
+        {
+          "type": "kFinalization",
+          "named": true
+        },
+        {
+          "type": "kFinally",
+          "named": true
+        },
+        {
+          "type": "kFor",
+          "named": true
+        },
+        {
+          "type": "kFunction",
+          "named": true
+        },
+        {
+          "type": "kGoto",
+          "named": true
+        },
+        {
+          "type": "kIf",
+          "named": true
+        },
+        {
+          "type": "kImplementation",
+          "named": true
+        },
+        {
+          "type": "kIn",
+          "named": true
+        },
+        {
+          "type": "kInherited",
+          "named": true
+        },
+        {
+          "type": "kInitialization",
+          "named": true
+        },
+        {
+          "type": "kInline",
+          "named": true
+        },
+        {
+          "type": "kInterface",
+          "named": true
+        },
+        {
+          "type": "kIs",
+          "named": true
+        },
+        {
+          "type": "kLabel",
+          "named": true
+        },
+        {
+          "type": "kLibrary",
+          "named": true
+        },
+        {
+          "type": "kMod",
+          "named": true
+        },
+        {
+          "type": "kNil",
+          "named": true
+        },
+        {
+          "type": "kNot",
+          "named": true
+        },
+        {
+          "type": "kObject",
+          "named": true
+        },
+        {
+          "type": "kOf",
+          "named": true
+        },
+        {
+          "type": "kOr",
+          "named": true
+        },
+        {
+          "type": "kPacked",
+          "named": true
+        },
+        {
+          "type": "kProcedure",
+          "named": true
+        },
+        {
+          "type": "kProgram",
+          "named": true
+        },
+        {
+          "type": "kProperty",
+          "named": true
+        },
+        {
+          "type": "kRaise",
+          "named": true
+        },
+        {
+          "type": "kRecord",
+          "named": true
+        },
+        {
+          "type": "kRepeat",
+          "named": true
+        },
+        {
+          "type": "kResourcestring",
+          "named": true
+        },
+        {
+          "type": "kSet",
+          "named": true
+        },
+        {
+          "type": "kShl",
+          "named": true
+        },
+        {
+          "type": "kShr",
+          "named": true
+        },
+        {
+          "type": "kString",
+          "named": true
+        },
+        {
+          "type": "kThen",
+          "named": true
+        },
+        {
+          "type": "kThreadvar",
+          "named": true
+        },
+        {
+          "type": "kTo",
+          "named": true
+        },
+        {
+          "type": "kTry",
+          "named": true
+        },
+        {
+          "type": "kType",
+          "named": true
+        },
+        {
+          "type": "kUnit",
+          "named": true
+        },
+        {
+          "type": "kUntil",
+          "named": true
+        },
+        {
+          "type": "kUses",
+          "named": true
+        },
+        {
+          "type": "kVar",
+          "named": true
+        },
+        {
+          "type": "kWhile",
+          "named": true
+        },
+        {
+          "type": "kWith",
+          "named": true
+        },
+        {
+          "type": "kXor",
+          "named": true
         }
       ]
     }

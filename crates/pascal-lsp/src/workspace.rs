@@ -17245,8 +17245,9 @@ pub(crate) fn withheld_report_diagnostic() -> LspDiagnostic {
 }
 
 /// Why lint was withheld for an incomplete expansion, from the expansion's
-/// errors and its conditional projection. An unresolved include comes
-/// first; then a compile-time analysis that stopped early; then code whose
+/// errors and its conditional projection. A compile-time analysis stopped
+/// by a limit comes first, named by its own reason; then an unresolved
+/// include; then an analysis stopped for another reason; then code whose
 /// activity the context leaves unknown, naming the defines `context` does
 /// not know (or the conditional, when it is not made of define tests).
 fn withheld_lint_message(
@@ -17255,18 +17256,25 @@ fn withheld_lint_message(
     context: &pascal_project::ConditionalContext,
 ) -> String {
     const WITHHELD: &str = "lint diagnostics were withheld";
+    let stopped = (!conditional.complete).then(|| {
+        errors
+            .iter()
+            .find_map(|error| error.strip_prefix(compile_time::ANALYSIS_STOPPED))
+            .unwrap_or("its safety limits were reached")
+    });
+    // An analysis stopped by a limit comes first: the includes after where
+    // it stopped were never walked, so they are not unresolved. Otherwise a
+    // missing include is the cause the analysis stopped on.
+    if let Some(reason) = stopped.filter(|reason| reason.ends_with(" was reached")) {
+        return format!("conditional compilation analysis stopped: {reason}; {WITHHELD}");
+    }
     if errors
         .iter()
         .any(|error| error.starts_with(compile_time::UNRESOLVED_INCLUDE))
     {
         return format!("include expansion was incomplete; {WITHHELD}");
     }
-    if !conditional.complete {
-        let reason = errors
-            .iter()
-            .find(|error| error.ends_with(" was reached"))
-            .or_else(|| errors.first())
-            .map_or("its safety limits were reached", String::as_str);
+    if let Some(reason) = stopped {
         return format!("conditional compilation analysis stopped: {reason}; {WITHHELD}");
     }
     if conditional.unknown_activity_requires_fail_closed() {
@@ -18287,6 +18295,42 @@ fn is_immutable_override_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Review M1/M2 (l4d-zgyw): a stopped analysis is named by its own
+    /// reason, not by a resolver warning listed before it, and an include
+    /// the stopped analysis never walked is not blamed as unresolved.
+    #[test]
+    fn withheld_lint_names_the_stopped_analysis_reason() {
+        let stopped = pascal_core::conditional::ConditionalAnalysis {
+            projected_source: String::new(),
+            inactive_spans: vec![],
+            unknown_spans: vec![],
+            directives: vec![],
+            complete: false,
+        };
+        let errors = vec![
+            "include candidate could not be loaded: Unauthorized { reason: \"was reached\" }"
+                .to_string(),
+            format!(
+                "{}the max_branch_states limit (64) was reached",
+                super::compile_time::ANALYSIS_STOPPED
+            ),
+            "shared compile-time analysis is incomplete".to_string(),
+            format!(
+                "{} {{$I Later.inc}}",
+                super::compile_time::UNRESOLVED_INCLUDE
+            ),
+        ];
+        assert_eq!(
+            super::withheld_lint_message(
+                &errors,
+                &stopped,
+                &pascal_project::ConditionalContext::default()
+            ),
+            "conditional compilation analysis stopped: the max_branch_states limit (64) was \
+             reached; lint diagnostics were withheld"
+        );
+    }
+
     #[test]
     fn context_states_differing_only_in_observations_are_not_equal() {
         let state = |warnings: Vec<String>| ContextState {

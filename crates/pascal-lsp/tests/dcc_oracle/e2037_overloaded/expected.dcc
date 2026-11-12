@@ -1,0 +1,5 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem Overloaded.pas
+Overloaded.pas(10) E2254 Overloaded procedure 'Foo' must be marked with the 'overload' directive
+Overloaded.pas(5) E2065 Unsatisfied forward or external declaration: 'Foo'
+Overloaded.pas(6) E2065 Unsatisfied forward or external declaration: 'Foo'

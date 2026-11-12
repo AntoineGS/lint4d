@@ -82,6 +82,12 @@ fn map_verified_header_location(uri: &Url, range: Range) -> Location {
 mod assistance;
 mod call_hierarchy;
 pub mod compiled_dcu;
+mod contracts;
+mod dcc_message;
+#[cfg(test)]
+mod dcc_oracle_tests;
+mod declarations;
+pub(crate) use dcc_message::{DccMessage, DccSeverity};
 mod documentation;
 mod facts;
 mod folding;
@@ -791,8 +797,30 @@ pub(crate) enum SemanticDiagnosticKind {
     MissingMember,
     TypeMismatch,
     IncompatibleArgument,
-    InvalidOverride,
-    MissingInterfaceImplementation,
+    #[allow(dead_code)]
+    Dcc(DccMessage),
+}
+
+impl SemanticDiagnosticKind {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::UnresolvedIdentifier => "pascal-unresolved-identifier",
+            Self::MissingMember => "pascal-missing-member",
+            Self::TypeMismatch => "pascal-type-mismatch",
+            Self::IncompatibleArgument => "pascal-incompatible-argument",
+            Self::Dcc(message) => message.code(),
+        }
+    }
+
+    pub(crate) fn severity(self) -> DccSeverity {
+        match self {
+            Self::Dcc(message) => message.severity(),
+            Self::UnresolvedIdentifier
+            | Self::MissingMember
+            | Self::TypeMismatch
+            | Self::IncompatibleArgument => DccSeverity::Error,
+        }
+    }
 }
 
 /// Syntactic role required by an add-missing-unit use site.
@@ -830,8 +858,7 @@ fn semantic_diagnostic_kind_rank(kind: SemanticDiagnosticKind) -> u8 {
         SemanticDiagnosticKind::MissingMember => 1,
         SemanticDiagnosticKind::TypeMismatch => 2,
         SemanticDiagnosticKind::IncompatibleArgument => 3,
-        SemanticDiagnosticKind::InvalidOverride => 4,
-        SemanticDiagnosticKind::MissingInterfaceImplementation => 5,
+        SemanticDiagnosticKind::Dcc(_) => 6,
     }
 }
 
@@ -2971,8 +2998,7 @@ impl NavigationIndex {
                     }
                     SemanticDiagnosticKind::TypeMismatch
                     | SemanticDiagnosticKind::IncompatibleArgument
-                    | SemanticDiagnosticKind::InvalidOverride
-                    | SemanticDiagnosticKind::MissingInterfaceImplementation => continue,
+                    | SemanticDiagnosticKind::Dcc(_) => continue,
                 };
                 report.diagnostics.push(SemanticDiagnostic {
                     kind,
@@ -3096,6 +3122,9 @@ impl NavigationIndex {
                     });
                 }
             }
+            if !report.has_capacity() {
+                break 'analysis;
+            }
             let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
             match self.contract_diagnostics_with_budget(
                 uri,
@@ -3111,6 +3140,45 @@ impl NavigationIndex {
                     if let Some(contracts) = report.checked_candidate(result, &budget)? {
                         report.diagnostics.extend(contracts);
                     }
+                }
+            }
+            if !report.has_capacity() {
+                break 'analysis;
+            }
+            let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
+            match self.ancestry_diagnostics_with_budget(
+                uri,
+                document,
+                capacity,
+                cancel,
+                &mut budget,
+            ) {
+                Err(error) if error == SEMANTIC_DIAGNOSTICS_LIMIT => {
+                    report.note(SemanticCoverageGap::DiagnosticCap);
+                }
+                result => {
+                    if let Some(ancestry) = report.checked_candidate(result, &budget)? {
+                        report.diagnostics.extend(ancestry);
+                    }
+                }
+            }
+            if !report.has_capacity() {
+                break 'analysis;
+            }
+            let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
+            let mut declaration_cap_reached = false;
+            let result = self.declaration_diagnostics_with_budget(
+                uri,
+                document,
+                capacity,
+                &mut declaration_cap_reached,
+                cancel,
+                &mut budget,
+            );
+            if let Some(declarations) = report.checked_candidate(result, &budget)? {
+                report.diagnostics.extend(declarations);
+                if declaration_cap_reached {
+                    report.note(SemanticCoverageGap::DiagnosticCap);
                 }
             }
         }
@@ -3457,10 +3525,6 @@ impl NavigationIndex {
         if class_resolution.interfaces.is_empty() && !inherited_from_abstract_parent {
             return Ok(Some((Vec::new(), ContractClassSurface::default())));
         }
-        if self.contract_type_is_abstract_with_budget(class_instance, cancel, budget)? {
-            return Ok(Some((Vec::new(), ContractClassSurface::default())));
-        }
-
         let mut requirements = Vec::new();
         let mut collected_requirements = HashSet::new();
         let mut interfaces = class_resolution.interfaces.clone();
@@ -3737,22 +3801,43 @@ impl NavigationIndex {
             if exact_virtual || uncertain || overloaded {
                 continue;
             }
-            let _ = (same_name, exact_nonvirtual);
+            let kind = if exact_nonvirtual {
+                SemanticDiagnosticKind::Dcc(DccMessage::E2170)
+            } else if !same_name {
+                SemanticDiagnosticKind::Dcc(DccMessage::E2137)
+            } else {
+                continue;
+            };
             if diagnostics.len() >= capacity {
                 return Err(SEMANTIC_DIAGNOSTICS_LIMIT.to_owned());
             }
-            let name = symbol.name.clone();
-            budget.require_bytes(name.len().saturating_mul(2), cancel)?;
+            let message = match kind {
+                SemanticDiagnosticKind::Dcc(DccMessage::E2170) => {
+                    budget.require_bytes(
+                        DccMessage::E2170.template().len().saturating_mul(2),
+                        cancel,
+                    )?;
+                    DccMessage::E2170.format(&[])
+                }
+                SemanticDiagnosticKind::Dcc(DccMessage::E2137) => {
+                    let name = symbol.name.clone();
+                    budget.require_bytes(
+                        name.len()
+                            .saturating_add(DccMessage::E2137.template().len())
+                            .saturating_mul(2),
+                        cancel,
+                    )?;
+                    DccMessage::E2137.format(&[&name])
+                }
+                _ => unreachable!("override diagnostics use only E2137 or E2170"),
+            };
             diagnostics.push(SemanticDiagnostic {
-                kind: SemanticDiagnosticKind::InvalidOverride,
+                kind,
                 span: SourceSpan {
                     start: symbol.span.start,
                     end: symbol.span.end,
                 },
-                message: format!(
-                    "invalid override '{}': no inherited virtual or dynamic method matches",
-                    name
-                ),
+                message,
             });
         }
 
@@ -3789,13 +3874,12 @@ impl NavigationIndex {
             if !contract_substitution_is_complete(&class_instance) {
                 continue;
             }
-            let Some((missing, _surface)) = self
-                .missing_interface_contracts_for_class_with_budget(
-                    &class_instance,
-                    &mut ancestry,
-                    cancel,
-                    budget,
-                )?
+            let Some((missing, surface)) = self.missing_interface_contracts_for_class_with_budget(
+                &class_instance,
+                &mut ancestry,
+                cancel,
+                budget,
+            )?
             else {
                 continue;
             };
@@ -3805,31 +3889,61 @@ impl NavigationIndex {
                 if obligation.implementation != ContractMatch::No {
                     continue;
                 }
+                if self.interface_signature_mismatch_with_budget(
+                    &class_instance,
+                    &obligation,
+                    &surface,
+                    cancel,
+                    budget,
+                )? {
+                    continue;
+                }
                 let Some(interface_method) = self.symbol(&obligation.requirement.candidate) else {
+                    continue;
+                };
+                let Some(interface_document) =
+                    self.documents.get(&obligation.requirement.interface.uri)
+                else {
+                    continue;
+                };
+                let Some(interface_indices) = interface_document
+                    .type_symbol_indices
+                    .get(&obligation.requirement.interface.key)
+                else {
+                    continue;
+                };
+                if interface_indices.len() != 1 {
+                    continue;
+                }
+                let Some(interface_symbol) = interface_document
+                    .symbols
+                    .get(interface_indices[0])
+                    .filter(|symbol| {
+                        symbol.kind == SymbolKind::Type && symbol.type_kind == TypeKind::Interface
+                    })
+                else {
                     continue;
                 };
                 if diagnostics.len() >= capacity {
                     return Err(SEMANTIC_DIAGNOSTICS_LIMIT.to_owned());
                 }
-                let class_name = class_symbol.name.clone();
+                let interface_name = interface_symbol.name.clone();
                 let method_name = interface_method.name.clone();
                 budget.require_bytes(
-                    class_name
+                    interface_name
                         .len()
                         .saturating_add(method_name.len())
+                        .saturating_add(DccMessage::E2291.template().len())
                         .saturating_mul(2),
                     cancel,
                 )?;
                 diagnostics.push(SemanticDiagnostic {
-                    kind: SemanticDiagnosticKind::MissingInterfaceImplementation,
+                    kind: SemanticDiagnosticKind::Dcc(DccMessage::E2291),
                     span: SourceSpan {
                         start: class_symbol.span.start,
                         end: class_symbol.span.end,
                     },
-                    message: format!(
-                        "class '{}' does not implement interface method '{}'",
-                        class_name, method_name
-                    ),
+                    message: DccMessage::E2291.format(&[&interface_name, &method_name]),
                 });
             }
         }
@@ -15543,6 +15657,7 @@ struct Symbol {
     type_shape: Option<TypeShape>,
     result_type_name: Option<String>,
     result_type_ref: Option<TypeRef>,
+    implementation_result_type_ref: Option<TypeRef>,
     result_type_span: Option<Span>,
     region: Region,
     origin: Origin,
@@ -15576,8 +15691,10 @@ struct RoutineDirectives {
     virtual_: bool,
     dynamic: bool,
     override_: bool,
+    message: bool,
     reintroduce: bool,
     forward: bool,
+    external: bool,
     abstract_: bool,
     calling_convention: Option<CallingConvention>,
     calling_convention_unknown: bool,
@@ -17275,6 +17392,7 @@ impl Document {
                 type_shape: None,
                 result_type_name: None,
                 result_type_ref: None,
+                implementation_result_type_ref: None,
                 result_type_span: None,
                 region: Region::Other,
                 origin: Origin::Declaration,
@@ -18458,6 +18576,7 @@ fn inject_abbreviated_parameters(
                 type_shape: type_shape.clone(),
                 result_type_name: None,
                 result_type_ref: None,
+                implementation_result_type_ref: None,
                 result_type_span: None,
                 region: Region::Implementation,
                 origin: Origin::Declaration,
@@ -18537,6 +18656,7 @@ fn add_definition_symbol<'a>(
         type_ref: None,
         type_shape: None,
         result_type_name: result_type.as_ref().map(|(name, _)| name.clone()),
+        implementation_result_type_ref: result_type_ref.clone(),
         result_type_ref,
         result_type_span: result_type.map(|(_, span)| span),
         region,
@@ -18616,6 +18736,7 @@ fn add_routine_symbol<'a>(
         type_shape: None,
         result_type_name: result_type.as_ref().map(|(name, _)| name.clone()),
         result_type_ref,
+        implementation_result_type_ref: None,
         result_type_span: result_type.map(|(_, span)| span),
         region,
         origin: Origin::Declaration,
@@ -18674,6 +18795,7 @@ fn push_routine_generic_parameter_symbols(
             type_shape: None,
             result_type_name: None,
             result_type_ref: None,
+            implementation_result_type_ref: None,
             result_type_span: None,
             region,
             origin: Origin::Declaration,
@@ -18779,6 +18901,7 @@ fn add_named_symbol<'a>(
             type_shape: type_shape.clone(),
             result_type_name: None,
             result_type_ref: None,
+            implementation_result_type_ref: None,
             result_type_span: None,
             region,
             origin: Origin::Declaration,
@@ -18821,6 +18944,7 @@ fn add_named_symbol<'a>(
                 type_shape: None,
                 result_type_name: None,
                 result_type_ref: None,
+                implementation_result_type_ref: None,
                 result_type_span: None,
                 region,
                 origin: Origin::Declaration,
@@ -19444,8 +19568,10 @@ fn routine_directives(node: Node<'_>) -> RoutineDirectives {
         "kVirtual" => directives.virtual_ = true,
         "kDynamic" => directives.dynamic = true,
         "kOverride" => directives.override_ = true,
+        "kMessage" => directives.message = true,
         "kReintroduce" => directives.reintroduce = true,
         "kForward" => directives.forward = true,
+        "kExternal" => directives.external = true,
         "kAbstract" => directives.abstract_ = true,
         "kCdecl" => directives.calling_convention = Some(CallingConvention::Cdecl),
         "kStdcall" => directives.calling_convention = Some(CallingConvention::Stdcall),
@@ -23015,6 +23141,28 @@ mod tests {
     use super::*;
     use std::fmt::Write as _;
 
+    fn is_override_diagnostic(diagnostic: &SemanticDiagnostic) -> bool {
+        matches!(
+            diagnostic.kind,
+            SemanticDiagnosticKind::Dcc(DccMessage::E2137 | DccMessage::E2170)
+        )
+    }
+
+    fn is_interface_diagnostic(diagnostic: &SemanticDiagnostic) -> bool {
+        diagnostic.kind == SemanticDiagnosticKind::Dcc(DccMessage::E2291)
+    }
+
+    fn diagnostics_without_declaration_pairing_findings(
+        diagnostics: &[SemanticDiagnostic],
+    ) -> impl Iterator<Item = &SemanticDiagnostic> {
+        diagnostics.iter().filter(|diagnostic| {
+            !matches!(
+                diagnostic.kind,
+                SemanticDiagnosticKind::Dcc(DccMessage::E2037 | DccMessage::E2065)
+            )
+        })
+    }
+
     fn repeated_class_field_source(repetitions: usize) -> String {
         let mut source = String::from(
             "unit RepeatedClassField;\ninterface\ntype\n  TFirst = class\n    FValue: Integer;\n    procedure Touch;\n  end;\nimplementation\nprocedure TFirst.Touch;\nbegin\n",
@@ -24299,8 +24447,8 @@ mod tests {
     }
 
     #[test]
-    fn semantic_diagnostics_report_an_override_without_a_matching_virtual_ancestor() {
-        let uri = Url::parse("file:///tmp/semantic-diagnostics-invalid-override.pas")
+    fn semantic_diagnostics_keep_same_name_signature_mismatches_out_of_e2137_and_e2170() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-override-signature-mismatch.pas")
             .expect("override URI");
         let source = concat!(
             "unit SemanticDiagnosticsInvalidOverride;\n",
@@ -24329,12 +24477,10 @@ mod tests {
             .expect("semantic diagnostics complete");
 
         assert!(
-            diagnostics.iter().any(|diagnostic| {
-                diagnostic.kind == SemanticDiagnosticKind::InvalidOverride
-                    && diagnostic.message
-                        == "invalid override 'Run': no inherited virtual or dynamic method matches"
-            }),
-            "the incompatible explicit override must be diagnosed: {diagnostics:?}"
+            diagnostics
+                .iter()
+                .all(|diagnostic| !is_override_diagnostic(diagnostic)),
+            "dcc reports a same-name signature mismatch as E2037, not E2137 or E2170: {diagnostics:?}"
         );
     }
 
@@ -24372,11 +24518,11 @@ mod tests {
         );
         assert_eq!(
             diagnostics[0].kind,
-            SemanticDiagnosticKind::MissingInterfaceImplementation
+            SemanticDiagnosticKind::Dcc(DccMessage::E2291)
         );
         assert_eq!(
             diagnostics[0].message,
-            "class 'TImplementation' does not implement interface method 'Required'"
+            "Missing implementation of interface method IRequired.Required"
         );
         let class_start = source
             .find("TImplementation = class")
@@ -24387,6 +24533,55 @@ mod tests {
                 start: class_start,
                 end: class_start + "TImplementation".len(),
             }
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_budget_the_fixed_e2291_message_template() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-e2291-byte-budget.pas")
+            .expect("E2291 byte-budget URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsE2291ByteBudget;\n",
+            "interface\ntype\n",
+            "  TObject = class\n  end;\n",
+            "  IRequired = interface\n    procedure Required;\n  end;\n",
+            "  TImplementation = class(TObject, IRequired)\n  end;\n",
+            "implementation\nend.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("E2291 byte-budget fixture parses");
+        let document = index.documents.get(&uri).expect("indexed document");
+        let cancel = AtomicBool::new(false);
+        let byte_limit = 8 * 1024 * 1024;
+        let mut prefix_budget = AssistanceBudget::new(100_000, byte_limit, "semantic diagnostics");
+        assert_eq!(
+            index.contract_diagnostics_with_budget(&uri, document, 0, &cancel, &mut prefix_budget,),
+            Err(SEMANTIC_DIAGNOSTICS_LIMIT.to_owned()),
+            "zero capacity must stop immediately before materializing E2291"
+        );
+        let prefix_bytes = byte_limit - prefix_budget.remaining_bytes;
+        let arguments_bytes = ("IRequired".len() + "Required".len()) * 2;
+        let mut args_only_budget = AssistanceBudget::new(
+            100_000,
+            prefix_bytes + arguments_bytes,
+            "semantic diagnostics",
+        );
+
+        let result = index.contract_diagnostics_with_budget(
+            &uri,
+            document,
+            1,
+            &cancel,
+            &mut args_only_budget,
+        );
+
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.contains("byte scan limit")),
+            "E2291 must charge more than its argument strings: {result:?}"
         );
     }
 
@@ -24477,7 +24672,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .all(|diagnostic| diagnostic.kind != SemanticDiagnosticKind::InvalidOverride),
+                .all(|diagnostic| !is_override_diagnostic(diagnostic)),
             "an implicit TObject root is not a proven empty ancestor: {diagnostics:?}"
         );
     }
@@ -24508,9 +24703,9 @@ mod tests {
             .expect("semantic diagnostics complete");
 
         assert!(
-            diagnostics.iter().all(|diagnostic| {
-                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
-            }),
+            diagnostics
+                .iter()
+                .all(|diagnostic| { !is_interface_diagnostic(diagnostic) }),
             "an implicit compiler root cannot prove ToString absent: {diagnostics:?}"
         );
     }
@@ -24563,7 +24758,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .all(|diagnostic| diagnostic.kind != SemanticDiagnosticKind::InvalidOverride),
+                .all(|diagnostic| !is_override_diagnostic(diagnostic)),
             "a complete source-backed TObject supplies Destroy: {diagnostics:?}"
         );
     }
@@ -24615,7 +24810,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .all(|diagnostic| diagnostic.kind != SemanticDiagnosticKind::InvalidOverride),
+                .all(|diagnostic| !is_override_diagnostic(diagnostic)),
             "provider recovery must suppress absence proofs: {diagnostics:?}"
         );
     }
@@ -24650,7 +24845,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .all(|diagnostic| diagnostic.kind != SemanticDiagnosticKind::InvalidOverride),
+                .all(|diagnostic| !is_override_diagnostic(diagnostic)),
             "an unresolved import prevents a closed-world override proof: {diagnostics:?}"
         );
     }
@@ -24686,9 +24881,9 @@ mod tests {
             .expect("semantic diagnostics complete");
 
         assert!(
-            diagnostics.iter().all(|diagnostic| {
-                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
-            }),
+            diagnostics
+                .iter()
+                .all(|diagnostic| { !is_interface_diagnostic(diagnostic) }),
             "unknown obligation signatures cannot support a missing claim: {diagnostics:?}"
         );
     }
@@ -24724,8 +24919,7 @@ mod tests {
 
         assert!(
             diagnostics.iter().all(|diagnostic| {
-                diagnostic.kind != SemanticDiagnosticKind::InvalidOverride
-                    && diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
+                !is_override_diagnostic(diagnostic) && !is_interface_diagnostic(diagnostic)
             }),
             "uninstantiated generic owners cannot support contract absence proofs: {diagnostics:?}"
         );
@@ -24762,7 +24956,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .all(|diagnostic| diagnostic.kind != SemanticDiagnosticKind::InvalidOverride),
+                .all(|diagnostic| !is_override_diagnostic(diagnostic)),
             "valid overrides must remain silent: {diagnostics:?}"
         );
     }
@@ -24803,7 +24997,7 @@ mod tests {
                 "semantic-diagnostics-register-target"
             )
             .iter()
-            .all(|diagnostic| diagnostic.kind != SemanticDiagnosticKind::InvalidOverride)
+            .all(|diagnostic| !is_override_diagnostic(diagnostic))
         );
 
         let explicit_register_override = concat!(
@@ -24829,7 +25023,7 @@ mod tests {
                 "semantic-diagnostics-register-override"
             )
             .iter()
-            .all(|diagnostic| diagnostic.kind != SemanticDiagnosticKind::InvalidOverride)
+            .all(|diagnostic| !is_override_diagnostic(diagnostic))
         );
 
         let explicit_register_interface = concat!(
@@ -24854,9 +25048,7 @@ mod tests {
                 "semantic-diagnostics-register-interface"
             )
             .iter()
-            .all(|diagnostic| {
-                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
-            })
+            .all(|diagnostic| { !is_interface_diagnostic(diagnostic) })
         );
 
         let explicit_register_implementation = concat!(
@@ -24881,9 +25073,7 @@ mod tests {
                 "semantic-diagnostics-register-implementation"
             )
             .iter()
-            .all(|diagnostic| {
-                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
-            })
+            .all(|diagnostic| { !is_interface_diagnostic(diagnostic) })
         );
 
         let explicit_incompatible_override = concat!(
@@ -24908,11 +25098,11 @@ mod tests {
                 explicit_incompatible_override,
                 "semantic-diagnostics-incompatible-convention-override"
             )
-            .iter()
-            .filter(|diagnostic| diagnostic.kind == SemanticDiagnosticKind::InvalidOverride)
+            .into_iter()
+            .filter(is_override_diagnostic)
             .count(),
-            1,
-            "two known explicit conventions remain incompatible"
+            0,
+            "a same-name calling-convention mismatch is neither E2137 nor E2170"
         );
 
         let explicit_incompatible_interface = concat!(
@@ -24937,9 +25127,7 @@ mod tests {
                 "semantic-diagnostics-incompatible-convention-interface"
             )
             .iter()
-            .filter(|diagnostic| {
-                diagnostic.kind == SemanticDiagnosticKind::MissingInterfaceImplementation
-            })
+            .filter(|diagnostic| { is_interface_diagnostic(diagnostic) })
             .count(),
             1,
             "two known explicit interface conventions remain incompatible"
@@ -24968,7 +25156,7 @@ mod tests {
                 "semantic-diagnostics-unsupported-convention-override"
             )
             .iter()
-            .all(|diagnostic| diagnostic.kind != SemanticDiagnosticKind::InvalidOverride)
+            .all(|diagnostic| !is_override_diagnostic(diagnostic))
         );
 
         let unsupported_interface = concat!(
@@ -24991,9 +25179,7 @@ mod tests {
                 "semantic-diagnostics-unsupported-convention-interface"
             )
             .iter()
-            .all(|diagnostic| {
-                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
-            })
+            .all(|diagnostic| { !is_interface_diagnostic(diagnostic) })
         );
     }
 
@@ -25029,15 +25215,15 @@ mod tests {
             .expect("semantic diagnostics complete");
 
         assert!(
-            diagnostics.iter().all(|diagnostic| {
-                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
-            }),
+            diagnostics
+                .iter()
+                .all(|diagnostic| { !is_interface_diagnostic(diagnostic) }),
             "inherited implementations must satisfy descendants: {diagnostics:?}"
         );
     }
 
     #[test]
-    fn semantic_diagnostics_suppress_missing_methods_on_abstract_classes() {
+    fn semantic_diagnostics_report_missing_methods_on_abstract_classes() {
         let uri = Url::parse("file:///tmp/semantic-diagnostics-abstract-interface.pas")
             .expect("interface URI");
         let source = concat!(
@@ -25063,11 +25249,18 @@ mod tests {
             .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
             .expect("semantic diagnostics complete");
 
-        assert!(
-            diagnostics.iter().all(|diagnostic| {
-                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
-            }),
-            "abstract classes may defer interface methods: {diagnostics:?}"
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "one interface obligation: {diagnostics:?}"
+        );
+        assert_eq!(
+            diagnostics[0].kind,
+            SemanticDiagnosticKind::Dcc(DccMessage::E2291)
+        );
+        assert_eq!(
+            diagnostics[0].message,
+            "Missing implementation of interface method IRequired.Required"
         );
     }
 
@@ -25105,9 +25298,7 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| {
-                    diagnostic.kind == SemanticDiagnosticKind::MissingInterfaceImplementation
-                })
+                .filter(|diagnostic| { is_interface_diagnostic(diagnostic) })
                 .count(),
             1,
             "a diamond obligation is reported once: {diagnostics:?}"
@@ -25126,9 +25317,7 @@ mod tests {
                 .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
                 .expect("semantic diagnostics complete")
                 .into_iter()
-                .filter(|diagnostic| {
-                    diagnostic.kind == SemanticDiagnosticKind::MissingInterfaceImplementation
-                })
+                .filter(is_interface_diagnostic)
                 .map(|diagnostic| diagnostic.message)
                 .collect()
         }
@@ -25153,14 +25342,8 @@ mod tests {
             missing_classes(missing_missing, "semantic-diagnostics-memo-missing-missing");
         assert_eq!(diagnostics.len(), 2, "both classes have an obligation");
         assert!(
-            diagnostics
-                .iter()
-                .any(|message| message.starts_with("class 'TFirst'"))
-        );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|message| message.starts_with("class 'TSecond'"))
+            diagnostics.iter().all(|message| message
+                == "Missing implementation of interface method IRequired.Required")
         );
 
         let valid_first_missing_second = concat!(
@@ -25190,7 +25373,10 @@ mod tests {
             1,
             "a later missing class remains visible"
         );
-        assert!(diagnostics[0].starts_with("class 'TSecond'"));
+        assert_eq!(
+            diagnostics[0],
+            "Missing implementation of interface method IRequired.Required"
+        );
 
         let missing_first_valid_second = concat!(
             "unit SemanticDiagnosticsMemoMissingFirst;\n",
@@ -25219,7 +25405,10 @@ mod tests {
             1,
             "source order must not alter obligations"
         );
-        assert!(diagnostics[0].starts_with("class 'TFirst'"));
+        assert_eq!(
+            diagnostics[0],
+            "Missing implementation of interface method IRequired.Required"
+        );
 
         let inherited_shared = concat!(
             "unit SemanticDiagnosticsMemoInherited;\n",
@@ -25281,12 +25470,8 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|message| message.starts_with("class 'TFirst'"))
-        );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|message| message.starts_with("class 'TSecond'"))
+                .all(|message| message
+                    == "Missing implementation of interface method IRoot.Required")
         );
     }
 
@@ -25321,7 +25506,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .all(|diagnostic| { diagnostic.kind != SemanticDiagnosticKind::InvalidOverride }),
+                .all(|diagnostic| { !is_override_diagnostic(diagnostic) }),
             "cyclic ancestry must not produce a confident override claim: {diagnostics:?}"
         );
     }
@@ -25356,9 +25541,9 @@ mod tests {
             .expect("semantic diagnostics complete");
 
         assert!(
-            diagnostics.iter().all(|diagnostic| {
-                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
-            }),
+            diagnostics
+                .iter()
+                .all(|diagnostic| { !is_interface_diagnostic(diagnostic) }),
             "cyclic interface ancestry must remain unknown: {diagnostics:?}"
         );
     }
@@ -25394,9 +25579,9 @@ mod tests {
             .expect("semantic diagnostics complete");
 
         assert!(
-            diagnostics.iter().all(|diagnostic| {
-                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
-            }),
+            diagnostics
+                .iter()
+                .all(|diagnostic| { !is_interface_diagnostic(diagnostic) }),
             "method resolution should satisfy the interface obligation: {diagnostics:?}"
         );
     }
@@ -25432,9 +25617,9 @@ mod tests {
             .expect("semantic diagnostics complete");
 
         assert!(
-            diagnostics.iter().all(|diagnostic| {
-                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
-            }),
+            diagnostics
+                .iter()
+                .all(|diagnostic| { !is_interface_diagnostic(diagnostic) }),
             "interface delegation should satisfy the obligation: {diagnostics:?}"
         );
     }
@@ -25472,9 +25657,9 @@ mod tests {
             .expect("semantic diagnostics complete");
 
         assert!(
-            diagnostics.iter().all(|diagnostic| {
-                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
-            }),
+            diagnostics
+                .iter()
+                .all(|diagnostic| { !is_interface_diagnostic(diagnostic) }),
             "delegating IChild supplies inherited IRoot methods: {diagnostics:?}"
         );
     }
@@ -25533,9 +25718,9 @@ mod tests {
             .expect("semantic diagnostics complete");
 
         assert!(
-            diagnostics.iter().all(|diagnostic| {
-                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
-            }),
+            diagnostics
+                .iter()
+                .all(|diagnostic| { !is_interface_diagnostic(diagnostic) }),
             "inherited delegation must retain its provider owner context: {diagnostics:?}"
         );
     }
@@ -25571,9 +25756,9 @@ mod tests {
             .expect("semantic diagnostics complete");
 
         assert!(
-            diagnostics.iter().all(|diagnostic| {
-                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
-            }),
+            diagnostics
+                .iter()
+                .all(|diagnostic| { !is_interface_diagnostic(diagnostic) }),
             "an inherited abstract method defers the interface obligation: {diagnostics:?}"
         );
     }
@@ -25615,12 +25800,10 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| {
-                    diagnostic.kind == SemanticDiagnosticKind::MissingInterfaceImplementation
-                })
+                .filter(|diagnostic| { is_interface_diagnostic(diagnostic) })
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
-            vec!["class 'TChild' does not implement interface method 'Other'"],
+            vec!["Missing implementation of interface method IOther.Other"],
             "only the concrete child's unrelated obligation is missing: {diagnostics:?}"
         );
     }
@@ -26336,6 +26519,265 @@ mod tests {
     }
 
     #[test]
+    fn declaration_diagnostics_do_not_pair_nested_routines_with_unit_routines() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-nested-routine-pairing.pas")
+            .expect("nested routine URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsNestedRoutinePairing;\n",
+            "interface\n",
+            "procedure Foo(Value: Integer);\n",
+            "implementation\n",
+            "procedure Outer;\n",
+            "  procedure Foo(Value: Integer); begin end;\n",
+            "begin end;\n",
+            "procedure AnotherOuter;\n",
+            "  procedure Foo(Other: Integer); begin end;\n",
+            "begin end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("nested routine fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("nested routine diagnostics complete");
+        let declaration_start = source
+            .find("Foo(Value: Integer)")
+            .expect("unit-level interface declaration");
+
+        assert_eq!(
+            diagnostics,
+            vec![SemanticDiagnostic {
+                kind: SemanticDiagnosticKind::Dcc(DccMessage::E2065),
+                span: SourceSpan {
+                    start: declaration_start,
+                    end: declaration_start + "Foo".len(),
+                },
+                message: "Unsatisfied forward or external declaration: 'Foo'".to_owned(),
+            }],
+            "nested routines must neither satisfy nor mismatch a unit-level routine: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn declaration_diagnostics_fail_closed_when_the_unit_has_parser_recovery() {
+        let cases = [
+            (
+                "E2065",
+                "RecoveryE2065",
+                concat!(
+                    "unit RecoveryE2065;\ninterface\ntype TFoo = class\n",
+                    "  procedure Missing;\nend;\nimplementation\n",
+                    "procedure Broken; var Value: Integer; begin Value := ; end;\nend.\n",
+                ),
+            ),
+            (
+                "E2037",
+                "RecoveryE2037",
+                concat!(
+                    "unit RecoveryE2037;\ninterface\nprocedure Run(Left: Integer);\n",
+                    "implementation\nprocedure Run(Right: Integer); begin end;\n",
+                    "procedure Broken; var Value: Integer; begin Value := ; end;\nend.\n",
+                ),
+            ),
+            (
+                "E2004",
+                "RecoveryE2004",
+                concat!(
+                    "unit RecoveryE2004;\ninterface\nimplementation\nprocedure Run;\n",
+                    "var Value: Integer; Value: Boolean;\nbegin Value := ; end;\nend.\n",
+                ),
+            ),
+            (
+                "E2252",
+                "RecoveryE2252",
+                concat!(
+                    "unit RecoveryE2252;\ninterface\ntype TFoo = class\n",
+                    "  procedure Same(Value: Integer); overload;\n",
+                    "  procedure Same(Value: Integer); overload;\nend;\n",
+                    "implementation\nprocedure Broken; var Value: Integer; begin Value := ; end;\nend.\n",
+                ),
+            ),
+            (
+                "E2254",
+                "RecoveryE2254",
+                concat!(
+                    "unit RecoveryE2254;\ninterface\ntype TFoo = class\n",
+                    "  procedure Different(Value: Integer); overload;\n",
+                    "  procedure Different(Value: string);\nend;\n",
+                    "implementation\nprocedure Broken; var Value: Integer; begin Value := ; end;\nend.\n",
+                ),
+            ),
+            (
+                "H2219",
+                "RecoveryH2219",
+                concat!(
+                    "unit RecoveryH2219;\ninterface\ntype TFoo = class private\n",
+                    "  FMaybeUsed: Integer;\nend;\nimplementation\n",
+                    "procedure Broken; var Value: Integer; begin Value := ; end;\nend.\n",
+                ),
+            ),
+        ];
+
+        let mut unexpected = Vec::new();
+        for (code, unit_name, source) in cases {
+            let uri = Url::parse(&format!("file:///tmp/{unit_name}.pas")).expect("fixture URI");
+            let mut index = NavigationIndex::new();
+            index
+                .update(uri.clone(), source.to_owned())
+                .expect("recovery fixture indexes");
+            assert!(
+                !index.documents[&uri].parser_recovery_spans.is_empty(),
+                "{unit_name} must exercise parser recovery"
+            );
+
+            let diagnostics = index
+                .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+                .expect("semantic diagnostics complete");
+            unexpected.extend(
+                diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.kind.code() == code)
+                    .map(|diagnostic| format!("{unit_name}: {}", diagnostic.message)),
+            );
+        }
+        assert!(
+            unexpected.is_empty(),
+            "recovery must suppress: {unexpected:?}"
+        );
+    }
+
+    #[test]
+    fn declaration_diagnostics_budget_h2219_container_storage_before_allocating() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-h2219-byte-budget.pas")
+            .expect("H2219 byte-budget URI");
+        let mut source =
+            String::from("unit H2219ByteBudget;\ninterface\ntype TFoo = class private ");
+        for index in 0..50 {
+            if index > 0 {
+                source.push_str(", ");
+            }
+            write!(&mut source, "F{index:02}").expect("write private field");
+        }
+        source.push_str(": Integer; end;\nimplementation\nend.\n");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("H2219 byte-budget fixture parses");
+        let document = index.documents.get(&uri).expect("indexed document");
+        assert_eq!(
+            document
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.kind == SymbolKind::Field)
+                .count(),
+            50,
+            "fixture must produce fifty private field candidates"
+        );
+        let mut budget = AssistanceBudget::new(10_000, 10_000, "semantic diagnostics");
+        let mut diagnostic_cap_reached = false;
+
+        let result = index.declaration_diagnostics_with_budget(
+            &uri,
+            document,
+            MAX_SEMANTIC_DIAGNOSTICS,
+            &mut diagnostic_cap_reached,
+            &AtomicBool::new(false),
+            &mut budget,
+        );
+        let mut report = SemanticDiagnosticReport::default();
+        let diagnostics = report
+            .checked_candidate(result, &budget)
+            .expect("budget exhaustion is a coverage gap, not a fatal error");
+
+        assert!(diagnostics.is_none());
+        assert_eq!(report.gaps, vec![SemanticCoverageGap::Budget]);
+        assert!(!diagnostic_cap_reached);
+    }
+
+    #[test]
+    fn semantic_diagnostics_contracts_budget_unmatched_inherited_routine_scans() {
+        const INHERITED_ROUTINES: usize = 1_024;
+
+        fn index_with_child_routine(include_child_method: bool) -> (NavigationIndex, Url) {
+            let unit = if include_child_method {
+                "AncestryScanBudgetWithChild"
+            } else {
+                "AncestryScanBudgetBaseline"
+            };
+            let uri = Url::parse(&format!("file:///tmp/{unit}.pas")).expect("fixture URI");
+            let mut source = format!(
+                "unit {unit};\ninterface\ntype\n  TObject = class\n  end;\n  TBase = class(TObject)\n  public\n"
+            );
+            for index in 0..INHERITED_ROUTINES {
+                writeln!(&mut source, "    procedure Base{index:04};")
+                    .expect("write inherited routine");
+            }
+            source.push_str("  end;\n  TChild = class(TBase)\n");
+            if include_child_method {
+                source.push_str("  public\n    procedure ChildOnly;\n");
+            }
+            source.push_str("  end;\nimplementation\n");
+            if include_child_method {
+                source.push_str("procedure TChild.ChildOnly;\nbegin\nend;\n");
+            }
+            source.push_str("end.\n");
+
+            let mut index = NavigationIndex::new();
+            index
+                .update(uri.clone(), source)
+                .expect("ancestry budget fixture parses");
+            (index, uri)
+        }
+
+        fn run_ancestry(
+            index: &NavigationIndex,
+            uri: &Url,
+            work_limit: usize,
+        ) -> (
+            SemanticDiagnosticReport,
+            Option<Vec<SemanticDiagnostic>>,
+            usize,
+        ) {
+            let document = index.documents.get(uri).expect("indexed fixture");
+            let cancel = AtomicBool::new(false);
+            let mut budget =
+                AssistanceBudget::new(work_limit, 8 * 1024 * 1024, "semantic diagnostics");
+            let result = index.ancestry_diagnostics_with_budget(
+                uri,
+                document,
+                MAX_SEMANTIC_DIAGNOSTICS,
+                &cancel,
+                &mut budget,
+            );
+            let mut report = SemanticDiagnosticReport::default();
+            let diagnostics = report
+                .checked_candidate(result, &budget)
+                .expect("budget exhaustion is a coverage gap, not a fatal error");
+            let work_used = budget.work_limit - budget.remaining_work;
+            (report, diagnostics, work_used)
+        }
+
+        let (baseline_index, baseline_uri) = index_with_child_routine(false);
+        let (baseline_report, baseline_diagnostics, baseline_work) =
+            run_ancestry(&baseline_index, &baseline_uri, 100_000);
+        assert!(baseline_diagnostics.is_some(), "{baseline_report:?}");
+        assert!(baseline_report.gaps.is_empty(), "{baseline_report:?}");
+
+        let (index, uri) = index_with_child_routine(true);
+        let tight_work_limit = baseline_work + INHERITED_ROUTINES + INHERITED_ROUTINES / 2;
+        let (report, diagnostics, _) = run_ancestry(&index, &uri, tight_work_limit);
+
+        assert!(
+            diagnostics.is_none(),
+            "the uncharged inherited-surface scan must not complete under {tight_work_limit} work units: {report:?}"
+        );
+        assert_eq!(report.gaps, vec![SemanticCoverageGap::Budget]);
+    }
+
+    #[test]
     fn semantic_diagnostics_keep_the_first_findings_up_to_the_cap() {
         let uri = Url::parse("file:///tmp/semantic-diagnostics-cap.pas").expect("cap URI");
         let mut source = String::from(
@@ -26368,6 +26810,65 @@ mod tests {
         assert_eq!(
             report.diagnostics[0].span.start,
             source.find("I;\n").expect("first mismatch")
+        );
+        assert_eq!(report.gaps, vec![SemanticCoverageGap::DiagnosticCap]);
+    }
+
+    #[test]
+    fn semantic_diagnostics_note_capacity_exhaustion_before_optional_passes() {
+        let uri =
+            Url::parse("file:///tmp/semantic-diagnostics-exact-cap.pas").expect("exact-cap URI");
+        let mut source = String::from(
+            "unit SemanticDiagnosticsExactCap;\ninterface\nimplementation\nprocedure Run;\nvar I: Integer; B: Boolean;\nbegin\n",
+        );
+        for _ in 0..MAX_SEMANTIC_DIAGNOSTICS {
+            source.push_str("  B := I;\n");
+        }
+        source.push_str("end;\nend.\n");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source)
+            .expect("exact-cap fixture parses");
+
+        let report = index
+            .semantic_diagnostic_report_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("exact-cap diagnostics complete");
+
+        assert_eq!(report.diagnostics.len(), MAX_SEMANTIC_DIAGNOSTICS);
+        assert_eq!(report.gaps, vec![SemanticCoverageGap::DiagnosticCap]);
+    }
+
+    #[test]
+    fn semantic_diagnostics_preserve_declaration_findings_at_the_cap() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-declaration-cap.pas")
+            .expect("declaration cap URI");
+        let mut source = String::from(
+            "unit SemanticDiagnosticsDeclarationCap;\ninterface\ntype\n  TMany = class\n",
+        );
+        for index in 0..=MAX_SEMANTIC_DIAGNOSTICS {
+            writeln!(&mut source, "    procedure Missing{index};").expect("write missing method");
+        }
+        source.push_str("  end;\nimplementation\nend.\n");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.clone())
+            .expect("declaration cap fixture parses");
+
+        let report = index
+            .semantic_diagnostic_report_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("declaration cap diagnostics complete");
+
+        assert_eq!(
+            report.diagnostics.len(),
+            MAX_SEMANTIC_DIAGNOSTICS,
+            "retain proven declaration findings up to the cap: {report:?}"
+        );
+        assert!(report.diagnostics.iter().all(|diagnostic| {
+            diagnostic.kind == SemanticDiagnosticKind::Dcc(DccMessage::E2065)
+        }));
+        assert_eq!(
+            report.diagnostics[0].span.start,
+            source.find("Missing0").expect("first missing method")
         );
         assert_eq!(report.gaps, vec![SemanticCoverageGap::DiagnosticCap]);
     }
@@ -26732,8 +27233,7 @@ mod tests {
         let diagnostics = index
             .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
             .expect("R1 diagnostics complete");
-        let messages = diagnostics
-            .iter()
+        let messages = diagnostics_without_declaration_pairing_findings(&diagnostics)
             .map(|diagnostic| diagnostic.message.as_str())
             .collect::<Vec<_>>();
 
@@ -26773,8 +27273,7 @@ mod tests {
             .expect("R2 diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec!["incompatible argument: expected 'Char', found 'String'"],
@@ -26809,8 +27308,7 @@ mod tests {
             .expect("R2 composite diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec!["incompatible argument: expected 'Char', found 'String'"],
@@ -26845,8 +27343,7 @@ mod tests {
         let diagnostics = index
             .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
             .expect("R3 diagnostics complete");
-        let messages = diagnostics
-            .iter()
+        let messages = diagnostics_without_declaration_pairing_findings(&diagnostics)
             .map(|diagnostic| diagnostic.message.as_str())
             .collect::<Vec<_>>();
 
@@ -26890,7 +27387,9 @@ mod tests {
             .expect("R3 incomplete diagnostics complete");
 
         assert!(
-            diagnostics.is_empty(),
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
+                .next()
+                .is_none(),
             "incomplete imports and with receivers must suppress argument claims: {diagnostics:?}"
         );
     }
@@ -26923,8 +27422,7 @@ mod tests {
             .expect("R3 unknown actual diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec![
@@ -26965,7 +27463,9 @@ mod tests {
             .expect("R3 unknown formal diagnostics complete");
 
         assert!(
-            diagnostics.is_empty(),
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
+                .next()
+                .is_none(),
             "unknown by-reference formals and overload candidates suppress claims: {diagnostics:?}"
         );
     }
@@ -27003,8 +27503,7 @@ mod tests {
             .expect("R3 element diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec![
@@ -27076,7 +27575,9 @@ mod tests {
             .expect("ambiguous element diagnostics complete");
 
         assert!(
-            diagnostics.is_empty(),
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
+                .next()
+                .is_none(),
             "differing candidate element types remain uncertain: {diagnostics:?}"
         );
     }
@@ -27128,8 +27629,7 @@ mod tests {
             .expect("R3 addressed-storage diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec![
@@ -27187,8 +27687,7 @@ mod tests {
             .expect("R3 default-property diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec![
@@ -27227,8 +27726,7 @@ mod tests {
             .expect("R3 unresolved-index diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec!["missing member 'Missing'", "missing member 'Missing'",],
@@ -27305,8 +27803,7 @@ mod tests {
         let diagnostics = index
             .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
             .expect("R4 generic default-property diagnostics complete");
-        let messages = diagnostics
-            .iter()
+        let messages = diagnostics_without_declaration_pairing_findings(&diagnostics)
             .map(|diagnostic| diagnostic.message.as_str())
             .collect::<Vec<_>>();
 
@@ -27325,8 +27822,7 @@ mod tests {
             .expect("forward call")
             + "TakeInteger(".len();
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.span)
                 .collect::<Vec<_>>(),
             vec![
@@ -27416,7 +27912,9 @@ mod tests {
             .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
             .expect("R4 imported-private diagnostics complete");
         assert!(
-            imported_diagnostics.is_empty(),
+            diagnostics_without_declaration_pairing_findings(&imported_diagnostics)
+                .next()
+                .is_none(),
             "private explicit and default properties must remain inaccessible: {imported_diagnostics:?}"
         );
 
@@ -27424,7 +27922,9 @@ mod tests {
             .semantic_diagnostics_with_cancel(&local_uri, &AtomicBool::new(false))
             .expect("R4 strict-private diagnostics complete");
         assert!(
-            local_diagnostics.is_empty(),
+            diagnostics_without_declaration_pairing_findings(&local_diagnostics)
+                .next()
+                .is_none(),
             "strict-private explicit and default properties must remain inaccessible: {local_diagnostics:?}"
         );
     }
@@ -27467,8 +27967,7 @@ mod tests {
         let diagnostics = index
             .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
             .expect("R4 index-argument diagnostics complete");
-        let messages = diagnostics
-            .iter()
+        let messages = diagnostics_without_declaration_pairing_findings(&diagnostics)
             .map(|diagnostic| diagnostic.message.as_str())
             .collect::<Vec<_>>();
 
@@ -27568,11 +28067,11 @@ mod tests {
             .semantic_diagnostics_with_cancel(&local_uri, &AtomicBool::new(false))
             .expect("R5 local public-default diagnostics complete");
         assert_eq!(
-            local_diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&local_diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec![
+                "Private symbol 'Unrelated' declared but never used",
                 "type mismatch: cannot assign 'Integer' to 'Boolean'",
                 "incompatible argument: expected 'Boolean', found 'Integer'",
                 "type mismatch: cannot assign 'Integer' to 'Boolean'",
@@ -27585,8 +28084,7 @@ mod tests {
             .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
             .expect("R5 imported public-default diagnostics complete");
         assert_eq!(
-            imported_diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&imported_diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec![
@@ -27637,8 +28135,7 @@ mod tests {
         let diagnostics = index
             .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
             .expect("R4 diagnostics complete");
-        let messages = diagnostics
-            .iter()
+        let messages = diagnostics_without_declaration_pairing_findings(&diagnostics)
             .map(|diagnostic| diagnostic.message.as_str())
             .collect::<Vec<_>>();
 
@@ -27678,8 +28175,7 @@ mod tests {
             .expect("R5 diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec!["type mismatch: cannot assign 'Integer' to 'Boolean'"],
@@ -27714,8 +28210,7 @@ mod tests {
             .expect("R5 record nil diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec!["type mismatch: cannot assign 'Integer' to 'Boolean'"],
@@ -27766,8 +28261,7 @@ mod tests {
             .expect("R6 diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec!["type mismatch: cannot assign 'Integer' to 'Boolean'"],
@@ -27817,8 +28311,7 @@ mod tests {
             .expect("same-System diagnostics complete");
 
         assert_eq!(
-            diagnostics
-                .iter()
+            diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec!["type mismatch: cannot assign 'Integer' to 'Boolean'"],

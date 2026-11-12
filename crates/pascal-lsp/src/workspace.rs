@@ -8,7 +8,7 @@ use crate::include_expansion::{ExpandedSource, ExpansionLimits};
 use crate::navigation::compiled_dcu::{
     AuthorizedCompiledUnit, discover_compiled_units, virtual_unit_identity,
 };
-use crate::navigation::{SemanticDiagnostic, SemanticDiagnosticKind};
+use crate::navigation::{DccSeverity, SemanticDiagnostic};
 use crate::persistent_cache::CacheExclusion;
 use crate::{NavigationIndex, NavigationTarget, text};
 use globset::GlobSetBuilder;
@@ -16231,25 +16231,10 @@ impl Workspace {
             let Some(end) = text::offset_to_position(source, span.range.end) else {
                 continue;
             };
-            let code = match diagnostic.kind {
-                SemanticDiagnosticKind::UnresolvedIdentifier => "pascal-unresolved-identifier",
-                SemanticDiagnosticKind::MissingMember => "pascal-missing-member",
-                SemanticDiagnosticKind::TypeMismatch => "pascal-type-mismatch",
-                SemanticDiagnosticKind::IncompatibleArgument => "pascal-incompatible-argument",
-                SemanticDiagnosticKind::InvalidOverride => "pascal-invalid-override",
-                SemanticDiagnosticKind::MissingInterfaceImplementation => {
-                    "pascal-missing-interface-implementation"
-                }
-            };
-            mapped.entry(span.uri).or_default().push(LspDiagnostic::new(
-                Range::new(start, end),
-                Some(DiagnosticSeverity::ERROR),
-                Some(NumberOrString::String(code.to_string())),
-                Some("pascal-lsp".to_string()),
-                diagnostic.message,
-                None,
-                None,
-            ));
+            mapped
+                .entry(span.uri)
+                .or_default()
+                .push(semantic_lsp_diagnostic(diagnostic, Range::new(start, end)));
         }
         mapped.entry(uri.clone()).or_default();
         let mut publications = mapped
@@ -17456,6 +17441,23 @@ fn withheld_lint_message(
     format!("include expansion was incomplete; {WITHHELD}")
 }
 
+fn semantic_lsp_diagnostic(diagnostic: SemanticDiagnostic, range: Range) -> LspDiagnostic {
+    let severity = match diagnostic.kind.severity() {
+        DccSeverity::Error => DiagnosticSeverity::ERROR,
+        DccSeverity::Warning => DiagnosticSeverity::WARNING,
+        DccSeverity::Hint => DiagnosticSeverity::HINT,
+    };
+    LspDiagnostic::new(
+        range,
+        Some(severity),
+        Some(NumberOrString::String(diagnostic.kind.code().to_string())),
+        Some("pascal-lsp".to_string()),
+        diagnostic.message,
+        None,
+        None,
+    )
+}
+
 pub(crate) fn server_diagnostic(message: &str, severity: DiagnosticSeverity) -> LspDiagnostic {
     LspDiagnostic::new(
         Range::new(Position::new(0, 0), Position::new(0, 0)),
@@ -18441,6 +18443,27 @@ fn is_immutable_override_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn semantic_lsp_diagnostic_mapping_sets_dcc_code_source_and_severity() {
+        let diagnostic = super::semantic_lsp_diagnostic(
+            crate::navigation::SemanticDiagnostic {
+                kind: crate::navigation::SemanticDiagnosticKind::Dcc(
+                    crate::navigation::DccMessage::H2219,
+                ),
+                span: crate::navigation::SourceSpan { start: 0, end: 1 },
+                message: "Private symbol 'Unused' declared but never used".to_string(),
+            },
+            super::Range::default(),
+        );
+
+        assert_eq!(
+            diagnostic.code,
+            Some(super::NumberOrString::String("H2219".to_string()))
+        );
+        assert_eq!(diagnostic.source.as_deref(), Some("pascal-lsp"));
+        assert_eq!(diagnostic.severity, Some(super::DiagnosticSeverity::HINT));
+    }
+
     /// Review M1/M2 (l4d-zgyw): a stopped analysis is named by its own
     /// reason, not by a resolver warning listed before it, and an include
     /// the stopped analysis never walked is not blamed as unresolved.

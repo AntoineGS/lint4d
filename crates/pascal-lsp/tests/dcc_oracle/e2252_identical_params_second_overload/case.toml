@@ -1,0 +1,3 @@
+unit = "IdenticalParamsSecondOverload.pas"
+recall = false
+reason = "dcc records E2267 as well as E2252 because the earlier declaration lacks overload; E2267 is not currently modeled. E2252 is checked separately."

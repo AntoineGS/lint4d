@@ -1,0 +1,3 @@
+unit = "Exempt.pas"
+requires_rtl = true
+reason = "The method-resolution clause uses TInterfacedObject from Delphi's RTL."

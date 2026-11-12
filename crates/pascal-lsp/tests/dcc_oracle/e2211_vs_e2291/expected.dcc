@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem E2211VsE2291.pas
+E2211VsE2291.pas(13) E2211 Declaration of 'Required' differs from declaration in interface 'IRequired'
+E2211VsE2291.pas(20) E2291 Missing implementation of interface method IRequired.Required

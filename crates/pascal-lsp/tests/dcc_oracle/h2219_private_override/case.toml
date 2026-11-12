@@ -1,0 +1,5 @@
+unit = "PrivateOverride.pas"
+requires_rtl = true
+recall = false
+reason = "The contract ancestry model still cannot prove Delphi's compiler-provided TObject virtual inventory, even with System.pas loaded; keep W1010 silent rather than infer it."
+silent = ["W1010"]

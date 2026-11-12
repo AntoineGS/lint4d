@@ -1,0 +1,5 @@
+unit = "ResolutionClause.pas"
+requires_rtl = true
+recall = false
+reason = "Needs System for IInterface obligations; loaded RTL conditional/recovery completeness makes interface ancestry unknown to the contract pass."
+silent = ["E2291"]

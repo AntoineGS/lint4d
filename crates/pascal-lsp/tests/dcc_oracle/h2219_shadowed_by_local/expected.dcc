@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem ShadowedByLocal.pas
+ShadowedByLocal.pas(19) H2077 Value assigned to 'FValue' never used
+ShadowedByLocal.pas(8) H2219 Private symbol 'FValue' declared but never used

@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem PrivateOverride.pas
+PrivateOverride.pas(8) W1010 Method 'Dispatch' hides virtual method of base type 'TObject'
+PrivateOverride.pas(13) H2269 Overriding virtual method 'TChild.Dispatch' has lower visibility (private) than base class 'TBase' (protected)

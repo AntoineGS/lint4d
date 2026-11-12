@@ -1,0 +1,4 @@
+unit = "SignatureMismatch.pas"
+recall = false
+reason = "dcc reports inherited parameter mismatch as E2037; the current declaration pass cannot prove cross-ancestor signature differences."
+silent = ["E2037"]

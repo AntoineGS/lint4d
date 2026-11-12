@@ -7286,6 +7286,7 @@ mod tests {
             type_shape: None,
             result_type_name: None,
             result_type_ref: None,
+            implementation_result_type_ref: None,
             result_type_span: None,
             region: Region::Interface,
             origin: Origin::Declaration,

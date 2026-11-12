@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::AtomicBool;
 use tree_sitter::Node;
 
-const MAX_OVERLOAD_GROUPS: usize = 128;
+pub(super) const MAX_OVERLOAD_GROUPS: usize = 128;
 const MAX_OVERLOAD_ARGUMENTS: usize = 256;
 const MAX_INDEX_ALIAS_DEPTH: usize = 64;
 

@@ -1,0 +1,5 @@
+unit = "MissingMethod.pas"
+requires_rtl = true
+recall = false
+reason = "Needs System for IInterface obligations; loaded RTL conditional/recovery completeness makes interface ancestry unknown, suppressing even the local obligation."
+silent = ["E2291"]

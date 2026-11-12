@@ -1,0 +1,3 @@
+unit = "UsedInInclude.pas"
+recall = false
+reason = "The standalone oracle index does not expand this include, so H2219 stays silent for the whole unit while include expansion is incomplete."

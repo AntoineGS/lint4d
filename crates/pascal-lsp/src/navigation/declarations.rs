@@ -288,6 +288,284 @@ impl NavigationIndex {
                 .conditionals
                 .unknown_activity_requires_fail_closed()
             && include_expansion_complete(document)
+            && document.parser_recovery_spans.is_empty()
+        {
+            budget.require_work(document.symbols.len(), cancel)?;
+            let candidate_storage_bytes = document.symbols.iter().fold(0usize, |bytes, symbol| {
+                if h2219_candidate_kind(symbol)
+                    && symbol.owner_type.is_some()
+                    && matches!(
+                        symbol.visibility,
+                        Visibility::Private | Visibility::StrictPrivate
+                    )
+                {
+                    bytes
+                        .saturating_add(std::mem::size_of::<usize>() * 3)
+                        .saturating_add(symbol.key.len())
+                } else {
+                    bytes
+                }
+            });
+            budget.require_owned_bytes(candidate_storage_bytes, cancel)?;
+
+            let mut candidates_by_name = HashMap::<String, Vec<usize>>::new();
+            let mut candidate_indices = Vec::new();
+            let mut definition_headers = HashMap::<usize, Span>::new();
+            for (candidate_index, candidate) in document.symbols.iter().enumerate() {
+                check_navigation_cancel(cancel)?;
+                let Some(owner_type) = candidate.owner_type.as_deref() else {
+                    continue;
+                };
+                if !h2219_candidate_kind(candidate)
+                    || candidate.origin != Origin::Declaration
+                    || !matches!(
+                        candidate.visibility,
+                        Visibility::Private | Visibility::StrictPrivate
+                    )
+                    || !symbol_is_proven(candidate, proven_end)
+                    || symbol_conditional_state_is_unknown(document, candidate_index)
+                    || !h2219_owner_is_proven_class(document, owner_type, proven_end)
+                {
+                    continue;
+                }
+
+                if candidate.kind == SymbolKind::Routine {
+                    if candidate.routine_directives.abstract_
+                        || candidate.routine_directives.external
+                    {
+                        continue;
+                    }
+                    let Some(routine_key) = candidate.routine_key.as_ref() else {
+                        continue;
+                    };
+                    let Some(routine_indices) = document.routine_symbol_indices.get(routine_key)
+                    else {
+                        continue;
+                    };
+                    let mut declarations = 0usize;
+                    let mut definition_index = None;
+                    let mut definition_count = 0usize;
+                    for &routine_index in routine_indices {
+                        budget.require_work(1, cancel)?;
+                        let Some(routine) = document.symbols.get(routine_index) else {
+                            continue;
+                        };
+                        if routine.owner_type.as_deref() != Some(owner_type)
+                            || routine.key != candidate.key
+                        {
+                            continue;
+                        }
+                        match routine.origin {
+                            Origin::Declaration => declarations += 1,
+                            Origin::Definition => {
+                                definition_count += 1;
+                                definition_index = Some(routine_index);
+                            }
+                        }
+                    }
+                    if declarations != 1 || definition_count != 1 {
+                        continue;
+                    }
+                    let Some(definition_index) = definition_index else {
+                        continue;
+                    };
+                    let Some(definition) = document.symbols.get(definition_index) else {
+                        continue;
+                    };
+                    let Some(header) = definition.routine_header_span else {
+                        continue;
+                    };
+                    if definition.body_scope.is_none()
+                        || definition.unresolved_abbreviated
+                        || !symbol_is_proven(definition, proven_end)
+                        || symbol_conditional_state_is_unknown(document, definition_index)
+                    {
+                        continue;
+                    }
+                    definition_headers.insert(candidate_index, header);
+                }
+
+                candidates_by_name
+                    .entry(candidate.key.clone())
+                    .or_default()
+                    .push(candidate_index);
+                candidate_indices.push(candidate_index);
+            }
+
+            let identifiers = if candidate_indices.is_empty() {
+                Vec::new()
+            } else {
+                identifier_nodes_with_budget(document.tree.root_node(), cancel, budget)?
+            };
+            let proof_slots = if candidate_indices.is_empty() {
+                0
+            } else {
+                document.symbols.len()
+            };
+            budget.require_owned_bytes(
+                proof_slots.saturating_mul(std::mem::size_of::<bool>() * 2),
+                cancel,
+            )?;
+            let mut used = vec![false; proof_slots];
+            let mut uncertain = vec![false; proof_slots];
+            for identifier in identifiers {
+                check_navigation_cancel(cancel)?;
+                let text = node_text_with_budget(identifier, &document.source, cancel, budget)?;
+                budget.require_owned_bytes(text.len(), cancel)?;
+                let key = canonical_name(text);
+                let Some(matching_candidates) = candidates_by_name.get(&key) else {
+                    continue;
+                };
+                budget.require_work(matching_candidates.len(), cancel)?;
+                if has_ancestor_kind_with_budget(identifier, "ppDirective", cancel, budget)? {
+                    continue;
+                }
+                let span = Span::from_node(identifier);
+                let has_relevant_candidate = matching_candidates.iter().any(|candidate_index| {
+                    let Some(candidate) = document.symbols.get(*candidate_index) else {
+                        return false;
+                    };
+                    !candidate.declaration_span.contains(span)
+                        && !definition_headers
+                            .get(candidate_index)
+                            .is_some_and(|header| header.contains(span))
+                });
+                if !has_relevant_candidate {
+                    continue;
+                }
+                budget.require_work(document.opaque_ranges.len(), cancel)?;
+
+                if document
+                    .opaque_ranges
+                    .iter()
+                    .any(|opaque| opaque.contains(span))
+                {
+                    for &candidate_index in matching_candidates {
+                        let Some(candidate) = document.symbols.get(candidate_index) else {
+                            continue;
+                        };
+                        if !candidate.declaration_span.contains(span)
+                            && !definition_headers
+                                .get(&candidate_index)
+                                .is_some_and(|header| header.contains(span))
+                        {
+                            uncertain[candidate_index] = true;
+                        }
+                    }
+                    continue;
+                }
+
+                let mut state = ResolutionState::new();
+                let targets = self.resolve_candidates_at_with_state_and_budget(
+                    uri, document, span.start, identifier, &mut state, 0, cancel, budget,
+                )?;
+                budget.require_work(targets.len(), cancel)?;
+                let resolution_is_uncertain = targets.is_empty()
+                    || state.receiver_resolution_uncertain()
+                    || state.member_lookup_incomplete
+                    || state.implicit_system_namespace_incomplete
+                    || state.inaccessible_candidate
+                    || state.ambiguous
+                    || self.is_unknown_global_fallback(document, identifier, span.start, &targets)
+                    || targets.iter().any(|target| {
+                        self.candidate_is_conditionally_unknown(target)
+                            || self.symbol(target).is_none_or(|symbol| {
+                                let Some(target_document) = self.documents.get(&target.uri) else {
+                                    return true;
+                                };
+                                let target_proven_end = target_document
+                                    .parser_recovery_spans
+                                    .iter()
+                                    .map(|recovery| recovery.start)
+                                    .min()
+                                    .unwrap_or(usize::MAX);
+                                symbol.unresolved_abbreviated
+                                    || !symbol_is_proven(symbol, target_proven_end)
+                            })
+                    });
+                if resolution_is_uncertain {
+                    for &candidate_index in matching_candidates {
+                        if document
+                            .symbols
+                            .get(candidate_index)
+                            .is_some_and(|candidate| {
+                                !candidate.declaration_span.contains(span)
+                                    && !definition_headers
+                                        .get(&candidate_index)
+                                        .is_some_and(|header| header.contains(span))
+                            })
+                        {
+                            uncertain[candidate_index] = true;
+                        }
+                    }
+                    continue;
+                }
+
+                budget.require_work(
+                    matching_candidates.len().saturating_mul(targets.len()),
+                    cancel,
+                )?;
+                for &candidate_index in matching_candidates {
+                    let Some(candidate) = document.symbols.get(candidate_index) else {
+                        continue;
+                    };
+                    if candidate.declaration_span.contains(span)
+                        || definition_headers
+                            .get(&candidate_index)
+                            .is_some_and(|header| header.contains(span))
+                    {
+                        continue;
+                    }
+                    // Delphi counts recursive calls, so only the declaration and header are excluded.
+                    let same_member_targets = targets
+                        .iter()
+                        .filter(|target| {
+                            h2219_target_matches_member(
+                                uri,
+                                candidate_index,
+                                candidate,
+                                target,
+                                self,
+                            )
+                        })
+                        .count();
+                    if same_member_targets == targets.len() {
+                        used[candidate_index] = true;
+                    } else if same_member_targets > 0 {
+                        uncertain[candidate_index] = true;
+                    }
+                }
+            }
+
+            for candidate_index in candidate_indices {
+                check_navigation_cancel(cancel)?;
+                if used[candidate_index] || uncertain[candidate_index] {
+                    continue;
+                }
+                let Some(candidate) = document.symbols.get(candidate_index) else {
+                    continue;
+                };
+                let message = DccMessage::H2219.format(&[&candidate.name]);
+                if !push_diagnostic(
+                    &mut diagnostics,
+                    capacity,
+                    DccMessage::H2219,
+                    candidate.selection_span,
+                    message,
+                    cancel,
+                    budget,
+                )? {
+                    *diagnostic_cap_reached = true;
+                    return Ok(diagnostics);
+                }
+            }
+        }
+
+        if document.conditionals.complete
+            && !document
+                .conditionals
+                .unknown_activity_requires_fail_closed()
+            && include_expansion_complete(document)
         {
             let mut declarations_by_scope = HashMap::<RedeclarationGroupKey, Vec<usize>>::new();
             let mut routines_by_scope = HashMap::<RedeclarationGroupKey, Vec<usize>>::new();
@@ -816,6 +1094,57 @@ fn include_expansion_complete(document: &Document) -> bool {
         && slots
             .iter()
             .all(|slot| matches!(slot.outcome, IncludeSlotOutcome::Expanded { .. }))
+}
+
+fn h2219_candidate_kind(symbol: &Symbol) -> bool {
+    matches!(
+        symbol.kind,
+        SymbolKind::Field | SymbolKind::Property | SymbolKind::Routine
+    )
+}
+
+fn h2219_owner_is_proven_class(document: &Document, owner_type: &str, proven_end: usize) -> bool {
+    let Some(indices) = document.type_symbol_indices.get(owner_type) else {
+        return false;
+    };
+    let mut owners = indices.iter().filter_map(|index| {
+        document
+            .symbols
+            .get(*index)
+            .filter(|symbol| symbol.kind == SymbolKind::Type && symbol.generic_parameter.is_none())
+            .map(|symbol| (*index, symbol))
+    });
+    let Some((owner_index, owner)) = owners.next() else {
+        return false;
+    };
+    owner.type_kind == TypeKind::Class
+        && symbol_is_proven(owner, proven_end)
+        && !symbol_conditional_state_is_unknown(document, owner_index)
+        && owners.next().is_none()
+}
+
+fn h2219_target_matches_member(
+    current_uri: &Url,
+    member_index: usize,
+    member: &Symbol,
+    target: &Candidate,
+    index: &NavigationIndex,
+) -> bool {
+    if target.uri != *current_uri {
+        return false;
+    }
+    let Some(target_symbol) = index.symbol(target) else {
+        return false;
+    };
+    if member.kind == SymbolKind::Routine {
+        target_symbol.kind == SymbolKind::Routine
+            && member.routine_key.is_some()
+            && member.routine_key == target_symbol.routine_key
+            && member.owner_type == target_symbol.owner_type
+            && member.key == target_symbol.key
+    } else {
+        target.index == member_index
+    }
 }
 
 fn symbol_is_proven(symbol: &Symbol, proven_end: usize) -> bool {

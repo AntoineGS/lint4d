@@ -6,7 +6,9 @@ use super::*;
 use std::path::{Path, PathBuf};
 
 /// dcc codes whose findings are compared. Grows as each rule lands.
-const ENABLED_CODES: &[&str] = &["E2004", "E2037", "E2065", "E2252", "E2254", "E2301"];
+const ENABLED_CODES: &[&str] = &[
+    "E2004", "E2037", "E2065", "E2252", "E2254", "E2301", "H2219",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Finding {

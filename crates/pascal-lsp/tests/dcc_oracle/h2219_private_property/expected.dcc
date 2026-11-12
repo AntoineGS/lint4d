@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem PrivateProperty.pas
+PrivateProperty.pas(9) H2219 Private symbol 'InternalValue' declared but never used

@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem StrictPrivate.pas
+StrictPrivate.pas(8) H2219 Private symbol 'FStrictUnused' declared but never used
+StrictPrivate.pas(9) H2219 Private symbol 'StrictUnused' declared but never used

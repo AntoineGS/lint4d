@@ -27720,6 +27720,7 @@ mod tests {
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             vec![
+                "Private symbol 'Unrelated' declared but never used",
                 "type mismatch: cannot assign 'Integer' to 'Boolean'",
                 "incompatible argument: expected 'Boolean', found 'Integer'",
                 "type mismatch: cannot assign 'Integer' to 'Boolean'",

@@ -291,21 +291,39 @@ impl NavigationIndex {
             && document.parser_recovery_spans.is_empty()
         {
             budget.require_work(document.symbols.len(), cancel)?;
-            let candidate_storage_bytes = document.symbols.iter().fold(0usize, |bytes, symbol| {
-                if h2219_candidate_kind(symbol)
-                    && symbol.owner_type.is_some()
-                    && matches!(
-                        symbol.visibility,
-                        Visibility::Private | Visibility::StrictPrivate
+            let (candidate_count, candidate_key_bytes) =
+                document
+                    .symbols
+                    .iter()
+                    .fold((0usize, 0usize), |(count, key_bytes), symbol| {
+                        if h2219_candidate_kind(symbol)
+                            && symbol.owner_type.is_some()
+                            && matches!(
+                                symbol.visibility,
+                                Visibility::Private | Visibility::StrictPrivate
+                            )
+                        {
+                            (
+                                count.saturating_add(1),
+                                key_bytes.saturating_add(symbol.key.len()),
+                            )
+                        } else {
+                            (count, key_bytes)
+                        }
+                    });
+            let candidate_storage_bytes = if candidate_count == 0 {
+                0
+            } else {
+                // Cover both maps' bucket/entry storage, geometric growth and
+                // small initial allocations for the index/grouped vectors,
+                // and every cloned key passed to `HashMap::entry`.
+                hash_map_clone_storage_bytes::<String, Vec<usize>>(candidate_count)
+                    .saturating_add(hash_map_clone_storage_bytes::<usize, Span>(candidate_count))
+                    .saturating_add(
+                        candidate_count.saturating_mul(std::mem::size_of::<usize>() * 8),
                     )
-                {
-                    bytes
-                        .saturating_add(std::mem::size_of::<usize>() * 3)
-                        .saturating_add(symbol.key.len())
-                } else {
-                    bytes
-                }
-            });
+                    .saturating_add(candidate_key_bytes)
+            };
             budget.require_owned_bytes(candidate_storage_bytes, cancel)?;
 
             let mut candidates_by_name = HashMap::<String, Vec<usize>>::new();
@@ -332,6 +350,8 @@ impl NavigationIndex {
                 if candidate.kind == SymbolKind::Routine {
                     if candidate.routine_directives.abstract_
                         || candidate.routine_directives.external
+                        || candidate.routine_directives.override_
+                        || candidate.routine_directives.message
                     {
                         continue;
                     }

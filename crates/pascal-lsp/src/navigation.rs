@@ -15628,6 +15628,7 @@ struct RoutineDirectives {
     virtual_: bool,
     dynamic: bool,
     override_: bool,
+    message: bool,
     reintroduce: bool,
     forward: bool,
     external: bool,
@@ -19504,6 +19505,7 @@ fn routine_directives(node: Node<'_>) -> RoutineDirectives {
         "kVirtual" => directives.virtual_ = true,
         "kDynamic" => directives.dynamic = true,
         "kOverride" => directives.override_ = true,
+        "kMessage" => directives.message = true,
         "kReintroduce" => directives.reintroduce = true,
         "kForward" => directives.forward = true,
         "kExternal" => directives.external = true,
@@ -26448,6 +26450,54 @@ mod tests {
             }],
             "nested routines must neither satisfy nor mismatch a unit-level routine: {diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn declaration_diagnostics_budget_h2219_container_storage_before_allocating() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-h2219-byte-budget.pas")
+            .expect("H2219 byte-budget URI");
+        let mut source =
+            String::from("unit H2219ByteBudget;\ninterface\ntype TFoo = class private ");
+        for index in 0..50 {
+            if index > 0 {
+                source.push_str(", ");
+            }
+            write!(&mut source, "F{index:02}").expect("write private field");
+        }
+        source.push_str(": Integer; end;\nimplementation\nend.\n");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("H2219 byte-budget fixture parses");
+        let document = index.documents.get(&uri).expect("indexed document");
+        assert_eq!(
+            document
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.kind == SymbolKind::Field)
+                .count(),
+            50,
+            "fixture must produce fifty private field candidates"
+        );
+        let mut budget = AssistanceBudget::new(10_000, 10_000, "semantic diagnostics");
+        let mut diagnostic_cap_reached = false;
+
+        let result = index.declaration_diagnostics_with_budget(
+            &uri,
+            document,
+            MAX_SEMANTIC_DIAGNOSTICS,
+            &mut diagnostic_cap_reached,
+            &AtomicBool::new(false),
+            &mut budget,
+        );
+        let mut report = SemanticDiagnosticReport::default();
+        let diagnostics = report
+            .checked_candidate(result, &budget)
+            .expect("budget exhaustion is a coverage gap, not a fatal error");
+
+        assert!(diagnostics.is_none());
+        assert_eq!(report.gaps, vec![SemanticCoverageGap::Budget]);
+        assert!(!diagnostic_cap_reached);
     }
 
     #[test]

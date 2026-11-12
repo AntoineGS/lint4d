@@ -14,7 +14,7 @@ use super::{
 };
 use crate::configuration::{config_directories, resolve_lint};
 use crate::navigation::{
-    AssistanceBudget, MAX_MISSING_UNIT_REQUEST_BYTES, MAX_MISSING_UNIT_REQUEST_WORK,
+    AssistanceBudget, DccMessage, MAX_MISSING_UNIT_REQUEST_BYTES, MAX_MISSING_UNIT_REQUEST_WORK,
     MissingInterfaceMethodImplementationCandidate, MissingMethodImplementationCandidate,
     MissingUnitCandidate, MissingUnitUseKind, NavigationTarget, SemanticDiagnosticKind, SourceSpan,
     UnitOrderSafety,
@@ -4186,7 +4186,7 @@ fn interface_post_edit_proves_obligation(
             && remaining.interface_method == candidate.interface_method
     });
     if diagnostics.iter().any(|diagnostic| {
-        diagnostic.kind == SemanticDiagnosticKind::MissingInterfaceImplementation
+        diagnostic.kind == SemanticDiagnosticKind::Dcc(DccMessage::E2291)
             && diagnostic.span.start == anchor_start
             && diagnostic.message.contains(&candidate.interface_method)
             && !same_named_obligation_remains
@@ -4235,8 +4235,7 @@ fn matching_missing_interface_diagnostic(
         .diagnostics
         .iter()
         .find(|diagnostic| {
-            diagnostic_code(diagnostic) == Some("pascal-missing-interface-implementation")
-                && diagnostic.range == candidate.anchor
+            diagnostic_code(diagnostic) == Some("E2291") && diagnostic.range == candidate.anchor
         })
         .cloned()
 }

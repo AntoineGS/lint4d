@@ -1,0 +1,6 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem MissingMethod.pas
+MissingMethod.pas(9) E2291 Missing implementation of interface method IRequired.Required
+MissingMethod.pas(9) E2291 Missing implementation of interface method IInterface.QueryInterface
+MissingMethod.pas(9) E2291 Missing implementation of interface method IInterface._AddRef
+MissingMethod.pas(9) E2291 Missing implementation of interface method IInterface._Release

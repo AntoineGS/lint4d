@@ -196,6 +196,9 @@ crates/pascal-lsp/tests/dcc_oracle/e2065_method_missing/MethodMissing.pas 5826ab
 crates/pascal-lsp/tests/dcc_oracle/e2065_nested_forward/NestedForward.pas 699a548e1615e9ad 5
 crates/pascal-lsp/tests/dcc_oracle/e2065_object_missing/ObjectMissing.pas 60521c9ae861e982 3
 crates/pascal-lsp/tests/dcc_oracle/e2065_standalone_missing/StandaloneMissing.pas a0dbed1c5f108161 2
+crates/pascal-lsp/tests/dcc_oracle/e2137_no_base_method/NoBaseMethod.pas f247515c06c9a43a 6
+crates/pascal-lsp/tests/dcc_oracle/e2137_signature_mismatch/SignatureMismatch.pas d3c5e1f15f93cb0a 12
+crates/pascal-lsp/tests/dcc_oracle/e2170_override_nonvirtual/OverrideNonvirtual.pas 3db50c9e62c870e7 8
 crates/pascal-lsp/tests/dcc_oracle/e2252_identical_params/IdenticalParams.pas 305cdd09820413e7 6
 crates/pascal-lsp/tests/dcc_oracle/e2252_identical_params_first_overload/IdenticalParamsFirstOverload.pas f0b10eadfe015c2c 6
 crates/pascal-lsp/tests/dcc_oracle/e2252_identical_params_second_overload/IdenticalParamsSecondOverload.pas 2845ed89324e3bb0 6
@@ -203,6 +206,10 @@ crates/pascal-lsp/tests/dcc_oracle/e2252_identical_params_unmarked/IdenticalPara
 crates/pascal-lsp/tests/dcc_oracle/e2254_missing_overload_definition/MissingOverloadDefinition.pas c2fe2422df9ca11c 7
 crates/pascal-lsp/tests/dcc_oracle/e2254_missing_overload_first/MissingOverloadFirst.pas 31f4751bfe49ddc8 7
 crates/pascal-lsp/tests/dcc_oracle/e2254_missing_overload_second/MissingOverloadSecond.pas 6cd19b78b33e80d6 7
+crates/pascal-lsp/tests/dcc_oracle/e2291_abstract_class/AbstractClass.pas 3f9a2f204abca8fb 5
+crates/pascal-lsp/tests/dcc_oracle/e2291_inherited_implementation/InheritedImplementation.pas 44e65a7d335c9180 8
+crates/pascal-lsp/tests/dcc_oracle/e2291_missing_method/MissingMethod.pas 95df243849fad525 5
+crates/pascal-lsp/tests/dcc_oracle/e2291_resolution_clause/ResolutionClause.pas f643cfe4dfc43d5e 8
 crates/pascal-lsp/tests/dcc_oracle/e2301_identical_procedure/IdenticalProcedure.pas 2f4e40c7eadade14 6
 crates/pascal-lsp/tests/dcc_oracle/e2301_identical_result/IdenticalResult.pas db4314e9e40111c5 6
 crates/pascal-lsp/tests/dcc_oracle/h2219_private_const_type/PrivateConstType.pas 683e734fece05685 4
@@ -222,6 +229,7 @@ crates/pascal-lsp/tests/dcc_oracle/h2219_used_method_pointer/UsedMethodPointer.p
 crates/pascal-lsp/tests/dcc_oracle/h2219_used_other_class/UsedOtherClass.pas abb0e0ec3748b0a1 9
 crates/pascal-lsp/tests/dcc_oracle/h2219_used_via_property/UsedViaProperty.pas f35ce6b0fc57b5df 7
 crates/pascal-lsp/tests/dcc_oracle/h2219_used_with/UsedWith.pas 1bc92d0d8c2f7396 6
+crates/pascal-lsp/tests/dcc_oracle/override_valid/OverrideValid.pas a319a6303ca71915 8
 crates/pascal-lsp/tests/dcc_oracle/probe_basic/Probe.pas 94fe15f87d462573 14
 crates/tree-sitter-pascal/examples/anon.pas 98815fa6b3f807b7 8
 crates/tree-sitter-pascal/examples/codetoolmanager.pas 07b059c3d53a05f5 2737

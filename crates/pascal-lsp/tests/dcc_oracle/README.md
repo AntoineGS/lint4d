@@ -26,3 +26,15 @@ present in dcc's recording. Recall is also enforced unless `requires_rtl = true`
 and `PASCAL_RTL` is unset, or `recall = false` is set with a reason. Cases
 without an `expected.dcc` fail and must be recorded before they can participate
 in the test.
+
+To enforce recall for RTL-dependent fixtures, set `PASCAL_RTL` to the Delphi
+source root (the directory containing `rtl/sys/System.pas`):
+
+```sh
+PASCAL_RTL="$HOME/.local/share/Headless-Delphi/files/Studio/37.0/source" \
+  cargo test -p pascal-lsp --lib dcc_oracle
+```
+
+When set, the oracle test loads `rtl/sys/System.pas` into the navigation index
+for each `requires_rtl = true` case and binds the case units to it, allowing
+source-backed resolution of `TObject`, `TInterfacedObject`, and `IInterface`.

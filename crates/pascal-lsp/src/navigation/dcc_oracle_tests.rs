@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 /// dcc codes whose findings are compared. Grows as each rule lands.
 const ENABLED_CODES: &[&str] = &[
-    "E2004", "E2037", "E2065", "E2252", "E2254", "E2301", "H2219",
+    "E2004", "E2037", "E2065", "E2137", "E2170", "E2252", "E2254", "E2291", "E2301", "H2219",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -28,6 +28,21 @@ struct Case {
 
 fn cases_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/dcc_oracle")
+}
+
+fn pascal_rtl_system() -> Option<(Url, String)> {
+    let root = PathBuf::from(std::env::var_os("PASCAL_RTL")?);
+    let root = root.strip_prefix("~").map_or(root.clone(), |suffix| {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join(suffix)
+    });
+    let path = root.join("rtl/sys/System.pas");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("PASCAL_RTL System source {path:?}: {error}"));
+    let uri = Url::from_file_path(&path).expect("PASCAL_RTL System source URI");
+    Some((uri, source))
 }
 
 fn load_case(dir: &Path) -> Case {
@@ -87,6 +102,12 @@ fn actual_findings(case: &Case) -> Vec<Finding> {
     let mut index = NavigationIndex::new();
     let mut unit_uri = None;
     let mut sources = HashMap::new();
+    let system = case.requires_rtl.then(pascal_rtl_system).flatten();
+    if let Some((uri, source)) = &system {
+        index
+            .update(uri.clone(), source.clone())
+            .expect("PASCAL_RTL System parses");
+    }
     let mut entries = std::fs::read_dir(&case.dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -104,6 +125,12 @@ fn actual_findings(case: &Case) -> Vec<Finding> {
             .expect("fixture parses");
         if path.file_name().unwrap().to_string_lossy() == case.unit {
             unit_uri = Some(uri.clone());
+        }
+        if let Some((system_uri, _)) = &system {
+            index.bind_imports(
+                &uri,
+                std::iter::once(("System".to_owned(), system_uri.clone())),
+            );
         }
         sources.insert(uri, source);
     }

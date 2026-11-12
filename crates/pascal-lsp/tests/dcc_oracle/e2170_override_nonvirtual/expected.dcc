@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem OverrideNonvirtual.pas
+OverrideNonvirtual.pas(10) E2170 Cannot override a non-virtual method

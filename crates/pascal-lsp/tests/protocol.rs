@@ -2437,7 +2437,7 @@ fn pull_diagnostics_keep_a_type_mismatch_above_a_syntax_error() {
 }
 
 #[test]
-fn diagnostics_report_override_and_interface_contracts_with_protocol_codes() {
+fn diagnostics_report_dcc_override_and_interface_contracts_with_protocol_codes() {
     let root = tempfile::tempdir().expect("workspace");
     let source_path = root.path().join("Main.pas");
     let source = concat!(
@@ -2447,19 +2447,23 @@ fn diagnostics_report_override_and_interface_contracts_with_protocol_codes() {
         "  TObject = class\r\n",
         "  end;\r\n",
         "  TBase = class\r\n",
-        "    procedure Run(Value: Integer); virtual;\r\n",
+        "    procedure Run; virtual;\r\n",
+        "    procedure Nonvirtual;\r\n",
         "  end;\r\n",
         "  IRequired = interface\r\n",
         "    procedure Required;\r\n",
         "  end;\r\n",
         "  TChild = class(TBase)\r\n",
-        "    procedure Run(Value: string); override;\r\n",
+        "    procedure Missing; override;\r\n",
+        "    procedure Nonvirtual; override;\r\n",
         "  end;\r\n",
         "  TImplementation = class(TObject, IRequired)\r\n",
         "  end;\r\n",
         "implementation\r\n",
-        "procedure TBase.Run(Value: Integer); begin end;\r\n",
-        "procedure TChild.Run(Value: string); begin end;\r\n",
+        "procedure TBase.Run; begin end;\r\n",
+        "procedure TBase.Nonvirtual; begin end;\r\n",
+        "procedure TChild.Missing; begin end;\r\n",
+        "procedure TChild.Nonvirtual; begin end;\r\n",
         "end.\r\n",
     );
     write_file(&source_path, source);
@@ -2482,30 +2486,47 @@ fn diagnostics_report_override_and_interface_contracts_with_protocol_codes() {
     let diagnostics = publication["diagnostics"]
         .as_array()
         .expect("diagnostics array");
-    let invalid_override = diagnostics
+    let missing_base_method = diagnostics
         .iter()
-        .find(|diagnostic| diagnostic["code"] == "pascal-invalid-override")
-        .expect("invalid override diagnostic");
+        .find(|diagnostic| diagnostic["code"] == "E2137")
+        .expect("missing base method diagnostic");
     assert_eq!(
-        invalid_override["message"],
-        "invalid override 'Run': no inherited virtual or dynamic method matches"
+        missing_base_method["message"],
+        "Method 'Missing' not found in base class"
     );
-    let override_start = position_of(source, "Run(Value: string)", 0);
+    let override_start = position_of(source, "Missing; override", 0);
     assert_eq!(
-        invalid_override["range"],
+        missing_base_method["range"],
         json!({
             "start": override_start,
-            "end": Position::new(override_start.line, override_start.character + 3),
+            "end": Position::new(override_start.line, override_start.character + 7),
+        })
+    );
+
+    let nonvirtual_override = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "E2170")
+        .expect("nonvirtual override diagnostic");
+    assert_eq!(
+        nonvirtual_override["message"],
+        "Cannot override a non-virtual method"
+    );
+    let nonvirtual_start = position_of(source, "Nonvirtual; override", 0);
+    assert_eq!(
+        nonvirtual_override["range"],
+        json!({
+            "start": nonvirtual_start,
+            "end": Position::new(nonvirtual_start.line, nonvirtual_start.character + 10),
         })
     );
 
     let missing_interface = diagnostics
         .iter()
-        .find(|diagnostic| diagnostic["code"] == "pascal-missing-interface-implementation")
+        .find(|diagnostic| diagnostic["code"] == "E2291")
         .expect("missing interface implementation diagnostic");
     assert_eq!(
         missing_interface["message"],
-        "class 'TImplementation' does not implement interface method 'Required'"
+        "Missing implementation of interface method IRequired.Required"
     );
     let required_start = position_of(source, "TImplementation = class", 0);
     assert_eq!(
@@ -2522,11 +2543,12 @@ fn diagnostics_report_override_and_interface_contracts_with_protocol_codes() {
         diagnostics
             .iter()
             .filter(|diagnostic| {
-                diagnostic["code"] == "pascal-invalid-override"
-                    || diagnostic["code"] == "pascal-missing-interface-implementation"
+                diagnostic["code"] == "E2137"
+                    || diagnostic["code"] == "E2170"
+                    || diagnostic["code"] == "E2291"
             })
             .count(),
-        2
+        3
     );
     server.shutdown();
 }
@@ -2575,7 +2597,7 @@ fn diagnostics_anchor_an_imported_interface_contract_to_the_consumer_physical_ur
         .expect("consumer diagnostics array");
     let diagnostic = diagnostics
         .iter()
-        .find(|diagnostic| diagnostic["code"] == "pascal-missing-interface-implementation")
+        .find(|diagnostic| diagnostic["code"] == "E2291")
         .expect("consumer interface diagnostic");
     let class_start = position_of(main_source, "TChild = class", 0);
     assert_eq!(
@@ -2591,7 +2613,7 @@ fn diagnostics_anchor_an_imported_interface_contract_to_the_consumer_physical_ur
     assert_eq!(
         diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic["code"] == "pascal-missing-interface-implementation")
+            .filter(|diagnostic| diagnostic["code"] == "E2291")
             .count(),
         1
     );
@@ -2658,7 +2680,7 @@ fn diagnostics_refresh_an_imported_interface_contract_after_a_provider_overlay_e
             .as_array()
             .expect("initial diagnostics")
             .iter()
-            .any(|diagnostic| diagnostic["code"] == "pascal-missing-interface-implementation")
+            .any(|diagnostic| diagnostic["code"] == "E2291")
     );
 
     server.send_notification(
@@ -2678,7 +2700,7 @@ fn diagnostics_refresh_an_imported_interface_contract_after_a_provider_overlay_e
             .as_array()
             .expect("refreshed diagnostics")
             .iter()
-            .all(|diagnostic| diagnostic["code"] != "pascal-missing-interface-implementation"),
+            .all(|diagnostic| diagnostic["code"] != "E2291"),
         "provider overlay should remove the stale interface obligation: {refreshed}"
     );
     server.shutdown();
@@ -2815,7 +2837,7 @@ fn diagnostics_map_type_mismatches_in_includes_to_physical_utf16_ranges() {
 }
 
 #[test]
-fn diagnostics_map_invalid_overrides_in_includes_to_physical_crlf_utf16_ranges() {
+fn diagnostics_map_missing_base_method_overrides_in_includes_to_physical_crlf_utf16_ranges() {
     let root = tempfile::tempdir().expect("workspace");
     let main = root.path().join("Main.pas");
     let include = root.path().join("Contracts.inc");
@@ -2836,8 +2858,9 @@ fn diagnostics_map_invalid_overrides_in_includes_to_physical_crlf_utf16_ranges()
         "{😀}\r\n",
         "type\r\n",
         "  TChild = class(TBase)\r\n",
-        "    procedure Run(Value: Integer); override;\r\n",
+        "    procedure Missing; override;\r\n",
         "  end;\r\n",
+        "procedure TChild.Missing; begin end;\r\n",
     );
     write_file(&main, main_source);
     write_file(&include, include_source);
@@ -2862,25 +2885,25 @@ fn diagnostics_map_invalid_overrides_in_includes_to_physical_crlf_utf16_ranges()
             .as_array()
             .expect("root diagnostics")
             .iter()
-            .all(|diagnostic| diagnostic["code"] != "pascal-invalid-override")
+            .all(|diagnostic| diagnostic["code"] != "E2137" && diagnostic["code"] != "E2170")
     );
     let include_publication = diagnostics_for_uri(&mut server, &uri(&include));
     let diagnostic = include_publication["diagnostics"]
         .as_array()
         .expect("include diagnostics")
         .iter()
-        .find(|diagnostic| diagnostic["code"] == "pascal-invalid-override")
-        .expect("physical include override diagnostic");
+        .find(|diagnostic| diagnostic["code"] == "E2137")
+        .expect("physical include missing base method diagnostic");
     assert_eq!(
         diagnostic["message"],
-        "invalid override 'Run': no inherited virtual or dynamic method matches"
+        "Method 'Missing' not found in base class"
     );
-    let start = position_of(include_source, "Run(Value: Integer)", 0);
+    let start = position_of(include_source, "Missing; override", 0);
     assert_eq!(
         diagnostic["range"],
         json!({
             "start": start,
-            "end": Position::new(start.line, start.character + 3),
+            "end": Position::new(start.line, start.character + 7),
         })
     );
     server.shutdown();
@@ -2942,15 +2965,19 @@ fn diagnostics_map_missing_interface_contracts_to_a_physical_include_class() {
             .as_array()
             .expect("root diagnostics")
             .iter()
-            .all(|diagnostic| diagnostic["code"] != "pascal-missing-interface-implementation")
+            .all(|diagnostic| diagnostic["code"] != "E2291")
     );
     let include_publication = diagnostics_for_uri(&mut server, &uri(&include));
     let diagnostic = include_publication["diagnostics"]
         .as_array()
         .expect("include diagnostics")
         .iter()
-        .find(|diagnostic| diagnostic["code"] == "pascal-missing-interface-implementation")
+        .find(|diagnostic| diagnostic["code"] == "E2291")
         .expect("physical include interface diagnostic");
+    assert_eq!(
+        diagnostic["message"],
+        "Missing implementation of interface method IRequired.Required"
+    );
     let class_start = position_of(include_source, "TChild = class", 0);
     assert_eq!(
         diagnostic["range"],
@@ -40758,7 +40785,7 @@ fn code_action_stabilizes_every_reference_in_a_compound_default_and_reanalyzes_i
             .as_array()
             .unwrap()
             .iter()
-            .any(|diagnostic| diagnostic["code"] == "pascal-missing-interface-implementation"),
+            .any(|diagnostic| diagnostic["code"] == "E2291"),
         "the applied implementation must satisfy the interface: {diagnostics}"
     );
 

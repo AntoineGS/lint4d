@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem SignatureMismatch.pas
+SignatureMismatch.pas(10) E2037 Declaration of 'Run' differs from previous declaration

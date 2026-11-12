@@ -84,26 +84,29 @@ proven incompatible; one compatible, ambiguous, unsupported, or uncertain
 candidate suppresses the claim. When all invalid candidates disagree about an
 expected type, the argument message uses `a compatible overload parameter`.
 
-Ranges cover exactly the offending right-hand expression or argument and are
-mapped back to physical include files just like the existing semantic
-diagnostics. The new codes are:
+Type and argument ranges cover exactly the offending right-hand expression or
+argument. Contract ranges cover the override method name or implementing class
+name, and all ranges map back to physical include files. The codes are:
 
 | Diagnostic | Code |
 | --- | --- |
 | Type mismatch | `pascal-type-mismatch` |
 | Incompatible argument | `pascal-incompatible-argument` |
-| Invalid explicit override | `pascal-invalid-override` |
-| Missing interface implementation | `pascal-missing-interface-implementation` |
+| Method not found in base class | `E2137` |
+| Override of non-virtual method | `E2170` |
+| Missing interface implementation | `E2291` |
 
 Override and interface diagnostics use the same complete source-backed ancestry,
 visibility, conditional-state, generic-substitution, cancellation, and traversal
-budgets as the other semantic diagnostics. An explicit `override` is reported
-only when a complete superclass chain proves that no matching inherited
-`virtual` or `dynamic` routine exists. An implicit class root is never treated as
-an empty chain: the pass requires a complete local/source-backed `TObject` fact
-or a unique complete `System.TObject`. Class/interface method identity includes
-routine kind, exact parameter types, `var`/`out`/`const` modes, generic arity,
-calling-convention boundaries, and function results. Supported
+budgets as the other semantic diagnostics. E2137 is reported only when a complete
+superclass chain proves that no same-named inherited method exists; an exact
+signature match that is non-virtual or non-dynamic reports E2170 when no other
+uncertain or overloaded candidate suppresses the claim. Same-name signature
+mismatches are not translated to either code. An implicit class root is never
+treated as an empty chain: the pass requires a complete local/source-backed
+`TObject` fact or a unique complete `System.TObject`. Class/interface method
+identity includes routine kind, exact parameter types, `var`/`out`/`const` modes,
+generic arity, calling-convention boundaries, and function results. Supported
 method-resolution clauses, uniquely resolved interface `implements`
 delegations (including inherited and derived-interface targets), and inherited
 implementations are followed; interface diamonds are memoized and charged on
@@ -344,7 +347,7 @@ obligation. These actions use the hierarchical kind
 request); each action completes only its named obligation, not an unsupported
 or unproven "implement all" operation. The private resolve-data discriminator
 is `implement-interface-method`.
-The action is associated with `pascal-missing-interface-implementation` when
+The action is associated with `E2291` when
 the requesting context supplies the matching diagnostic. A declaration is
 added only when the exact class member is absent; an existing exact
 declaration receives only its missing body.
@@ -353,9 +356,10 @@ The proof follows complete source-backed interface and class ancestry,
 instantiated generic substitutions, exact routine kind/parameters/modes/result,
 calling conventions, overload identity, method-resolution mappings, and
 supported interface delegation. Inherited concrete implementations suppress
-generation, while abstract, compiler-only, ambiguous, conditional, parser-
-recovery, incomplete-import, unresolved-type, unsupported-generic, and
-unsupported-calling-convention contexts remain silent. Standalone implicit
+generation, while inherited abstract methods, compiler-only, ambiguous,
+conditional, parser-recovery, incomplete-import, unresolved-type,
+unsupported-generic, and unsupported-calling-convention contexts remain silent.
+Standalone implicit
 `TObject` is an open compiler-member namespace: diagnostics do not claim an
 interface method is absent, and a missing declaration is withheld until a
 source-backed authoritative root is available. An exact direct class

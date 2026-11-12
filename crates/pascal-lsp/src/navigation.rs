@@ -26551,6 +26551,86 @@ mod tests {
     }
 
     #[test]
+    fn semantic_diagnostics_contracts_budget_unmatched_inherited_routine_scans() {
+        const INHERITED_ROUTINES: usize = 1_024;
+
+        fn index_with_child_routine(include_child_method: bool) -> (NavigationIndex, Url) {
+            let unit = if include_child_method {
+                "AncestryScanBudgetWithChild"
+            } else {
+                "AncestryScanBudgetBaseline"
+            };
+            let uri = Url::parse(&format!("file:///tmp/{unit}.pas")).expect("fixture URI");
+            let mut source = format!(
+                "unit {unit};\ninterface\ntype\n  TObject = class\n  end;\n  TBase = class(TObject)\n  public\n"
+            );
+            for index in 0..INHERITED_ROUTINES {
+                writeln!(&mut source, "    procedure Base{index:04};")
+                    .expect("write inherited routine");
+            }
+            source.push_str("  end;\n  TChild = class(TBase)\n");
+            if include_child_method {
+                source.push_str("  public\n    procedure ChildOnly;\n");
+            }
+            source.push_str("  end;\nimplementation\n");
+            if include_child_method {
+                source.push_str("procedure TChild.ChildOnly;\nbegin\nend;\n");
+            }
+            source.push_str("end.\n");
+
+            let mut index = NavigationIndex::new();
+            index
+                .update(uri.clone(), source)
+                .expect("ancestry budget fixture parses");
+            (index, uri)
+        }
+
+        fn run_ancestry(
+            index: &NavigationIndex,
+            uri: &Url,
+            work_limit: usize,
+        ) -> (
+            SemanticDiagnosticReport,
+            Option<Vec<SemanticDiagnostic>>,
+            usize,
+        ) {
+            let document = index.documents.get(uri).expect("indexed fixture");
+            let cancel = AtomicBool::new(false);
+            let mut budget =
+                AssistanceBudget::new(work_limit, 8 * 1024 * 1024, "semantic diagnostics");
+            let result = index.ancestry_diagnostics_with_budget(
+                uri,
+                document,
+                MAX_SEMANTIC_DIAGNOSTICS,
+                &cancel,
+                &mut budget,
+            );
+            let mut report = SemanticDiagnosticReport::default();
+            let diagnostics = report
+                .checked_candidate(result, &budget)
+                .expect("budget exhaustion is a coverage gap, not a fatal error");
+            let work_used = budget.work_limit - budget.remaining_work;
+            (report, diagnostics, work_used)
+        }
+
+        let (baseline_index, baseline_uri) = index_with_child_routine(false);
+        let (baseline_report, baseline_diagnostics, baseline_work) =
+            run_ancestry(&baseline_index, &baseline_uri, 100_000);
+        assert!(baseline_diagnostics.is_some(), "{baseline_report:?}");
+        assert!(baseline_report.gaps.is_empty(), "{baseline_report:?}");
+
+        let (index, uri) = index_with_child_routine(true);
+        let tight_work_limit = baseline_work + INHERITED_ROUTINES + INHERITED_ROUTINES / 2;
+        let (report, diagnostics, _) = run_ancestry(&index, &uri, tight_work_limit);
+
+        assert!(
+            diagnostics.is_none(),
+            "the uncharged inherited-surface scan must not complete under {tight_work_limit} work units: {report:?}"
+        );
+        assert_eq!(report.gaps, vec![SemanticCoverageGap::Budget]);
+    }
+
+    #[test]
     fn semantic_diagnostics_keep_the_first_findings_up_to_the_cap() {
         let uri = Url::parse("file:///tmp/semantic-diagnostics-cap.pas").expect("cap URI");
         let mut source = String::from(

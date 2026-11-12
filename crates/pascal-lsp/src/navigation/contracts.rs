@@ -78,12 +78,12 @@ impl NavigationIndex {
 
             let mut hidden_virtual = None;
             let mut uncertain = false;
-            for candidate in inherited
-                .iter()
-                .filter(|candidate| candidate.symbol_key == symbol.key)
-            {
+            for candidate in &inherited {
                 check_navigation_cancel(cancel)?;
                 budget.require_work(1, cancel)?;
+                if candidate.symbol_key != symbol.key {
+                    continue;
+                }
                 if candidate.conditional_unknown(self) {
                     uncertain = true;
                     continue;
@@ -325,6 +325,7 @@ impl NavigationIndex {
             }
             for index in member_indices {
                 check_navigation_cancel(cancel)?;
+                budget.require_work(1, cancel)?;
                 let Some(property) = document.symbols.get(*index) else {
                     continue;
                 };
@@ -368,24 +369,30 @@ impl NavigationIndex {
         let Some(interface_method) = self.symbol(&obligation.requirement.candidate) else {
             return Ok(false);
         };
-        if obligation.method_name != interface_method.key
-            || surface.method_resolutions.iter().any(|resolution| {
-                resolution.interface_owner == obligation.requirement.interface.key
-                    && resolution.interface_method == interface_method.key
-            })
-        {
+        if obligation.method_name != interface_method.key {
             return Ok(false);
+        }
+        for resolution in &surface.method_resolutions {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            if resolution.interface_owner == obligation.requirement.interface.key
+                && resolution.interface_method == interface_method.key
+            {
+                return Ok(false);
+            }
         }
 
         let mut mismatch = false;
         let mut uncertain = false;
         let mut direct_candidates = 0usize;
-        for candidate in surface.routines.iter().filter(|candidate| {
-            candidate.symbol_key == obligation.method_name
-                && candidate.candidate.uri == class_instance.uri
-        }) {
+        for candidate in &surface.routines {
             check_navigation_cancel(cancel)?;
             budget.require_work(1, cancel)?;
+            if candidate.symbol_key != obligation.method_name
+                || candidate.candidate.uri != class_instance.uri
+            {
+                continue;
+            }
             let Some(candidate_symbol) = self.symbol(&candidate.candidate) else {
                 uncertain = true;
                 continue;

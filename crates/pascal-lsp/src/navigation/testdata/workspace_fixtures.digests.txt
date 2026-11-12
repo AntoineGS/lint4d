@@ -208,6 +208,8 @@ crates/pascal-lsp/tests/dcc_oracle/e2254_missing_overload_first/MissingOverloadF
 crates/pascal-lsp/tests/dcc_oracle/e2254_missing_overload_second/MissingOverloadSecond.pas 6cd19b78b33e80d6 7
 crates/pascal-lsp/tests/dcc_oracle/e2291_abstract_class/AbstractClass.pas 3f9a2f204abca8fb 5
 crates/pascal-lsp/tests/dcc_oracle/e2291_inherited_implementation/InheritedImplementation.pas 44e65a7d335c9180 8
+crates/pascal-lsp/tests/dcc_oracle/e2291_local_complete_method/E2291LocalCompleteMethod.pas 973a4e955676d33e 17
+crates/pascal-lsp/tests/dcc_oracle/e2291_local_missing_method/E2291LocalMissingMethod.pas 4ebafea2f45f0a58 15
 crates/pascal-lsp/tests/dcc_oracle/e2291_missing_method/MissingMethod.pas 95df243849fad525 5
 crates/pascal-lsp/tests/dcc_oracle/e2291_resolution_clause/ResolutionClause.pas f643cfe4dfc43d5e 8
 crates/pascal-lsp/tests/dcc_oracle/e2301_identical_procedure/IdenticalProcedure.pas 2f4e40c7eadade14 6

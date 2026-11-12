@@ -199,6 +199,8 @@ crates/pascal-lsp/tests/dcc_oracle/e2065_standalone_missing/StandaloneMissing.pa
 crates/pascal-lsp/tests/dcc_oracle/e2137_no_base_method/NoBaseMethod.pas f247515c06c9a43a 6
 crates/pascal-lsp/tests/dcc_oracle/e2137_signature_mismatch/SignatureMismatch.pas d3c5e1f15f93cb0a 12
 crates/pascal-lsp/tests/dcc_oracle/e2170_override_nonvirtual/OverrideNonvirtual.pas 3db50c9e62c870e7 8
+crates/pascal-lsp/tests/dcc_oracle/e2211_signature_differs/E2211SignatureDiffers.pas 5ede6afccc43a97b 20
+crates/pascal-lsp/tests/dcc_oracle/e2211_vs_e2291/E2211VsE2291.pas 91092bc0f5145560 31
 crates/pascal-lsp/tests/dcc_oracle/e2252_identical_params/IdenticalParams.pas 305cdd09820413e7 6
 crates/pascal-lsp/tests/dcc_oracle/e2252_identical_params_first_overload/IdenticalParamsFirstOverload.pas f0b10eadfe015c2c 6
 crates/pascal-lsp/tests/dcc_oracle/e2252_identical_params_second_overload/IdenticalParamsSecondOverload.pas 2845ed89324e3bb0 6
@@ -233,6 +235,14 @@ crates/pascal-lsp/tests/dcc_oracle/h2219_used_via_property/UsedViaProperty.pas f
 crates/pascal-lsp/tests/dcc_oracle/h2219_used_with/UsedWith.pas 1bc92d0d8c2f7396 6
 crates/pascal-lsp/tests/dcc_oracle/override_valid/OverrideValid.pas a319a6303ca71915 8
 crates/pascal-lsp/tests/dcc_oracle/probe_basic/Probe.pas 94fe15f87d462573 14
+crates/pascal-lsp/tests/dcc_oracle/w1009_field_hides_field/W1009FieldHidesField.pas ce480df353c6ecca 6
+crates/pascal-lsp/tests/dcc_oracle/w1009_method_hides_static/W1009MethodHidesStatic.pas 9cc02c8c9255bc37 8
+crates/pascal-lsp/tests/dcc_oracle/w1009_property/W1009Property.pas d7cf35ed2492937e 7
+crates/pascal-lsp/tests/dcc_oracle/w1010_hides_virtual/W1010HidesVirtual.pas 63efcdcd40e2a7b0 8
+crates/pascal-lsp/tests/dcc_oracle/w1010_overload/W1010Overload.pas 8f8f08291eeafc62 10
+crates/pascal-lsp/tests/dcc_oracle/w1010_private_ancestor/PrivateAncestor.pas 591ae17bdb6b5095 5
+crates/pascal-lsp/tests/dcc_oracle/w1010_private_ancestor/W1010PrivateAncestor.pas af23a94558192c83 4
+crates/pascal-lsp/tests/dcc_oracle/w1010_reintroduce/W1010Reintroduce.pas dea6f0ab6eb0873e 8
 crates/tree-sitter-pascal/examples/anon.pas 98815fa6b3f807b7 8
 crates/tree-sitter-pascal/examples/codetoolmanager.pas 07b059c3d53a05f5 2737
 crates/tree-sitter-pascal/examples/foo.pas 215ffe0c944dd222 90

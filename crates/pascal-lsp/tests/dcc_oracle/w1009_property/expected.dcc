@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem W1009Property.pas
+W1009Property.pas(18) W1009 Redeclaration of 'Value' hides a member in the base class

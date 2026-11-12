@@ -82,6 +82,7 @@ fn map_verified_header_location(uri: &Url, range: Range) -> Location {
 mod assistance;
 mod call_hierarchy;
 pub mod compiled_dcu;
+mod contracts;
 mod dcc_message;
 #[cfg(test)]
 mod dcc_oracle_tests;
@@ -3139,6 +3140,23 @@ impl NavigationIndex {
                 }
             }
             let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
+            match self.ancestry_diagnostics_with_budget(
+                uri,
+                document,
+                capacity,
+                cancel,
+                &mut budget,
+            ) {
+                Err(error) if error == SEMANTIC_DIAGNOSTICS_LIMIT => {
+                    report.note(SemanticCoverageGap::DiagnosticCap);
+                }
+                result => {
+                    if let Some(ancestry) = report.checked_candidate(result, &budget)? {
+                        report.diagnostics.extend(ancestry);
+                    }
+                }
+            }
+            let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
             let mut declaration_cap_reached = false;
             let result = self.declaration_diagnostics_with_budget(
                 uri,
@@ -3847,13 +3865,12 @@ impl NavigationIndex {
             if !contract_substitution_is_complete(&class_instance) {
                 continue;
             }
-            let Some((missing, _surface)) = self
-                .missing_interface_contracts_for_class_with_budget(
-                    &class_instance,
-                    &mut ancestry,
-                    cancel,
-                    budget,
-                )?
+            let Some((missing, surface)) = self.missing_interface_contracts_for_class_with_budget(
+                &class_instance,
+                &mut ancestry,
+                cancel,
+                budget,
+            )?
             else {
                 continue;
             };
@@ -3861,6 +3878,15 @@ impl NavigationIndex {
                 check_navigation_cancel(cancel)?;
                 budget.require_work(1, cancel)?;
                 if obligation.implementation != ContractMatch::No {
+                    continue;
+                }
+                if self.interface_signature_mismatch_with_budget(
+                    &class_instance,
+                    &obligation,
+                    &surface,
+                    cancel,
+                    budget,
+                )? {
                     continue;
                 }
                 let Some(interface_method) = self.symbol(&obligation.requirement.candidate) else {

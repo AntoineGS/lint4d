@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 /// dcc codes whose findings are compared. Grows as each rule lands.
 const ENABLED_CODES: &[&str] = &[
-    "E2004", "E2037", "E2065", "E2137", "E2170", "E2252", "E2254", "E2291", "E2301", "H2219",
+    "E2004", "E2037", "E2065", "E2137", "E2170", "E2211", "E2252", "E2254", "E2291", "E2301",
+    "H2219", "W1009", "W1010",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

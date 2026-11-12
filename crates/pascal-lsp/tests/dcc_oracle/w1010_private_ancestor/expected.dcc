@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem W1010PrivateAncestor.pas
+PrivateAncestor.pas(11) H2219 Private symbol 'Hidden' declared but never used

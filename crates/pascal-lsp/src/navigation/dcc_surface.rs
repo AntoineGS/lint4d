@@ -115,7 +115,13 @@ impl SurfaceTable {
     }
 }
 
-const TABLES: &[(&str, &str)] = &[];
+const TABLES: &[(&str, &str)] = &[
+    ("21.0-Win32", include_str!("dcc_surface/21.0-Win32.txt")),
+    ("24.0-Win32", include_str!("dcc_surface/24.0-Win32.txt")),
+    ("24.0-Win64", include_str!("dcc_surface/24.0-Win64.txt")),
+    ("37.0-Win32", include_str!("dcc_surface/37.0-Win32.txt")),
+    ("37.0-Win64", include_str!("dcc_surface/37.0-Win64.txt")),
+];
 
 static CHECKED_IN_TABLES: OnceLock<HashMap<String, Arc<SurfaceTable>>> = OnceLock::new();
 
@@ -182,7 +188,10 @@ pub(crate) fn blake3_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pascal_project::{CompilerVersion, ConditionalContext, LayoutContext, LayoutPlatform};
+    use pascal_project::{
+        CompilerVersion, ConditionalContext, ConditionalFact, LayoutContext, LayoutPlatform,
+        TargetPlatform,
+    };
 
     const MINIMAL_TABLE: &str = "# dcc-surface v1\n\
 # banner: Embarcadero Delphi for Win32 compiler version 37.0\n\
@@ -343,5 +352,117 @@ Free\n\
         for (_, text) in TABLES {
             SurfaceTable::parse(text).unwrap();
         }
+    }
+
+    #[test]
+    fn checked_in_tables_cover_every_key() {
+        let expected = [
+            "21.0-Win32",
+            "24.0-Win32",
+            "24.0-Win64",
+            "37.0-Win32",
+            "37.0-Win64",
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let actual = TABLES
+            .iter()
+            .map(|(file_stem, _)| *file_stem)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            TABLES.len(),
+            expected.len(),
+            "unexpected duplicate table key"
+        );
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn predefined_defines_match_dcc() {
+        let keys = [
+            (21, 0, SurfacePlatform::Win32, TargetPlatform::Win32),
+            (24, 0, SurfacePlatform::Win32, TargetPlatform::Win32),
+            (24, 0, SurfacePlatform::Win64, TargetPlatform::Win64),
+            (37, 0, SurfacePlatform::Win32, TargetPlatform::Win32),
+            (37, 0, SurfacePlatform::Win64, TargetPlatform::Win64),
+        ];
+        let mut mismatches = Vec::new();
+
+        for (major, minor, surface_platform, target_platform) in keys {
+            let key = SurfaceKey {
+                major,
+                minor,
+                platform: surface_platform,
+            };
+            let Some(table) = table_for(&key) else {
+                mismatches.push(format!("{}: missing table", key.file_stem()));
+                continue;
+            };
+            let defines = pascal_project::compiler_defines::predefined_defines(
+                Some(CompilerVersion::new(major, minor)),
+                Some(&target_platform),
+                ConditionalFact::False,
+            );
+
+            for (symbol, fact) in &defines {
+                match fact {
+                    ConditionalFact::True if !table.is_defined(symbol) => mismatches.push(format!(
+                        "{}: {symbol} is True but absent from dcc table",
+                        key.file_stem()
+                    )),
+                    ConditionalFact::False if table.is_defined(symbol) => mismatches.push(format!(
+                        "{}: {symbol} is False but present in dcc table",
+                        key.file_stem()
+                    )),
+                    _ => {}
+                }
+            }
+
+            for symbol in table.defines() {
+                let fact = defines
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(symbol))
+                    .map(|(_, fact)| fact);
+                if fact != Some(&ConditionalFact::True) {
+                    mismatches.push(format!(
+                        "{}: {symbol} is present in dcc table but not True in predefined_defines",
+                        key.file_stem()
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "define mismatches:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    #[test]
+    fn every_checked_in_table_contains_core_builtins() {
+        let mut failures = Vec::new();
+
+        for (file_stem, text) in TABLES {
+            let table = SurfaceTable::parse(text).unwrap();
+            for name in ["Writeln", "SizeOf", "Exit", "TObject", "Integer"] {
+                if !table.has_name(name) {
+                    failures.push(format!("{file_stem}: missing {name}"));
+                }
+            }
+            if table.has_name("Zq1Undeclared") {
+                failures.push(format!("{file_stem}: contains Zq1Undeclared"));
+            }
+        }
+        if TABLES.is_empty() {
+            failures.push("no checked-in tables".to_owned());
+        }
+
+        assert!(
+            failures.is_empty(),
+            "table surface failures:\n{}",
+            failures.join("\n")
+        );
     }
 }

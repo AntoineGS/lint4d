@@ -86,6 +86,7 @@ mod contracts;
 mod dcc_message;
 #[cfg(test)]
 mod dcc_oracle_tests;
+mod dcc_surface;
 mod declarations;
 pub(crate) use dcc_message::{DccMessage, DccSeverity};
 mod documentation;

@@ -1,3 +1,4 @@
 unit = "DefaultValue.pas"
 recall = false
 reason = "dcc reports E2037 for a changed default literal, which the current symbol model records only as default-value presence."
+silent = ["E2037"]

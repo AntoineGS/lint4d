@@ -25,6 +25,7 @@ struct Case {
     unit: String,
     requires_rtl: bool,
     recall: bool,
+    silent_codes: Vec<String>,
 }
 
 fn cases_root() -> PathBuf {
@@ -61,10 +62,22 @@ fn load_case(dir: &Path) -> Case {
         recall || value("reason").is_some(),
         "{name}: recall = false requires a reason"
     );
+    let silent_codes = value("silent")
+        .map(|raw| {
+            raw.strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .unwrap_or_else(|| panic!("{name}: silent must be an array of diagnostic codes"))
+                .split(',')
+                .map(|code| code.trim().trim_matches('"').to_owned())
+                .filter(|code| !code.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
     Case {
         unit: value("unit").unwrap_or_else(|| panic!("{name}: case.toml has no unit")),
         requires_rtl: value("requires_rtl").as_deref() == Some("true"),
         recall,
+        silent_codes,
         name,
         dir: dir.to_path_buf(),
     }
@@ -150,8 +163,16 @@ fn actual_findings(case: &Case) -> Vec<Finding> {
         .collect()
 }
 
-fn finding_differences(expected: &[Finding], actual: &[Finding]) -> (Vec<Finding>, Vec<Finding>) {
-    let mut expected = expected.to_vec();
+fn finding_differences(
+    expected: &[Finding],
+    actual: &[Finding],
+    silent_codes: &[String],
+) -> (Vec<Finding>, Vec<Finding>) {
+    let mut expected = expected
+        .iter()
+        .filter(|finding| !silent_codes.contains(&finding.code))
+        .cloned()
+        .collect::<Vec<_>>();
     let mut actual = actual.to_vec();
     expected.sort();
     actual.sort();
@@ -189,13 +210,37 @@ fn finding_differences_compare_duplicate_occurrences() {
     let one = vec![finding.clone()];
     let two = vec![finding.clone(), finding.clone()];
 
-    let (invented, missed) = finding_differences(&one, &two);
+    let (invented, missed) = finding_differences(&one, &two, &[]);
     assert_eq!(invented, vec![finding.clone()]);
     assert!(missed.is_empty());
 
-    let (invented, missed) = finding_differences(&two, &one);
+    let (invented, missed) = finding_differences(&two, &one, &[]);
     assert!(invented.is_empty());
     assert_eq!(missed, vec![finding]);
+}
+
+#[test]
+fn silent_case_codes_override_matching_dcc_and_linter_findings() {
+    let case = load_case(&cases_root().join("e2065_conditional_body"));
+    assert_eq!(case.silent_codes, vec!["E2065"]);
+    let finding = parse_expected(&case)
+        .into_iter()
+        .find(|finding| finding.code == "E2065")
+        .expect("fixture records E2065");
+
+    let (invented, missed) = finding_differences(
+        std::slice::from_ref(&finding),
+        std::slice::from_ref(&finding),
+        &case.silent_codes,
+    );
+
+    assert_eq!(invented, vec![finding.clone()]);
+    assert!(missed.is_empty());
+
+    let (invented, missed) =
+        finding_differences(std::slice::from_ref(&finding), &[], &case.silent_codes);
+    assert!(invented.is_empty());
+    assert!(missed.is_empty());
 }
 
 #[test]
@@ -214,7 +259,7 @@ fn identical_parameter_methods_match_dcc_across_overload_directives() {
             .into_iter()
             .filter(|finding| finding.code == "E2252")
             .collect::<Vec<_>>();
-        let (invented, missed) = finding_differences(&expected, &actual);
+        let (invented, missed) = finding_differences(&expected, &actual, &case.silent_codes);
 
         assert_eq!(expected.len(), 1, "{name}: expected one dcc E2252");
         assert!(invented.is_empty(), "{name}: invented E2252: {invented:?}");
@@ -244,7 +289,7 @@ fn dcc_oracle_cases_match_recorded_dcc_output() {
             .into_iter()
             .filter(enabled)
             .collect::<Vec<_>>();
-        let (invented, missed) = finding_differences(&expected, &actual);
+        let (invented, missed) = finding_differences(&expected, &actual, &case.silent_codes);
         if !invented.is_empty() {
             failures.push(format!("{}: not reported by dcc: {invented:?}", case.name));
         }

@@ -195,6 +195,8 @@ crates/pascal-lsp/tests/dcc_oracle/e2065_generic_method/GenericMethod.pas 174e92
 crates/pascal-lsp/tests/dcc_oracle/e2065_method_missing/MethodMissing.pas 5826abbc9dd03b9a 5
 crates/pascal-lsp/tests/dcc_oracle/e2065_nested_forward/NestedForward.pas 699a548e1615e9ad 5
 crates/pascal-lsp/tests/dcc_oracle/e2065_object_missing/ObjectMissing.pas 60521c9ae861e982 3
+crates/pascal-lsp/tests/dcc_oracle/e2065_record_method_implemented/RecordMethodImplemented.pas 7a7875f034df1b19 4
+crates/pascal-lsp/tests/dcc_oracle/e2065_record_method_missing/RecordMethodMissing.pas c21cfe781d9ff1a1 5
 crates/pascal-lsp/tests/dcc_oracle/e2065_standalone_missing/StandaloneMissing.pas a0dbed1c5f108161 2
 crates/pascal-lsp/tests/dcc_oracle/e2137_no_base_method/NoBaseMethod.pas f247515c06c9a43a 6
 crates/pascal-lsp/tests/dcc_oracle/e2137_signature_mismatch/SignatureMismatch.pas d3c5e1f15f93cb0a 12
@@ -216,6 +218,7 @@ crates/pascal-lsp/tests/dcc_oracle/e2291_missing_method/MissingMethod.pas 95df24
 crates/pascal-lsp/tests/dcc_oracle/e2291_resolution_clause/ResolutionClause.pas f643cfe4dfc43d5e 8
 crates/pascal-lsp/tests/dcc_oracle/e2301_identical_procedure/IdenticalProcedure.pas 2f4e40c7eadade14 6
 crates/pascal-lsp/tests/dcc_oracle/e2301_identical_result/IdenticalResult.pas db4314e9e40111c5 6
+crates/pascal-lsp/tests/dcc_oracle/h2219_dfm_event_handler/DfmHandler.pas 0453e4daa185318f 9
 crates/pascal-lsp/tests/dcc_oracle/h2219_private_const_type/PrivateConstType.pas 683e734fece05685 4
 crates/pascal-lsp/tests/dcc_oracle/h2219_private_dynamic/PrivateDynamic.pas 8fe3a8033cec1bdd 4
 crates/pascal-lsp/tests/dcc_oracle/h2219_private_message/PrivateMessage.pas fda8424d632015cc 12

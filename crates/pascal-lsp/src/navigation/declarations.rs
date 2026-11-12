@@ -25,6 +25,12 @@ impl NavigationIndex {
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<SemanticDiagnostic>, String> {
         *diagnostic_cap_reached = false;
+        // Recovery can hide any declaration or use in the unit, so even
+        // findings anchored in the parsed prefix are not complete claims.
+        if !document.parser_recovery_spans.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut declarations_by_name = HashMap::<RoutineGroupKey, Vec<usize>>::new();
         let mut definitions_by_name = HashMap::<RoutineGroupKey, Vec<usize>>::new();
         budget.require_work(document.symbols.len(), cancel)?;

@@ -3122,6 +3122,9 @@ impl NavigationIndex {
                     });
                 }
             }
+            if !report.has_capacity() {
+                break 'analysis;
+            }
             let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
             match self.contract_diagnostics_with_budget(
                 uri,
@@ -3139,6 +3142,9 @@ impl NavigationIndex {
                     }
                 }
             }
+            if !report.has_capacity() {
+                break 'analysis;
+            }
             let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
             match self.ancestry_diagnostics_with_budget(
                 uri,
@@ -3155,6 +3161,9 @@ impl NavigationIndex {
                         report.diagnostics.extend(ancestry);
                     }
                 }
+            }
+            if !report.has_capacity() {
+                break 'analysis;
             }
             let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
             let mut declaration_cap_reached = false;
@@ -3924,6 +3933,7 @@ impl NavigationIndex {
                     interface_name
                         .len()
                         .saturating_add(method_name.len())
+                        .saturating_add(DccMessage::E2291.template().len())
                         .saturating_mul(2),
                     cancel,
                 )?;
@@ -24527,6 +24537,55 @@ mod tests {
     }
 
     #[test]
+    fn semantic_diagnostics_budget_the_fixed_e2291_message_template() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-e2291-byte-budget.pas")
+            .expect("E2291 byte-budget URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsE2291ByteBudget;\n",
+            "interface\ntype\n",
+            "  TObject = class\n  end;\n",
+            "  IRequired = interface\n    procedure Required;\n  end;\n",
+            "  TImplementation = class(TObject, IRequired)\n  end;\n",
+            "implementation\nend.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("E2291 byte-budget fixture parses");
+        let document = index.documents.get(&uri).expect("indexed document");
+        let cancel = AtomicBool::new(false);
+        let byte_limit = 8 * 1024 * 1024;
+        let mut prefix_budget = AssistanceBudget::new(100_000, byte_limit, "semantic diagnostics");
+        assert_eq!(
+            index.contract_diagnostics_with_budget(&uri, document, 0, &cancel, &mut prefix_budget,),
+            Err(SEMANTIC_DIAGNOSTICS_LIMIT.to_owned()),
+            "zero capacity must stop immediately before materializing E2291"
+        );
+        let prefix_bytes = byte_limit - prefix_budget.remaining_bytes;
+        let arguments_bytes = ("IRequired".len() + "Required".len()) * 2;
+        let mut args_only_budget = AssistanceBudget::new(
+            100_000,
+            prefix_bytes + arguments_bytes,
+            "semantic diagnostics",
+        );
+
+        let result = index.contract_diagnostics_with_budget(
+            &uri,
+            document,
+            1,
+            &cancel,
+            &mut args_only_budget,
+        );
+
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.contains("byte scan limit")),
+            "E2291 must charge more than its argument strings: {result:?}"
+        );
+    }
+
+    #[test]
     fn semantic_diagnostics_anchor_an_imported_interface_obligation_to_the_consumer_class() {
         let provider_uri = Url::parse("file:///tmp/semantic-diagnostics-contract-provider.pas")
             .expect("provider URI");
@@ -26503,6 +26562,94 @@ mod tests {
     }
 
     #[test]
+    fn declaration_diagnostics_fail_closed_when_the_unit_has_parser_recovery() {
+        let cases = [
+            (
+                "E2065",
+                "RecoveryE2065",
+                concat!(
+                    "unit RecoveryE2065;\ninterface\ntype TFoo = class\n",
+                    "  procedure Missing;\nend;\nimplementation\n",
+                    "procedure Broken; var Value: Integer; begin Value := ; end;\nend.\n",
+                ),
+            ),
+            (
+                "E2037",
+                "RecoveryE2037",
+                concat!(
+                    "unit RecoveryE2037;\ninterface\nprocedure Run(Left: Integer);\n",
+                    "implementation\nprocedure Run(Right: Integer); begin end;\n",
+                    "procedure Broken; var Value: Integer; begin Value := ; end;\nend.\n",
+                ),
+            ),
+            (
+                "E2004",
+                "RecoveryE2004",
+                concat!(
+                    "unit RecoveryE2004;\ninterface\nimplementation\nprocedure Run;\n",
+                    "var Value: Integer; Value: Boolean;\nbegin Value := ; end;\nend.\n",
+                ),
+            ),
+            (
+                "E2252",
+                "RecoveryE2252",
+                concat!(
+                    "unit RecoveryE2252;\ninterface\ntype TFoo = class\n",
+                    "  procedure Same(Value: Integer); overload;\n",
+                    "  procedure Same(Value: Integer); overload;\nend;\n",
+                    "implementation\nprocedure Broken; var Value: Integer; begin Value := ; end;\nend.\n",
+                ),
+            ),
+            (
+                "E2254",
+                "RecoveryE2254",
+                concat!(
+                    "unit RecoveryE2254;\ninterface\ntype TFoo = class\n",
+                    "  procedure Different(Value: Integer); overload;\n",
+                    "  procedure Different(Value: string);\nend;\n",
+                    "implementation\nprocedure Broken; var Value: Integer; begin Value := ; end;\nend.\n",
+                ),
+            ),
+            (
+                "H2219",
+                "RecoveryH2219",
+                concat!(
+                    "unit RecoveryH2219;\ninterface\ntype TFoo = class private\n",
+                    "  FMaybeUsed: Integer;\nend;\nimplementation\n",
+                    "procedure Broken; var Value: Integer; begin Value := ; end;\nend.\n",
+                ),
+            ),
+        ];
+
+        let mut unexpected = Vec::new();
+        for (code, unit_name, source) in cases {
+            let uri = Url::parse(&format!("file:///tmp/{unit_name}.pas")).expect("fixture URI");
+            let mut index = NavigationIndex::new();
+            index
+                .update(uri.clone(), source.to_owned())
+                .expect("recovery fixture indexes");
+            assert!(
+                !index.documents[&uri].parser_recovery_spans.is_empty(),
+                "{unit_name} must exercise parser recovery"
+            );
+
+            let diagnostics = index
+                .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+                .expect("semantic diagnostics complete");
+            unexpected.extend(
+                diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.kind.code() == code)
+                    .map(|diagnostic| format!("{unit_name}: {}", diagnostic.message)),
+            );
+        }
+        assert!(
+            unexpected.is_empty(),
+            "recovery must suppress: {unexpected:?}"
+        );
+    }
+
+    #[test]
     fn declaration_diagnostics_budget_h2219_container_storage_before_allocating() {
         let uri = Url::parse("file:///tmp/semantic-diagnostics-h2219-byte-budget.pas")
             .expect("H2219 byte-budget URI");
@@ -26664,6 +26811,30 @@ mod tests {
             report.diagnostics[0].span.start,
             source.find("I;\n").expect("first mismatch")
         );
+        assert_eq!(report.gaps, vec![SemanticCoverageGap::DiagnosticCap]);
+    }
+
+    #[test]
+    fn semantic_diagnostics_note_capacity_exhaustion_before_optional_passes() {
+        let uri =
+            Url::parse("file:///tmp/semantic-diagnostics-exact-cap.pas").expect("exact-cap URI");
+        let mut source = String::from(
+            "unit SemanticDiagnosticsExactCap;\ninterface\nimplementation\nprocedure Run;\nvar I: Integer; B: Boolean;\nbegin\n",
+        );
+        for _ in 0..MAX_SEMANTIC_DIAGNOSTICS {
+            source.push_str("  B := I;\n");
+        }
+        source.push_str("end;\nend.\n");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source)
+            .expect("exact-cap fixture parses");
+
+        let report = index
+            .semantic_diagnostic_report_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("exact-cap diagnostics complete");
+
+        assert_eq!(report.diagnostics.len(), MAX_SEMANTIC_DIAGNOSTICS);
         assert_eq!(report.gaps, vec![SemanticCoverageGap::DiagnosticCap]);
     }
 

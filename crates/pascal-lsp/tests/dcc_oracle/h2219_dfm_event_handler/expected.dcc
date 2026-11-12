@@ -1,0 +1,5 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem DfmHandler.pas
+DfmHandler.pas(11) H2219 Private symbol 'Button1' declared but never used
+DfmHandler.pas(12) H2219 Private symbol 'ButtonNeverUsed' declared but never used
+DfmHandler.pas(13) H2219 Private symbol 'PrivateHandler' declared but never used

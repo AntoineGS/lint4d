@@ -88,13 +88,24 @@ Type and argument ranges cover exactly the offending right-hand expression or
 argument. Contract ranges cover the override method name or implementing class
 name, and all ranges map back to physical include files. The codes are:
 
-| Diagnostic | Code |
-| --- | --- |
-| Type mismatch | `pascal-type-mismatch` |
-| Incompatible argument | `pascal-incompatible-argument` |
-| Method not found in base class | `E2137` |
-| Override of non-virtual method | `E2170` |
-| Missing interface implementation | `E2291` |
+| Severity | Diagnostic | Code | Meaning |
+| --- | --- | --- | --- |
+| Error | Unresolved identifier | `pascal-unresolved-identifier` | Name is absent from the proven visible scope. |
+| Error | Missing member | `pascal-missing-member` | Member is absent from the proven receiver type. |
+| Error | Type mismatch | `pascal-type-mismatch` | Proven expression types are incompatible. |
+| Error | Incompatible argument | `pascal-incompatible-argument` | Argument is incompatible with every proven overload. |
+| Error | Unsatisfied declaration | `E2065` | A non-exempt routine declaration has no matching definition. |
+| Error | Declaration differs | `E2037` | An implementation declaration differs from its previous declaration. |
+| Error | Identifier redeclared | `E2004` | A name is declared more than once in the same scope. |
+| Error | Missing base method | `E2137` | An override has no matching inherited method. |
+| Error | Non-virtual override | `E2170` | An override matches an inherited method that is not virtual or dynamic. |
+| Error | Missing interface method | `E2291` | A class does not implement a required interface method. |
+| Error | Duplicate method parameters | `E2252` | A method with identical parameters already exists. |
+| Error | Missing overload directive | `E2254` | An overloaded procedure is missing its `overload` directive. |
+| Error | Interface declaration differs | `E2211` | A declaration differs from its interface declaration. |
+| Warning | Hides virtual method | `W1010` | A method hides an accessible virtual or dynamic ancestor method. |
+| Warning | Hides base member | `W1009` | A redeclaration hides a base-class member. |
+| Hint | Private symbol unused | `H2219` | A private class member is declared but never used. |
 
 Override and interface diagnostics use the same complete source-backed ancestry,
 visibility, conditional-state, generic-substitution, cancellation, and traversal
@@ -113,10 +124,10 @@ implementations are followed; interface diamonds are memoized and charged on
 every visit, while cyclic or depth/budget-exhausted ancestry is treated as
 incomplete.
 
-Missing-interface diagnostics are emitted only for concrete source-declared
-classes with complete source-declared interface ancestry, recursively complete
-providers/imports, and resolved obligation signatures. Abstract classes and
-inherited abstract methods may defer obligations. The diagnostic range is the
+Missing-interface diagnostics are emitted for source-declared classes,
+including abstract classes, with complete source-declared interface ancestry,
+recursively complete providers/imports, and resolved obligation signatures.
+Inherited abstract methods may defer obligations. The diagnostic range is the
 responsible class declaration in the requesting source, never a foreign
 interface declaration; include mappings retain a claim only when the physical
 owner is unambiguous. The pass is bounded by the semantic diagnostic

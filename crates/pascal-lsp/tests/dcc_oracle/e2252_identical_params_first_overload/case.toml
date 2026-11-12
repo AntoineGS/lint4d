@@ -1,3 +1,4 @@
 unit = "IdenticalParamsFirstOverload.pas"
 recall = false
 reason = "dcc records E2254 as well as E2252 for this same-parameter, different-result pair; E2254 is not proven by the current method model. E2252 is checked separately."
+silent = ["E2254"]

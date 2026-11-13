@@ -1,0 +1,4 @@
+unit = "E2003GenericParams.pas"
+compilers = ["21.0", "24.0", "37.0"]
+recall = false
+reason = "The semantic model does not yet prove absent identifiers inside generic type arguments such as TBox<U>; precision remains enforced."

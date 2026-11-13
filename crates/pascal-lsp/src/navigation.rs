@@ -88,6 +88,8 @@ mod dcc_message;
 mod dcc_oracle_tests;
 mod dcc_surface;
 mod declarations;
+#[cfg(test)]
+mod surface_tests;
 pub(crate) use dcc_message::{DccMessage, DccSeverity};
 mod documentation;
 mod facts;
@@ -2943,6 +2945,7 @@ impl NavigationIndex {
         }
 
         'analysis: {
+            let mut reported_undeclared_names = HashSet::new();
             for identifier in identifiers {
                 if cancel.load(Ordering::Relaxed) {
                     return Err("request cancelled".to_string());
@@ -2976,6 +2979,11 @@ impl NavigationIndex {
                     break 'analysis;
                 }
                 let name = node_text(identifier, &document.source);
+                if !is_qualified_identifier_rhs(identifier)
+                    && !reported_undeclared_names.insert(canonical_name(&name))
+                {
+                    continue;
+                }
                 let message = DccMessage::E2003.format(&[&name]);
                 report.diagnostics.push(SemanticDiagnostic {
                     kind,
@@ -6608,6 +6616,13 @@ impl NavigationIndex {
         if !self.imports_are_complete_for_proof(document, offset, cancel, budget)? {
             return Ok(SemanticProofStatus::Incomplete);
         }
+        if is_implicit_system_unit_qualifier(identifier, &document.source)
+            && dcc_surface::SurfaceKey::from_context(&document.conditional_context)
+                .and_then(|surface| dcc_surface::table_for(&surface))
+                .is_some()
+        {
+            return Ok(SemanticProofStatus::Resolved);
+        }
 
         let mut state = ResolutionState::new();
         let candidates = self.resolve_candidates_at_with_state_and_budget(
@@ -6620,6 +6635,9 @@ impl NavigationIndex {
             return Ok(SemanticProofStatus::Incomplete);
         }
         if !candidates.is_empty() {
+            return Ok(SemanticProofStatus::Resolved);
+        }
+        if state.compiler_surface_resolved {
             return Ok(SemanticProofStatus::Resolved);
         }
         if state.ambiguous {
@@ -8061,7 +8079,7 @@ impl NavigationIndex {
         }
 
         let implicit_system =
-            self.implicit_system_references_with_budget(key, state, cancel, budget)?;
+            self.implicit_system_references_with_budget(document, key, state, cancel, budget)?;
         if !implicit_system.is_empty() {
             return Ok(implicit_system);
         }
@@ -8071,23 +8089,25 @@ impl NavigationIndex {
 
     fn implicit_system_references_with_budget(
         &self,
+        document: &Document,
         key: &str,
         state: &mut ResolutionState,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Candidate>, String> {
-        let status = self.implicit_system_namespace_status();
-        let ImplicitSystemNamespaceStatus::SourceBacked { uri } = status else {
-            // The compiler's implicit System namespace is not represented by
-            // a complete source catalogue here.  A failed value lookup,
-            // including an assignment target, therefore cannot prove that
-            // the name is absent: compiler-provided writable globals may be
-            // missing from the retained source index.
-            state.mark_implicit_system_namespace_incomplete();
-            return Ok(Vec::new());
+        let uri = match self.implicit_system_namespace_status() {
+            ImplicitSystemNamespaceStatus::Unavailable => {
+                self.apply_compiler_surface_fallback(document, key, state);
+                return Ok(Vec::new());
+            }
+            ImplicitSystemNamespaceStatus::Ambiguous => {
+                state.mark_implicit_system_namespace_incomplete();
+                return Ok(Vec::new());
+            }
+            ImplicitSystemNamespaceStatus::SourceBacked { uri } => uri,
         };
         let Some(provider) = self.documents.get(&uri) else {
-            state.mark_implicit_system_namespace_incomplete();
+            self.apply_compiler_surface_fallback(document, key, state);
             return Ok(Vec::new());
         };
         budget.require_work(
@@ -8100,18 +8120,30 @@ impl NavigationIndex {
         if !provider.parser_recovery_spans.is_empty()
             || !provider.conditionals.unknown_spans.is_empty()
         {
-            state.mark_implicit_system_namespace_incomplete();
+            self.apply_compiler_surface_fallback(document, key, state);
             return Ok(Vec::new());
         }
 
         let candidates = self.exported_references_for_key_with_budget(&uri, key, cancel, budget)?;
         if candidates.is_empty() {
-            // Source-backed names are usable as positive evidence, but an
-            // arbitrary System.pas does not establish the compiler's full
-            // implicit export surface.
-            state.mark_implicit_system_namespace_incomplete();
+            self.apply_compiler_surface_fallback(document, key, state);
         }
         Ok(candidates)
+    }
+
+    fn apply_compiler_surface_fallback(
+        &self,
+        document: &Document,
+        key: &str,
+        state: &mut ResolutionState,
+    ) {
+        let table = dcc_surface::SurfaceKey::from_context(&document.conditional_context)
+            .and_then(|surface| dcc_surface::table_for(&surface));
+        match table {
+            Some(table) if table.has_name(key) => state.mark_compiler_surface_resolved(),
+            Some(_) => {}
+            None => state.mark_implicit_system_namespace_incomplete(),
+        }
     }
 
     fn implicit_system_namespace_status(&self) -> ImplicitSystemNamespaceStatus {
@@ -8191,8 +8223,24 @@ impl NavigationIndex {
             state.mark_member_lookup_incomplete();
             return Ok(Vec::new());
         };
+        let system_qualified = lhs.kind() == "identifier"
+            && node_text_with_budget(lhs, &current_document.source, cancel, budget)?
+                .eq_ignore_ascii_case("System");
         budget.require_bytes(member_name.len(), cancel)?;
         let key = canonical_name(member_name);
+        if system_qualified
+            && self.implicit_system_qualifier_is_unshadowed_with_budget(
+                current_uri,
+                current_document,
+                offset,
+                lhs,
+                cancel,
+                budget,
+            )?
+        {
+            self.apply_compiler_surface_fallback(current_document, &key, state);
+            return Ok(Vec::new());
+        }
         let receivers = self.resolve_receivers_with_state_and_budget(
             current_uri,
             current_document,
@@ -8205,7 +8253,16 @@ impl NavigationIndex {
             depth.saturating_add(1),
         )?;
         if receivers.is_empty() {
-            state.mark_member_lookup_incomplete();
+            if system_qualified
+                && !state.receiver_resolution_uncertain()
+                && !state.member_lookup_incomplete
+                && !state.inaccessible_candidate
+                && !state.ambiguous
+            {
+                self.apply_compiler_surface_fallback(current_document, &key, state);
+            } else {
+                state.mark_member_lookup_incomplete();
+            }
             return Ok(Vec::new());
         }
         if receivers.len() != 1 {
@@ -8217,9 +8274,32 @@ impl NavigationIndex {
             budget.require_work(1, cancel)?;
             match receiver {
                 Receiver::Unit(unit_uri) => {
-                    references.extend(self.exported_references_for_key_with_budget(
-                        &unit_uri, &key, cancel, budget,
-                    )?);
+                    let system_document = self
+                        .documents
+                        .get(&unit_uri)
+                        .filter(|document| document.unit_name == "system");
+                    if let Some(provider) = system_document {
+                        budget.require_work(
+                            provider
+                                .parser_recovery_spans
+                                .len()
+                                .saturating_add(provider.conditionals.unknown_spans.len()),
+                            cancel,
+                        )?;
+                        if !provider.parser_recovery_spans.is_empty()
+                            || !provider.conditionals.unknown_spans.is_empty()
+                        {
+                            self.apply_compiler_surface_fallback(current_document, &key, state);
+                            continue;
+                        }
+                    }
+                    let candidates = self
+                        .exported_references_for_key_with_budget(&unit_uri, &key, cancel, budget)?;
+                    if candidates.is_empty() && system_document.is_some() {
+                        self.apply_compiler_surface_fallback(current_document, &key, state);
+                    } else {
+                        references.extend(candidates);
+                    }
                 }
                 Receiver::Type(instance) => {
                     let lookup = self.member_references_for_instance_with_budget(
@@ -8253,6 +8333,47 @@ impl NavigationIndex {
             }
         }
         Ok(references)
+    }
+
+    fn implicit_system_qualifier_is_unshadowed_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        identifier: Node<'_>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        let mut state = ResolutionState::new();
+        let references = self.unqualified_references_with_budget_and_state(
+            current_uri,
+            current_document,
+            offset,
+            "System",
+            identifier,
+            &mut state,
+            cancel,
+            budget,
+        )?;
+        if !references.is_empty()
+            || state.ambiguous
+            || state.member_lookup_incomplete
+            || state.implicit_system_namespace_incomplete
+            || state.receiver_resolution_uncertain()
+            || state.inaccessible_candidate
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .visible_unit_urls_with_budget(
+                current_uri,
+                current_document,
+                offset,
+                "System",
+                cancel,
+                budget,
+            )?
+            .is_empty())
     }
 
     /// The type an owner segment of a method heading names. Its first
@@ -16492,6 +16613,7 @@ struct ResolutionState {
     receiver_uncertain: bool,
     member_lookup_incomplete: bool,
     implicit_system_namespace_incomplete: bool,
+    compiler_surface_resolved: bool,
     inaccessible_candidate: bool,
     ambiguous: bool,
     with_receivers: Vec<WithReceiverSlot>,
@@ -16504,6 +16626,7 @@ struct ResolutionState {
 #[derive(Clone, Copy)]
 struct ReceiverLookupScope {
     implicit_system_namespace_incomplete: bool,
+    compiler_surface_resolved: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -16523,6 +16646,7 @@ impl ResolutionState {
             receiver_uncertain: false,
             member_lookup_incomplete: false,
             implicit_system_namespace_incomplete: false,
+            compiler_surface_resolved: false,
             inaccessible_candidate: false,
             ambiguous: false,
             with_receivers: Vec::new(),
@@ -16545,9 +16669,14 @@ impl ResolutionState {
         self.implicit_system_namespace_incomplete = true;
     }
 
+    fn mark_compiler_surface_resolved(&mut self) {
+        self.compiler_surface_resolved = true;
+    }
+
     fn begin_receiver_lookup_scope(&self) -> ReceiverLookupScope {
         ReceiverLookupScope {
             implicit_system_namespace_incomplete: self.implicit_system_namespace_incomplete,
+            compiler_surface_resolved: self.compiler_surface_resolved,
         }
     }
 
@@ -16560,6 +16689,7 @@ impl ResolutionState {
         // retained, so unknown with/receiver/helper state cannot be cleared
         // by a unit-shaped fallback.
         self.implicit_system_namespace_incomplete = scope.implicit_system_namespace_incomplete;
+        self.compiler_surface_resolved = scope.compiler_surface_resolved;
     }
 
     fn mark_inaccessible_candidate(&mut self) {
@@ -22965,6 +23095,25 @@ fn is_implicit_or_intrinsic_name(name: &str) -> bool {
         name,
         "self" | "result" | "inherited" | "exit" | "break" | "continue" | "raise"
     )
+}
+
+fn is_implicit_system_unit_qualifier(identifier: Node<'_>, source: &str) -> bool {
+    node_text(identifier, source).eq_ignore_ascii_case("System")
+        && identifier.tree_parent().is_some_and(|parent| {
+            matches!(parent.kind(), "exprDot" | "genericDot" | "typerefDot")
+                && parent
+                    .child_by_field_name("lhs")
+                    .is_some_and(|lhs| Span::from_node(lhs) == Span::from_node(identifier))
+        })
+}
+
+fn is_qualified_identifier_rhs(identifier: Node<'_>) -> bool {
+    identifier.tree_parent().is_some_and(|parent| {
+        matches!(parent.kind(), "exprDot" | "genericDot" | "typerefDot")
+            && parent
+                .child_by_field_name("rhs")
+                .is_some_and(|rhs| Span::from_node(rhs) == Span::from_node(identifier))
+    })
 }
 
 /// Whether a class names `TObject` or `System.TObject` as its superclass.

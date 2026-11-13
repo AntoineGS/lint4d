@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 24.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem E2003GenericParams.pas
+E2003GenericParams.pas(14) E2003 Undeclared identifier: 'U'

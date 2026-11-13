@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 21.0
+# dcc32 -B -H+ -W+ -Q -U<lib> E2003MisspeltBuiltin.pas
+E2003MisspeltBuiltin.pas(6) E2003 Undeclared identifier: 'Writlen'

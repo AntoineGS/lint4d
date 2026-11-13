@@ -1,0 +1,353 @@
+use super::dcc_surface::{SurfaceKey, SurfacePlatform, SurfaceTable, with_test_table};
+use super::*;
+use pascal_project::{CompilerVersion, ConditionalFact, LayoutContext, TargetPlatform};
+
+const TEST_TABLE: &str = "# dcc-surface v1\n\
+# banner: Embarcadero Delphi for Win32 compiler version 37.0\n\
+# script-version: 1\n\
+# system-blake3: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+# sysinit-blake3: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\
+# candidates: 3\n\
+[surface]\n\
+Length\n\
+TObject\n\
+Writeln\n\
+[defines]\n\
+[members TObject]\n\
+[members IInterface]\n\
+[members IUnknown]\n\
+[members TInterfacedObject]\n";
+
+fn context(version: (u32, u32), platform: Option<TargetPlatform>) -> ConditionalContext {
+    let compiler_version = CompilerVersion::new(version.0, version.1);
+    ConditionalContext {
+        compiler_version: Some(compiler_version),
+        layout: LayoutContext::for_target(Some(compiler_version), platform.as_ref()),
+        ..ConditionalContext::default()
+    }
+    .with_absent_define(ConditionalFact::False)
+}
+
+fn test_table() -> SurfaceTable {
+    SurfaceTable::parse(TEST_TABLE).expect("synthetic dcc surface table")
+}
+
+fn uri(name: &str) -> Url {
+    Url::parse(&format!("file:///surface-tests/{name}.pas")).expect("test URI")
+}
+
+fn update(
+    index: &mut NavigationIndex,
+    name: &str,
+    source: &str,
+    context: &ConditionalContext,
+) -> Url {
+    let uri = uri(name);
+    index
+        .update_with_context_with_cancel(
+            uri.clone(),
+            source.to_owned(),
+            context,
+            &AtomicBool::new(false),
+        )
+        .expect("surface test unit parses");
+    uri
+}
+
+fn diagnostics(index: &NavigationIndex, uri: &Url) -> Vec<SemanticDiagnostic> {
+    index
+        .semantic_diagnostics_with_cancel(uri, &AtomicBool::new(false))
+        .expect("semantic diagnostics complete")
+}
+
+fn with_context_table<R>(context: &ConditionalContext, body: impl FnOnce() -> R) -> R {
+    let key = SurfaceKey::from_context(context).expect("test context has a surface key");
+    with_test_table(key, test_table(), body)
+}
+
+fn e2003(diagnostics: &[SemanticDiagnostic]) -> Vec<&SemanticDiagnostic> {
+    diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.kind.code() == "E2003")
+        .collect()
+}
+
+fn proof_status(
+    index: &NavigationIndex,
+    uri: &Url,
+    source: &str,
+    spelling: &str,
+) -> SemanticProofStatus {
+    let offset = source
+        .rfind(spelling)
+        .unwrap_or_else(|| panic!("missing {spelling:?} in test source"));
+    index
+        .semantic_proof_status_at_with_cancel(
+            uri,
+            text::offset_to_position(source, offset).expect("identifier position"),
+            &AtomicBool::new(false),
+        )
+        .expect("semantic proof status")
+}
+
+#[test]
+fn e2003_reported_for_an_unknown_unqualified_name() {
+    let context = context((37, 0), Some(TargetPlatform::Win32));
+    let source = "unit SurfaceUnknown; interface implementation procedure P; var X: Integer; begin X := ZzSurfaceAbsent; end; end.";
+    let mut index = NavigationIndex::new();
+    let uri = update(&mut index, "SurfaceUnknown", source, &context);
+
+    let diagnostics = with_context_table(&context, || diagnostics(&index, &uri));
+
+    let findings = e2003(&diagnostics);
+    assert_eq!(findings.len(), 1, "{diagnostics:?}");
+    assert_eq!(
+        findings[0].message,
+        "Undeclared identifier: 'ZzSurfaceAbsent'"
+    );
+    assert_eq!(
+        proof_status(&index, &uri, source, "ZzSurfaceAbsent"),
+        SemanticProofStatus::ProvenAbsent
+    );
+}
+
+#[test]
+fn e2003_silent_for_a_table_builtin() {
+    let context = context((37, 0), Some(TargetPlatform::Win32));
+    let source =
+        "unit SurfaceBuiltin; interface implementation procedure P; begin Writeln('ok'); end; end.";
+    let mut index = NavigationIndex::new();
+    let uri = update(&mut index, "SurfaceBuiltin", source, &context);
+
+    let diagnostics = with_context_table(&context, || diagnostics(&index, &uri));
+
+    assert!(e2003(&diagnostics).is_empty(), "{diagnostics:?}");
+    assert_eq!(
+        proof_status(&index, &uri, source, "Writeln"),
+        SemanticProofStatus::Resolved
+    );
+}
+
+#[test]
+fn e2003_silent_without_a_table_for_the_key() {
+    let context = context((21, 0), Some(TargetPlatform::Win64));
+    let source = "unit SurfaceUnsupportedKey; interface implementation procedure P; begin ZzNoTable := 1; end; end.";
+    let mut index = NavigationIndex::new();
+    let uri = update(&mut index, "SurfaceUnsupportedKey", source, &context);
+
+    let diagnostics = diagnostics(&index, &uri);
+
+    assert!(e2003(&diagnostics).is_empty(), "{diagnostics:?}");
+    assert_eq!(
+        proof_status(&index, &uri, source, "ZzNoTable"),
+        SemanticProofStatus::Incomplete
+    );
+}
+
+#[test]
+fn e2003_silent_without_a_platform() {
+    let context = context((37, 0), None);
+    let source = "unit SurfaceNoPlatform; interface implementation procedure P; begin ZzNoPlatform := 1; end; end.";
+    let mut index = NavigationIndex::new();
+    let uri = update(&mut index, "SurfaceNoPlatform", source, &context);
+
+    let diagnostics = diagnostics(&index, &uri);
+
+    assert!(e2003(&diagnostics).is_empty(), "{diagnostics:?}");
+    assert_eq!(
+        proof_status(&index, &uri, source, "ZzNoPlatform"),
+        SemanticProofStatus::Incomplete
+    );
+}
+
+#[test]
+fn e2003_silent_when_a_used_unit_is_not_indexed() {
+    let context = context((37, 0), Some(TargetPlatform::Win32));
+    let source = "unit SurfaceMissingProvider; interface implementation uses MissingProvider; procedure P; begin ZzFromUnknownProvider := 1; end; end.";
+    let mut index = NavigationIndex::new();
+    let uri = update(&mut index, "SurfaceMissingProvider", source, &context);
+
+    let diagnostics = with_context_table(&context, || diagnostics(&index, &uri));
+
+    assert!(e2003(&diagnostics).is_empty(), "{diagnostics:?}");
+}
+
+#[test]
+fn e2003_silent_when_a_used_unit_has_unknown_conditionals() {
+    let context = context((37, 0), Some(TargetPlatform::Win32));
+    let provider_context = ConditionalContext {
+        absent_define: ConditionalFact::Unknown,
+        ..context.clone()
+    };
+    let mut index = NavigationIndex::new();
+    let provider =
+        "unit Provider; interface {$IFDEF MAYBE} const MaybeName = 1; {$ENDIF} implementation end.";
+    let consumer = "unit SurfaceUnknownProvider; interface implementation uses Provider; procedure P; begin ZzFromUnknownProvider := 1; end; end.";
+    update(&mut index, "Provider", provider, &provider_context);
+    let uri = update(&mut index, "SurfaceUnknownProvider", consumer, &context);
+
+    let diagnostics = with_context_table(&context, || diagnostics(&index, &uri));
+
+    assert!(e2003(&diagnostics).is_empty(), "{diagnostics:?}");
+}
+
+#[test]
+fn e2003_silent_when_unit_scope_alias_is_unresolved() {
+    let context = context((37, 0), Some(TargetPlatform::Win32));
+    let mut index = NavigationIndex::new();
+    update(
+        &mut index,
+        "VclForms",
+        "unit Vcl.Forms; interface const KnownFormValue = 1; implementation end.",
+        &context,
+    );
+    let source = "unit SurfaceUnresolvedAlias; interface implementation uses Forms; procedure P; begin ZzFromUnresolvedAlias := 1; end; end.";
+    let uri = update(&mut index, "SurfaceUnresolvedAlias", source, &context);
+
+    let diagnostics = with_context_table(&context, || diagnostics(&index, &uri));
+
+    assert!(e2003(&diagnostics).is_empty(), "{diagnostics:?}");
+}
+
+#[test]
+fn e2003_silent_inside_asm() {
+    let context = context((37, 0), Some(TargetPlatform::Win32));
+    let source =
+        "unit SurfaceAsm; interface implementation procedure P; asm mov eax, ZzInsideAsm end; end.";
+    let mut index = NavigationIndex::new();
+    let uri = update(&mut index, "SurfaceAsm", source, &context);
+
+    let diagnostics = with_context_table(&context, || diagnostics(&index, &uri));
+
+    assert!(e2003(&diagnostics).is_empty(), "{diagnostics:?}");
+}
+
+#[test]
+fn e2003_silent_in_an_unknown_conditional_region() {
+    let context = ConditionalContext {
+        absent_define: ConditionalFact::Unknown,
+        ..context((37, 0), Some(TargetPlatform::Win32))
+    };
+    let source = "unit SurfaceUnknownConditional; interface implementation procedure P; begin {$IFDEF MAYBE} ZzConditional := 1; {$ENDIF} end; end.";
+    let mut index = NavigationIndex::new();
+    let uri = update(&mut index, "SurfaceUnknownConditional", source, &context);
+
+    let diagnostics = with_context_table(&context, || diagnostics(&index, &uri));
+
+    assert!(e2003(&diagnostics).is_empty(), "{diagnostics:?}");
+}
+
+#[test]
+fn e2003_silent_after_parser_recovery() {
+    let context = context((37, 0), Some(TargetPlatform::Win32));
+    let source = concat!(
+        "unit SurfaceRecovery;\n",
+        "interface\nimplementation\n",
+        "procedure P;\nvar B: Integer;\nbegin\n",
+        "  B := ;\n",
+        "  ZzAfterRecovery := 1;\n",
+        "end;\nend.\n",
+    );
+    let mut index = NavigationIndex::new();
+    let uri = update(&mut index, "SurfaceRecovery", source, &context);
+    assert!(!index.documents[&uri].parser_recovery_spans.is_empty());
+
+    let diagnostics = with_context_table(&context, || diagnostics(&index, &uri));
+
+    assert!(e2003(&diagnostics).is_empty(), "{diagnostics:?}");
+}
+
+#[test]
+fn e2003_silent_for_attribute_names() {
+    let context = context((37, 0), Some(TargetPlatform::Win32));
+    let source = "unit SurfaceAttribute; interface implementation type TAttributed = class [MissingAttr] procedure P; end; procedure TAttributed.P; begin end; end.";
+    let mut index = NavigationIndex::new();
+    let uri = update(&mut index, "SurfaceAttribute", source, &context);
+
+    let diagnostics = with_context_table(&context, || diagnostics(&index, &uri));
+
+    assert!(e2003(&diagnostics).is_empty(), "{diagnostics:?}");
+}
+
+#[test]
+fn e2003_silent_inside_with_of_unknown_type() {
+    let context = context((37, 0), Some(TargetPlatform::Win32));
+    let source = "unit SurfaceUnknownWith; interface implementation procedure P; begin with TObject.Create do MissingInUnknownWith := 1; end; end.";
+    let mut index = NavigationIndex::new();
+    let uri = update(&mut index, "SurfaceUnknownWith", source, &context);
+
+    let diagnostics = with_context_table(&context, || diagnostics(&index, &uri));
+
+    assert!(e2003(&diagnostics).is_empty(), "{diagnostics:?}");
+}
+
+#[test]
+fn e2003_reported_for_an_unknown_qualified_system_name() {
+    let context = context((37, 0), Some(TargetPlatform::Win32));
+    let source = "unit SurfaceQualifiedSystem; interface implementation procedure P; var X: Integer; begin X := System.ZzQualified; end; end.";
+    let mut index = NavigationIndex::new();
+    let uri = update(&mut index, "SurfaceQualifiedSystem", source, &context);
+
+    let diagnostics = with_context_table(&context, || diagnostics(&index, &uri));
+
+    let findings = e2003(&diagnostics);
+    assert_eq!(findings.len(), 1, "{diagnostics:?}");
+    assert_eq!(findings[0].message, "Undeclared identifier: 'ZzQualified'");
+}
+
+#[test]
+fn e2003_silent_for_a_qualified_system_builtin() {
+    let context = context((37, 0), Some(TargetPlatform::Win32));
+    let source = "unit SurfaceQualifiedBuiltin; interface implementation procedure P; begin System.Writeln('ok'); end; end.";
+    let mut index = NavigationIndex::new();
+    let uri = update(&mut index, "SurfaceQualifiedBuiltin", source, &context);
+
+    let diagnostics = with_context_table(&context, || diagnostics(&index, &uri));
+
+    assert!(e2003(&diagnostics).is_empty(), "{diagnostics:?}");
+}
+
+#[test]
+fn e2003_reported_once_for_a_repeated_unknown_name() {
+    let context = context((37, 0), Some(TargetPlatform::Win32));
+    let source = concat!(
+        "unit SurfaceRepeatedName; interface implementation\n",
+        "procedure P; var X: Integer; begin\n",
+        "  X := ZzRepeated + ZzRepeated;\n",
+        "  X := ZzRepeated;\n",
+        "end; end.",
+    );
+    let mut index = NavigationIndex::new();
+    let uri = update(&mut index, "SurfaceRepeatedName", source, &context);
+
+    let diagnostics = with_context_table(&context, || diagnostics(&index, &uri));
+
+    let findings = e2003(&diagnostics);
+    assert_eq!(findings.len(), 1, "{diagnostics:?}");
+    assert_eq!(findings[0].message, "Undeclared identifier: 'ZzRepeated'");
+    assert_eq!(
+        findings[0].span.start,
+        source.find("ZzRepeated").expect("first occurrence")
+    );
+}
+
+#[test]
+fn closed_unit_receiver_scope_restores_compiler_surface_proof() {
+    let mut state = ResolutionState::new();
+    let scope = state.begin_receiver_lookup_scope();
+    state.mark_compiler_surface_resolved();
+
+    state.complete_receiver_lookup_as_closed_unit(scope);
+
+    assert!(!state.compiler_surface_resolved);
+}
+
+#[test]
+fn surface_key_uses_the_document_compiler_and_platform() {
+    let context = context((37, 0), Some(TargetPlatform::Win32));
+
+    let key = SurfaceKey::from_context(&context).expect("surface key");
+
+    assert_eq!(key.platform, SurfacePlatform::Win32);
+    assert_eq!(key.file_stem(), "37.0-Win32");
+}

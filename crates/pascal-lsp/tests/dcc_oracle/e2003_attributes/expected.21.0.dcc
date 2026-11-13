@@ -1,0 +1,5 @@
+# Embarcadero Delphi for Win32 compiler version 21.0
+# dcc32 -B -H+ -W+ -Q -U<lib> E2003Attributes.pas
+E2003Attributes.pas(8) W1025 Unsupported language feature: 'custom attribute'
+E2003Attributes.pas(10) W1025 Unsupported language feature: 'custom attribute'
+E2003Attributes.pas(8) H2219 Private symbol 'FRef' declared but never used

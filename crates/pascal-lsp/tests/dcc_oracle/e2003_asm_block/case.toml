@@ -1,0 +1,5 @@
+unit = "E2003AsmBlock.pas"
+compilers = ["21.0", "24.0", "37.0"]
+recall = false
+reason = "The recorded E2003 is inside opaque asm; semantic proof must remain silent there."
+silent = ["E2003"]

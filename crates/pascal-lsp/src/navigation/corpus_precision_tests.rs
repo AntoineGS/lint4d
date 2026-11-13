@@ -588,24 +588,159 @@ fn semantic_diagnostics_recognize_exception_handler_variables() {
 #[derive(Debug, Default)]
 struct ScanResult {
     files: Vec<PathBuf>,
-    missing_directories: Vec<PathBuf>,
+    missing_directories: Vec<(PathBuf, &'static str, bool)>,
     errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExpectedCorpusSkip {
+    unit: &'static str,
+    reason: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CorpusVersionPolicy {
+    major: u32,
+    minor: u32,
+    expected_absent_directories: &'static [(&'static str, &'static str)],
+    expected_skips: &'static [ExpectedCorpusSkip],
+}
+
+const SYSTEM_INTERNAL_UNWINDER_REASON: &str = "System.Internal.Unwinder declares unwind only under LINUX/MACOS but references it unconditionally; the Windows corpus cannot provide that library binding";
+
+const CORPUS_VERSION_POLICIES: &[CorpusVersionPolicy] = &[
+    CorpusVersionPolicy {
+        major: 21,
+        minor: 0,
+        expected_absent_directories: &[],
+        expected_skips: &[],
+    },
+    CorpusVersionPolicy {
+        major: 24,
+        minor: 0,
+        expected_absent_directories: &[],
+        expected_skips: &[ExpectedCorpusSkip {
+            unit: "System.Internal.Unwinder",
+            reason: SYSTEM_INTERNAL_UNWINDER_REASON,
+        }],
+    },
+    CorpusVersionPolicy {
+        major: 37,
+        minor: 0,
+        expected_absent_directories: &[],
+        expected_skips: &[],
+    },
+];
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ImportCoverage {
+    resolved_entries: usize,
+    unresolved_entries: usize,
+    units_with_active_uses: usize,
+    units_with_all_active_uses_resolved: usize,
 }
 
 #[derive(Debug, Default)]
 struct KeyReport {
     key: String,
+    major: u32,
+    minor: u32,
     source_roots: Vec<PathBuf>,
     files_seen: usize,
     files_indexed: usize,
     skipped_files: Vec<(PathBuf, String)>,
     lossy_files: Vec<PathBuf>,
-    missing_directories: Vec<PathBuf>,
+    missing_directories: Vec<(PathBuf, &'static str, bool)>,
+    import_coverage: ImportCoverage,
     duplicate_unit_names: Vec<String>,
     scan_errors: Vec<String>,
     diagnostic_errors: Vec<(PathBuf, String)>,
     e2003: Vec<String>,
     proof_counters: SemanticProofCounters,
+}
+
+fn corpus_version_policy(major: u32, minor: u32) -> Option<&'static CorpusVersionPolicy> {
+    CORPUS_VERSION_POLICIES
+        .iter()
+        .find(|policy| policy.major == major && policy.minor == minor)
+}
+
+fn directory_absence_reason(
+    policy: &CorpusVersionPolicy,
+    relative_directory: &str,
+) -> Option<&'static str> {
+    policy
+        .expected_absent_directories
+        .iter()
+        .find(|(directory, _)| *directory == relative_directory)
+        .map(|(_, reason)| *reason)
+}
+
+fn expected_absent_directory_reason(
+    major: u32,
+    minor: u32,
+    relative_directory: &str,
+) -> Option<&'static str> {
+    corpus_version_policy(major, minor)
+        .and_then(|policy| directory_absence_reason(policy, relative_directory))
+}
+
+fn expected_corpus_skip(
+    major: u32,
+    minor: u32,
+    unit_name: &str,
+) -> Option<&'static ExpectedCorpusSkip> {
+    corpus_version_policy(major, minor)?
+        .expected_skips
+        .iter()
+        .find(|skip| skip.unit.eq_ignore_ascii_case(unit_name))
+}
+
+fn is_expected_corpus_skip(major: u32, minor: u32, unit_name: &str, reason: &str) -> bool {
+    expected_corpus_skip(major, minor, unit_name).is_some_and(|expected| expected.reason == reason)
+}
+
+fn record_import_coverage(
+    document: &super::Document,
+    unique_units: &HashMap<String, Url>,
+    coverage: &mut ImportCoverage,
+) {
+    let mut active_entries = 0;
+    let mut every_active_entry_resolved = true;
+    for import in &document.imports {
+        if document
+            .conditionals
+            .inactive_spans
+            .iter()
+            .any(|span| span.start <= import.span.start && import.span.end <= span.end)
+        {
+            continue;
+        }
+
+        // Unknown activity remains a potential active entry and is counted as
+        // unresolved rather than silently omitted from the coverage summary.
+        active_entries += 1;
+        let activity_is_known = document.conditionals.complete
+            && !document
+                .conditionals
+                .unknown_spans
+                .iter()
+                .any(|span| span.start <= import.span.start && import.span.end <= span.end);
+        let provider_is_unique = unique_units.contains_key(&import.name.to_ascii_lowercase());
+        if activity_is_known && provider_is_unique {
+            coverage.resolved_entries += 1;
+        } else {
+            coverage.unresolved_entries += 1;
+            every_active_entry_resolved = false;
+        }
+    }
+
+    if active_entries > 0 {
+        coverage.units_with_active_uses += 1;
+        if every_active_entry_resolved {
+            coverage.units_with_all_active_uses_resolved += 1;
+        }
+    }
 }
 
 #[test]
@@ -638,29 +773,77 @@ fn corpus_reports_no_e2003_on_dcc_clean_rtl() {
     let mut failures = Vec::new();
     for report in &reports {
         println!(
-            "{}: indexed={} seen={} skipped={} lossy_utf8={} E2003={} proofs(resolved={}, proven_absent={}, table_backed={})",
+            "{}: indexed={} seen={} skipped={} lossy_utf8={} E2003={} uses(resolved={}, unresolved={}) units_all_active_uses_resolved={}/{} proofs(resolved={}, proven_absent={}, table_backed={})",
             report.key,
             report.files_indexed,
             report.files_seen,
             report.skipped_files.len(),
             report.lossy_files.len(),
             report.e2003.len(),
+            report.import_coverage.resolved_entries,
+            report.import_coverage.unresolved_entries,
+            report.import_coverage.units_with_all_active_uses_resolved,
+            report.import_coverage.units_with_active_uses,
             report.proof_counters.resolved,
             report.proof_counters.proven_absent,
             report.proof_counters.table_backed_implicit_system
         );
         println!("  source roots: {}", display_paths(&report.source_roots));
-        if !report.missing_directories.is_empty() {
-            println!(
-                "  missing standard directories (skipped): {}",
-                display_paths(&report.missing_directories)
-            );
+        let policy = corpus_version_policy(report.major, report.minor)
+            .expect("every scanned compiler version has an explicit corpus policy");
+        for (path, relative, was_not_found) in &report.missing_directories {
+            if *was_not_found && let Some(reason) = directory_absence_reason(policy, relative) {
+                println!(
+                    "  expected absent standard directory {}: {reason}",
+                    path.display()
+                );
+            } else {
+                println!("  required standard directory missing: {}", path.display());
+                failures.push(format!(
+                    "{} required standard directory missing: {}",
+                    report.key,
+                    path.display()
+                ));
+            }
         }
         for path in &report.lossy_files {
             println!("  decoded lossily: {}", path.display());
         }
+        let mut observed_expected_skips = HashSet::new();
         for (path, reason) in &report.skipped_files {
-            println!("  skipped {}: {reason}", path.display());
+            let unit_name = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "<unknown>".to_owned());
+            if is_expected_corpus_skip(report.major, report.minor, &unit_name, reason) {
+                println!("  expected skip {} ({unit_name}): {reason}", path.display());
+                let expected = expected_corpus_skip(report.major, report.minor, &unit_name)
+                    .expect("matched skip has a policy entry");
+                if !observed_expected_skips.insert(expected.unit) {
+                    failures.push(format!(
+                        "{} expected skip {} was recorded more than once",
+                        report.key, expected.unit
+                    ));
+                }
+            } else {
+                println!(
+                    "  unexpected skip {} ({unit_name}): {reason}",
+                    path.display()
+                );
+                failures.push(format!(
+                    "{} unexpected skipped file {} ({unit_name}): {reason}",
+                    report.key,
+                    path.display()
+                ));
+            }
+        }
+        for expected in policy.expected_skips {
+            if !observed_expected_skips.contains(expected.unit) {
+                failures.push(format!(
+                    "{} expected skip {} was not observed ({})",
+                    report.key, expected.unit, expected.reason
+                ));
+            }
         }
         for name in &report.duplicate_unit_names {
             println!("  ambiguous unit stem left unbound: {name}");
@@ -857,6 +1040,8 @@ fn check_key(major: u32, minor: u32, platform: SurfacePlatform, root: &Path) -> 
     let Some(table) = table_for(&key) else {
         return KeyReport {
             key: label,
+            major,
+            minor,
             scan_errors: vec!["no checked-in dcc surface table for key".to_owned()],
             ..KeyReport::default()
         };
@@ -864,17 +1049,29 @@ fn check_key(major: u32, minor: u32, platform: SurfacePlatform, root: &Path) -> 
     let context = verified_system_context(&key, &table);
     let mut report = KeyReport {
         key: label,
+        major,
+        minor,
         ..KeyReport::default()
     };
     let mut scan = ScanResult::default();
 
     for relative in CORPUS_DIRECTORIES {
         let directory = root.join(relative);
+        let expected_absence = expected_absent_directory_reason(major, minor, relative);
         match fs::metadata(&directory) {
-            Ok(metadata) if metadata.is_dir() => collect_pascal_files(&directory, &mut scan),
-            Ok(_) => scan.missing_directories.push(directory),
+            Ok(metadata) if metadata.is_dir() => {
+                if let Some(reason) = expected_absence {
+                    scan.errors.push(format!(
+                        "{} is present but version policy declares it absent: {reason}",
+                        directory.display()
+                    ));
+                } else {
+                    collect_pascal_files(&directory, &mut scan);
+                }
+            }
+            Ok(_) => scan.missing_directories.push((directory, relative, false)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                scan.missing_directories.push(directory);
+                scan.missing_directories.push((directory, relative, true));
             }
             Err(error) => scan
                 .errors
@@ -972,6 +1169,7 @@ fn check_key(major: u32, minor: u32, platform: SurfacePlatform, root: &Path) -> 
         let Some(document) = index.documents.get(uri) else {
             continue;
         };
+        record_import_coverage(document, &unique_units, &mut report.import_coverage);
         let imports = document
             .interface_uses
             .iter()
@@ -998,8 +1196,10 @@ fn check_key(major: u32, minor: u32, platform: SurfacePlatform, root: &Path) -> 
             ));
             continue;
         };
-        if let Some(reason) = windows_corpus_skip_reason(&document.unit_name) {
-            report.skipped_files.push((path.clone(), reason.to_owned()));
+        if let Some(expected) = expected_corpus_skip(major, minor, &document.unit_name) {
+            report
+                .skipped_files
+                .push((path.clone(), expected.reason.to_owned()));
             continue;
         }
         match index.semantic_diagnostics_with_cancel(uri, &cancel) {
@@ -1023,17 +1223,96 @@ fn check_key(major: u32, minor: u32, platform: SurfacePlatform, root: &Path) -> 
     report
 }
 
-fn windows_corpus_skip_reason(unit_name: &str) -> Option<&'static str> {
-    (unit_name == "system.internal.unwinder").then_some(
-        "not applicable to Win32/Win64: the source defines its unwinder library only for Linux/macOS",
-    )
+#[test]
+fn corpus_policy_requires_standard_directories_and_scopes_skips_by_version_unit_and_reason() {
+    for (major, minor) in [(21, 0), (24, 0), (37, 0)] {
+        for directory in CORPUS_DIRECTORIES {
+            assert_eq!(
+                expected_absent_directory_reason(major, minor, directory),
+                None,
+                "{major}.{minor} requires standard directory {directory} unless policy records a reason"
+            );
+        }
+    }
+    let explicitly_absent_directory = CorpusVersionPolicy {
+        major: 99,
+        minor: 0,
+        expected_absent_directories: &[("rtl/win", "this install does not ship Windows RTL")],
+        expected_skips: &[],
+    };
+    assert_eq!(
+        directory_absence_reason(&explicitly_absent_directory, "rtl/win"),
+        Some("this install does not ship Windows RTL")
+    );
+
+    let reason = "System.Internal.Unwinder declares unwind only under LINUX/MACOS but references it unconditionally; the Windows corpus cannot provide that library binding";
+    assert!(is_expected_corpus_skip(
+        24,
+        0,
+        "System.Internal.Unwinder",
+        reason
+    ));
+    assert!(!is_expected_corpus_skip(24, 0, "Unwinder", reason));
+    assert!(!is_expected_corpus_skip(
+        24,
+        0,
+        "System.Internal.Unwinder",
+        "different reason"
+    ));
+    assert!(!is_expected_corpus_skip(
+        21,
+        0,
+        "System.Internal.Unwinder",
+        reason
+    ));
 }
 
 #[test]
-fn windows_corpus_skip_uses_the_exact_dotted_unit_name() {
-    assert!(windows_corpus_skip_reason("system.internal.unwinder").is_some());
-    assert!(windows_corpus_skip_reason("unwinder").is_none());
-    assert!(windows_corpus_skip_reason("system.internal.unwinder2").is_none());
+fn corpus_import_coverage_counts_entries_and_units_with_all_imports_resolved() {
+    let provider_uri = Url::parse("file:///tmp/coverage-provider.pas").expect("provider URI");
+    let other_uri = Url::parse("file:///tmp/coverage-other.pas").expect("other URI");
+    let complete_uri = Url::parse("file:///tmp/coverage-complete.pas").expect("complete URI");
+    let partial_uri = Url::parse("file:///tmp/coverage-partial.pas").expect("partial URI");
+    let mut index = NavigationIndex::new();
+    for (uri, source) in [
+        (
+            provider_uri.clone(),
+            "unit Provider;\ninterface\nimplementation\nend.\n",
+        ),
+        (
+            other_uri.clone(),
+            "unit Other;\ninterface\nimplementation\nend.\n",
+        ),
+        (
+            complete_uri.clone(),
+            "unit Complete;\ninterface\nuses Provider;\nimplementation\nuses Other;\nend.\n",
+        ),
+        (
+            partial_uri.clone(),
+            "unit Partial;\ninterface\nuses Provider, Missing;\nimplementation\nend.\n",
+        ),
+    ] {
+        index
+            .update(uri, source.to_owned())
+            .expect("coverage fixture parses");
+    }
+    let unique_units = HashMap::from([
+        ("provider".to_owned(), provider_uri),
+        ("other".to_owned(), other_uri),
+    ]);
+    let mut coverage = ImportCoverage::default();
+    for uri in [&complete_uri, &partial_uri] {
+        record_import_coverage(
+            index.documents.get(uri).expect("coverage unit indexed"),
+            &unique_units,
+            &mut coverage,
+        );
+    }
+
+    assert_eq!(coverage.resolved_entries, 3);
+    assert_eq!(coverage.unresolved_entries, 1);
+    assert_eq!(coverage.units_with_active_uses, 2);
+    assert_eq!(coverage.units_with_all_active_uses_resolved, 1);
 }
 
 fn configured_path(variable: &str) -> Option<PathBuf> {

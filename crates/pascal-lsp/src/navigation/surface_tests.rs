@@ -388,6 +388,182 @@ fn qualified_system_source_exports_resolve_before_surface_fallback() {
 }
 
 #[test]
+fn qualified_system_source_exports_survive_unknown_spans_and_table_still_proves_misses() {
+    let context = context((37, 0), Some(TargetPlatform::Win32));
+    let system_context = ConditionalContext {
+        absent_define: ConditionalFact::Unknown,
+        ..context.clone()
+    };
+    let system = concat!(
+        "unit System;\ninterface\n",
+        "{$IFDEF SOMETHING_UNKNOWN}\nconst MaybeSystem = 1;\n{$ENDIF}\n",
+        "const KnownSystem = 1;\nimplementation\nend.\n",
+    );
+    let consumer = concat!(
+        "unit SurfaceQualifiedIncompleteSystem;\ninterface\n",
+        "implementation\nprocedure P; var X: Integer; begin\n",
+        "X := System.KnownSystem; X := System.Zz;\nend; end.\n",
+    );
+    let mut index = NavigationIndex::new();
+    let system_uri = update(&mut index, "System", system, &system_context);
+    let consumer_uri = update(
+        &mut index,
+        "SurfaceQualifiedIncompleteSystem",
+        consumer,
+        &context,
+    );
+    let provider = index.documents.get(&system_uri).expect("indexed System");
+    assert!(!provider.conditionals.unknown_spans.is_empty());
+    assert!(
+        !provider
+            .conditionals
+            .is_unknown_at(system.find("KnownSystem").expect("known export"))
+    );
+
+    let (definition, diagnostics, absent_proof) = with_context_table(&context, || {
+        let definition = index.navigate(
+            &consumer_uri,
+            text::offset_to_position(
+                consumer,
+                consumer
+                    .find("KnownSystem")
+                    .expect("qualified known export"),
+            )
+            .expect("known export position"),
+            NavigationTarget::Definition,
+        );
+        let diagnostics = diagnostics(&index, &consumer_uri);
+        let absent_proof = proof_status(&index, &consumer_uri, consumer, "Zz");
+        (definition, diagnostics, absent_proof)
+    });
+    let findings = e2003(&diagnostics);
+
+    assert_eq!(
+        definition.len(),
+        1,
+        "known System export must still navigate"
+    );
+    assert_eq!(definition[0].uri, system_uri);
+    assert_eq!(absent_proof, SemanticProofStatus::ProvenAbsent);
+    assert_eq!(findings.len(), 1, "the table proves System.Zz absent");
+    assert_eq!(findings[0].message, "Undeclared identifier: 'Zz'");
+}
+
+#[test]
+fn qualified_system_miss_without_importer_table_stays_incomplete_for_unknown_source() {
+    let context = context((21, 0), Some(TargetPlatform::Win64));
+    let system_context = ConditionalContext {
+        absent_define: ConditionalFact::Unknown,
+        ..context.clone()
+    };
+    let system = concat!(
+        "unit System;\ninterface\n",
+        "{$IFDEF SOMETHING_UNKNOWN}\nconst MaybeSystem = 1;\n{$ENDIF}\n",
+        "const KnownSystem = 1;\nimplementation\nend.\n",
+    );
+    let consumer = concat!(
+        "unit SurfaceQualifiedIncompleteNoTable;\ninterface\n",
+        "implementation\nprocedure P; var X: Integer; begin\n",
+        "X := System.KnownSystem; X := System.Zz;\nend; end.\n",
+    );
+    let mut index = NavigationIndex::new();
+    let system_uri = update(&mut index, "System", system, &system_context);
+    let consumer_uri = update(
+        &mut index,
+        "SurfaceQualifiedIncompleteNoTable",
+        consumer,
+        &context,
+    );
+
+    let definition = index.navigate(
+        &consumer_uri,
+        text::offset_to_position(
+            consumer,
+            consumer
+                .find("KnownSystem")
+                .expect("qualified known export"),
+        )
+        .expect("known export position"),
+        NavigationTarget::Definition,
+    );
+    let diagnostics = diagnostics(&index, &consumer_uri);
+
+    assert_eq!(
+        definition.len(),
+        1,
+        "known System export must still navigate"
+    );
+    assert_eq!(definition[0].uri, system_uri);
+    assert!(e2003(&diagnostics).is_empty(), "{diagnostics:?}");
+    assert_eq!(
+        proof_status(&index, &consumer_uri, consumer, "Zz"),
+        SemanticProofStatus::Incomplete
+    );
+}
+
+#[test]
+fn qualified_imported_system_exports_survive_unknown_spans() {
+    let context = context((21, 0), Some(TargetPlatform::Win64));
+    let system_context = ConditionalContext {
+        absent_define: ConditionalFact::Unknown,
+        ..context.clone()
+    };
+    let system = concat!(
+        "unit System;\ninterface\n",
+        "{$IFDEF SOMETHING_UNKNOWN}\nconst MaybeSystem = 1;\n{$ENDIF}\n",
+        "const KnownSystem = 1;\nimplementation\nend.\n",
+    );
+    let consumer = concat!(
+        "unit SurfaceQualifiedImportedSystem;\ninterface\nimplementation\nuses System;\n",
+        "procedure P; var X: Integer; begin\n",
+        "X := System.KnownSystem;\nend; end.\n",
+    );
+    let mut index = NavigationIndex::new();
+    let system_uri = update(&mut index, "System", system, &system_context);
+    let consumer_uri = update(
+        &mut index,
+        "SurfaceQualifiedImportedSystem",
+        consumer,
+        &context,
+    );
+    index.bind_imports(
+        &consumer_uri,
+        std::iter::once(("System".to_owned(), system_uri.clone())),
+    );
+    let provider = index.documents.get(&system_uri).expect("indexed System");
+    assert_eq!(provider.unit_name, "system");
+    assert!(!provider.conditionals.unknown_spans.is_empty());
+    assert!(
+        index
+            .documents
+            .get(&consumer_uri)
+            .expect("indexed consumer")
+            .active_uses(Region::Implementation)
+            .iter()
+            .any(|used| used.as_str() == "system")
+    );
+
+    let definition = index.navigate(
+        &consumer_uri,
+        text::offset_to_position(
+            consumer,
+            consumer
+                .find("KnownSystem")
+                .expect("qualified known export"),
+        )
+        .expect("known export position"),
+        NavigationTarget::Definition,
+    );
+
+    assert_eq!(
+        definition.len(),
+        1,
+        "known System export must still navigate"
+    );
+    assert_eq!(definition[0].uri, system_uri);
+}
+
+#[test]
 fn e2003_silent_for_a_qualified_system_builtin() {
     let context = context((37, 0), Some(TargetPlatform::Win32));
     let source = "unit SurfaceQualifiedBuiltin; interface implementation procedure P; begin System.Writeln('ok'); end; end.";

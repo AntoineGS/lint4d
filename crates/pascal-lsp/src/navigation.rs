@@ -8131,6 +8131,44 @@ impl NavigationIndex {
         Ok(candidates)
     }
 
+    fn qualified_system_references_with_budget(
+        &self,
+        document: &Document,
+        key: &str,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
+        let uri = match self.implicit_system_namespace_status() {
+            ImplicitSystemNamespaceStatus::Unavailable => {
+                self.apply_compiler_surface_fallback(document, key, state);
+                return Ok(Vec::new());
+            }
+            ImplicitSystemNamespaceStatus::Ambiguous => {
+                state.mark_implicit_system_namespace_incomplete();
+                return Ok(Vec::new());
+            }
+            ImplicitSystemNamespaceStatus::SourceBacked { uri } => uri,
+        };
+        let Some(provider) = self.documents.get(&uri) else {
+            self.apply_compiler_surface_fallback(document, key, state);
+            return Ok(Vec::new());
+        };
+        budget.require_work(
+            provider
+                .parser_recovery_spans
+                .len()
+                .saturating_add(provider.conditionals.unknown_spans.len()),
+            cancel,
+        )?;
+
+        let candidates = self.exported_references_for_key_with_budget(&uri, key, cancel, budget)?;
+        if candidates.is_empty() {
+            self.apply_compiler_surface_fallback(document, key, state);
+        }
+        Ok(candidates)
+    }
+
     fn apply_compiler_surface_fallback(
         &self,
         document: &Document,
@@ -8238,7 +8276,7 @@ impl NavigationIndex {
                 budget,
             )?
         {
-            return self.implicit_system_references_with_budget(
+            return self.qualified_system_references_with_budget(
                 current_document,
                 &key,
                 state,
@@ -8291,12 +8329,6 @@ impl NavigationIndex {
                                 .saturating_add(provider.conditionals.unknown_spans.len()),
                             cancel,
                         )?;
-                        if !provider.parser_recovery_spans.is_empty()
-                            || !provider.conditionals.unknown_spans.is_empty()
-                        {
-                            self.apply_compiler_surface_fallback(current_document, &key, state);
-                            continue;
-                        }
                     }
                     let candidates = self
                         .exported_references_for_key_with_budget(&unit_uri, &key, cancel, budget)?;
@@ -8360,10 +8392,14 @@ impl NavigationIndex {
             cancel,
             budget,
         )?;
+        let indexed_system_unit = matches!(
+            self.implicit_system_namespace_status(),
+            ImplicitSystemNamespaceStatus::SourceBacked { .. }
+        );
         if !references.is_empty()
             || state.ambiguous
             || state.member_lookup_incomplete
-            || state.implicit_system_namespace_incomplete
+            || (state.implicit_system_namespace_incomplete && !indexed_system_unit)
             || state.receiver_resolution_uncertain()
             || state.inaccessible_candidate
         {
@@ -9785,7 +9821,7 @@ impl NavigationIndex {
                 .unwrap_or(false)
             {
                 return self
-                    .implicit_system_references_with_budget(
+                    .qualified_system_references_with_budget(
                         current_document,
                         &canonical_name(member_name),
                         state,

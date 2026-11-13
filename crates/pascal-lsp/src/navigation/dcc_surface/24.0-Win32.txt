@@ -272,6 +272,7 @@ IDispatch
 IEditGridLinkObserver
 IEnumerable
 IEnumerator
+IEquatable
 IInterface
 IInvokable
 ImageBase
@@ -658,6 +659,7 @@ SysUnregisterExpectedMemoryLeak
 sysvari
 TAggregatedObject
 Tangent
+TArray
 TAssertErrorProc
 TBoundArray
 TBytes

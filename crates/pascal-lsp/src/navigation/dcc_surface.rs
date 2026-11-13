@@ -527,11 +527,12 @@ Free\n\
             "HasWeakRef",
             "GetTypeKind",
         ];
+        const GENERIC_SYSTEM_TYPES: &[&str] = &["TArray"];
 
         let mut failures = Vec::new();
         for (file_stem, text) in TABLES {
             let table = SurfaceTable::parse(text).unwrap();
-            for name in INTRINSICS.iter().chain(
+            for name in INTRINSICS.iter().chain(GENERIC_SYSTEM_TYPES.iter()).chain(
                 file_stem
                     .starts_with("37.0-")
                     .then_some(DELPHI_37_INTRINSICS)

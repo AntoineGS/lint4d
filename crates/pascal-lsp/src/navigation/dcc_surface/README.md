@@ -54,6 +54,16 @@ errors, and refuses to probe fewer than 5,000 candidates. The script invokes
 the `dcc_surface_table` example to write the sorted output and re-parse it
 before accepting the table.
 
+Names from `System.pas` and `SysInit.pas` that are followed by `<` are also
+tracked as generic type candidates, including matches in comments and
+conditional branches. If a bare-name probe reports E2003, the script retries
+the name as `Name<Integer>`, `Name<Integer, Integer>`, and
+`Name<Integer, Integer, Integer>` in variable type declarations. These probes
+use at most 60 declarations per compile and split on E2226 or fatal errors. A
+generic name is considered present if any form does not produce a line-specific
+E2003 for that name; the table still records one unqualified name regardless
+of arity.
+
 Surface candidates are compiled as one statement per line in batches of at
 most 60. A name is **absent** only when dcc emits the exact E2003 diagnostic
 for that name on its corresponding line. If a batch reports E2226, any fatal

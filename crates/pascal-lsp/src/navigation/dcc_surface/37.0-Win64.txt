@@ -350,6 +350,7 @@ IComparable
 IDispatch
 IEnumerable
 IEnumerator
+IEquatable
 IInterface
 IInvokable
 ImageBase
@@ -769,6 +770,7 @@ SystemThreadFuncProc
 SysUnregisterExpectedMemoryLeak
 TAggregatedObject
 Tangent
+TArray
 TAssertErrorProc
 TBoundArray
 TCallDesc

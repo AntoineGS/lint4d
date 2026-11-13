@@ -98,9 +98,11 @@ mkdir -- "$tmpdir/work"
 system_identifiers_raw="$tmpdir/system-identifiers.raw"
 rtl_identifiers_raw="$tmpdir/rtl-identifiers.raw"
 binary_identifiers_raw="$tmpdir/binary-identifiers.raw"
+generic_identifiers_raw="$tmpdir/system-generic-identifiers.raw"
 define_literals_raw="$tmpdir/define-literals.raw"
 candidate_file="$tmpdir/candidates.txt"
 system_candidate_file="$tmpdir/system-candidates.txt"
+generic_candidate_file="$tmpdir/generic-candidates.txt"
 grep_matches="$tmpdir/grep-matches.out"
 compiler_files_raw="$tmpdir/compiler-files.raw"
 compiler_files_sorted="$tmpdir/compiler-files.sorted"
@@ -110,6 +112,7 @@ source_files_sorted="$tmpdir/source-files.sorted"
 : > "$system_identifiers_raw"
 : > "$rtl_identifiers_raw"
 : > "$binary_identifiers_raw"
+: > "$generic_identifiers_raw"
 : > "$define_literals_raw"
 : > "$grep_matches"
 : > "$compiler_files_raw"
@@ -131,7 +134,23 @@ append_grep_matches() {
   fi
 }
 
+append_generic_identifiers() {
+  local input=$1
+  local grep_status
+
+  if grep -oP '\b([A-Za-z_][A-Za-z0-9_]*)\s*<' "$input" > "$grep_matches"; then
+    sed -E 's/[[:space:]]*<$//' "$grep_matches" >> "$generic_identifiers_raw" \
+      || fail "cannot append generic identifiers from $input"
+  else
+    grep_status=$?
+    ((grep_status == 1)) && return 0
+    fail "cannot find generic identifiers in $input (grep status $grep_status)"
+  fi
+}
+
 append_grep_matches '[A-Za-z_][A-Za-z0-9_]{0,62}' "$system_file" "$system_identifiers_raw" "$system_file"
+append_generic_identifiers "$system_file"
+append_generic_identifiers "$sysinit_file"
 
 for source_tree in rtl vcl; do
   source_tree_path="$rtl_root/$source_tree"
@@ -206,9 +225,11 @@ sanitize_candidates() {
 }
 sanitize_candidates "$tmpdir/all-candidates.raw" "$candidate_file"
 sanitize_candidates "$tmpdir/system-candidates-source.raw" "$system_candidate_file"
+sanitize_candidates "$generic_identifiers_raw" "$generic_candidate_file"
 
 mapfile -t candidate_names < "$candidate_file"
 mapfile -t system_names < "$system_candidate_file"
+mapfile -t generic_source_names < "$generic_candidate_file"
 (( ${#candidate_names[@]} >= 5000 )) \
   || fail "candidate set is too small (${#candidate_names[@]}; require at least 5000)"
 
@@ -321,8 +342,95 @@ for ((first = 0; first < ${#candidate_names[@]}; first += 60)); do
   fi
 done
 
-awk 'FILENAME == ARGV[1] { absent[tolower($0)] = 1; next } !(tolower($0) in absent)' \
-  "$surface_absent" "$candidate_file" > "$surface_file"
+generic_probe_candidates_file="$tmpdir/generic-probe-candidates.txt"
+generic_present_file="$tmpdir/generic-present.txt"
+: > "$generic_present_file"
+awk '
+  FILENAME == ARGV[1] { absent[tolower($0)] = 1; next }
+  FILENAME == ARGV[2] { generic[tolower($0)] = 1; next }
+  tolower($0) in absent && tolower($0) in generic
+' "$surface_absent" "$generic_candidate_file" "$candidate_file" \
+  > "$generic_probe_candidates_file"
+mapfile -t generic_probe_names < "$generic_probe_candidates_file"
+
+generic_splits=0
+generic_unresolved=0
+line_has_generic_e2003() {
+  local line=$1
+  local candidate=$2
+  line_has_e2003 "$line" "$candidate" \
+    || grep -iFq "L4dSurfaceProbe.pas($line) Error: E2003 Undeclared identifier: '$candidate<" \
+      <<< "$compiler_output"
+}
+
+write_generic_probe() {
+  local first=$1
+  local count=$2
+  local offset candidate
+  {
+    printf 'unit L4dSurfaceProbe;\ninterface\nimplementation\nprocedure L4dProbeProc;\nvar\n'
+    for ((offset = 0; offset < count; offset++)); do
+      candidate=${generic_probe_names[first + offset]}
+      printf '  L4dG%d: %s<Integer>;\n' "$((offset * 3))" "$candidate"
+      printf '  L4dG%d: %s<Integer, Integer>;\n' "$((offset * 3 + 1))" "$candidate"
+      printf '  L4dG%d: %s<Integer, Integer, Integer>;\n' "$((offset * 3 + 2))" "$candidate"
+    done
+    printf 'begin\nend;\nend.\n'
+  } > "$tmpdir/work/$probe_name"
+}
+
+probe_generic_range() {
+  local first=$1
+  local count=$2
+  local offset left candidate first_line second_line third_line
+  write_generic_probe "$first" "$count"
+  run_compiler "$probe_name"
+  if compiler_needs_split; then
+    if ((count == 1)); then
+      generic_unresolved=$((generic_unresolved + 1))
+      printf '%s\n' "${generic_probe_names[first]}" >> "$generic_present_file"
+      printf 'dcc-surface-derive: generic probe unresolved for %s (status %s); keeping present\n' \
+        "${generic_probe_names[first]}" "$compiler_status" >&2
+      return 0
+    fi
+    generic_splits=$((generic_splits + 1))
+    left=$((count / 2))
+    probe_generic_range "$first" "$left"
+    probe_generic_range "$((first + left))" "$((count - left))"
+    return 0
+  fi
+
+  for ((offset = 0; offset < count; offset++)); do
+    candidate=${generic_probe_names[first + offset]}
+    first_line=$((6 + 3 * offset))
+    second_line=$((first_line + 1))
+    third_line=$((first_line + 2))
+    if ! line_has_generic_e2003 "$first_line" "$candidate" \
+      || ! line_has_generic_e2003 "$second_line" "$candidate" \
+      || ! line_has_generic_e2003 "$third_line" "$candidate"; then
+      printf '%s\n' "$candidate" >> "$generic_present_file"
+    fi
+  done
+}
+
+generic_batch_count=$((( ${#generic_probe_names[@]} + 19 ) / 20))
+printf 'Generic type probes: source=%s System.pas/SysInit.pas names; bare-absent=%s candidates; batches=%s (max 60 declarations)\n' \
+  "${#generic_source_names[@]}" "${#generic_probe_names[@]}" "$generic_batch_count"
+for ((first = 0; first < ${#generic_probe_names[@]}; first += 20)); do
+  count=20
+  ((first + count <= ${#generic_probe_names[@]})) || count=$((${#generic_probe_names[@]} - first))
+  probe_generic_range "$first" "$count"
+  completed=$((first / 20 + 1))
+  if ((completed % 25 == 0 || completed == generic_batch_count)); then
+    printf 'Generic type probes: %s/%s batches\n' "$completed" "$generic_batch_count"
+  fi
+done
+
+awk '
+  FILENAME == ARGV[1] { absent[tolower($0)] = 1; next }
+  FILENAME == ARGV[2] { generic_present[tolower($0)] = 1; next }
+  !(tolower($0) in absent) || (tolower($0) in generic_present)
+' "$surface_absent" "$generic_present_file" "$candidate_file" > "$surface_file"
 
 defines_splits=0
 write_defines_probe() {
@@ -462,6 +570,7 @@ done
 candidate_count=$(wc -l < "$candidate_file" | tr -d '[:space:]')
 surface_count=$(wc -l < "$surface_file" | tr -d '[:space:]')
 define_count=$(wc -l < "$defines_file" | tr -d '[:space:]')
+generic_present_count=$(wc -l < "$generic_present_file" | tr -d '[:space:]')
 object_member_count=$(wc -l < "$(member_file TObject)" | tr -d '[:space:]')
 interface_member_count=$(wc -l < "$(member_file IInterface)" | tr -d '[:space:]')
 unknown_member_count=$(wc -l < "$(member_file IUnknown)" | tr -d '[:space:]')
@@ -483,10 +592,10 @@ cp -- "$tmpdir/generated-table.txt" "$table_path"
 cmp -- "$tmpdir/generated-table.txt" "$table_path" \
   || fail "written table differs from the re-parsed generated table"
 
-printf 'Done %s %s: candidates=%s surface=%s defines=%s members[TObject]=%s members[IInterface]=%s members[IUnknown]=%s members[TInterfacedObject]=%s runtime=%ss splits[surface/defines/members]=%s/%s/%s unresolved[surface/members]=%s/%s\n' \
+printf 'Done %s %s: candidates=%s surface=%s defines=%s generic-present=%s members[TObject]=%s members[IInterface]=%s members[IUnknown]=%s members[TInterfacedObject]=%s runtime=%ss splits[surface/defines/members/generic]=%s/%s/%s/%s unresolved[surface/members/generic]=%s/%s/%s\n' \
   "$version" "$platform" \
-  "$candidate_count" "$surface_count" "$define_count" \
+  "$candidate_count" "$surface_count" "$define_count" "$generic_present_count" \
   "$object_member_count" "$interface_member_count" "$unknown_member_count" \
   "$interfaced_object_member_count" \
-  "$SECONDS" "$surface_splits" "$defines_splits" "$member_splits" \
-  "$surface_unresolved" "$member_unresolved"
+  "$SECONDS" "$surface_splits" "$defines_splits" "$member_splits" "$generic_splits" \
+  "$surface_unresolved" "$member_unresolved" "$generic_unresolved"

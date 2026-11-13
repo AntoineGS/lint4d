@@ -236,6 +236,7 @@ IComparable
 IDispatch
 IEnumerable
 IEnumerator
+IEquatable
 IInterface
 IInvokable
 ImgDelayDescr
@@ -575,6 +576,7 @@ SystemThreadFuncProc
 SysUnregisterExpectedMemoryLeak
 sysvari
 TAggregatedObject
+TArray
 TAssertErrorProc
 TBoundArray
 TCallDesc

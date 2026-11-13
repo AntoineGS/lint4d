@@ -96,22 +96,68 @@ trap 'rm -rf -- "$tmpdir"' EXIT
 mkdir -- "$tmpdir/work"
 
 system_identifiers_raw="$tmpdir/system-identifiers.raw"
-all_identifiers_raw="$tmpdir/all-identifiers.raw"
+rtl_identifiers_raw="$tmpdir/rtl-identifiers.raw"
 binary_identifiers_raw="$tmpdir/binary-identifiers.raw"
 define_literals_raw="$tmpdir/define-literals.raw"
 candidate_file="$tmpdir/candidates.txt"
 system_candidate_file="$tmpdir/system-candidates.txt"
+grep_matches="$tmpdir/grep-matches.out"
+compiler_files_raw="$tmpdir/compiler-files.raw"
+compiler_files_sorted="$tmpdir/compiler-files.sorted"
+source_files_raw="$tmpdir/source-files.raw"
+source_files_sorted="$tmpdir/source-files.sorted"
 
-grep -oE '[A-Za-z_][A-Za-z0-9_]*' "$system_file" > "$system_identifiers_raw" || true
-grep -oE '[A-Za-z_][A-Za-z0-9_]*' "$sysinit_file" >> "$all_identifiers_raw" || true
-grep -oE '[A-Za-z_][A-Za-z0-9_]*' "$system_file" >> "$all_identifiers_raw" || true
+: > "$system_identifiers_raw"
+: > "$rtl_identifiers_raw"
+: > "$binary_identifiers_raw"
+: > "$define_literals_raw"
+: > "$grep_matches"
+: > "$compiler_files_raw"
+: > "$source_files_raw"
 
-mapfile -d '' -t compiler_files < <(
-  find "$install/bin" -maxdepth 1 -type f \( -iname 'dcc*.exe' -o -iname 'dcc*.dll' \) -print0 \
-    | sort -z
-)
+append_grep_matches() {
+  local pattern=$1
+  local input=$2
+  local output=$3
+  local description=$4
+  local grep_status
+
+  if grep -oE "$pattern" "$input" > "$grep_matches"; then
+    cat "$grep_matches" >> "$output" || fail "cannot append extracted tokens from $description"
+  else
+    grep_status=$?
+    ((grep_status == 1)) && return 0
+    fail "cannot extract tokens from $description (grep status $grep_status)"
+  fi
+}
+
+append_grep_matches '[A-Za-z_][A-Za-z0-9_]{0,62}' "$system_file" "$system_identifiers_raw" "$system_file"
+
+for source_tree in rtl vcl; do
+  source_tree_path="$rtl_root/$source_tree"
+  [[ -d "$source_tree_path" ]] || fail "RTL source subtree not found: $source_tree_path"
+  find "$source_tree_path" -type f \( -iname '*.pas' -o -iname '*.inc' \) -print0 \
+    >> "$source_files_raw" \
+    || fail "cannot enumerate Pascal source files under $source_tree_path"
+done
+sort -z "$source_files_raw" > "$source_files_sorted" \
+  || fail "cannot sort Pascal source file list under $rtl_root"
+mapfile -d '' -t source_files < "$source_files_sorted"
+[[ ${#source_files[@]} -gt 0 ]] || fail "no .pas or .inc files found under $rtl_root/rtl and $rtl_root/vcl"
+for source_file in "${source_files[@]}"; do
+  [[ -f "$source_file" && -r "$source_file" ]] || fail "Pascal source file is not readable: $source_file"
+  append_grep_matches '[A-Za-z_][A-Za-z0-9_]{0,62}' "$source_file" "$rtl_identifiers_raw" "$source_file"
+done
+
+find "$install/bin" -maxdepth 1 -type f \( -iname 'dcc*.exe' -o -iname 'dcc*.dll' \) -print0 \
+  > "$compiler_files_raw" \
+  || fail "cannot enumerate dcc*.exe and dcc*.dll files under $install/bin"
+sort -z "$compiler_files_raw" > "$compiler_files_sorted" \
+  || fail "cannot sort compiler binary list under $install/bin"
+mapfile -d '' -t compiler_files < "$compiler_files_sorted"
 [[ ${#compiler_files[@]} -gt 0 ]] || fail "no dcc*.exe or dcc*.dll files found under $install/bin"
 for compiler_file in "${compiler_files[@]}"; do
+  [[ -f "$compiler_file" && -r "$compiler_file" ]] || fail "compiler binary is not readable: $compiler_file"
   for encoding in ascii utf16le; do
     strings_output="$tmpdir/strings.out"
     if [[ $encoding == ascii ]]; then
@@ -121,13 +167,17 @@ for compiler_file in "${compiler_files[@]}"; do
       strings -a -el -n 2 "$compiler_file" > "$strings_output" \
         || fail "wide strings failed for $compiler_file"
     fi
-    grep -E '^[A-Za-z_][A-Za-z0-9_]{0,62}$' "$strings_output" >> "$binary_identifiers_raw" || true
+    append_grep_matches '[A-Za-z_][A-Za-z0-9_]{0,62}' "$strings_output" "$binary_identifiers_raw" "$encoding strings in $compiler_file"
   done
 done
 
-grep -oE '"[A-Z0-9_]+"' "$root/crates/pascal-project/src/compiler_defines.rs" \
-  | sed -E 's/^"//; s/"$//' > "$define_literals_raw" || true
-cat "$all_identifiers_raw" "$binary_identifiers_raw" "$define_literals_raw" \
+define_literals_quoted="$tmpdir/define-literals-quoted.raw"
+: > "$define_literals_quoted"
+append_grep_matches '"[A-Z0-9_]+"' "$root/crates/pascal-project/src/compiler_defines.rs" \
+  "$define_literals_quoted" "$root/crates/pascal-project/src/compiler_defines.rs"
+sed -E 's/^"//; s/"$//' "$define_literals_quoted" > "$define_literals_raw" \
+  || fail "cannot normalize define literals from compiler_defines.rs"
+cat "$rtl_identifiers_raw" "$binary_identifiers_raw" "$define_literals_raw" \
   > "$tmpdir/all-candidates.raw"
 cat "$system_identifiers_raw" > "$tmpdir/system-candidates-source.raw"
 
@@ -159,7 +209,8 @@ sanitize_candidates "$tmpdir/system-candidates-source.raw" "$system_candidate_fi
 
 mapfile -t candidate_names < "$candidate_file"
 mapfile -t system_names < "$system_candidate_file"
-[[ ${#candidate_names[@]} -gt 0 ]] || fail "candidate set is empty"
+(( ${#candidate_names[@]} >= 5000 )) \
+  || fail "candidate set is too small (${#candidate_names[@]}; require at least 5000)"
 
 probe_name=L4dSurfaceProbe.pas
 compiler_output=''

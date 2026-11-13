@@ -465,4 +465,89 @@ Free\n\
             failures.join("\n")
         );
     }
+
+    #[test]
+    fn every_checked_in_table_contains_documented_intrinsics() {
+        const INTRINSICS: &[&str] = &[
+            "Abs",
+            "Addr",
+            "Assert",
+            "Assigned",
+            "Break",
+            "Chr",
+            "Concat",
+            "Continue",
+            "Copy",
+            "Dec",
+            "Delete",
+            "Dispose",
+            "Exit",
+            "FillChar",
+            "Finalize",
+            "FreeMem",
+            "GetMem",
+            "Halt",
+            "Hi",
+            "High",
+            "Inc",
+            "Include",
+            "Initialize",
+            "Insert",
+            "Length",
+            "Lo",
+            "Low",
+            "Move",
+            "New",
+            "Odd",
+            "Ord",
+            "Pred",
+            "Ptr",
+            "Read",
+            "Readln",
+            "ReallocMem",
+            "Round",
+            "SetLength",
+            "SetString",
+            "SizeOf",
+            "Slice",
+            "Sqr",
+            "Str",
+            "Succ",
+            "Swap",
+            "Trunc",
+            "TypeInfo",
+            "Val",
+            "Write",
+            "Writeln",
+        ];
+        const DELPHI_37_INTRINSICS: &[&str] = &[
+            "Default",
+            "IsManagedType",
+            "AtomicIncrement",
+            "HasWeakRef",
+            "GetTypeKind",
+        ];
+
+        let mut failures = Vec::new();
+        for (file_stem, text) in TABLES {
+            let table = SurfaceTable::parse(text).unwrap();
+            for name in INTRINSICS.iter().chain(
+                file_stem
+                    .starts_with("37.0-")
+                    .then_some(DELPHI_37_INTRINSICS)
+                    .into_iter()
+                    .flatten(),
+            ) {
+                if !table.has_name(name) {
+                    failures.push(format!("{file_stem}: missing {name}"));
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "documented intrinsic surface failures:\n{}",
+            failures.join("\n")
+        );
+    }
 }

@@ -42,13 +42,17 @@ scripts/dcc-surface-derive.sh 37.0 Win32
 cmp /tmp/opencode/37.0-Win32.txt crates/pascal-lsp/src/navigation/dcc_surface/37.0-Win32.txt
 ```
 
-The candidate set combines identifier tokens from `System.pas` and
-`SysInit.pas`, ASCII and UTF-16 strings from the install's `bin/dcc*.exe` and
-`bin/dcc*.dll` files, and uppercase quoted literals in
-`crates/pascal-project/src/compiler_defines.rs`. Candidates are deduplicated
+The candidate set combines identifier tokens from every `.pas` and `.inc` file
+under the install's `source/.../rtl` and `source/.../vcl` trees, every
+identifier token found in ASCII and UTF-16 strings from `bin/dcc*.exe` and
+`bin/dcc*.dll`, and uppercase quoted literals in
+`crates/pascal-project/src/compiler_defines.rs`. Binary strings are tokenized,
+not required to consist of a single identifier. Candidates are deduplicated
 case-insensitively; Delphi reserved words and the probe's own identifiers are
-excluded. The script invokes the `dcc_surface_table` example to write the
-sorted output and re-parse it before accepting the table.
+excluded. Extraction fails on source, binary, `find`, `sort`, or `strings`
+errors, and refuses to probe fewer than 5,000 candidates. The script invokes
+the `dcc_surface_table` example to write the sorted output and re-parse it
+before accepting the table.
 
 Surface candidates are compiled as one statement per line in batches of at
 most 60. A name is **absent** only when dcc emits the exact E2003 diagnostic

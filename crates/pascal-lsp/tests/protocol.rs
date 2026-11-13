@@ -31,6 +31,10 @@ use common::*;
 #[path = "protocol/workspace_selection_support.rs"]
 mod workspace_selection_support;
 
+fn dcc_surface_options() -> Value {
+    json!({"compilerVersion": "37.0", "platform": "Win32"})
+}
+
 #[test]
 fn diagnostics_suppress_unqualified_global_absence_without_a_system_catalogue() {
     let root = tempfile::tempdir().expect("workspace");
@@ -2259,7 +2263,7 @@ fn diagnostics_report_a_missing_member_with_utf16_and_crlf_coordinates() {
     write_file(&source_path, source);
 
     let mut server = TestServer::launch();
-    server.initialize(root.path(), Value::Null);
+    server.initialize(root.path(), dcc_surface_options());
     server.send_notification(
         "textDocument/didOpen",
         json!({
@@ -2730,7 +2734,7 @@ fn diagnostics_map_missing_members_in_includes_to_the_physical_document() {
     write_file(&include, include_source);
 
     let mut server = TestServer::launch();
-    server.initialize(root.path(), Value::Null);
+    server.initialize(root.path(), dcc_surface_options());
     server.send_notification(
         "textDocument/didOpen",
         json!({
@@ -4526,7 +4530,7 @@ fn percent_encoded_at_sign_related_document_reports_use_the_client_uri() {
     let include_uri = encoded(&include);
 
     let mut server = TestServer::launch();
-    server.initialize_with_pull_diagnostics(&root);
+    server.initialize_with_pull_diagnostics_options(&root, dcc_surface_options());
     server.send_notification(
         "textDocument/didOpen",
         json!({
@@ -5249,7 +5253,7 @@ fn pull_document_diagnostics_returns_full_for_changed_foreign_and_empty_reports(
     write_file(&source, invalid);
 
     let mut server = TestServer::launch();
-    server.initialize_with_pull_diagnostics(root.path());
+    server.initialize_with_pull_diagnostics_options(root.path(), dcc_surface_options());
 
     let first_id = RequestId::from("pull-document-diagnostic-ids-first".to_string());
     server.send_request(
@@ -5411,7 +5415,7 @@ fn pull_document_diagnostics_returns_owned_related_include_reports() {
     write_file(&include, include_source);
 
     let mut server = TestServer::launch();
-    server.initialize_with_pull_diagnostics(root.path());
+    server.initialize_with_pull_diagnostics_options(root.path(), dcc_surface_options());
     let request_id = RequestId::from("pull-document-diagnostic-related".to_string());
     server.send_request(
         request_id.clone(),
@@ -5495,7 +5499,7 @@ fn related_document_clears_preserve_other_root_owners() {
     write_file(&second, &root_source("B"));
 
     let mut server = TestServer::launch();
-    server.initialize_with_pull_diagnostics(root.path());
+    server.initialize_with_pull_diagnostics_options(root.path(), dcc_surface_options());
     let pull = |server: &mut TestServer, id: &str, file: &Path, previous: Option<String>| {
         let request_id = RequestId::from(id.to_string());
         server.send_request(

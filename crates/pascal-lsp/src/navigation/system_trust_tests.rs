@@ -55,13 +55,176 @@ TObject\n\
 [defines]\n\
 MSWINDOWS\n\
 [members TObject]\n\
+Create\n\
+DisposeOf\n\
+Free\n\
 Present\n\
 [members IInterface]\n\
+QueryInterface\n\
 [members IUnknown]\n\
-[members TInterfacedObject]\n",
+QueryInterface\n\
+[members TInterfacedObject]\n\
+_AddRef\n",
         blake3_hex(source.as_bytes())
     );
     SurfaceTable::parse(&text).expect("synthetic surface table")
+}
+
+fn context_without_surface_table() -> ConditionalContext {
+    let version = CompilerVersion::new(38, 0);
+    ConditionalContext {
+        compiler_version: Some(version),
+        layout: LayoutContext::for_target(Some(version), Some(&TargetPlatform::Win32)),
+        ..ConditionalContext::default()
+    }
+}
+
+fn update_probe(source: &str, context: &ConditionalContext) -> (NavigationIndex, Url) {
+    let uri = Url::parse("file:///system-trust-tests/RootProbe.pas").unwrap();
+    let mut index = NavigationIndex::new();
+    index
+        .update_with_context_with_cancel(
+            uri.clone(),
+            source.to_owned(),
+            context,
+            &AtomicBool::new(false),
+        )
+        .expect("root probe indexes");
+    (index, uri)
+}
+
+fn with_context_table<R>(context: &ConditionalContext, body: impl FnOnce() -> R) -> R {
+    let key = SurfaceKey::from_context(context).expect("test context has a surface key");
+    with_test_table(key, table_for_system(SYSTEM_SOURCE), body)
+}
+
+fn cross_document_ancestor_probe(
+    provider_context: &ConditionalContext,
+    context: &ConditionalContext,
+) -> (NavigationIndex, Url) {
+    let provider_uri = Url::parse("file:///system-trust-tests/AncestorProvider.pas").unwrap();
+    let facade_uri = Url::parse("file:///system-trust-tests/AncestorFacade.pas").unwrap();
+    let consumer_uri = Url::parse("file:///system-trust-tests/AncestorConsumer.pas").unwrap();
+    let provider = concat!(
+        "unit AncestorProvider;\n",
+        "interface\n",
+        "{$IFDEF UNKNOWN_PARENT_MEMBERS}\n",
+        "const MaybePresent = 1;\n",
+        "{$ENDIF}\n",
+        "type TParent = class end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let facade = concat!(
+        "unit AncestorFacade;\n",
+        "interface\n",
+        "uses AncestorProvider;\n",
+        "type TBase = class(TParent) end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let consumer = concat!(
+        "unit AncestorConsumer;\n",
+        "interface\n",
+        "uses AncestorFacade;\n",
+        "type TFoo = class(TBase) end;\n",
+        "implementation\n",
+        "procedure Probe;\n",
+        "var Foo: TFoo;\n",
+        "begin\n",
+        "  Foo.Nope;\n",
+        "end;\n",
+        "end.\n",
+    );
+
+    let mut index = NavigationIndex::new();
+    index
+        .update_with_context_with_cancel(
+            provider_uri.clone(),
+            provider.to_owned(),
+            provider_context,
+            &AtomicBool::new(false),
+        )
+        .expect("ancestor provider indexes");
+    index
+        .update_with_context_with_cancel(
+            facade_uri.clone(),
+            facade.to_owned(),
+            context,
+            &AtomicBool::new(false),
+        )
+        .expect("ancestor facade indexes");
+    index
+        .update_with_context_with_cancel(
+            consumer_uri.clone(),
+            consumer.to_owned(),
+            context,
+            &AtomicBool::new(false),
+        )
+        .expect("ancestor consumer indexes");
+    index.bind_imports(
+        &facade_uri,
+        std::iter::once(("AncestorProvider".to_owned(), provider_uri)),
+    );
+    index.bind_imports(
+        &consumer_uri,
+        std::iter::once(("AncestorFacade".to_owned(), facade_uri)),
+    );
+    (index, consumer_uri)
+}
+
+fn direct_ancestor_probe(
+    provider_context: &ConditionalContext,
+    context: &ConditionalContext,
+) -> (NavigationIndex, Url) {
+    let provider_uri = Url::parse("file:///system-trust-tests/DirectAncestorProvider.pas").unwrap();
+    let consumer_uri = Url::parse("file:///system-trust-tests/DirectAncestorConsumer.pas").unwrap();
+    let provider = concat!(
+        "unit DirectAncestorProvider;\n",
+        "interface\n",
+        "{$IFDEF UNKNOWN_BASE_MEMBERS}\n",
+        "const MaybePresent = 1;\n",
+        "{$ENDIF}\n",
+        "type TBase = class end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let consumer = concat!(
+        "unit DirectAncestorConsumer;\n",
+        "interface\n",
+        "uses DirectAncestorProvider;\n",
+        "type TFoo = class(TBase) end;\n",
+        "implementation\n",
+        "procedure Probe;\n",
+        "var Foo: TFoo;\n",
+        "begin\n",
+        "  Foo.Nope;\n",
+        "end;\n",
+        "end.\n",
+    );
+
+    let mut index = NavigationIndex::new();
+    index
+        .update_with_context_with_cancel(
+            provider_uri.clone(),
+            provider.to_owned(),
+            provider_context,
+            &AtomicBool::new(false),
+        )
+        .expect("direct ancestor provider indexes");
+    index
+        .update_with_context_with_cancel(
+            consumer_uri.clone(),
+            consumer.to_owned(),
+            context,
+            &AtomicBool::new(false),
+        )
+        .expect("direct ancestor consumer indexes");
+    index.bind_imports(
+        &consumer_uri,
+        std::iter::once(("DirectAncestorProvider".to_owned(), provider_uri)),
+    );
+    (index, consumer_uri)
 }
 
 fn update_system_and_consumer(
@@ -106,6 +269,24 @@ fn diagnostics(index: &NavigationIndex, uri: &Url) -> Vec<SemanticDiagnostic> {
     index
         .semantic_diagnostics_with_cancel(uri, &AtomicBool::new(false))
         .expect("semantic diagnostics complete")
+}
+
+fn proof_status(
+    index: &NavigationIndex,
+    uri: &Url,
+    source: &str,
+    name: &str,
+) -> SemanticProofStatus {
+    let offset = source
+        .rfind(name)
+        .unwrap_or_else(|| panic!("missing {name:?} in probe"));
+    index
+        .semantic_proof_status_at_with_cancel(
+            uri,
+            text::offset_to_position(source, offset).expect("proof position"),
+            &AtomicBool::new(false),
+        )
+        .expect("semantic proof status")
 }
 
 fn span_description(source: &str, start: usize, end: usize) -> String {
@@ -192,7 +373,231 @@ fn hash_matched_system_is_closed_and_proves_missing_root_members() {
 }
 
 #[test]
-fn a_system_source_hash_mismatch_does_not_prove_missing_root_members() {
+fn parentless_class_uses_the_table_for_implicit_tobject_members() {
+    let context = context(TargetPlatform::Win32);
+    let source = concat!(
+        "unit ImplicitRootTableConsumer;\n",
+        "interface\n",
+        "type TFoo = class end;\n",
+        "implementation\n",
+        "procedure Probe;\n",
+        "var Foo: TFoo;\n",
+        "begin\n",
+        "  Foo.DisposeOf;\n",
+        "  Foo.Nope;\n",
+        "end;\n",
+        "end.\n",
+    );
+
+    let (index, uri) = update_probe(source, &context);
+    let diagnostics = with_context_table(&context, || diagnostics(&index, &uri));
+    let findings = e2003(&diagnostics);
+
+    assert_eq!(findings.len(), 1, "{diagnostics:?}");
+    assert_eq!(findings[0].message, "Undeclared identifier: 'Nope'");
+    assert_eq!(
+        with_context_table(&context, || proof_status(&index, &uri, source, "DisposeOf")),
+        SemanticProofStatus::Resolved
+    );
+    assert_eq!(
+        with_context_table(&context, || proof_status(&index, &uri, source, "Nope")),
+        SemanticProofStatus::ProvenAbsent
+    );
+}
+
+#[test]
+fn parentless_class_without_a_surface_table_keeps_root_member_proofs_incomplete() {
+    let context = context_without_surface_table();
+    let source = concat!(
+        "unit ImplicitRootNoTableConsumer;\n",
+        "interface\n",
+        "type TFoo = class end;\n",
+        "implementation\n",
+        "procedure Probe;\n",
+        "var Foo: TFoo;\n",
+        "begin\n",
+        "  Foo.DisposeOf;\n",
+        "  Foo.Nope;\n",
+        "end;\n",
+        "end.\n",
+    );
+
+    let (index, uri) = update_probe(source, &context);
+    let diagnostics = diagnostics(&index, &uri);
+    let findings = e2003(&diagnostics);
+
+    assert!(
+        findings.is_empty(),
+        "without a root member table, neither presence nor absence is provable: {findings:?}"
+    );
+    assert_eq!(
+        proof_status(&index, &uri, source, "DisposeOf"),
+        SemanticProofStatus::Incomplete
+    );
+    assert_eq!(
+        proof_status(&index, &uri, source, "Nope"),
+        SemanticProofStatus::Incomplete
+    );
+}
+
+#[test]
+fn incomplete_transitive_ancestor_provider_cannot_prove_member_absence() {
+    let context = context(TargetPlatform::Win32);
+    let provider_context = ConditionalContext {
+        absent_define: ConditionalFact::Unknown,
+        ..context.clone()
+    };
+    let (index, uri) = cross_document_ancestor_probe(&provider_context, &context);
+    let provider = index
+        .documents
+        .values()
+        .find(|document| document.unit_name == "ancestorprovider")
+        .expect("ancestor provider indexed");
+    assert!(!provider.conditionals.unknown_spans.is_empty());
+    assert!(provider.parser_recovery_spans.is_empty());
+
+    let diagnostics = with_context_table(&context, || diagnostics(&index, &uri));
+    let findings = e2003(&diagnostics);
+
+    assert!(
+        findings.is_empty(),
+        "the transitive ancestor provider has an unknown conditional span: {findings:?}"
+    );
+    let source = &index.documents.get(&uri).expect("consumer document").source;
+    assert_eq!(
+        proof_status(&index, &uri, source, "Nope"),
+        SemanticProofStatus::Incomplete
+    );
+}
+
+#[test]
+fn complete_transitive_ancestor_provider_allows_proving_member_absence() {
+    let context = context(TargetPlatform::Win32);
+    let provider_context = context.clone().with_absent_define(ConditionalFact::False);
+    let (index, uri) = cross_document_ancestor_probe(&provider_context, &context);
+    let provider = index
+        .documents
+        .values()
+        .find(|document| document.unit_name == "ancestorprovider")
+        .expect("ancestor provider indexed");
+    assert!(provider.conditionals.unknown_spans.is_empty());
+    assert!(provider.parser_recovery_spans.is_empty());
+
+    let diagnostics = with_context_table(&context, || diagnostics(&index, &uri));
+    let findings = e2003(&diagnostics);
+
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].message, "Undeclared identifier: 'Nope'");
+    let source = &index.documents.get(&uri).expect("consumer document").source;
+    assert_eq!(
+        proof_status(&index, &uri, source, "Nope"),
+        SemanticProofStatus::ProvenAbsent
+    );
+}
+
+#[test]
+fn direct_ancestor_provider_completeness_gates_member_absence() {
+    let context = context(TargetPlatform::Win32);
+    let incomplete_context = ConditionalContext {
+        absent_define: ConditionalFact::Unknown,
+        ..context.clone()
+    };
+    let (incomplete_index, incomplete_uri) = direct_ancestor_probe(&incomplete_context, &context);
+    let provider = incomplete_index
+        .documents
+        .values()
+        .find(|document| document.unit_name == "directancestorprovider")
+        .expect("direct ancestor provider indexed");
+    assert!(!provider.conditionals.unknown_spans.is_empty());
+    assert!(provider.parser_recovery_spans.is_empty());
+    let incomplete_diagnostics =
+        with_context_table(&context, || diagnostics(&incomplete_index, &incomplete_uri));
+    assert!(
+        e2003(&incomplete_diagnostics).is_empty(),
+        "an incomplete direct ancestor cannot prove absence: {incomplete_diagnostics:?}"
+    );
+
+    let complete_context = context.clone().with_absent_define(ConditionalFact::False);
+    let (complete_index, complete_uri) = direct_ancestor_probe(&complete_context, &context);
+    let provider = complete_index
+        .documents
+        .values()
+        .find(|document| document.unit_name == "directancestorprovider")
+        .expect("direct ancestor provider indexed");
+    assert!(provider.conditionals.unknown_spans.is_empty());
+    assert!(provider.parser_recovery_spans.is_empty());
+    let complete_diagnostics =
+        with_context_table(&context, || diagnostics(&complete_index, &complete_uri));
+    let findings = e2003(&complete_diagnostics);
+    assert_eq!(findings.len(), 1, "{complete_diagnostics:?}");
+    assert_eq!(findings[0].message, "Undeclared identifier: 'Nope'");
+}
+
+#[test]
+fn interfaced_object_members_use_the_table_when_system_is_not_loaded() {
+    let context = context(TargetPlatform::Win32);
+    let source = concat!(
+        "unit InterfacedObjectTableConsumer;\n",
+        "interface\n",
+        "type TFoo = class(TInterfacedObject) end;\n",
+        "implementation\n",
+        "procedure Probe;\n",
+        "var Foo: TFoo;\n",
+        "begin\n",
+        "  Foo._AddRef;\n",
+        "  Foo.Nope;\n",
+        "end;\n",
+        "end.\n",
+    );
+
+    let (index, uri) = update_probe(source, &context);
+    let diagnostics = with_context_table(&context, || diagnostics(&index, &uri));
+    let findings = e2003(&diagnostics);
+
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].message, "Undeclared identifier: 'Nope'");
+    assert_eq!(
+        with_context_table(&context, || proof_status(&index, &uri, source, "_AddRef")),
+        SemanticProofStatus::Resolved
+    );
+}
+
+#[test]
+fn parentless_interface_uses_the_table_for_implicit_iinterface_members() {
+    let context = context(TargetPlatform::Win32);
+    let source = concat!(
+        "unit ImplicitInterfaceTableConsumer;\n",
+        "interface\n",
+        "type IThing = interface end;\n",
+        "implementation\n",
+        "procedure Probe;\n",
+        "var Value: IThing;\n",
+        "begin\n",
+        "  Value.QueryInterface;\n",
+        "  Value.Nope;\n",
+        "end;\n",
+        "end.\n",
+    );
+
+    let (index, uri) = update_probe(source, &context);
+    let diagnostics = with_context_table(&context, || diagnostics(&index, &uri));
+    let findings = e2003(&diagnostics);
+
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].message, "Undeclared identifier: 'Nope'");
+    assert_eq!(
+        with_context_table(&context, || proof_status(
+            &index,
+            &uri,
+            source,
+            "QueryInterface"
+        )),
+        SemanticProofStatus::Resolved
+    );
+}
+
+#[test]
+fn a_system_source_hash_mismatch_falls_back_to_root_member_table() {
     let context = context(TargetPlatform::Win32);
     let key = SurfaceKey {
         major: 37,
@@ -207,7 +612,10 @@ fn a_system_source_hash_mismatch_does_not_prove_missing_root_members() {
             update_system_and_consumer(&changed_source, &context);
         let parsed_system = index.parsed_document(&system_uri).expect("System parsed");
         assert!(!parsed_system.conditionals.unknown_spans.is_empty());
-        assert!(e2003(&diagnostics(&index, &consumer_uri)).is_empty());
+        let diagnostics = diagnostics(&index, &consumer_uri);
+        let findings = e2003(&diagnostics);
+        assert_eq!(findings.len(), 1, "{diagnostics:?}");
+        assert_eq!(findings[0].message, "Undeclared identifier: 'Nope'");
     });
 }
 
@@ -226,7 +634,10 @@ fn a_system_hash_from_another_platform_does_not_close_the_parse() {
             update_system_and_consumer(SYSTEM_SOURCE, &other_platform_context);
         let parsed_system = index.parsed_document(&system_uri).expect("System parsed");
         assert!(!parsed_system.conditionals.unknown_spans.is_empty());
-        assert!(e2003(&diagnostics(&index, &consumer_uri)).is_empty());
+        let diagnostics = diagnostics(&index, &consumer_uri);
+        let findings = e2003(&diagnostics);
+        assert_eq!(findings.len(), 1, "{diagnostics:?}");
+        assert_eq!(findings[0].message, "Undeclared identifier: 'Nope'");
     });
 }
 

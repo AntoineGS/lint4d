@@ -1,5 +1,3 @@
 unit = "ConditionalBody.pas"
+compilers = ["21.0", "24.0", "37.0"]
 requires_rtl = false
-recall = false
-reason = "The default project context leaves UNKNOWN_SYMBOL's absence unproven, so E2065 must fail closed for this conditional unit."
-silent = ["E2065"]

@@ -794,8 +794,6 @@ pub(crate) enum SemanticProofStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SemanticDiagnosticKind {
-    UnresolvedIdentifier,
-    MissingMember,
     TypeMismatch,
     IncompatibleArgument,
     #[allow(dead_code)]
@@ -805,8 +803,6 @@ pub(crate) enum SemanticDiagnosticKind {
 impl SemanticDiagnosticKind {
     pub(crate) fn code(self) -> &'static str {
         match self {
-            Self::UnresolvedIdentifier => "pascal-unresolved-identifier",
-            Self::MissingMember => "pascal-missing-member",
             Self::TypeMismatch => "pascal-type-mismatch",
             Self::IncompatibleArgument => "pascal-incompatible-argument",
             Self::Dcc(message) => message.code(),
@@ -816,10 +812,7 @@ impl SemanticDiagnosticKind {
     pub(crate) fn severity(self) -> DccSeverity {
         match self {
             Self::Dcc(message) => message.severity(),
-            Self::UnresolvedIdentifier
-            | Self::MissingMember
-            | Self::TypeMismatch
-            | Self::IncompatibleArgument => DccSeverity::Error,
+            Self::TypeMismatch | Self::IncompatibleArgument => DccSeverity::Error,
         }
     }
 }
@@ -855,8 +848,7 @@ impl MissingUnitUseKind {
 
 fn semantic_diagnostic_kind_rank(kind: SemanticDiagnosticKind) -> u8 {
     match kind {
-        SemanticDiagnosticKind::UnresolvedIdentifier => 0,
-        SemanticDiagnosticKind::MissingMember => 1,
+        SemanticDiagnosticKind::Dcc(DccMessage::E2003) => 0,
         SemanticDiagnosticKind::TypeMismatch => 2,
         SemanticDiagnosticKind::IncompatibleArgument => 3,
         SemanticDiagnosticKind::Dcc(_) => 6,
@@ -2974,13 +2966,7 @@ impl NavigationIndex {
                 };
                 let kind = match status {
                     SemanticProofStatus::ProvenAbsent => {
-                        if member_expression_at(identifier)
-                            .is_some_and(|dot| is_right_hand_member(dot, identifier))
-                        {
-                            SemanticDiagnosticKind::MissingMember
-                        } else {
-                            SemanticDiagnosticKind::UnresolvedIdentifier
-                        }
+                        SemanticDiagnosticKind::Dcc(DccMessage::E2003)
                     }
                     SemanticProofStatus::Resolved
                     | SemanticProofStatus::Ambiguous
@@ -2990,17 +2976,7 @@ impl NavigationIndex {
                     break 'analysis;
                 }
                 let name = node_text(identifier, &document.source);
-                let message = match kind {
-                    SemanticDiagnosticKind::UnresolvedIdentifier => {
-                        format!("unresolved identifier '{name}'")
-                    }
-                    SemanticDiagnosticKind::MissingMember => {
-                        format!("missing member '{name}'")
-                    }
-                    SemanticDiagnosticKind::TypeMismatch
-                    | SemanticDiagnosticKind::IncompatibleArgument
-                    | SemanticDiagnosticKind::Dcc(_) => continue,
-                };
+                let message = DccMessage::E2003.format(&[&name]);
                 report.diagnostics.push(SemanticDiagnostic {
                     kind,
                     span: SourceSpan {
@@ -24435,7 +24411,7 @@ mod tests {
             .expect("semantic diagnostics complete");
 
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].kind, SemanticDiagnosticKind::MissingMember);
+        assert_eq!(diagnostics[0].kind.code(), "E2003");
         let start = source.rfind("Missing").expect("missing member");
         assert_eq!(
             diagnostics[0].span,
@@ -24444,7 +24420,7 @@ mod tests {
                 end: start + "Missing".len(),
             }
         );
-        assert_eq!(diagnostics[0].message, "missing member 'Missing'");
+        assert_eq!(diagnostics[0].message, "Undeclared identifier: 'Missing'");
     }
 
     #[test]
@@ -25938,12 +25914,12 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.message == "missing member 'UnknownName'")
+                .any(|diagnostic| diagnostic.message == "Undeclared identifier: 'UnknownName'")
         );
         assert!(
             !diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.message == "missing member 'Secret'")
+                .any(|diagnostic| diagnostic.message == "Undeclared identifier: 'Secret'")
         );
     }
 
@@ -26084,7 +26060,7 @@ mod tests {
             diagnostics.iter().all(|diagnostic| {
                 !matches!(
                     diagnostic.message.as_str(),
-                    "unresolved identifier 'Missing'" | "unresolved identifier 'AncestorMethod'"
+                    "Undeclared identifier: 'Missing'" | "Undeclared identifier: 'AncestorMethod'"
                 )
             }),
             "unknown receiver/ancestry must suppress claims: {diagnostics:?}"
@@ -26173,7 +26149,10 @@ mod tests {
 
         assert_eq!(
             messages,
-            vec!["missing member 'Missing'", "missing member 'Integer'"]
+            vec![
+                "Undeclared identifier: 'Missing'",
+                "Undeclared identifier: 'Integer'"
+            ]
         );
     }
 
@@ -26447,8 +26426,11 @@ mod tests {
             .expect("semantic diagnostics complete");
 
         assert_eq!(diagnostics.len(), 1, "only the missing export is absent");
-        assert_eq!(diagnostics[0].kind, SemanticDiagnosticKind::MissingMember);
-        assert_eq!(diagnostics[0].message, "missing member 'MissingExport'");
+        assert_eq!(diagnostics[0].kind.code(), "E2003");
+        assert_eq!(
+            diagnostics[0].message,
+            "Undeclared identifier: 'MissingExport'"
+        );
         let missing_offset = consumer.find("MissingExport").expect("missing export");
         assert_eq!(
             diagnostics[0].span,
@@ -27351,7 +27333,7 @@ mod tests {
         assert_eq!(
             messages,
             vec![
-                "missing member 'Missing'",
+                "Undeclared identifier: 'Missing'",
                 "incompatible argument: expected 'Integer', found 'non-writable expression'",
                 "incompatible argument: expected 'Integer', found 'Boolean'",
             ],
@@ -27730,7 +27712,10 @@ mod tests {
             diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
-            vec!["missing member 'Missing'", "missing member 'Missing'",],
+            vec![
+                "Undeclared identifier: 'Missing'",
+                "Undeclared identifier: 'Missing'",
+            ],
             "an unresolved index child prevents an outer element mismatch cascade: {diagnostics:?}"
         );
     }
@@ -28916,7 +28901,7 @@ mod tests {
             diagnostics.iter().all(|diagnostic| {
                 !matches!(
                     diagnostic.message.as_str(),
-                    "missing member 'Free'" | "missing member 'Create'"
+                    "Undeclared identifier: 'Free'" | "Undeclared identifier: 'Create'"
                 )
             }),
             "implicit class root members are not proven absent: {diagnostics:?}"
@@ -29145,9 +29130,9 @@ mod tests {
             report
                 .diagnostics
                 .iter()
-                .map(|diagnostic| (diagnostic.kind, diagnostic.span.start))
+                .map(|diagnostic| (diagnostic.kind.code(), diagnostic.span.start))
                 .collect::<Vec<_>>(),
-            vec![(SemanticDiagnosticKind::MissingMember, missing_start)]
+            vec![("E2003", missing_start)]
         );
         assert_eq!(report.gaps, vec![SemanticCoverageGap::Budget]);
     }

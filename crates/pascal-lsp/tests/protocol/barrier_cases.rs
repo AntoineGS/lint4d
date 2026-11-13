@@ -8003,7 +8003,7 @@ fn package_descriptor_batch_fallback_clears_then_pushes_fresh_provider_diagnosti
             .as_array()
             .unwrap()
             .iter()
-            .all(|diagnostic| diagnostic["message"] != "missing member 'Value'")
+            .all(|diagnostic| diagnostic["message"] != "Undeclared identifier: 'Value'")
     );
 
     let stamp = fs::metadata(&packages[0]).expect("package stamp");
@@ -8100,7 +8100,7 @@ fn package_descriptor_batch_fallback_clears_then_pushes_fresh_provider_diagnosti
                     assert!(
                         diagnostics
                             .iter()
-                            .any(|diagnostic| diagnostic["message"] == "missing member 'Value'"),
+                            .any(|diagnostic| diagnostic["message"] == "Undeclared identifier: 'Value'"),
                         "new full diagnostic must reflect provider B, not stale provider A: {notification:?}"
                     );
                     saw_new_full = true;

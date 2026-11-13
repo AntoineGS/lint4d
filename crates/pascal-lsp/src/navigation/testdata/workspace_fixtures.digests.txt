@@ -169,6 +169,8 @@ crates/lint4d/tests/fixtures/use_after_free/good_nil_checks_after_freeandnil.pas
 crates/lint4d/tests/fixtures/use_after_free/good_no_use_after_free.pas c90d770049a92b50 3
 crates/lint4d/tests/fixtures/use_after_free/good_reassign_after_free.pas 129376ac8f2191ac 3
 crates/pascal-lsp/tests/dcc_oracle/clean_unit/Clean.pas be2bd41795dedee4 10
+crates/pascal-lsp/tests/dcc_oracle/e2003_member_typo_record/E2003MemberTypoRecord.pas f935f4789a4ca965 5
+crates/pascal-lsp/tests/dcc_oracle/e2003_missing_member_local_root/E2003MissingMemberLocalRoot.pas 0f1c3c3934ff7c8f 7
 crates/pascal-lsp/tests/dcc_oracle/e2004_class_field_method/ClassFieldMethod.pas a240c99bd2bc89fa 4
 crates/pascal-lsp/tests/dcc_oracle/e2004_class_fields/ClassFields.pas 2db580b468e8fe40 4
 crates/pascal-lsp/tests/dcc_oracle/e2004_implementation_redeclaration/ImplementationRedeclaration.pas 5ffc669f3c4becaf 3

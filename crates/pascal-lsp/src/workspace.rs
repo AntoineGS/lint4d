@@ -6641,8 +6641,7 @@ impl Workspace {
                         matches!(
                             diagnostic.code.as_ref(),
                             Some(NumberOrString::String(code))
-                                if code == "pascal-unresolved-identifier"
-                                    || code == "pascal-missing-member"
+                                if code == "E2003"
                                     || code == "pascal-type-mismatch"
                                     || code == "pascal-incompatible-argument"
                         )
@@ -18462,6 +18461,28 @@ mod tests {
         );
         assert_eq!(diagnostic.source.as_deref(), Some("pascal-lsp"));
         assert_eq!(diagnostic.severity, Some(super::DiagnosticSeverity::HINT));
+    }
+
+    #[test]
+    fn semantic_lsp_diagnostic_publishes_e2003_as_an_error() {
+        let diagnostic = super::semantic_lsp_diagnostic(
+            crate::navigation::SemanticDiagnostic {
+                kind: crate::navigation::SemanticDiagnosticKind::Dcc(
+                    crate::navigation::DccMessage::E2003,
+                ),
+                span: crate::navigation::SourceSpan { start: 0, end: 3 },
+                message: "Undeclared identifier: 'Baz'".to_string(),
+            },
+            super::Range::default(),
+        );
+
+        assert_eq!(
+            diagnostic.code,
+            Some(super::NumberOrString::String("E2003".to_string()))
+        );
+        assert_eq!(diagnostic.source.as_deref(), Some("pascal-lsp"));
+        assert_eq!(diagnostic.severity, Some(super::DiagnosticSeverity::ERROR));
+        assert_eq!(diagnostic.message, "Undeclared identifier: 'Baz'");
     }
 
     /// Review M1/M2 (l4d-zgyw): a stopped analysis is named by its own

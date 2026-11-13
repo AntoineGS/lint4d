@@ -53,14 +53,16 @@ their identity.
 
 ### Source-semantic diagnostics
 
-In addition to lint4d rules, diagnostics report
-`pascal-unresolved-identifier` and `pascal-missing-member` only when the
-bounded source model proves absence. It also reports
+In addition to lint4d rules, diagnostics report dcc-compatible `E2003`
+(`Undeclared identifier: '<name>'`) only when the bounded source model proves
+absence. Member absences require complete source-backed ancestry; unqualified
+names stay silent when the implicit System surface is unknown. It also reports
 `pascal-type-mismatch` for a proven incompatible assignment and
 `pascal-incompatible-argument` for a proven incompatible argument to a
 source-declared routine. These are error diagnostics with stable messages:
 
 ```text
+Undeclared identifier: '<name>'
 type mismatch: cannot assign '<actual>' to '<expected>'
 incompatible argument: expected '<expected>', found '<actual>'
 ```
@@ -90,8 +92,7 @@ name, and all ranges map back to physical include files. The codes are:
 
 | Severity | Diagnostic | Code | Meaning |
 | --- | --- | --- | --- |
-| Error | Unresolved identifier | `pascal-unresolved-identifier` | Name is absent from the proven visible scope. |
-| Error | Missing member | `pascal-missing-member` | Member is absent from the proven receiver type. |
+| Error | Undeclared identifier | `E2003` | Name or member is absent from the proven visible scope or receiver type. |
 | Error | Type mismatch | `pascal-type-mismatch` | Proven expression types are incompatible. |
 | Error | Incompatible argument | `pascal-incompatible-argument` | Argument is incompatible with every proven overload. |
 | Error | Unsatisfied declaration | `E2065` | A non-exempt routine declaration has no matching definition. |

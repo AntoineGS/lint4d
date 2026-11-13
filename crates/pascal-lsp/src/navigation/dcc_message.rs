@@ -1,7 +1,8 @@
-// The catalogue lands before the corresponding semantic checks start emitting it.
+// Exact message text used by the dcc-parity semantic checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub(crate) enum DccMessage {
+    E2003,
     E2004,
     E2037,
     E2065,
@@ -28,6 +29,7 @@ pub(crate) enum DccSeverity {
 impl DccMessage {
     pub(crate) fn code(self) -> &'static str {
         match self {
+            Self::E2003 => "E2003",
             Self::E2004 => "E2004",
             Self::E2037 => "E2037",
             Self::E2065 => "E2065",
@@ -47,6 +49,7 @@ impl DccMessage {
     pub(crate) fn severity(self) -> DccSeverity {
         match self {
             Self::E2004
+            | Self::E2003
             | Self::E2037
             | Self::E2065
             | Self::E2137
@@ -63,6 +66,7 @@ impl DccMessage {
 
     pub(crate) fn template(self) -> &'static str {
         match self {
+            Self::E2003 => "Undeclared identifier: '%s'",
             Self::E2004 => "Identifier redeclared: '%s'",
             Self::E2037 => "Declaration of '%s' differs from previous declaration",
             Self::E2065 => "Unsatisfied forward or external declaration: '%s'",
@@ -111,12 +115,14 @@ mod tests {
     fn severity_follows_the_code_prefix() {
         assert_eq!(DccMessage::H2219.severity(), DccSeverity::Hint);
         assert_eq!(DccMessage::W1010.severity(), DccSeverity::Warning);
+        assert_eq!(DccMessage::E2003.severity(), DccSeverity::Error);
         assert_eq!(DccMessage::E2037.severity(), DccSeverity::Error);
     }
 
     #[test]
     fn every_message_has_its_exact_code_and_template() {
         let messages = [
+            (DccMessage::E2003, "E2003", "Undeclared identifier: '%s'"),
             (DccMessage::E2004, "E2004", "Identifier redeclared: '%s'"),
             (
                 DccMessage::E2037,

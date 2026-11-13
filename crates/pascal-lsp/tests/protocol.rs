@@ -309,7 +309,7 @@ fn compiled_dcu_source_navigation_serves_read_only_virtual_type() {
     assert!(
         !diagnostics
             .iter()
-            .any(|diagnostic| diagnostic["message"] == "missing member 'GetName'"),
+            .any(|diagnostic| diagnostic["message"] == "Undeclared identifier: 'GetName'"),
         "an omitted real compiled method is opaque, not proven absent: {diagnostics:?}"
     );
     // Assistance snapshots must discover/index selected-context DCUs on their
@@ -2243,7 +2243,9 @@ fn diagnostics_report_a_missing_member_with_utf16_and_crlf_coordinates() {
         "unit Main;\r\n",
         "interface\r\n",
         "type\r\n",
-        "  TBox = class\r\n",
+        "  TObject = class\r\n",
+        "  end;\r\n",
+        "  TBox = class(TObject)\r\n",
         "    Value: Integer;\r\n",
         "  end;\r\n",
         "implementation\r\n",
@@ -2276,14 +2278,15 @@ fn diagnostics_report_a_missing_member_with_utf16_and_crlf_coordinates() {
         .expect("diagnostics array");
     let diagnostic = diagnostics
         .iter()
-        .find(|diagnostic| diagnostic["code"] == "pascal-missing-member")
-        .expect("missing member diagnostic");
-    assert_eq!(diagnostic["message"], "missing member 'Missing'");
+        .find(|diagnostic| diagnostic["code"] == "E2003")
+        .unwrap_or_else(|| panic!("missing E2003 member diagnostic: {diagnostics:?}"));
+    assert_eq!(diagnostic["message"], "Undeclared identifier: 'Missing'");
+    assert_eq!(diagnostic["severity"], 1, "E2003 is an error");
     assert_eq!(
         diagnostic["range"],
         json!({
-            "start": {"line": 10, "character": 21},
-            "end": {"line": 10, "character": 28},
+            "start": {"line": 12, "character": 21},
+            "end": {"line": 12, "character": 28},
         })
     );
     server.shutdown();
@@ -2746,16 +2749,16 @@ fn diagnostics_map_missing_members_in_includes_to_the_physical_document() {
             .as_array()
             .expect("root diagnostics")
             .iter()
-            .all(|diagnostic| diagnostic["code"] != "pascal-missing-member")
+            .all(|diagnostic| diagnostic["code"] != "E2003")
     );
     let include_diagnostics = diagnostics_for_uri(&mut server, &uri(&include));
     let diagnostic = include_diagnostics["diagnostics"]
         .as_array()
         .expect("include diagnostics")
         .iter()
-        .find(|diagnostic| diagnostic["code"] == "pascal-missing-member")
+        .find(|diagnostic| diagnostic["code"] == "E2003")
         .expect("physical include missing member diagnostic");
-    assert_eq!(diagnostic["message"], "missing member 'Missing'");
+    assert_eq!(diagnostic["message"], "Undeclared identifier: 'Missing'");
     assert_eq!(
         diagnostic["range"],
         json!({
@@ -3048,8 +3051,8 @@ fn diagnostics_suppress_unknown_imports_and_inaccessible_members() {
     assert!(
         diagnostics
             .iter()
-            .all(|diagnostic| diagnostic["code"] != "pascal-missing-member"
-                && diagnostic["message"] != "unresolved identifier 'UnknownName'"),
+            .all(|diagnostic| diagnostic["code"] != "E2003"
+                && diagnostic["message"] != "Undeclared identifier: 'UnknownName'"),
         "unexpected diagnostics: {diagnostics:?}"
     );
     server.shutdown();
@@ -3114,7 +3117,7 @@ fn diagnostics_refresh_when_an_unsaved_provider_adds_the_missing_export() {
             .as_array()
             .expect("initial diagnostics")
             .iter()
-            .any(|diagnostic| diagnostic["message"] == "missing member 'Missing'")
+            .any(|diagnostic| diagnostic["message"] == "Undeclared identifier: 'Missing'")
     );
 
     server.send_notification(
@@ -3134,7 +3137,7 @@ fn diagnostics_refresh_when_an_unsaved_provider_adds_the_missing_export() {
             .as_array()
             .expect("refreshed diagnostics")
             .iter()
-            .all(|diagnostic| diagnostic["message"] != "missing member 'Missing'"),
+            .all(|diagnostic| diagnostic["message"] != "Undeclared identifier: 'Missing'"),
         "provider overlay should remove the consumer diagnostic: {refreshed}"
     );
     server.shutdown();
@@ -3299,8 +3302,8 @@ fn diagnostics_suppress_shared_include_claims_for_both_root_open_orders() {
                         .expect("include diagnostics")
                         .iter()
                         .all(|diagnostic| {
-                            !(diagnostic["code"] == "pascal-missing-member"
-                                && diagnostic["message"] == "missing member 'Value'")
+                            !(diagnostic["code"] == "E2003"
+                                && diagnostic["message"] == "Undeclared identifier: 'Value'")
                         }),
                     "shared include claim must be retracted for open order {open_order:?}: {diagnostics}"
                 );
@@ -3311,8 +3314,8 @@ fn diagnostics_suppress_shared_include_claims_for_both_root_open_orders() {
                         .expect("include diagnostics")
                         .iter()
                         .all(|diagnostic| {
-                            !(diagnostic["code"] == "pascal-missing-member"
-                                && diagnostic["message"] == "missing member 'Value'")
+                            !(diagnostic["code"] == "E2003"
+                                && diagnostic["message"] == "Undeclared identifier: 'Value'")
                         }),
                     "shared include claim must be suppressed for open order {open_order:?}: {diagnostics}"
                 );
@@ -3401,7 +3404,8 @@ fn diagnostics_suppress_shared_include_claims_for_incomplete_competing_roots_and
                         .as_array()
                         .expect("B diagnostics")
                         .iter()
-                        .any(|diagnostic| diagnostic["message"] == "missing member 'OwnTypoo'"),
+                        .any(|diagnostic| diagnostic["message"]
+                            == "Undeclared identifier: 'OwnTypoo'"),
                     "the competing root's independent local claim must remain visible: {root_diagnostics}"
                 );
             }
@@ -3415,7 +3419,7 @@ fn diagnostics_suppress_shared_include_claims_for_incomplete_competing_roots_and
                 .as_array()
                 .expect("initial shared diagnostics")
                 .iter()
-                .any(|diagnostic| diagnostic["message"] == "missing member 'SharedName'"),
+                .any(|diagnostic| diagnostic["message"] == "Undeclared identifier: 'SharedName'"),
             "initial claim should be visible before the competing root owns Shared.inc: {initial}"
         );
 
@@ -3447,7 +3451,9 @@ fn diagnostics_suppress_shared_include_claims_for_incomplete_competing_roots_and
                         .as_array()
                         .expect("shared diagnostics")
                         .iter()
-                        .all(|diagnostic| diagnostic["message"] != "missing member 'SharedName'")
+                        .all(|diagnostic| {
+                            diagnostic["message"] != "Undeclared identifier: 'SharedName'"
+                        })
                 }
             )
             .is_some(),
@@ -3478,7 +3484,9 @@ fn diagnostics_suppress_shared_include_claims_for_incomplete_competing_roots_and
                     .as_array()
                     .expect("shared diagnostics")
                     .iter()
-                    .all(|diagnostic| diagnostic["message"] != "missing member 'SharedName'"),
+                    .all(
+                        |diagnostic| diagnostic["message"] != "Undeclared identifier: 'SharedName'"
+                    ),
                 "incomplete overlay must not restore a physical include claim: {publication}"
             );
         }
@@ -3508,7 +3516,9 @@ fn diagnostics_suppress_shared_include_claims_for_incomplete_competing_roots_and
                     .as_array()
                     .expect("shared diagnostics")
                     .iter()
-                    .all(|diagnostic| diagnostic["message"] != "missing member 'SharedName'"),
+                    .all(
+                        |diagnostic| diagnostic["message"] != "Undeclared identifier: 'SharedName'"
+                    ),
                 "removing the missing include must not restore a claim while both roots remain owners: {publication}"
             );
         }
@@ -3527,7 +3537,9 @@ fn diagnostics_suppress_shared_include_claims_for_incomplete_competing_roots_and
                         .as_array()
                         .expect("shared diagnostics after close")
                         .iter()
-                        .any(|diagnostic| diagnostic["message"] == "missing member 'SharedName'")
+                        .any(|diagnostic| {
+                            diagnostic["message"] == "Undeclared identifier: 'SharedName'"
+                        })
                 }
             )
             .is_some(),
@@ -3601,7 +3613,8 @@ fn diagnostics_suppress_shared_claims_for_unknown_suffix_ownership() {
                         .as_array()
                         .expect("B diagnostics")
                         .iter()
-                        .any(|diagnostic| diagnostic["message"] == "missing member 'OwnTypoo'"),
+                        .any(|diagnostic| diagnostic["message"]
+                            == "Undeclared identifier: 'OwnTypoo'"),
                     "the competing root's independent local claim must remain visible: {root_diagnostics}"
                 );
             }
@@ -3629,7 +3642,9 @@ fn diagnostics_suppress_shared_claims_for_unknown_suffix_ownership() {
                     .as_array()
                     .expect("shared diagnostics")
                     .iter()
-                    .any(|diagnostic| diagnostic["message"] == "missing member 'SharedName'");
+                    .any(|diagnostic| {
+                        diagnostic["message"] == "Undeclared identifier: 'SharedName'"
+                    });
                 if has_claim {
                     saw_physical_claim.set(true);
                     false
@@ -4720,8 +4735,8 @@ fn workspace_pull_suppresses_shared_include_claims_for_unopened_and_open_roots()
             .any(|report| {
                 report["items"].as_array().is_some_and(|items| {
                     items.iter().any(|diagnostic| {
-                        diagnostic["code"] == "pascal-missing-member"
-                            && diagnostic["message"] == "missing member 'Missing'"
+                        diagnostic["code"] == "E2003"
+                            && diagnostic["message"] == "Undeclared identifier: 'Missing'"
                     })
                 })
             })
@@ -4766,8 +4781,8 @@ fn workspace_pull_suppresses_shared_include_claims_for_unopened_and_open_roots()
             .any(|report| {
                 report["items"].as_array().is_some_and(|items| {
                     items.iter().any(|diagnostic| {
-                        diagnostic["code"] == "pascal-missing-member"
-                            && diagnostic["message"] == "missing member 'Missing'"
+                        diagnostic["code"] == "E2003"
+                            && diagnostic["message"] == "Undeclared identifier: 'Missing'"
                     })
                 })
             })
@@ -4805,8 +4820,8 @@ fn workspace_pull_suppresses_shared_include_claims_for_unopened_and_open_roots()
     {
         let diagnostics = report["items"].as_array().map_or(&[][..], Vec::as_slice);
         assert!(!diagnostics.iter().any(|diagnostic| {
-            diagnostic["code"] == "pascal-missing-member"
-                && diagnostic["message"] == "missing member 'Missing'"
+            diagnostic["code"] == "E2003"
+                && diagnostic["message"] == "Undeclared identifier: 'Missing'"
         }));
     }
     server.shutdown();
@@ -5432,7 +5447,7 @@ fn pull_document_diagnostics_returns_owned_related_include_reports() {
             .as_array()
             .expect("include related diagnostics")
             .iter()
-            .any(|diagnostic| diagnostic["message"] == "missing member 'Missing'")
+            .any(|diagnostic| diagnostic["message"] == "Undeclared identifier: 'Missing'")
     );
 
     let fixed_include = include_source.replace("Missing", "Value");
@@ -5508,11 +5523,9 @@ fn related_document_clears_preserve_other_root_owners() {
         .as_object()
         .expect("second root related reports");
     assert!(second_related.values().any(|report| {
-        report["items"].as_array().is_some_and(|items| {
-            items
-                .iter()
-                .any(|diagnostic| diagnostic["code"] == "pascal-missing-member")
-        })
+        report["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|diagnostic| diagnostic["code"] == "E2003"))
     }));
 
     let fixed_first = root_source("A").replace("{$I Shared.inc}", "");
@@ -5527,11 +5540,9 @@ fn related_document_clears_preserve_other_root_owners() {
         .as_object()
         .expect("remaining related owner report");
     assert!(related_after_clear.values().any(|report| {
-        report["items"].as_array().is_some_and(|items| {
-            items
-                .iter()
-                .any(|diagnostic| diagnostic["code"] == "pascal-missing-member")
-        })
+        report["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|diagnostic| diagnostic["code"] == "E2003"))
     }));
     server.shutdown();
 }
@@ -37396,7 +37407,7 @@ fn code_action_adds_a_unique_provider_unit_and_reanalysis_resolves_the_use() {
             .as_array()
             .expect("reanalysis diagnostics")
             .iter()
-            .any(|diagnostic| diagnostic["code"] == "pascal-unresolved-identifier")
+            .any(|diagnostic| diagnostic["code"] == "E2003")
     );
     server.shutdown();
 }
@@ -37506,7 +37517,7 @@ fn code_action_resolve_adds_a_missing_provider_unit_when_edit_resolution_is_adve
             .as_array()
             .expect("reanalysis diagnostics")
             .iter()
-            .any(|diagnostic| diagnostic["code"] == "pascal-unresolved-identifier")
+            .any(|diagnostic| diagnostic["code"] == "E2003")
     );
     server.shutdown();
 }

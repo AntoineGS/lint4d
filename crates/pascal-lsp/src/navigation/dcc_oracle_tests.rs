@@ -2,9 +2,9 @@
 //! codes in `ENABLED_CODES`, the semantic pass must report exactly what dcc
 //! recorded (precision always; recall unless a case needs the RTL and
 //! `PASCAL_RTL_<version>` is unset).
-use super::dcc_surface::{SurfaceKey, table_for};
+use super::dcc_surface::{SurfaceKey, SurfacePlatform, table_for, verified_system_context};
 use super::*;
-use pascal_project::{CompilerVersion, ConditionalFact, LayoutContext, TargetPlatform};
+use pascal_project::{CompilerVersion, ConditionalFact};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -48,20 +48,14 @@ fn cases_root() -> PathBuf {
 fn oracle_context(version: &str) -> ConditionalContext {
     let compiler_version = CompilerVersion::parse(version)
         .unwrap_or_else(|| panic!("unsupported Delphi compiler version {version:?}"));
-    let mut context = ConditionalContext {
-        compiler_version: Some(compiler_version),
-        layout: LayoutContext::for_target(Some(compiler_version), Some(&TargetPlatform::Win32)),
-        ..ConditionalContext::default()
-    }
-    .with_absent_define(ConditionalFact::False);
-    let key = SurfaceKey::from_context(&context)
-        .unwrap_or_else(|| panic!("no dcc surface key for compiler {version}"));
+    let key = SurfaceKey {
+        major: compiler_version.major,
+        minor: compiler_version.minor,
+        platform: SurfacePlatform::Win32,
+    };
     let table = table_for(&key)
         .unwrap_or_else(|| panic!("no dcc surface table for compiler {version}-Win32"));
-    for define in table.defines() {
-        context.set_define(define, ConditionalFact::True);
-    }
-    context
+    verified_system_context(&key, &table)
 }
 
 fn rtl_root(version: &str) -> Option<PathBuf> {

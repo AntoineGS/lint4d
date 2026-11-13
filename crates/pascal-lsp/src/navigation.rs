@@ -90,6 +90,8 @@ mod dcc_surface;
 mod declarations;
 #[cfg(test)]
 mod surface_tests;
+#[cfg(test)]
+mod system_trust_tests;
 pub(crate) use dcc_message::{DccMessage, DccSeverity};
 mod documentation;
 mod facts;
@@ -1345,10 +1347,19 @@ impl NavigationIndex {
             .documents
             .get(&uri)
             .map(|document| document.parsed.clone());
+        let system_context = uri
+            .to_file_path()
+            .ok()
+            .filter(|path| {
+                path.file_stem()
+                    .is_some_and(|stem| stem.to_string_lossy().eq_ignore_ascii_case("system"))
+            })
+            .and_then(|_| dcc_surface::verified_system_key(context, &source))
+            .map(|(key, table)| dcc_surface::verified_system_context(&key, &table));
         let document = Document::parse_with_session(
             uri.clone(),
             source,
-            context,
+            system_context.as_ref().unwrap_or(context),
             cancel,
             previous.or(cached),
             expansion,

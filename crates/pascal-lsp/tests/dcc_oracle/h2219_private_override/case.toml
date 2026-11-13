@@ -1,5 +1,4 @@
 unit = "PrivateOverride.pas"
 requires_rtl = true
 recall = false
-reason = "The contract ancestry model still cannot prove Delphi's compiler-provided TObject virtual inventory, even with System.pas loaded; keep W1010 silent rather than infer it."
-silent = ["W1010"]
+reason = "Delphi 13's hash-matching System.pas still has 52 parser-recovery spans under the verified context; the incomplete provider prevents proving TObject.Dispatch and W1010 remains missed."

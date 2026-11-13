@@ -5,7 +5,10 @@ mod format;
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use format::{parse as parse_table_format, write as write_table_format};
 
-use pascal_project::{ConditionalContext, LayoutPlatform};
+use pascal_project::{
+    CompilerVersion, ConditionalContext, ConditionalFact, LayoutContext, LayoutPlatform,
+    TargetPlatform,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
@@ -149,6 +152,40 @@ pub(crate) fn table_for(key: &SurfaceKey) -> Option<Arc<SurfaceTable>> {
             .collect()
     });
     tables.get(&key.file_stem()).cloned()
+}
+
+/// Return the closed conditional context in which the surface table's
+/// System.pas was verified for this compiler and platform.
+pub(crate) fn verified_system_context(
+    key: &SurfaceKey,
+    table: &SurfaceTable,
+) -> ConditionalContext {
+    let compiler_version = CompilerVersion::new(key.major, key.minor);
+    let target_platform = match key.platform {
+        SurfacePlatform::Win32 => TargetPlatform::Win32,
+        SurfacePlatform::Win64 => TargetPlatform::Win64,
+    };
+    let mut context = ConditionalContext {
+        compiler_version: Some(compiler_version),
+        layout: LayoutContext::for_target(Some(compiler_version), Some(&target_platform)),
+        ..ConditionalContext::default()
+    }
+    .with_absent_define(ConditionalFact::False);
+    for define in table.defines() {
+        context.set_define(define, ConditionalFact::True);
+    }
+    context
+}
+
+/// Return the table key only when `source` is byte-identical to the System.pas
+/// used to derive that table.
+pub(crate) fn verified_system_key(
+    context: &ConditionalContext,
+    source: &str,
+) -> Option<(SurfaceKey, Arc<SurfaceTable>)> {
+    let key = SurfaceKey::from_context(context)?;
+    let table = table_for(&key)?;
+    (blake3_hex(source.as_bytes()) == table.system_blake3).then_some((key, table))
 }
 
 #[cfg(test)]

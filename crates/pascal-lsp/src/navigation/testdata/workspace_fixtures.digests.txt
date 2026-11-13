@@ -177,6 +177,7 @@ crates/pascal-lsp/tests/dcc_oracle/e2003_class_helper/E2003ClassHelper.pas f8480
 crates/pascal-lsp/tests/dcc_oracle/e2003_generic_params/E2003GenericParams.pas dc850ef6df45aea3 10
 crates/pascal-lsp/tests/dcc_oracle/e2003_inactive_branch/E2003InactiveBranch.pas 4883759b6b56865d 2
 crates/pascal-lsp/tests/dcc_oracle/e2003_inline_var_and_closure/E2003InlineVarAndClosure.pas 6f3560fea096e8f9 5
+crates/pascal-lsp/tests/dcc_oracle/e2003_member_of_system_rooted_class/E2003MemberOfSystemRootedClass.pas 0d2879853b32b26d 6
 crates/pascal-lsp/tests/dcc_oracle/e2003_member_typo_record/E2003MemberTypoRecord.pas f935f4789a4ca965 5
 crates/pascal-lsp/tests/dcc_oracle/e2003_missing_member_local_root/E2003MissingMemberLocalRoot.pas 0f1c3c3934ff7c8f 7
 crates/pascal-lsp/tests/dcc_oracle/e2003_misspelt_builtin/E2003MisspeltBuiltin.pas dabbf6300aa31ddc 2

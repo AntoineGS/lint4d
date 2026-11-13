@@ -55,7 +55,10 @@ their identity.
 
 In addition to lint4d rules, diagnostics report dcc-compatible `E2003`
 (`Undeclared identifier: '<name>'`) only when the bounded source model proves
-absence. Member absences require complete source-backed ancestry; unqualified
+absence. Member absences normally require complete source-backed ancestry; for
+the four System roots (`TObject`, `TInterfacedObject`, `IInterface`, and
+`IUnknown`), matching compiler/platform tables can also prove the member
+surface. Table-backed proofs do not create navigation targets. Unqualified
 names stay silent when the implicit System surface is unknown. It also reports
 `pascal-type-mismatch` for a proven incompatible assignment and
 `pascal-incompatible-argument` for a proven incompatible argument to a

@@ -1467,7 +1467,10 @@ impl NavigationIndex {
             })
             .filter(|_| unit == "system")
             .and_then(|_| dcc_surface::verified_system_key(context, &parsed.source))
-            .map(|(key, _)| key);
+            .and_then(|(key, table)| {
+                (parsed.conditional_context == dcc_surface::verified_system_context(&key, &table))
+                    .then_some(key)
+            });
         self.documents.insert(
             uri.clone(),
             Document {
@@ -31184,6 +31187,32 @@ mod insert_parsed_tests {
         index.parsed_document(uri).unwrap()
     }
 
+    fn system_surface(source: &str) -> (dcc_surface::SurfaceKey, dcc_surface::SurfaceTable) {
+        let key = dcc_surface::SurfaceKey {
+            major: 37,
+            minor: 0,
+            platform: dcc_surface::SurfacePlatform::Win32,
+        };
+        let table = format!(
+            "# dcc-surface v1\n\
+             # banner: Embarcadero Delphi for Win32 compiler version 37.0\n\
+             # script-version: 1\n\
+             # system-blake3: {}\n\
+             # sysinit-blake3: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\
+             # candidates: 1\n\
+             [surface]\n\
+             TObject\n\
+             [defines]\n\
+             MSWINDOWS\n\
+             [members TObject]\n\
+             [members IInterface]\n\
+             [members IUnknown]\n\
+             [members TInterfacedObject]\n",
+            dcc_surface::blake3_hex(source.as_bytes())
+        );
+        (key, dcc_surface::SurfaceTable::parse(&table).unwrap())
+    }
+
     #[test]
     fn insert_parsed_shares_a_cached_document_without_replacing_one() {
         let uri = Url::parse("file:///ws/Base.pas").unwrap();
@@ -31216,5 +31245,36 @@ mod insert_parsed_tests {
 
         assert!(!index.insert_parsed(uri.clone(), document, &other));
         assert!(!index.contains(&uri));
+    }
+
+    #[test]
+    fn insert_parsed_does_not_trust_system_parsed_with_unknown_absent_define() {
+        let uri = Url::parse("file:///ws/System.pas").unwrap();
+        let source = "unit System;\ninterface\ntype TObject = class end;\nimplementation\nend.\n";
+        let (key, table) = system_surface(source);
+        let verified_context = dcc_surface::verified_system_context(&key, &table);
+        let project_context = verified_context
+            .clone()
+            .with_absent_define(pascal_project::ConditionalFact::Unknown);
+        let mut parser = NavigationIndex::new();
+        parser
+            .update_with_context_and_cached_with_cancel(
+                uri.clone(),
+                source.to_owned(),
+                &project_context,
+                None,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let parsed = parser.parsed_document(&uri).unwrap();
+        let mut index = NavigationIndex::new();
+
+        dcc_surface::with_test_table(key, table, || {
+            assert!(index.insert_parsed(uri.clone(), parsed, &project_context));
+            assert_eq!(
+                index.documents[&uri].verified_system_surface, None,
+                "a hash match is not proof that this cached parse used the verified context"
+            );
+        });
     }
 }

@@ -80,3 +80,25 @@ When set, the oracle test loads that version's `rtl/sys/System.pas` into the
 navigation index for each `requires_rtl = true` case and binds the case units
 to it, allowing source-backed resolution of `TObject`, `TInterfacedObject`, and
 `IInterface`.
+
+## RTL/VCL E2003 corpus precision check
+
+The ignored developer test indexes every `.pas` file under `rtl/sys`,
+`rtl/common`, `rtl/win`, and `vcl`, binds imports by their exact `uses` unit
+name (including dotted unit/file stems), and checks that the five supported
+Windows keys produce no E2003 findings. Set all three version roots to run all
+five keys; `PASCAL_CORPUS_<major>_<minor>` can add another dcc-clean tree for a
+version.
+
+```sh
+PASCAL_RTL_21_0="$HOME/.local/share/Headless-Delphi/files/RAD Studio/7.0/source/Win32" \
+PASCAL_RTL_24_0="$HOME/.local/share/Headless-Delphi/files/RAD Studio/10.0/source" \
+PASCAL_RTL_37_0="$HOME/.local/share/Headless-Delphi/files/Studio/37.0/source" \
+  cargo test -p pascal-lsp --lib corpus_reports_no_e2003_on_dcc_clean_rtl -- --ignored --nocapture
+```
+
+The report prints per-key file counts, skipped and lossily decoded files,
+E2003 locations, resolved/proven-absent proof counts, and table-backed implicit
+System decisions. `System.Internal.Unwinder` is reported as skipped on these
+Windows keys because its unwinder library binding is only defined for Linux or
+macOS.

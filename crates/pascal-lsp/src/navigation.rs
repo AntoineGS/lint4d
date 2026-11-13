@@ -83,6 +83,8 @@ mod assistance;
 mod call_hierarchy;
 pub mod compiled_dcu;
 mod contracts;
+#[cfg(test)]
+mod corpus_precision_tests;
 mod dcc_message;
 #[cfg(test)]
 mod dcc_oracle_tests;
@@ -214,6 +216,62 @@ thread_local! {
     static TEST_QUALIFIED_IDENTIFIER_CANCEL_REQUESTED: Cell<bool> = const { Cell::new(false) };
     static TEST_UNIT_PATH_NODE_VISITS: Cell<usize> = const { Cell::new(0) };
     static TEST_CANCEL_AFTER_UNIT_PATH_NODE_VISITS: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SemanticProofCounters {
+    pub(super) resolved: usize,
+    pub(super) proven_absent: usize,
+    pub(super) table_backed_implicit_system: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SEMANTIC_PROOF_COUNTERS: Cell<SemanticProofCounters> = const {
+        Cell::new(SemanticProofCounters {
+            resolved: 0,
+            proven_absent: 0,
+            table_backed_implicit_system: 0,
+        })
+    };
+}
+
+#[cfg(test)]
+pub(super) fn test_reset_semantic_proof_counters() {
+    TEST_SEMANTIC_PROOF_COUNTERS.with(|counters| counters.set(SemanticProofCounters::default()));
+}
+
+#[cfg(test)]
+pub(super) fn test_semantic_proof_counters() -> SemanticProofCounters {
+    TEST_SEMANTIC_PROOF_COUNTERS.with(Cell::get)
+}
+
+#[cfg(test)]
+fn test_record_semantic_proof_status(status: SemanticProofStatus) {
+    TEST_SEMANTIC_PROOF_COUNTERS.with(|slot| {
+        let mut counters = slot.get();
+        match status {
+            SemanticProofStatus::Resolved => {
+                counters.resolved = counters.resolved.saturating_add(1)
+            }
+            SemanticProofStatus::ProvenAbsent => {
+                counters.proven_absent = counters.proven_absent.saturating_add(1)
+            }
+            SemanticProofStatus::Incomplete | SemanticProofStatus::Ambiguous => return,
+        }
+        slot.set(counters);
+    });
+}
+
+#[cfg(test)]
+fn test_record_table_backed_implicit_system_decision() {
+    TEST_SEMANTIC_PROOF_COUNTERS.with(|slot| {
+        let mut counters = slot.get();
+        counters.table_backed_implicit_system =
+            counters.table_backed_implicit_system.saturating_add(1);
+        slot.set(counters);
+    });
 }
 
 #[cfg(test)]
@@ -6648,6 +6706,8 @@ impl NavigationIndex {
                 .and_then(|surface| dcc_surface::table_for(&surface))
                 .is_some()
         {
+            #[cfg(test)]
+            test_record_semantic_proof_status(SemanticProofStatus::Resolved);
             return Ok(SemanticProofStatus::Resolved);
         }
 
@@ -6662,9 +6722,13 @@ impl NavigationIndex {
             return Ok(SemanticProofStatus::Incomplete);
         }
         if !candidates.is_empty() {
+            #[cfg(test)]
+            test_record_semantic_proof_status(SemanticProofStatus::Resolved);
             return Ok(SemanticProofStatus::Resolved);
         }
         if state.compiler_surface_resolved {
+            #[cfg(test)]
+            test_record_semantic_proof_status(SemanticProofStatus::Resolved);
             return Ok(SemanticProofStatus::Resolved);
         }
         if state.ambiguous {
@@ -6677,6 +6741,8 @@ impl NavigationIndex {
         {
             return Ok(SemanticProofStatus::Incomplete);
         }
+        #[cfg(test)]
+        test_record_semantic_proof_status(SemanticProofStatus::ProvenAbsent);
         Ok(SemanticProofStatus::ProvenAbsent)
     }
 
@@ -7888,8 +7954,22 @@ impl NavigationIndex {
                 WithLookup::NotFound => {}
             }
         }
-        let owner_type =
-            document.owner_type_at_identifier_with_budget(identifier, scope, cancel, budget)?;
+        let owner_type = if let Some(owner_type) =
+            document.owner_type_at_identifier_with_budget(identifier, scope, cancel, budget)?
+        {
+            if document.owner_type_is_alias_definition_context_with_budget(
+                &owner_type,
+                identifier.start_byte(),
+                cancel,
+                budget,
+            )? {
+                None
+            } else {
+                Some(owner_type)
+            }
+        } else {
+            None
+        };
 
         let scope_chain = self.scope_chain_from_with_budget(document, scope, cancel, budget)?;
         budget.require_bytes(
@@ -8142,7 +8222,7 @@ impl NavigationIndex {
     ) -> Result<Vec<Candidate>, String> {
         let uri = match self.implicit_system_namespace_status() {
             ImplicitSystemNamespaceStatus::Unavailable => {
-                self.apply_compiler_surface_fallback(document, key, state);
+                self.apply_implicit_system_surface_fallback(document, key, state);
                 return Ok(Vec::new());
             }
             ImplicitSystemNamespaceStatus::Ambiguous => {
@@ -8152,7 +8232,7 @@ impl NavigationIndex {
             ImplicitSystemNamespaceStatus::SourceBacked { uri } => uri,
         };
         let Some(provider) = self.documents.get(&uri) else {
-            self.apply_compiler_surface_fallback(document, key, state);
+            self.apply_implicit_system_surface_fallback(document, key, state);
             return Ok(Vec::new());
         };
         budget.require_work(
@@ -8165,13 +8245,57 @@ impl NavigationIndex {
         if !provider.parser_recovery_spans.is_empty()
             || !provider.conditionals.unknown_spans.is_empty()
         {
-            self.apply_compiler_surface_fallback(document, key, state);
+            if document.unit_name == "sysinit" && matches!(key, "_startexe" | "_startlib") {
+                let candidates =
+                    self.exported_references_for_key_with_budget(&uri, key, cancel, budget)?;
+                if !candidates.is_empty()
+                    && candidates
+                        .iter()
+                        .all(|candidate| !self.candidate_is_conditionally_unknown(candidate))
+                {
+                    // Known declarations in these exact compiler-hidden
+                    // exports are usable by SysInit even when unrelated
+                    // System source is incomplete.
+                    return Ok(candidates);
+                }
+
+                let verified_key =
+                    dcc_surface::SurfaceKey::from_context(&document.conditional_context);
+                let system_matches_importer = verified_key.as_ref().is_some_and(|surface| {
+                    provider.verified_system_surface.as_ref() == Some(surface)
+                        && dcc_surface::table_for(surface)
+                            .is_some_and(|table| table.is_defined("MSWINDOWS"))
+                });
+                if system_matches_importer {
+                    let declared_by_system = candidates.iter().any(|candidate| {
+                        self.documents
+                            .get(&candidate.uri)
+                            .and_then(|system| system.symbols.get(candidate.index))
+                            .is_some_and(|symbol| {
+                                symbol.kind == SymbolKind::Routine
+                                    && symbol.region == Region::Interface
+                                    && symbol.origin == Origin::Declaration
+                            })
+                    });
+                    if declared_by_system {
+                        // These exact declarations are compiler-hidden from
+                        // ordinary units, but SysInit consumes them. Accept
+                        // them only for the exact System.pas hash and Windows
+                        // key used to derive the table; a failed global
+                        // conditional analysis must not invalidate that
+                        // source-level bootstrap fact (l4d-1m02.3.1).
+                        state.mark_compiler_surface_resolved();
+                        return Ok(Vec::new());
+                    }
+                }
+            }
+            self.apply_implicit_system_surface_fallback(document, key, state);
             return Ok(Vec::new());
         }
 
         let candidates = self.exported_references_for_key_with_budget(&uri, key, cancel, budget)?;
         if candidates.is_empty() {
-            self.apply_compiler_surface_fallback(document, key, state);
+            self.apply_implicit_system_surface_fallback(document, key, state);
         }
         Ok(candidates)
     }
@@ -8219,13 +8343,32 @@ impl NavigationIndex {
         document: &Document,
         key: &str,
         state: &mut ResolutionState,
-    ) {
+    ) -> bool {
         let table = dcc_surface::SurfaceKey::from_context(&document.conditional_context)
             .and_then(|surface| dcc_surface::table_for(&surface));
         match table {
-            Some(table) if table.has_name(key) => state.mark_compiler_surface_resolved(),
-            Some(_) => {}
-            None => state.mark_implicit_system_namespace_incomplete(),
+            Some(table) => {
+                if table.has_name(key) {
+                    state.mark_compiler_surface_resolved();
+                }
+                true
+            }
+            None => {
+                state.mark_implicit_system_namespace_incomplete();
+                false
+            }
+        }
+    }
+
+    fn apply_implicit_system_surface_fallback(
+        &self,
+        document: &Document,
+        key: &str,
+        state: &mut ResolutionState,
+    ) {
+        if self.apply_compiler_surface_fallback(document, key, state) {
+            #[cfg(test)]
+            test_record_table_backed_implicit_system_decision();
         }
     }
 
@@ -8278,6 +8421,54 @@ impl NavigationIndex {
                         && symbol.routine_key.as_ref().is_some_and(|routine_key| {
                             document.interface_routine_keys.contains(routine_key)
                         })))
+            {
+                result.push(Candidate {
+                    uri: uri.clone(),
+                    index: *index,
+                });
+            }
+        }
+        Ok(result)
+    }
+
+    fn current_unit_references_for_key_with_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        offset: usize,
+        key: &str,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
+        budget.require_bytes(key.len(), cancel)?;
+        let key = key.to_owned();
+        let Some(indices) = document.symbol_indices_by_scope_key.get(&(ROOT_SCOPE, key)) else {
+            return Ok(Vec::new());
+        };
+        budget.require_work(indices.len(), cancel)?;
+        budget.require_bytes(uri.as_str().len().saturating_mul(indices.len()), cancel)?;
+        budget.require_owned_bytes(
+            indices
+                .len()
+                .saturating_mul(std::mem::size_of::<Candidate>()),
+            cancel,
+        )?;
+        let region = document.region_at(offset);
+        let mut result = Vec::with_capacity(indices.len());
+        for index in indices {
+            check_navigation_cancel(cancel)?;
+            let Some(symbol) = document.symbols.get(*index) else {
+                continue;
+            };
+            if symbol.kind != SymbolKind::Unit
+                && !symbol.local_only
+                && document.has_unqualified_owner(*index, symbol)
+                && symbol.generic_parameter.is_none()
+                && !symbol.unresolved_abbreviated
+                && symbol_is_available_at_with_budget(
+                    document, symbol, uri, uri, offset, cancel, budget,
+                )?
+                && symbol_visible_in_region(symbol, region)
             {
                 result.push(Candidate {
                     uri: uri.clone(),
@@ -8362,6 +8553,17 @@ impl NavigationIndex {
             budget.require_work(1, cancel)?;
             match receiver {
                 Receiver::Unit(unit_uri) => {
+                    if unit_uri == *current_uri {
+                        references.extend(self.current_unit_references_for_key_with_budget(
+                            current_uri,
+                            current_document,
+                            offset,
+                            &key,
+                            cancel,
+                            budget,
+                        )?);
+                        continue;
+                    }
                     let system_document = self
                         .documents
                         .get(&unit_uri)
@@ -11763,6 +11965,41 @@ impl NavigationIndex {
             let Some(document) = self.documents.get(type_uri) else {
                 return Ok(None);
             };
+            if let Some(indices) = document.type_symbol_indices.get(type_key) {
+                budget.require_work(indices.len(), cancel)?;
+                if indices.len() == 1
+                    && let Some(symbol) = document.symbols.get(indices[0])
+                    && symbol.kind == SymbolKind::Type
+                    && symbol.type_kind == TypeKind::Other
+                    && let Some(alias_ref) = symbol.type_ref.as_ref()
+                {
+                    if alias_ref.path.len() == 1 && alias_ref.args.is_empty() {
+                        let alias_key = canonical_name(&alias_ref.path[0]);
+                        if let Some(alias_indices) = document.type_symbol_indices.get(&alias_key) {
+                            budget.require_work(alias_indices.len(), cancel)?;
+                            if alias_indices.len() == 1
+                                && document
+                                    .symbols
+                                    .get(alias_indices[0])
+                                    .is_some_and(|symbol| symbol.kind == SymbolKind::Type)
+                            {
+                                return self.member_owner_substitution_with_budget_inner(
+                                    type_uri,
+                                    &alias_key,
+                                    substitution,
+                                    owner_uri,
+                                    owner_key,
+                                    state,
+                                    active,
+                                    cancel,
+                                    budget,
+                                );
+                            }
+                        }
+                    }
+                    return Ok(None);
+                }
+            }
             let Some(entries) = document.type_ancestry.get(type_key) else {
                 return Ok(None);
             };
@@ -12778,6 +13015,17 @@ impl NavigationIndex {
             &helper.generic_parameters,
         ) {
             return Ok(HelperTargetMatch::Yes(0));
+        }
+
+        let unresolved_named_alias = self
+            .type_symbol_candidate(&resolved)
+            .and_then(|candidate| self.symbol(&candidate))
+            .is_some_and(|symbol| symbol.type_kind == TypeKind::Other && symbol.type_ref.is_some());
+        if unresolved_named_alias && helper.kind == target.kind {
+            // A named alias may resolve to this helper's target kind, but
+            // until its target is followed it cannot prove the helper does
+            // not apply (l4d-1m02.3.1).
+            return Ok(HelperTargetMatch::Unknown);
         }
 
         if target.kind != TypeKind::Class {
@@ -13826,6 +14074,69 @@ impl NavigationIndex {
                 cancel,
                 budget,
             )?;
+            if direct.is_empty()
+                && let Some(document) = self.documents.get(type_uri)
+                && let Some(indices) = document.type_symbol_indices.get(type_key)
+            {
+                budget.require_work(indices.len(), cancel)?;
+                if indices.len() == 1
+                    && let Some(symbol) = document.symbols.get(indices[0])
+                {
+                    budget.require_work(1, cancel)?;
+                    if symbol.kind == SymbolKind::Type && symbol.type_kind == TypeKind::Pointer {
+                        // Delphi implicitly dereferences pointers for member
+                        // access. Until that shape is followed, absence on
+                        // the pointer type is not a sound member proof.
+                        return Ok(MemberLookup::unknown(direct));
+                    }
+                    if symbol.kind == SymbolKind::Type
+                        && symbol.type_kind == TypeKind::Other
+                        && let Some(alias_ref) = symbol.type_ref.as_ref()
+                    {
+                        if alias_ref.path.len() == 1 && alias_ref.args.is_empty() {
+                            let alias_name = &alias_ref.path[0];
+                            let alias_key = canonical_name(alias_name);
+                            if let Some(alias_indices) =
+                                document.type_symbol_indices.get(&alias_key)
+                            {
+                                budget.require_work(alias_indices.len(), cancel)?;
+                                if alias_indices.len() == 1
+                                    && let Some(alias_symbol) =
+                                        document.symbols.get(alias_indices[0])
+                                    && alias_symbol.kind == SymbolKind::Type
+                                {
+                                    let resolved = self
+                                        .member_candidates_for_type_with_state_and_budget(
+                                            type_uri,
+                                            &alias_key,
+                                            alias_symbol.scope,
+                                            member_key,
+                                            allow_implementation,
+                                            state,
+                                            cancel,
+                                            budget,
+                                        )?;
+                                    return Ok(resolved);
+                                }
+                                return Ok(MemberLookup::unknown(direct));
+                            }
+                            if overload::builtin_type(alias_name).is_some() {
+                                // A source alias may target a compiler builtin such
+                                // as Integer. There is no local type symbol to
+                                // recurse into; keep the alias's own complete
+                                // ancestry instead of making unrelated type
+                                // inference incomplete.
+                            } else {
+                                return Ok(MemberLookup::unknown(direct));
+                            }
+                        } else {
+                            // Qualified, generic, and otherwise unresolved aliases
+                            // stay incomplete rather than proving absence.
+                            return Ok(MemberLookup::unknown(direct));
+                        }
+                    }
+                }
+            }
             let mut proof_incomplete = false;
             let type_document = self.documents.get(type_uri);
             if let Some(type_document) = type_document {
@@ -18396,6 +18707,43 @@ impl Document {
         Ok(Some(owner_type.owner_type.clone()))
     }
 
+    fn owner_type_is_alias_definition_context_with_budget(
+        &self,
+        owner_type: &str,
+        offset: usize,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        // The RHS of a named alias is not a member namespace belonging to
+        // that alias. Keep real member lookups on unresolved aliases
+        // fail-closed, but don't let this declaration context shadow imports.
+        budget.require_bytes(owner_type.len(), cancel)?;
+        let Some(context_index) = self
+            .owner_type_intervals
+            .at_with_budget(offset, cancel, budget)?
+        else {
+            return Ok(false);
+        };
+        let Some(context) = self.owner_type_contexts.get(context_index) else {
+            return Ok(false);
+        };
+        if context.owner_type != owner_type {
+            return Ok(false);
+        }
+        let Some(indices) = self.type_symbol_indices.get(owner_type) else {
+            return Ok(false);
+        };
+        budget.require_work(indices.len(), cancel)?;
+        if indices.len() != 1 {
+            return Ok(false);
+        }
+        Ok(self.symbols.get(indices[0]).is_some_and(|symbol| {
+            symbol.kind == SymbolKind::Type
+                && symbol.type_kind == TypeKind::Other
+                && symbol.type_ref.is_some()
+        }))
+    }
+
     fn owner_type_at_identifier_with_budget_or_unknown(
         &self,
         identifier: Node<'_>,
@@ -18478,6 +18826,47 @@ fn symbol_is_available_at(
                     && declaration.span.start <= offset
             })
         })
+}
+
+fn symbol_is_available_at_with_budget(
+    document: &Document,
+    symbol: &Symbol,
+    candidate_uri: &Url,
+    current_uri: &Url,
+    offset: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    check_navigation_cancel(cancel)?;
+    if candidate_uri != current_uri
+        || (symbol.owner_type.is_some() && symbol.kind != SymbolKind::EnumValue)
+        || !symbol.declaration_ordered
+    {
+        return Ok(true);
+    }
+    if symbol.span.start <= offset {
+        return Ok(true);
+    }
+    if symbol.kind != SymbolKind::Routine || symbol.origin != Origin::Definition {
+        return Ok(false);
+    }
+    let Some(routine_key) = symbol.routine_key.as_ref() else {
+        return Ok(false);
+    };
+    for declaration in &document.symbols {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        check_navigation_cancel(cancel)?;
+        if declaration.kind == SymbolKind::Routine
+            && declaration.origin == Origin::Declaration
+            && declaration.routine_key.as_ref() == Some(routine_key)
+            && (declaration.region == Region::Interface || declaration.routine_directives.forward)
+            && declaration.span.start <= offset
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The visibility section a member declaration is in, given its ancestors
@@ -18704,6 +19093,20 @@ fn collect_symbols(
                 scope_by_span,
                 symbols,
                 SymbolKind::Parameter,
+                type_name,
+            );
+        }
+        "exceptionHandler" => {
+            let type_name = node
+                .child_by_field_name("exception")
+                .and_then(|exception| simple_type_path(exception, source));
+            add_named_symbol(
+                node,
+                ancestors,
+                source,
+                scope_by_span,
+                symbols,
+                SymbolKind::Variable,
                 type_name,
             );
         }
@@ -19339,6 +19742,8 @@ fn add_named_symbol<'a>(
         .and_then(|type_node| type_shape_from_node(type_node, source));
     let identifiers = if kind == SymbolKind::Type {
         declaration_name_identifiers(node)
+    } else if node.kind() == "exceptionHandler" {
+        node.child_by_field_name("variable").into_iter().collect()
     } else if matches!(node.kind(), "varDef" | "varAssignDef") {
         identifier_nodes(node).into_iter().take(1).collect()
     } else if node.kind() == "declLabel" {
@@ -19700,7 +20105,7 @@ fn helper_target_may_match(helper: &HelperDefinition, target: &TypeInstance) -> 
         .is_some_and(|name| canonical_name(name) == target.key)
         || matches!(
             (helper.kind, target.kind),
-            (TypeKind::Class, TypeKind::Class)
+            (TypeKind::Class, TypeKind::Class) | (TypeKind::Record, TypeKind::Record)
         )
 }
 
@@ -20452,6 +20857,9 @@ fn type_ref_from_node_at_depth(node: Node<'_>, source: &str, depth: usize) -> Op
 
 fn declaration_name_identifiers(node: Node<'_>) -> Vec<Node<'_>> {
     let Some(name) = node.child_by_field_name("name") else {
+        if node.kind() == "exceptionHandler" {
+            return node.child_by_field_name("variable").into_iter().collect();
+        }
         if matches!(node.kind(), "varDef" | "varAssignDef") {
             return (0..node.named_child_count())
                 .filter_map(|index| node.named_child(index))
@@ -20632,14 +21040,15 @@ fn build_scopes(
     root: Node<'_>,
     source: &str,
 ) -> (Vec<Scope>, HashMap<Span, usize>) {
-    // Routine definitions first, then lambdas, then blocks: the stable sort
-    // below keeps that order between scopes with one span.
-    let mut seeds_by_kind: [Vec<(Span, Option<String>)>; 3] = Default::default();
+    // Routine definitions first, then lambdas, exception handlers, and blocks:
+    // the stable sort below keeps that order between scopes with one span.
+    let mut seeds_by_kind: [Vec<(Span, Option<String>)>; 4] = Default::default();
     collect_nodes_with_ancestors(root, &mut |node, ancestors| {
         let seeds = match node.kind() {
             "defProc" => &mut seeds_by_kind[0],
             "lambda" => &mut seeds_by_kind[1],
-            "block" => &mut seeds_by_kind[2],
+            "exceptionHandler" => &mut seeds_by_kind[2],
+            "block" => &mut seeds_by_kind[3],
             _ => return,
         };
         let owner_type = node
@@ -24620,6 +25029,153 @@ mod tests {
             error.contains("missing-unit test exceeds"),
             "unexpected deterministic budget error: {error}"
         );
+    }
+
+    #[test]
+    fn missing_unit_alias_target_is_not_shadowed_by_alias_member_lookup() {
+        let uri = Url::parse("file:///tmp/missing-unit-alias-target.pas").expect("fixture URI");
+        let source = "unit MissingUnitAliasTarget;\ninterface\ntype TAlias = MissingType;\nimplementation\nend.\n";
+        let offset = source.find("MissingType").expect("missing type identifier");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("alias target fixture parses");
+        let document = index.documents.get(&uri).expect("indexed document");
+        let identifier = identifier_at(document.tree.root_node(), offset)
+            .expect("alias target identifier is parsed");
+        let mut budget = AssistanceBudget::new(
+            MAX_MISSING_UNIT_REQUEST_WORK,
+            MAX_MISSING_UNIT_REQUEST_BYTES,
+            "missing-unit alias target test",
+        );
+
+        assert!(
+            index
+                .missing_unit_is_unresolved_at_with_budget(
+                    &uri,
+                    offset,
+                    identifier,
+                    &AtomicBool::new(false),
+                    &mut budget,
+                )
+                .expect("complete alias target lookup")
+        );
+    }
+
+    fn current_unit_reference_budget_fixture() -> (NavigationIndex, Url, usize, usize) {
+        let uri = Url::parse("file:///tmp/current-unit-reference-budget.pas").expect("fixture URI");
+        let source = concat!(
+            "unit CurrentUnitReferenceBudget;\n",
+            "interface\n",
+            "type TBefore = Integer;\n",
+            "procedure Foo;\n",
+            "implementation\n",
+            "procedure Caller;\n",
+            "begin\n",
+            "end;\n",
+            "procedure Foo;\n",
+            "begin\n",
+            "end;\n",
+            "end.\n",
+        );
+        let offset = source.find("procedure Caller").expect("caller declaration");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("current-unit reference fixture parses");
+        let document = index.documents.get(&uri).expect("indexed fixture");
+        let indices = document
+            .symbol_indices_by_scope_key
+            .get(&(ROOT_SCOPE, "foo".to_owned()))
+            .expect("Foo declarations are indexed at unit scope")
+            .len();
+        assert!(
+            indices >= 2,
+            "fixture contains a declaration and definition"
+        );
+        (index, uri, offset, indices)
+    }
+
+    #[test]
+    fn current_unit_references_charge_candidate_storage_before_allocation() {
+        let (index, uri, offset, indices) = current_unit_reference_budget_fixture();
+        let document = index.documents.get(&uri).expect("indexed fixture");
+        let key = "foo";
+        let bytes_without_candidate_storage = key
+            .len()
+            .saturating_add(uri.as_str().len().saturating_mul(indices));
+        let cancel = AtomicBool::new(false);
+        let mut budget = AssistanceBudget::new(
+            usize::MAX,
+            bytes_without_candidate_storage,
+            "current-unit byte budget",
+        );
+
+        let error = index
+            .current_unit_references_for_key_with_budget(
+                &uri,
+                document,
+                offset,
+                key,
+                &cancel,
+                &mut budget,
+            )
+            .expect_err("candidate vector storage must consume the byte budget");
+
+        assert!(
+            error.contains("current-unit byte budget exceeds")
+                && error.contains("byte proof/materialization limit"),
+            "unexpected deterministic budget error: {error}"
+        );
+    }
+
+    #[test]
+    fn current_unit_references_charge_routine_availability_scans() {
+        let (index, uri, offset, indices) = current_unit_reference_budget_fixture();
+        let document = index.documents.get(&uri).expect("indexed fixture");
+        let cancel = AtomicBool::new(false);
+        let mut budget =
+            AssistanceBudget::new(indices, usize::MAX, "current-unit availability budget");
+
+        let error = index
+            .current_unit_references_for_key_with_budget(
+                &uri,
+                document,
+                offset,
+                "foo",
+                &cancel,
+                &mut budget,
+            )
+            .expect_err("routine availability scans must consume the work budget");
+
+        assert!(
+            error.contains("current-unit availability budget exceeds")
+                && error.contains("node traversal limit"),
+            "unexpected deterministic budget error: {error}"
+        );
+    }
+
+    #[test]
+    fn current_unit_references_observe_cancellation_during_routine_availability_scan() {
+        let (index, uri, offset, indices) = current_unit_reference_budget_fixture();
+        let document = index.documents.get(&uri).expect("indexed fixture");
+        let cancel = AtomicBool::new(false);
+        let mut budget =
+            AssistanceBudget::new(usize::MAX, usize::MAX, "current-unit cancellation budget");
+        budget.cancel_after_work(indices.saturating_add(1));
+
+        let error = index
+            .current_unit_references_for_key_with_budget(
+                &uri,
+                document,
+                offset,
+                "foo",
+                &cancel,
+                &mut budget,
+            )
+            .expect_err("cancellation during a routine availability scan must propagate");
+
+        assert_eq!(error, "request cancelled");
     }
 
     #[test]

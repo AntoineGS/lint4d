@@ -1546,11 +1546,26 @@ impl NavigationIndex {
                 }
             }
 
-            if !with_lookup_blocks
-                && !accumulator.exhausted
-                && let Some(owner_type) = current_document
-                    .owner_type_at(offset)
-                    .filter(|_| !current_document.offset_is_in_helper_declaration(offset))
+            let owner_type = if !with_lookup_blocks && !accumulator.exhausted {
+                if let Some(owner_type) = current_document.owner_type_at(offset) {
+                    if current_document.owner_type_is_alias_definition_context_with_budget(
+                        &owner_type,
+                        offset,
+                        cancel,
+                        accumulator.budget,
+                    )? {
+                        None
+                    } else {
+                        Some(owner_type)
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(owner_type) =
+                owner_type.filter(|_| !current_document.offset_is_in_helper_declaration(offset))
             {
                 let (member_uri, member_type, member_scope, member_substitution, helper_owner) =
                     self.helper_target_for_owner_with_budget(

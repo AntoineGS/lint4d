@@ -8238,8 +8238,13 @@ impl NavigationIndex {
                 budget,
             )?
         {
-            self.apply_compiler_surface_fallback(current_document, &key, state);
-            return Ok(Vec::new());
+            return self.implicit_system_references_with_budget(
+                current_document,
+                &key,
+                state,
+                cancel,
+                budget,
+            );
         }
         let receivers = self.resolve_receivers_with_state_and_budget(
             current_uri,
@@ -9760,6 +9765,36 @@ impl NavigationIndex {
             state.mark_member_lookup_incomplete();
             return Vec::new();
         };
+        if lhs.kind() == "identifier"
+            && node_text(lhs, &current_document.source).eq_ignore_ascii_case("System")
+        {
+            let cancel = AtomicBool::new(false);
+            // The legacy navigation entry point has no request budget. Reuse
+            // the source-first implicit-System lookup with an unbounded one.
+            let mut budget =
+                AssistanceBudget::new(usize::MAX, usize::MAX, "implicit System lookup");
+            if self
+                .implicit_system_qualifier_is_unshadowed_with_budget(
+                    current_uri,
+                    current_document,
+                    offset,
+                    lhs,
+                    &cancel,
+                    &mut budget,
+                )
+                .unwrap_or(false)
+            {
+                return self
+                    .implicit_system_references_with_budget(
+                        current_document,
+                        &canonical_name(member_name),
+                        state,
+                        &cancel,
+                        &mut budget,
+                    )
+                    .unwrap_or_default();
+            }
+        }
         let key = canonical_name(member_name);
         let mut references = Vec::new();
         let receivers =

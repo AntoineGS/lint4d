@@ -296,6 +296,98 @@ fn e2003_reported_for_an_unknown_qualified_system_name() {
 }
 
 #[test]
+fn qualified_system_source_exports_resolve_before_surface_fallback() {
+    let context = context((37, 0), Some(TargetPlatform::Win32));
+    let system = "unit System; interface const KnownSystem = 1; implementation end.";
+    let consumer = concat!(
+        "unit SurfaceQualifiedSystemSource; interface implementation ",
+        "procedure P; var X: Integer; begin ",
+        "X := System.KnownSystem; X := System.KnownSystem; X := System.Zz; ",
+        "end; end.",
+    );
+    let mut index = NavigationIndex::new();
+    let system_uri = update(&mut index, "System", system, &context);
+    let consumer_uri = update(
+        &mut index,
+        "SurfaceQualifiedSystemSource",
+        consumer,
+        &context,
+    );
+
+    let (definition, first_reference, second_reference, references, absent_proof) =
+        with_context_table(&context, || {
+            let definition = index.navigate(
+                &system_uri,
+                text::offset_to_position(
+                    system,
+                    system.find("KnownSystem").expect("source declaration"),
+                )
+                .expect("declaration position"),
+                NavigationTarget::Definition,
+            );
+            let first_offset = consumer
+                .find("KnownSystem")
+                .expect("first source reference");
+            let first_reference = index.navigate(
+                &consumer_uri,
+                text::offset_to_position(consumer, first_offset).expect("first reference position"),
+                NavigationTarget::Definition,
+            );
+            let second_offset = consumer
+                .match_indices("KnownSystem")
+                .nth(1)
+                .expect("second source reference")
+                .0;
+            let second_reference = index.navigate(
+                &consumer_uri,
+                text::offset_to_position(consumer, second_offset)
+                    .expect("second reference position"),
+                NavigationTarget::Definition,
+            );
+            let references = index
+                .binding_locations(
+                    &consumer_uri,
+                    text::offset_to_position(consumer, first_offset)
+                        .expect("first reference position"),
+                    true,
+                )
+                .expect("source-backed qualified references");
+            let absent_proof = proof_status(&index, &consumer_uri, consumer, "Zz");
+            (
+                definition,
+                first_reference,
+                second_reference,
+                references,
+                absent_proof,
+            )
+        });
+
+    assert_eq!(
+        definition.len(),
+        1,
+        "System.KnownSystem definition should resolve to indexed System source"
+    );
+    assert_eq!(definition[0].uri, system_uri);
+    assert_eq!(
+        first_reference, definition,
+        "the first qualified source reference should navigate to its definition"
+    );
+    assert_eq!(
+        second_reference, definition,
+        "the second qualified source reference should navigate to its definition"
+    );
+    assert_eq!(
+        references
+            .iter()
+            .filter(|location| location.uri == consumer_uri)
+            .count(),
+        2,
+        "source-backed reference search should retain both System.KnownSystem uses"
+    );
+    assert_eq!(absent_proof, SemanticProofStatus::ProvenAbsent);
+}
+
+#[test]
 fn e2003_silent_for_a_qualified_system_builtin() {
     let context = context((37, 0), Some(TargetPlatform::Win32));
     let source = "unit SurfaceQualifiedBuiltin; interface implementation procedure P; begin System.Writeln('ok'); end; end.";

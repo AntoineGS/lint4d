@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem W1000DeclarationSiteNotReported.pas
+W1000DeclarationSiteNotReported.pas(16) W1000 Symbol 'DeprecatedRoutine' is deprecated

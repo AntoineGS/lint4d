@@ -1,6 +1,6 @@
 use crate::manifest::manifest_encoder;
 use crate::{CanonicalKey, Digest, KeyKind};
-use pascal_project::ProjectContext;
+use pascal_project::{ProjectContext, PropertyValue};
 
 /// The complete analysis inputs of one project/configuration context.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -101,6 +101,18 @@ impl ContextKey {
         });
         encoder.field(29);
         encoder.bool(context.unit_directories_unknown());
+        encoder.field(30);
+        encoder.map(
+            context.warning_properties(),
+            |encoder, name| encoder.str(name),
+            |encoder, value| match value {
+                PropertyValue::Known(value) => {
+                    encoder.variant(1);
+                    encoder.str(value);
+                }
+                PropertyValue::Unknown => encoder.variant(0),
+            },
+        );
         Self(CanonicalKey::finish(KeyKind::Context, encoder))
     }
 

@@ -289,11 +289,11 @@ fn a_reset_reclaims_shared_content_and_rows_of_the_old_scope() {
     }
 }
 
-/// Stored identities and fact checksums, as container 4 computed them: the
-/// layout changes of containers 5 to 7 leave every artifact ID, fact
-/// checksum and evidence ID as it was. Only the storage projection
-/// changed: container 6 drops the per-row checksum column, container 7
-/// adds the scope surrogate.
+/// Stored identities and fact checksums for container 4's storage projection.
+/// The layout changes of containers 5 to 7 leave every artifact ID, fact
+/// checksum and evidence ID as it was. Only the storage projection changed:
+/// container 6 drops the per-row checksum column, container 7 adds the scope
+/// surrogate. Context-key input changes intentionally update this digest.
 #[test]
 fn identities_and_checksums_are_those_of_container_4() {
     let root = private_tempdir();
@@ -332,7 +332,7 @@ fn identities_and_checksums_are_those_of_container_4() {
         .to_hex()
         .to_string();
     assert_eq!(
-        digest, "21e1a4b28576229aea09975f4010693e0eb0d8e5c2d1e3ababd116a0bc88e761",
+        digest, "77d4e435cef442b8336913e8d6422f49bf4e0ab1a49fd5be6a6102650e9ce873",
         "{lines:#?}"
     );
     assert_eq!(

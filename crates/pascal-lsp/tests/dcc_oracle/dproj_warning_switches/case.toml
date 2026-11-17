@@ -1,0 +1,4 @@
+unit = "DprojWarningSwitches.pas"
+compilers = ["21.0", "24.0", "37.0"]
+config = "Debug"
+platform = "Win32"

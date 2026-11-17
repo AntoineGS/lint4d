@@ -1,0 +1,6 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem WarnAllError.pas
+WarnAllError.pas(22) E1009 Redeclaration of 'Value' hides a member in the base class
+WarnAllError.pas(32) E1010 Method 'Invoke' hides virtual method of base type 'TBaseVirtual'
+WarnAllError.pas(48) E1000 Symbol 'DeprecatedRoutine' is deprecated
+WarnAllError.pas(37) H2219 Private symbol 'FUnused' declared but never used

@@ -1,0 +1,5 @@
+unit = "HintUse.pas"
+compilers = ["21.0", "24.0", "37.0"]
+recall = false
+reason = "The compiler sees FileCtrl/Vcl.FileCtrl only as a precompiled DCU; the semantic oracle has no indexed source unit."
+silent = ["W1005"]

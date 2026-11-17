@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 21.0
+# dcc32 -B -H+ -W+ -Q -U<lib> W1003Experimental.pas
+W1003Experimental.pas(16) W1003 Symbol 'ExperimentalRoutine' is experimental

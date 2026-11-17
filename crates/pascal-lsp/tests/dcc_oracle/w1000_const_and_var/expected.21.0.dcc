@@ -1,0 +1,6 @@
+# Embarcadero Delphi for Win32 compiler version 21.0
+# dcc32 -B -H+ -W+ -Q -U<lib> W1000ConstAndVar.pas
+W1000ConstAndVar.pas(19) W1000 Symbol 'DeprecatedConst' is deprecated
+W1000ConstAndVar.pas(20) W1000 Symbol 'DeprecatedVar' is deprecated
+W1000ConstAndVar.pas(20) H2077 Value assigned to 'Value' never used
+W1000ConstAndVar.pas(19) H2077 Value assigned to 'Value' never used

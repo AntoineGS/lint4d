@@ -1,7 +1,9 @@
+use super::super::dcc_switches::SwitchState;
+use super::super::warning_switches::WarningSwitches;
 use super::super::{
     AssistanceBudget, Candidate, DccMessage, DccSeverity, Document, NavigationIndex,
-    ResolutionState, SemanticDiagnostic, SourceSpan, SymbolKind, check_navigation_cancel,
-    node_text,
+    ResolutionState, SemanticDiagnostic, SemanticDiagnosticKind, SourceSpan, SymbolKind,
+    check_navigation_cancel, node_text,
 };
 use super::model::{RoutineFlow, VarOccurrence, collect_nodes};
 use super::{Access, LocalKind, VarType};
@@ -52,6 +54,7 @@ pub(super) fn flow_diagnostics(
     budget: &mut AssistanceBudget,
 ) -> Result<Vec<SemanticDiagnostic>, String> {
     let mut diagnostics = Vec::new();
+    let warning_switches = WarningSwitches::new(document);
     for flow in flows {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
@@ -97,7 +100,14 @@ pub(super) fn flow_diagnostics(
             }
         }
 
-        if routine_has_error(flow, prior_diagnostics, cancel, budget)? {
+        if routine_has_error(
+            flow,
+            document,
+            prior_diagnostics,
+            &warning_switches,
+            cancel,
+            budget,
+        )? {
             continue;
         }
 
@@ -1219,14 +1229,25 @@ fn parse_single_char_literal(text: &str) -> Option<char> {
 // within the enclosing routine's range and suppress its H2077 findings too.
 fn routine_has_error(
     flow: &RoutineFlow<'_>,
+    document: &Document,
     diagnostics: &[SemanticDiagnostic],
+    warning_switches: &WarningSwitches,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<bool, String> {
     for diagnostic in diagnostics {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
-        if diagnostic.kind.severity() == DccSeverity::Error
+        let promoted_warning = match diagnostic.kind {
+            SemanticDiagnosticKind::Dcc(message)
+                if warning_switches.error_capable(message.code()) =>
+            {
+                warning_switches.effective_switch(document, message.code(), diagnostic.span.start)
+                    == Some(SwitchState::Error)
+            }
+            _ => false,
+        };
+        if (diagnostic.kind.severity() == DccSeverity::Error || promoted_warning)
             && flow.node.start_byte() <= diagnostic.span.start
             && diagnostic.span.end <= flow.node.end_byte()
         {

@@ -3612,6 +3612,7 @@ fn buffer_symbols(
             None,
             cancel,
             None,
+            None,
         )
         .map_err(|error| format!("rename workspace scan could not index {uri}: {error}"))?;
     index.workspace_symbols_with_cancel(query, cancel)

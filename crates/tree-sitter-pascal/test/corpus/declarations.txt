@@ -12,16 +12,25 @@ var
 (root
   (declVars
     (kVar)
-    (declVar (identifier)
-      (type (typeref (identifier))))
+    (declVar
+      (identifier)
+      (type
+        (typeref
+          (identifier))))
     (declVar
       (identifier)
       (identifier)
-      (type (typeref (identifier))))
+      (type
+        (typeref
+          (identifier))))
     (declVar
       (identifier)
-      (type (typeref (identifier)))
-      (defaultValue (kEq) (identifier)))))
+      (type
+        (typeref
+          (identifier)))
+      (defaultValue
+        (kEq)
+        (identifier)))))
 
 ===
 Constants
@@ -39,16 +48,26 @@ resourcestring
 (root
   (declConsts
     (kConst)
-    (declConst (identifier)
-      (defaultValue (kEq) (identifier)))
     (declConst
       (identifier)
-      (type (typeref (identifier)))
-      (defaultValue (kEq) (identifier))))
+      (defaultValue
+        (kEq)
+        (identifier)))
+    (declConst
+      (identifier)
+      (type
+        (typeref
+          (identifier)))
+      (defaultValue
+        (kEq)
+        (identifier))))
   (declConsts
     (kResourcestring)
-    (declConst (identifier)
-      (defaultValue (kEq) (identifier)))))
+    (declConst
+      (identifier)
+      (defaultValue
+        (kEq)
+        (identifier)))))
 
 ===
 Typedefs
@@ -75,58 +94,123 @@ type
 (root
   (declTypes
     (kType)
-    (declType (identifier) (kEq)
-      (type (typeref (identifier))))
-    (declType (identifier) (kEq)
+    (declType
+      (identifier)
+      (kEq)
+      (type
+        (typeref
+          (identifier))))
+    (declType
+      (identifier)
+      (kEq)
       (type
         (declEnum
-          (declEnumValue (identifier))
-          (declEnumValue (identifier)))))
-    (declType (identifier) (kEq)
+          (declEnumValue
+            (identifier))
+          (declEnumValue
+            (identifier)))))
+    (declType
+      (identifier)
+      (kEq)
       (type
-        (declArray (kArray) (kOf) (type (typeref (identifier))))))
-    (declType (identifier) (kEq)
-      (type
-        (declArray (kArray) (range (literalNumber) (literalNumber)) (kOf)
+        (declArray
+          (kArray)
+          (kOf)
           (type
-            (typeref (identifier))))))
-    (declType (identifier) (kEq)
+            (typeref
+              (identifier))))))
+    (declType
+      (identifier)
+      (kEq)
       (type
-        (declSet (kSet) (kOf)
+        (declArray
+          (kArray)
+          (range
+            (literalNumber)
+            (literalNumber))
+          (kOf)
           (type
-            (typeref (identifier))))))
-    (declType (identifier) (kEq)
+            (typeref
+              (identifier))))))
+    (declType
+      (identifier)
+      (kEq)
       (type
-        (declSet (kSet) (kOf)
+        (declSet
+          (kSet)
+          (kOf)
+          (type
+            (typeref
+              (identifier))))))
+    (declType
+      (identifier)
+      (kEq)
+      (type
+        (declSet
+          (kSet)
+          (kOf)
           (type
             (declEnum
-              (declEnumValue (identifier))
-              (declEnumValue (identifier)))))))
-    (declType (identifier) (kEq)
+              (declEnumValue
+                (identifier))
+              (declEnumValue
+                (identifier)))))))
+    (declType
+      (identifier)
+      (kEq)
       (type
-        (declString (kString) (literalNumber))))
-    (declType (identifier) (kEq)
-      (declClass (kClass)))
-    (declType (identifier) (kEq)
-      (declClass (kClass)
-        (typeref (identifier))))
-    (declType (identifier) (kEq)
+        (declString
+          (kString)
+          (literalNumber))))
+    (declType
+      (identifier)
+      (kEq)
+      (declClass
+        (kClass)))
+    (declType
+      (identifier)
+      (kEq)
+      (declClass
+        (kClass)
+        (typeref
+          (identifier))))
+    (declType
+      (identifier)
+      (kEq)
       (type
-        (declMetaClass (kClass) (kOf) (typeref (identifier)))))
-    (declType (identifier) (kEq)
-      (declIntf (kInterface)))
-    (declType (identifier) (kEq)
-      (declIntf (kInterface)
-        (typeref (identifier))))
-    (declType (identifier) (kEq)
+        (declMetaClass
+          (kClass)
+          (kOf)
+          (typeref
+            (identifier)))))
+    (declType
+      (identifier)
+      (kEq)
+      (declIntf
+        (kInterface)))
+    (declType
+      (identifier)
+      (kEq)
+      (declIntf
+        (kInterface)
+        (typeref
+          (identifier))))
+    (declType
+      (identifier)
+      (kEq)
       (type
-        (declFile (kFile))))
-    (declType (identifier) (kEq)
+        (declFile
+          (kFile))))
+    (declType
+      (identifier)
+      (kEq)
       (type
-        (declFile (kFile) (kOf)
+        (declFile
+          (kFile)
+          (kOf)
           (type
-            (typeref (identifier))))))))
-
+            (typeref
+              (identifier))))))))
 
 ===
 Procedure references
@@ -146,54 +230,96 @@ type
 ---
 
 (root
-  (declTypes (kType)
-    (declType (identifier) (kEq)
+  (declTypes
+    (kType)
+    (declType
+      (identifier)
+      (kEq)
       (type
-        (declProcRef (kProcedure))))
-    (declType (identifier) (kEq)
+        (declProcRef
+          (kProcedure))))
+    (declType
+      (identifier)
+      (kEq)
       (type
-        (declProcRef (kProcedure)
+        (declProcRef
+          (kProcedure)
           (declArgs
             (declArg
               (identifier)
-              (type (typeref (identifier))))))))
-    (declType (identifier) (kEq)
+              (type
+                (typeref
+                  (identifier))))))))
+    (declType
+      (identifier)
+      (kEq)
       (type
-        (declProcRef (kFunction)
-          (typeref (identifier)))))
-    (declType (identifier) (kEq)
+        (declProcRef
+          (kFunction)
+          (typeref
+            (identifier)))))
+    (declType
+      (identifier)
+      (kEq)
       (type
-        (declProcRef (kFunction)
+        (declProcRef
+          (kFunction)
           (declArgs
             (declArg
               (identifier)
-              (type (typeref (identifier)))))
-          (typeref (identifier)))))
-    (declType (identifier) (kEq)
+              (type
+                (typeref
+                  (identifier)))))
+          (typeref
+            (identifier)))))
+    (declType
+      (identifier)
+      (kEq)
       (type
-        (declProcRef (kProcedure) (kOf) (kObject))))
-    (declType (identifier) (kEq)
+        (declProcRef
+          (kProcedure)
+          (kOf)
+          (kObject))))
+    (declType
+      (identifier)
+      (kEq)
       (type
-        (declProcRef (kProcedure)
+        (declProcRef
+          (kProcedure)
           (declArgs
             (declArg
               (identifier)
-              (type (typeref (identifier)))))
-          (kOf) (kObject))))
-    (declType (identifier) (kEq)
+              (type
+                (typeref
+                  (identifier)))))
+          (kOf)
+          (kObject))))
+    (declType
+      (identifier)
+      (kEq)
       (type
-        (declProcRef (kFunction)
-          (typeref (identifier))
-          (kOf) (kObject))))
-    (declType (identifier) (kEq)
+        (declProcRef
+          (kFunction)
+          (typeref
+            (identifier))
+          (kOf)
+          (kObject))))
+    (declType
+      (identifier)
+      (kEq)
       (type
-        (declProcRef (kFunction)
+        (declProcRef
+          (kFunction)
           (declArgs
             (declArg
               (identifier)
-              (type (typeref (identifier)))))
-          (typeref (identifier))
-          (kOf) (kObject))))))
+              (type
+                (typeref
+                  (identifier)))))
+          (typeref
+            (identifier))
+          (kOf)
+          (kObject))))))
 
 ===
 Forward declarations
@@ -210,30 +336,72 @@ function a(b, c: d; e: f): g; forward;
 ---
 
 (root
-  (declProc (kProcedure) (identifier) (kForward))
-  (declProc (kProcedure) (identifier)
-    (declArgs
-      (declArg (identifier) (type (typeref (identifier)))))
+  (declProc
+    (kProcedure)
+    (identifier)
     (kForward))
-  (declProc (kProcedure) (identifier)
+  (declProc
+    (kProcedure)
+    (identifier)
     (declArgs
-      (declArg (identifier) (identifier) (type (typeref (identifier))))
-      (declArg (identifier) (type (typeref (identifier)))))
+      (declArg
+        (identifier)
+        (type
+          (typeref
+            (identifier)))))
     (kForward))
-
-  (declProc (kFunction) (identifier) (typeref (identifier)) (kForward))
-  (declProc (kFunction) (identifier)
+  (declProc
+    (kProcedure)
+    (identifier)
     (declArgs
-      (declArg (identifier) (type (typeref (identifier)))))
-    (typeref (identifier))
+      (declArg
+        (identifier)
+        (identifier)
+        (type
+          (typeref
+            (identifier))))
+      (declArg
+        (identifier)
+        (type
+          (typeref
+            (identifier)))))
     (kForward))
-  (declProc (kFunction) (identifier)
+  (declProc
+    (kFunction)
+    (identifier)
+    (typeref
+      (identifier))
+    (kForward))
+  (declProc
+    (kFunction)
+    (identifier)
     (declArgs
-      (declArg (identifier) (identifier) (type (typeref (identifier))))
-      (declArg (identifier) (type (typeref (identifier)))))
-    (typeref (identifier))
+      (declArg
+        (identifier)
+        (type
+          (typeref
+            (identifier)))))
+    (typeref
+      (identifier))
+    (kForward))
+  (declProc
+    (kFunction)
+    (identifier)
+    (declArgs
+      (declArg
+        (identifier)
+        (identifier)
+        (type
+          (typeref
+            (identifier))))
+      (declArg
+        (identifier)
+        (type
+          (typeref
+            (identifier)))))
+    (typeref
+      (identifier))
     (kForward)))
-
 
 ===
 Structures
@@ -259,13 +427,40 @@ type
 ---
 
 (root
-  (declTypes (kType)
-    (declType (identifier) (kEq) (declClass (kClass) (kEnd)))
-    (declType (identifier) (kEq) (declClass (kRecord) (kEnd)))
-    (declType (identifier) (kEq) (declClass (kObject) (kEnd)))
-    (declType (identifier) (kEq) (declIntf (kInterface) (kEnd)))
-    (declType (identifier) (kEq) (declIntf (kInterface) (guid (literalString)) (kEnd)))))
-
+  (declTypes
+    (kType)
+    (declType
+      (identifier)
+      (kEq)
+      (declClass
+        (kClass)
+        (kEnd)))
+    (declType
+      (identifier)
+      (kEq)
+      (declClass
+        (kRecord)
+        (kEnd)))
+    (declType
+      (identifier)
+      (kEq)
+      (declClass
+        (kObject)
+        (kEnd)))
+    (declType
+      (identifier)
+      (kEq)
+      (declIntf
+        (kInterface)
+        (kEnd)))
+    (declType
+      (identifier)
+      (kEq)
+      (declIntf
+        (kInterface)
+        (guid
+          (literalString))
+        (kEnd)))))
 
 ===
 Inheritance
@@ -281,17 +476,29 @@ type
 ---
 
 (root
-   (declTypes (kType)
-     (declType (identifier) (kEq)
-       (declClass (kClass)
-         (typeref (identifier))
-         (typeref (identifier))
-         (kEnd)))
-     (declType (identifier) (kEq)
-       (declIntf (kInterface)
-         (typeref (identifier))
-         (typeref (identifier))
-         (kEnd)))))
+  (declTypes
+    (kType)
+    (declType
+      (identifier)
+      (kEq)
+      (declClass
+        (kClass)
+        (typeref
+          (identifier))
+        (typeref
+          (identifier))
+        (kEnd)))
+    (declType
+      (identifier)
+      (kEq)
+      (declIntf
+        (kInterface)
+        (typeref
+          (identifier))
+        (typeref
+          (identifier))
+        (kEnd)))))
+
 ===
 Members
 ===
@@ -309,15 +516,38 @@ type
 ---
 
 (root
-  (declTypes (kType)
-    (declType (identifier) (kEq)
-      (declClass (kClass)
-        (declField (identifier) (identifier) (type (typeref (identifier))))
-        (declField (identifier) (type (typeref (identifier))))
-        (declProc (kConstructor) (identifier))
-        (declProc (kDestructor) (identifier))
-        (declProc (kProcedure) (identifier))
-        (declProc (kFunction) (identifier) (typeref (identifier)))
+  (declTypes
+    (kType)
+    (declType
+      (identifier)
+      (kEq)
+      (declClass
+        (kClass)
+        (declField
+          (identifier)
+          (identifier)
+          (type
+            (typeref
+              (identifier))))
+        (declField
+          (identifier)
+          (type
+            (typeref
+              (identifier))))
+        (declProc
+          (kConstructor)
+          (identifier))
+        (declProc
+          (kDestructor)
+          (identifier))
+        (declProc
+          (kProcedure)
+          (identifier))
+        (declProc
+          (kFunction)
+          (identifier)
+          (typeref
+            (identifier)))
         (kEnd)))))
 
 ===
@@ -356,31 +586,79 @@ type
 (root
   (declTypes
     (kType)
-    (declType (identifier) (kEq)
-      (declClass (kClass)
-        (declField (identifier) (type (typeref (identifier))))
-        (declProc (kProcedure) (identifier))
-        (declSection (kPrivate)
-          (declField (identifier) (type (typeref (identifier))))
-          (declProc (kProcedure) (identifier)))
-        (declSection (kProtected)
-          (declField (identifier) (type (typeref (identifier))))
-          (declProc (kProcedure) (identifier)))
-        (declSection (kPublic)
-          (declField (identifier) (type (typeref (identifier))))
-          (declProc (kProcedure) (identifier)))
-        (declSection (kPublished)
-          (declField (identifier) (type (typeref (identifier))))
-          (declProc (kProcedure) (identifier)))
+    (declType
+      (identifier)
+      (kEq)
+      (declClass
+        (kClass)
+        (declField
+          (identifier)
+          (type
+            (typeref
+              (identifier))))
+        (declProc
+          (kProcedure)
+          (identifier))
+        (declSection
+          (kPrivate)
+          (declField
+            (identifier)
+            (type
+              (typeref
+                (identifier))))
+          (declProc
+            (kProcedure)
+            (identifier)))
+        (declSection
+          (kProtected)
+          (declField
+            (identifier)
+            (type
+              (typeref
+                (identifier))))
+          (declProc
+            (kProcedure)
+            (identifier)))
+        (declSection
+          (kPublic)
+          (declField
+            (identifier)
+            (type
+              (typeref
+                (identifier))))
+          (declProc
+            (kProcedure)
+            (identifier)))
+        (declSection
+          (kPublished)
+          (declField
+            (identifier)
+            (type
+              (typeref
+                (identifier))))
+          (declProc
+            (kProcedure)
+            (identifier)))
         (kEnd)))
-    (declType (identifier) (kEq)
-      (declClass (kClass)
-        (declSection (kStrict) (kPrivate))
-        (declSection (kPrivate))
-        (declSection (kStrict) (kProtected))
-        (declSection (kProtected))
-        (declSection (kPublic))
-        (declSection (kPublished))
+    (declType
+      (identifier)
+      (kEq)
+      (declClass
+        (kClass)
+        (declSection
+          (kStrict)
+          (kPrivate))
+        (declSection
+          (kPrivate))
+        (declSection
+          (kStrict)
+          (kProtected))
+        (declSection
+          (kProtected))
+        (declSection
+          (kPublic))
+        (declSection
+          (kPublished))
         (kEnd)))))
 
 ===
@@ -404,22 +682,46 @@ type
 ---
 
 (root
-  (declTypes (kType)
-    (declType (identifier) (kEq)
-      (declClass (kClass)
-        (declTypes (kType)
-          (declType (identifier) (kEq)
+  (declTypes
+    (kType)
+    (declType
+      (identifier)
+      (kEq)
+      (declClass
+        (kClass)
+        (declTypes
+          (kType)
+          (declType
+            (identifier)
+            (kEq)
             (declClass
               (kClass)
               (kEnd)))
-          (declType (identifier) (kEq)
-            (type (typeref (identifier)))))
-        (declVars (kVar)
-          (declVar (identifier) (type (typeref (identifier)))))
-        (declConsts (kConst)
-          (declConst (identifier) (defaultValue (kEq) (identifier))))
-        (declSection (kPublic)
-          (declProc (kConstructor) (identifier)))
+          (declType
+            (identifier)
+            (kEq)
+            (type
+              (typeref
+                (identifier)))))
+        (declVars
+          (kVar)
+          (declVar
+            (identifier)
+            (type
+              (typeref
+                (identifier)))))
+        (declConsts
+          (kConst)
+          (declConst
+            (identifier)
+            (defaultValue
+              (kEq)
+              (identifier))))
+        (declSection
+          (kPublic)
+          (declProc
+            (kConstructor)
+            (identifier)))
         (kEnd)))))
 
 ===
@@ -437,13 +739,30 @@ type
 ---
 
 (root
-  (declTypes (kType)
-    (declType (identifier) (kEq)
-      (declClass (kClass)
-        (declProc (kClass) (kProcedure) (identifier))
-        (declVars (kClass) (kVar)
-          (declVar (identifier) (type (typeref (identifier))))
-          (declVar (identifier) (type (typeref (identifier)))))
+  (declTypes
+    (kType)
+    (declType
+      (identifier)
+      (kEq)
+      (declClass
+        (kClass)
+        (declProc
+          (kClass)
+          (kProcedure)
+          (identifier))
+        (declVars
+          (kClass)
+          (kVar)
+          (declVar
+            (identifier)
+            (type
+              (typeref
+                (identifier))))
+          (declVar
+            (identifier)
+            (type
+              (typeref
+                (identifier)))))
         (kEnd)))))
 
 ===
@@ -469,47 +788,113 @@ type
 (root
   (declTypes
     (kType)
-    (declType (identifier) (kEq)
-      (declClass (kClass)
-        (declProp (kProperty) (identifier)
-          (type (typeref (identifier)))
-          (kRead) (identifier)
-          (kWrite) (identifier))
-        (declProp (kProperty) (identifier)
-          (type (typeref (identifier)))
-          (kRead) (identifier))
-        (declProp (kProperty) (identifier)
-          (type (typeref (identifier)))
-          (kWrite) (identifier))
-        (declProp (kProperty) (identifier)
-          (type (typeref (identifier)))
-          (kRead) (identifier)
-          (kWrite) (identifier)
-          (kDefault) (identifier))
-        (declProp (kProperty) (identifier)
-          (type (typeref (identifier)))
-          (kRead) (identifier)
-          (kWrite) (identifier)
-          (kIndex) (identifier))
-        (declProp (kProperty) (identifier)
-          (type (typeref (identifier)))
-          (kRead) (identifier)
-          (kWrite) (identifier)
-          (kStored) (identifier))
-        (declProp (kProperty) (identifier)
+    (declType
+      (identifier)
+      (kEq)
+      (declClass
+        (kClass)
+        (declProp
+          (kProperty)
+          (identifier)
+          (type
+            (typeref
+              (identifier)))
+          (kRead)
+          (identifier)
+          (kWrite)
+          (identifier))
+        (declProp
+          (kProperty)
+          (identifier)
+          (type
+            (typeref
+              (identifier)))
+          (kRead)
+          (identifier))
+        (declProp
+          (kProperty)
+          (identifier)
+          (type
+            (typeref
+              (identifier)))
+          (kWrite)
+          (identifier))
+        (declProp
+          (kProperty)
+          (identifier)
+          (type
+            (typeref
+              (identifier)))
+          (kRead)
+          (identifier)
+          (kWrite)
+          (identifier)
+          (kDefault)
+          (identifier))
+        (declProp
+          (kProperty)
+          (identifier)
+          (type
+            (typeref
+              (identifier)))
+          (kRead)
+          (identifier)
+          (kWrite)
+          (identifier)
+          (kIndex)
+          (identifier))
+        (declProp
+          (kProperty)
+          (identifier)
+          (type
+            (typeref
+              (identifier)))
+          (kRead)
+          (identifier)
+          (kWrite)
+          (identifier)
+          (kStored)
+          (identifier))
+        (declProp
+          (kProperty)
+          (identifier)
           (declPropArgs
-            (declArg (identifier) (identifier) (type (typeref (identifier))))
-            (declArg (identifier) (type (typeref (identifier)))))
-          (type (typeref (identifier)))
-          (kRead) (identifier)
-          (kWrite) (identifier))
-        (declProp (kProperty) (identifier)
+            (declArg
+              (identifier)
+              (identifier)
+              (type
+                (typeref
+                  (identifier))))
+            (declArg
+              (identifier)
+              (type
+                (typeref
+                  (identifier)))))
+          (type
+            (typeref
+              (identifier)))
+          (kRead)
+          (identifier)
+          (kWrite)
+          (identifier))
+        (declProp
+          (kProperty)
+          (identifier)
           (declPropArgs
-            (declArg (identifier) (type (typeref (identifier)))))
-          (type (typeref (identifier)))
-          (kRead) (identifier)
-          (kWrite) (identifier)
-          (procAttribute (kDefault)))
+            (declArg
+              (identifier)
+              (type
+                (typeref
+                  (identifier)))))
+          (type
+            (typeref
+              (identifier)))
+          (kRead)
+          (identifier)
+          (kWrite)
+          (identifier)
+          (procAttribute
+            (kDefault)))
         (kEnd)))))
 
 ===
@@ -548,84 +933,147 @@ type
 ---
 
 (root
-  (declTypes (kType)
-    (declType (identifier) (kEq)
-      (declClass (kRecord)
-        (declField (identifier) (type (typeref (identifier))))
-        (declVariant (kCase) (typeref (identifier)) (kOf)
+  (declTypes
+    (kType)
+    (declType
+      (identifier)
+      (kEq)
+      (declClass
+        (kRecord)
+        (declField
+          (identifier)
+          (type
+            (typeref
+              (identifier))))
+        (declVariant
+          (kCase)
+          (typeref
+            (identifier))
+          (kOf)
           (declVariantClause
             (caseLabel
               (literalNumber))
             (declField
               (identifier)
-              (type (typeref (identifier)))))
+              (type
+                (typeref
+                  (identifier)))))
           (declVariantClause
             (caseLabel
               (literalNumber))
             (declField
               (identifier)
               (identifier)
-              (type (typeref (identifier))))
+              (type
+                (typeref
+                  (identifier))))
             (declField
               (identifier)
-              (type (typeref (identifier))))))
+              (type
+                (typeref
+                  (identifier))))))
         (kEnd)))
-    (declType (identifier) (kEq)
-      (declClass (kRecord)
-        (declField (identifier) (type (typeref (identifier))))
-        (declVariant (kCase) (identifier) (typeref (identifier)) (kOf)
+    (declType
+      (identifier)
+      (kEq)
+      (declClass
+        (kRecord)
+        (declField
+          (identifier)
+          (type
+            (typeref
+              (identifier))))
+        (declVariant
+          (kCase)
+          (identifier)
+          (typeref
+            (identifier))
+          (kOf)
           (declVariantClause
             (caseLabel
               (literalNumber))
             (declField
               (identifier)
-              (type (typeref (identifier)))))
+              (type
+                (typeref
+                  (identifier)))))
           (declVariantClause
             (caseLabel
               (literalNumber))
             (declField
               (identifier)
-              (type (typeref (identifier))))))
+              (type
+                (typeref
+                  (identifier))))))
         (kEnd)))
-    (declType (identifier) (kEq)
-      (declClass (kRecord)
-        (declField (identifier) (type (typeref (identifier))))
-        (declVariant (kCase) (typeref (identifier)) (kOf)
+    (declType
+      (identifier)
+      (kEq)
+      (declClass
+        (kRecord)
+        (declField
+          (identifier)
+          (type
+            (typeref
+              (identifier))))
+        (declVariant
+          (kCase)
+          (typeref
+            (identifier))
+          (kOf)
           (declVariantClause
             (caseLabel
               (literalNumber))
             (declField
               (identifier)
-              (type (typeref (identifier))))
-            (declVariant (kCase) (typeref (identifier)) (kOf)
+              (type
+                (typeref
+                  (identifier))))
+            (declVariant
+              (kCase)
+              (typeref
+                (identifier))
+              (kOf)
               (declVariantClause
                 (caseLabel
                   (literalNumber))
                 (declField
                   (identifier)
-                  (type (typeref (identifier)))))
+                  (type
+                    (typeref
+                      (identifier)))))
               (declVariantClause
                 (caseLabel
                   (literalNumber))
                 (declField
                   (identifier)
-                  (type (typeref (identifier)))))))
+                  (type
+                    (typeref
+                      (identifier)))))))
           (declVariantClause
             (caseLabel
               (literalNumber))
-            (declVariant (kCase) (typeref (identifier)) (kOf)
+            (declVariant
+              (kCase)
+              (typeref
+                (identifier))
+              (kOf)
               (declVariantClause
                 (caseLabel
                   (literalNumber))
                 (declField
                   (identifier)
-                  (type (typeref (identifier)))))
+                  (type
+                    (typeref
+                      (identifier)))))
               (declVariantClause
                 (caseLabel
                   (literalNumber))
                 (declField
                   (identifier)
-                  (type (typeref (identifier))))))))
+                  (type
+                    (typeref
+                      (identifier))))))))
         (kEnd)))))
 
 ===
@@ -641,23 +1089,40 @@ type
 ---
 
 (root
-  (declTypes (kType)
-    (declType (identifier) (kEq)
-      (declClass (kRecord)
-        (declProc (kOperator) (operatorName (kAdd))
+  (declTypes
+    (kType)
+    (declType
+      (identifier)
+      (kEq)
+      (declClass
+        (kRecord)
+        (declProc
+          (kOperator)
+          (operatorName
+            (kAdd))
           (declArgs
             (declArg
               (identifier)
               (identifier)
-              (type (typeref (identifier)))))
-          (type (typeref (identifier))))
-        (declProc (kOperator) (identifier)
+              (type
+                (typeref
+                  (identifier)))))
+          (type
+            (typeref
+              (identifier))))
+        (declProc
+          (kOperator)
+          (identifier)
           (declArgs
             (declArg
               (identifier)
               (identifier)
-              (type (typeref (identifier)))))
-          (type (typeref (identifier))))
+              (type
+                (typeref
+                  (identifier)))))
+          (type
+            (typeref
+              (identifier))))
         (kEnd)))))
 
 ===
@@ -679,22 +1144,46 @@ end;
 ---
 
 (root
-  (declVars (kVar)
+  (declVars
+    (kVar)
     (declVar
       (identifier)
-      (type (declArray (kArray) (kOf) (type (typeref (identifier))))))
+      (type
+        (declArray
+          (kArray)
+          (kOf)
+          (type
+            (typeref
+              (identifier))))))
     (declVar
       (identifier)
-      (type (declString (kString) (identifier))))
+      (type
+        (declString
+          (kString)
+          (identifier))))
     (declVar
       (identifier)
-      (type (declFile (kFile) (kOf) (type (typeref (identifier))))))
+      (type
+        (declFile
+          (kFile)
+          (kOf)
+          (type
+            (typeref
+              (identifier))))))
     (declVar
       (identifier)
-      (type (declFile (kFile))))
+      (type
+        (declFile
+          (kFile))))
     (declVar
       (identifier)
-      (type (declSet (kSet) (kOf) (type (typeref (identifier))))))
+      (type
+        (declSet
+          (kSet)
+          (kOf)
+          (type
+            (typeref
+              (identifier))))))
     (declVar
       (identifier)
       (type
@@ -708,18 +1197,35 @@ end;
               (declEnumValue
                 (identifier))))))))
   (defProc
-    (declProc (kProcedure) (identifier)
+    (declProc
+      (kProcedure)
+      (identifier)
       (declArgs
         (declArg
           (identifier)
-          (type (declArray (kArray) (kOf) (type (typeref (identifier))))))
+          (type
+            (declArray
+              (kArray)
+              (kOf)
+              (type
+                (typeref
+                  (identifier))))))
         (declArg
           (identifier)
-          (type (declArray (kArray) (kOf) (type (typeref (identifier))))))
+          (type
+            (declArray
+              (kArray)
+              (kOf)
+              (type
+                (typeref
+                  (identifier))))))
         (declArg
           (kVar)
           (identifier)
-          (type (declString (kString) (literalNumber))))))
+          (type
+            (declString
+              (kString)
+              (literalNumber))))))
     (block
       (kBegin)
       (kEnd))))
@@ -739,17 +1245,41 @@ type
 ---
 
 (root
-  (declTypes (kType)
-    (declType (identifier) (kEq)
-      (declClass (kClass)
-        (declField (identifier)
-          (type (typeref (identifier) (kDeprecated))))
-        (declField (identifier)
-          (type (typeref (identifier) (kDeprecated) (literalString))))
-        (declField (identifier)
-          (type (declString (kString) (kDeprecated))))
-        (declField (identifier)
-          (type (declString (kString) (kDeprecated) (literalString))))
+  (declTypes
+    (kType)
+    (declType
+      (identifier)
+      (kEq)
+      (declClass
+        (kClass)
+        (declField
+          (identifier)
+          (type
+            (typeref
+              (identifier)))
+          (procAttribute
+            (kDeprecated)))
+        (declField
+          (identifier)
+          (type
+            (typeref
+              (identifier)))
+          (procAttribute
+            (kDeprecated)
+            (literalString)))
+        (declField
+          (identifier)
+          (type
+            (declString
+              (kString)
+              (kDeprecated))))
+        (declField
+          (identifier)
+          (type
+            (declString
+              (kString)
+              (kDeprecated)
+              (literalString))))
         (kEnd)))))
 
 ===
@@ -766,25 +1296,56 @@ type
 ---
 
 (root
-  (declTypes (kType)
-    (declType (identifier) (kEq)
-      (type (declSubRange
-        (exprUnary (kSub) (identifier))
-        (identifier))))
-    (declType (identifier) (kEq)
-      (type (declSubRange
-        (exprCall (identifier) (exprArgs (identifier)))
-        (exprCall (identifier) (exprArgs (identifier))))))
-    (declType (identifier) (kEq)
-      (type (declSubRange
-        (literalNumber)
-        (exprBinary (identifier) (kSub) (literalNumber)))))
-    (declType (identifier) (kEq)
-      (type (declSubRange (identifier) (identifier))))
-    (declType (identifier) (kEq)
-      (type (declEnum
-        (declEnumValue (identifier))
-        (declEnumValue (identifier)))))))
+  (declTypes
+    (kType)
+    (declType
+      (identifier)
+      (kEq)
+      (type
+        (declSubRange
+          (exprUnary
+            (kSub)
+            (identifier))
+          (identifier))))
+    (declType
+      (identifier)
+      (kEq)
+      (type
+        (declSubRange
+          (exprCall
+            (identifier)
+            (exprArgs
+              (identifier)))
+          (exprCall
+            (identifier)
+            (exprArgs
+              (identifier))))))
+    (declType
+      (identifier)
+      (kEq)
+      (type
+        (declSubRange
+          (literalNumber)
+          (exprBinary
+            (identifier)
+            (kSub)
+            (literalNumber)))))
+    (declType
+      (identifier)
+      (kEq)
+      (type
+        (declSubRange
+          (identifier)
+          (identifier))))
+    (declType
+      (identifier)
+      (kEq)
+      (type
+        (declEnum
+          (declEnumValue
+            (identifier))
+          (declEnumValue
+            (identifier)))))))
 
 ===
 Routine attribute keywords as variable names
@@ -800,19 +1361,37 @@ var
 ---
 
 (root
-  (declVars (kVar)
-    (declVar (identifier) (type (typeref (identifier))))
-    (declVar (identifier) (type (typeref (identifier))))
-    (declVar (identifier) (type (typeref (identifier))))
+  (declVars
+    (kVar)
+    (declVar
+      (identifier)
+      (type
+        (typeref
+          (identifier))))
+    (declVar
+      (identifier)
+      (type
+        (typeref
+          (identifier))))
+    (declVar
+      (identifier)
+      (type
+        (typeref
+          (identifier))))
     (declVar
       (identifier)
       (ERROR
         (kInline)
         (kString))
       (identifier)
-      (type (typeref (identifier)))
-      (procAttribute (kCvar))
-      (procExternal (kExternal) (identifier)))))
+      (type
+        (typeref
+          (identifier)))
+      (procAttribute
+        (kCvar))
+      (procExternal
+        (kExternal)
+        (identifier)))))
 
 ===
 Subrange typed constants keep their value
@@ -824,12 +1403,20 @@ const
 ---
 
 (root
-  (declConsts (kConst)
-    (declConst (identifier)
-      (type (declSubRange
-        (literalNumber)
-        (exprBinary (identifier) (kSub) (literalNumber))))
-      (defaultValue (kEq) (literalNumber)))))
+  (declConsts
+    (kConst)
+    (declConst
+      (identifier)
+      (type
+        (declSubRange
+          (literalNumber)
+          (exprBinary
+            (identifier)
+            (kSub)
+            (literalNumber))))
+      (defaultValue
+        (kEq)
+        (literalNumber)))))
 
 ===
 Code page string types
@@ -846,20 +1433,39 @@ var
 ---
 
 (root
-  (declTypes (kType)
-    (declType (identifier) (kEq) (kType)
+  (declTypes
+    (kType)
+    (declType
+      (identifier)
+      (kEq)
+      (kType)
       (type
-        (declStringCodePage (identifier) (literalNumber))))
-    (declType (identifier) (kEq) (kType)
+        (declStringCodePage
+          (identifier)
+          (literalNumber))))
+    (declType
+      (identifier)
+      (kEq)
+      (kType)
       (type
-        (declStringCodePage (identifier) (literalNumber))))
-    (declType (identifier) (kEq)
+        (declStringCodePage
+          (identifier)
+          (literalNumber))))
+    (declType
+      (identifier)
+      (kEq)
       (type
-        (declStringCodePage (identifier) (literalNumber)))))
-  (declVars (kVar)
+        (declStringCodePage
+          (identifier)
+          (literalNumber)))))
+  (declVars
+    (kVar)
     (declVar
       (identifier)
-      (type (declStringCodePage (identifier) (identifier))))))
+      (type
+        (declStringCodePage
+          (identifier)
+          (identifier))))))
 
 ===
 Property accessors through record fields, readonly and writeonly dispids
@@ -878,19 +1484,65 @@ type
 ---
 
 (root
-  (declTypes (kType)
-    (declType (identifier) (kEq)
-      (declClass (kClass)
-        (declProp (kProperty) (identifier) (type (typeref (identifier)))
-          (kRead) (exprDot (identifier) (kDot) (identifier))
-          (kWrite) (exprDot (identifier) (kDot) (identifier)))
-        (declProp (kProperty) (identifier) (type (typeref (identifier)))
-          (kRead) (exprDot (exprDot (identifier) (kDot) (identifier)) (kDot) (identifier)))
+  (declTypes
+    (kType)
+    (declType
+      (identifier)
+      (kEq)
+      (declClass
+        (kClass)
+        (declProp
+          (kProperty)
+          (identifier)
+          (type
+            (typeref
+              (identifier)))
+          (kRead)
+          (exprDot
+            (identifier)
+            (kDot)
+            (identifier))
+          (kWrite)
+          (exprDot
+            (identifier)
+            (kDot)
+            (identifier)))
+        (declProp
+          (kProperty)
+          (identifier)
+          (type
+            (typeref
+              (identifier)))
+          (kRead)
+          (exprDot
+            (exprDot
+              (identifier)
+              (kDot)
+              (identifier))
+            (kDot)
+            (identifier)))
         (kEnd)))
-    (declType (identifier) (kEq)
-      (declIntf (kDispInterface)
-        (declProp (kProperty) (identifier) (type (typeref (identifier)))
-          (kReadonly) (kDispId) (literalNumber))
-        (declProp (kProperty) (identifier) (type (typeref (identifier)))
-          (kWriteonly) (kDispId) (literalNumber))
+    (declType
+      (identifier)
+      (kEq)
+      (declIntf
+        (kDispInterface)
+        (declProp
+          (kProperty)
+          (identifier)
+          (type
+            (typeref
+              (identifier)))
+          (kReadonly)
+          (kDispId)
+          (literalNumber))
+        (declProp
+          (kProperty)
+          (identifier)
+          (type
+            (typeref
+              (identifier)))
+          (kWriteonly)
+          (kDispId)
+          (literalNumber))
         (kEnd)))))

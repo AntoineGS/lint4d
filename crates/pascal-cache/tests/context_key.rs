@@ -5,7 +5,8 @@ use pascal_project::delphi_overrides::EffectiveOverrides;
 use pascal_project::delphi_overrides::OverrideSession;
 use pascal_project::{
     CompilerVersion, ConditionalFact, InstallationSelection, ProjectContext, ProjectContextParts,
-    ProjectPathEntry, ProjectPathIssue, ProjectPathIssueKind, ProjectPathProvenance, ReadPolicy,
+    ProjectPathEntry, ProjectPathIssue, ProjectPathIssueKind, ProjectPathProvenance, PropertyValue,
+    ReadPolicy,
 };
 use std::path::{Path, PathBuf};
 
@@ -40,6 +41,7 @@ fn every_context_field_changes_the_key() {
         include_path_entries: _,
         unit_namespaces: _,
         unit_aliases: _,
+        warning_properties: _,
         conditional_context: _,
         conditional_closure: _,
         library_conditional_context: _,
@@ -120,6 +122,12 @@ fn every_context_field_changes_the_key() {
                 .unit_aliases
                 .insert("WinTypes".into(), "Winapi.Windows".into());
         }),
+        ("warning_properties", |parts| {
+            parts.warning_properties.insert(
+                "DCC_SYMBOL_PLATFORM".into(),
+                PropertyValue::Known("false".into()),
+            );
+        }),
         ("conditional_context", |parts| {
             parts
                 .conditional_context
@@ -174,7 +182,7 @@ fn every_context_field_changes_the_key() {
             parts.override_error = Some("bad override".into())
         }),
     ];
-    assert_eq!(mutations.len(), 29);
+    assert_eq!(mutations.len(), 30);
     let base = key(ProjectContextParts::default());
     let mut seen = vec![base.digest()];
     for (name, mutate) in mutations {
@@ -186,6 +194,23 @@ fn every_context_field_changes_the_key() {
         );
         seen.push(changed.digest());
     }
+}
+
+#[test]
+fn warning_property_known_and_unknown_states_have_distinct_keys() {
+    let known = with(|parts| {
+        parts.warning_properties.insert(
+            "DCC_SYMBOL_PLATFORM".into(),
+            PropertyValue::Known("false".into()),
+        );
+    });
+    let unknown = with(|parts| {
+        parts
+            .warning_properties
+            .insert("DCC_SYMBOL_PLATFORM".into(), PropertyValue::Unknown);
+    });
+
+    assert_ne!(known, unknown);
 }
 
 #[test]

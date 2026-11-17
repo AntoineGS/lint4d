@@ -1,0 +1,13 @@
+# Embarcadero Delphi for Win32 compiler version 21.0
+# dcc32 -B -H+ -W+ -Q -U<lib> WarnAllOnAfterOff.pas
+WarnAllOnAfterOff.pas(7) E1030 Invalid compiler directive: 'ALL'
+WarnAllOnAfterOff.pas(22) W1009 Redeclaration of 'ValueOff' hides a member in the base class
+WarnAllOnAfterOff.pas(32) W1010 Method 'InvokeOff' hides virtual method of base type 'TBaseVirtualOff'
+WarnAllOnAfterOff.pas(40) E1030 Invalid compiler directive: 'ALL'
+WarnAllOnAfterOff.pas(52) W1009 Redeclaration of 'ValueOn' hides a member in the base class
+WarnAllOnAfterOff.pas(62) W1010 Method 'InvokeOn' hides virtual method of base type 'TBaseVirtualOn'
+WarnAllOnAfterOff.pas(73) E1030 Invalid compiler directive: 'ALL'
+WarnAllOnAfterOff.pas(74) W1000 Symbol 'DeprecatedRoutine' is deprecated
+WarnAllOnAfterOff.pas(75) E1030 Invalid compiler directive: 'ALL'
+WarnAllOnAfterOff.pas(76) W1000 Symbol 'DeprecatedRoutine' is deprecated
+WarnAllOnAfterOff.pas(37) H2219 Private symbol 'FUnused' declared but never used

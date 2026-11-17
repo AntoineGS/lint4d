@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem W1001LibraryVar.pas
+W1001LibraryVar.pas(16) W1001 Symbol 'LibraryVariable' is specific to a library
+W1001LibraryVar.pas(16) H2077 Value assigned to 'Value' never used

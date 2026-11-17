@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 24.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem W1000FieldAndProperty.pas
+W1000FieldAndProperty.pas(20) W1000 Symbol 'FDeprecated' is deprecated
+W1000FieldAndProperty.pas(27) H2077 Value assigned to 'N' never used

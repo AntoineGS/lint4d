@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 21.0
+# dcc32 -B -H+ -W+ -Q -U<lib> W1000AllOverloadsDeprecated.pas
+W1000AllOverloadsDeprecated.pas(21) W1000 Symbol 'Overloaded' is deprecated: 'replace Overloaded'
+W1000AllOverloadsDeprecated.pas(22) W1000 Symbol 'Overloaded' is deprecated: 'replace Overloaded'

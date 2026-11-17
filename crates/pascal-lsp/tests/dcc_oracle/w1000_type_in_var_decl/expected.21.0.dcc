@@ -1,0 +1,7 @@
+# Embarcadero Delphi for Win32 compiler version 21.0
+# dcc32 -B -H+ -W+ -Q -U<lib> W1000TypeInVarDecl.pas
+W1000TypeInVarDecl.pas(10) W1000 Symbol 'TDeprecated' is deprecated
+W1000TypeInVarDecl.pas(10) W1000 Symbol 'TDeprecated' is deprecated
+W1000TypeInVarDecl.pas(18) W1000 Symbol 'TDeprecated' is deprecated
+W1000TypeInVarDecl.pas(18) W1000 Symbol 'TDeprecated' is deprecated
+W1000TypeInVarDecl.pas(20) W1036 Variable 'LocalValue' might not have been initialized

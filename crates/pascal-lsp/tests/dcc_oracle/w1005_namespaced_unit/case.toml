@@ -1,0 +1,2 @@
+unit = "NamespacedUse.pas"
+compilers = ["24.0", "37.0"]

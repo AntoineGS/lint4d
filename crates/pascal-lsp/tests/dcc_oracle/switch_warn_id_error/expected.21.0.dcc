@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 21.0
+# dcc32 -B -H+ -W+ -Q -U<lib> SwitchWarnIdError.pas
+SwitchWarnIdError.pas(22) E1009 Redeclaration of 'Value' hides a member in the base class
+SwitchWarnIdError.pas(23) E1010 Method 'Invoke' hides virtual method of base type 'TBase'

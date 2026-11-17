@@ -452,10 +452,10 @@ thread_local! {
 /// Tests compare a lazy walk with the eager one (l4d-fpyu).
 fn eager_imports_for_test() -> bool {
     #[cfg(test)]
-    if TEST_EAGER_SNAPSHOT_IMPORTS.with(std::cell::Cell::get) {
-        return true;
-    }
-    false
+    let eager = TEST_EAGER_SNAPSHOT_IMPORTS.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let eager = false;
+    eager
 }
 
 fn navigation_walk_byte_limit() -> usize {
@@ -9632,6 +9632,12 @@ impl Workspace {
             .as_ref()
             .map(|context| conditional_context_for_uri(context, uri))
             .unwrap_or_default();
+        let warning_properties = context.as_ref().and_then(|context| {
+            uri.to_file_path()
+                .ok()
+                .filter(|path| context.owns_unit_source(path))
+                .map(|_| Arc::new(context.warning_properties().clone()))
+        });
         let source_hash =
             raw_content_hash.unwrap_or_else(|| crate::project_cache::overlay_content_hash(&source));
         let overlays = self.overlay_inputs();
@@ -9717,6 +9723,7 @@ impl Workspace {
                 cached,
                 cancel,
                 expansion.as_ref().map(|e| &e.expanded),
+                warning_properties.clone(),
             ),
             None => {
                 let cancel = AtomicBool::new(false);
@@ -9727,6 +9734,7 @@ impl Workspace {
                     cached,
                     &cancel,
                     expansion.as_ref().map(|e| &e.expanded),
+                    warning_properties,
                 )
             }
         };

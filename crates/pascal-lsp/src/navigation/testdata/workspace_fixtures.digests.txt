@@ -169,6 +169,8 @@ crates/lint4d/tests/fixtures/use_after_free/good_nil_checks_after_freeandnil.pas
 crates/lint4d/tests/fixtures/use_after_free/good_no_use_after_free.pas c90d770049a92b50 3
 crates/lint4d/tests/fixtures/use_after_free/good_reassign_after_free.pas 129376ac8f2191ac 3
 crates/pascal-lsp/tests/dcc_oracle/clean_unit/Clean.pas be2bd41795dedee4 10
+crates/pascal-lsp/tests/dcc_oracle/dproj_hints_off/DprojHintsOff.pas 3665fcd4c859615d 3
+crates/pascal-lsp/tests/dcc_oracle/dproj_platform_off_debug_only/DprojPlatformOffDebugOnly.pas 09a37d79c7273217 7
 crates/pascal-lsp/tests/dcc_oracle/dproj_warning_switches/DprojWarningSwitches.pas 811918ac4530da97 5
 crates/pascal-lsp/tests/dcc_oracle/dproj_warnings_off/DprojWarningsOff.pas 107be51f9c639eab 5
 crates/pascal-lsp/tests/dcc_oracle/e2003_asm_block/E2003AsmBlock.pas 3181b2bac4d8fe4c 2
@@ -266,6 +268,17 @@ crates/pascal-lsp/tests/dcc_oracle/h2219_used_via_property/UsedViaProperty.pas f
 crates/pascal-lsp/tests/dcc_oracle/h2219_used_with/UsedWith.pas 1bc92d0d8c2f7396 6
 crates/pascal-lsp/tests/dcc_oracle/override_valid/OverrideValid.pas a319a6303ca71915 8
 crates/pascal-lsp/tests/dcc_oracle/probe_basic/Probe.pas 94fe15f87d462573 14
+crates/pascal-lsp/tests/dcc_oracle/switch_hints_off_h2219/SwitchHintsOffH2219.pas 060485c536ec4ab5 4
+crates/pascal-lsp/tests/dcc_oracle/switch_in_include/SwitchInInclude.pas fa7b406fd6727567 10
+crates/pascal-lsp/tests/dcc_oracle/switch_in_include/Switches.inc c8d76b92e67691eb 0
+crates/pascal-lsp/tests/dcc_oracle/switch_in_unexpanded_include/SwitchInUnexpandedInclude.pas 5bf11f7525407bb6 7
+crates/pascal-lsp/tests/dcc_oracle/switch_in_unexpanded_include/Switches.inc 2420cc3dd40672e0 0
+crates/pascal-lsp/tests/dcc_oracle/switch_in_unknown_conditional/SwitchInUnknownConditional.pas 4e1c2e6b0c527f31 7
+crates/pascal-lsp/tests/dcc_oracle/switch_w1010_off/SwitchW1010Off.pas 6921b7c5393a0630 8
+crates/pascal-lsp/tests/dcc_oracle/switch_warn_default/SwitchWarnDefault.pas 9db74951531cd444 10
+crates/pascal-lsp/tests/dcc_oracle/switch_warn_id_error/SwitchWarnIdError.pas 6b7f2dc4398df66a 11
+crates/pascal-lsp/tests/dcc_oracle/switch_warn_id_off/SwitchWarnIdOff.pas dddb8101cd715d21 7
+crates/pascal-lsp/tests/dcc_oracle/switch_warnings_off_region/SwitchWarningsOffRegion.pas 2d8f54d36d1cfc3f 10
 crates/pascal-lsp/tests/dcc_oracle/w1009_field_hides_field/W1009FieldHidesField.pas ce480df353c6ecca 6
 crates/pascal-lsp/tests/dcc_oracle/w1009_method_hides_static/W1009MethodHidesStatic.pas 9cc02c8c9255bc37 8
 crates/pascal-lsp/tests/dcc_oracle/w1009_property/W1009Property.pas d7cf35ed2492937e 7

@@ -7504,6 +7504,7 @@ fn build_snapshot_with_policy(
                     cached,
                     cancel,
                     loader.expansions.get(&uri).map(|e| &e.expanded),
+                    None,
                 )
                 .map_err(|error| format!("rename workspace scan could not index {uri}: {error}"))?;
             if let Some(content_hash) = content_hash

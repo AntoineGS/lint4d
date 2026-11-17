@@ -66,6 +66,31 @@ output switch; `-H+` and `-H-` are accepted to enable/disable hints. The
 recorder keeps the defaults `-H+ -W+`, then appends configured `.dproj`
 switches so project values take precedence.
 
+## Warning and hint switch fixtures
+
+Tier 1B adds 11 switch cases recorded with Delphi 21.0, 24.0, and 37.0. The
+recordings agree across all three versions: global warning regions and
+per-ID `OFF` suppress only the governed findings, `DEFAULT` restores the
+initial state, and `ERROR` reports warning IDs as `E1009`/`E1010` with Error
+severity. The `.dproj` cases cover a configuration/platform-specific warning
+property and `DCC_Hints=false`.
+
+The paired H2219 case settles its governing position: dcc uses the hint state
+at the end of the unit, so turning hints off before `end.` suppresses H2219
+even when the private field precedes the directive. The dcc recording confirms
+that a switch inside an expanded include affects following declarations. The
+unexpanded-include case
+records dcc's W1009 but sets `recall = false`: the navigation-only oracle
+cannot see the include's switch, so lint4d must stay silent after that include
+while precision remains enforced. Likewise, a switch in an unknown conditional
+leaves the affected state unknown from that point; a direct switch-state test
+covers this independently of whether semantic analysis produced a candidate
+diagnostic.
+
+If the document has no recognized compiler-version switch table, warning and
+hint findings are withheld because their effective state cannot be proven.
+Error diagnostics are not filtered by warning or hint switches.
+
 The unit test in `src/navigation/dcc_oracle_tests.rs` compares only codes in
 `ENABLED_CODES`; add a code there as the corresponding lint rule is implemented.
 For enabled codes, precision is always enforced: every lint4d finding must be

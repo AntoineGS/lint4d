@@ -196,6 +196,10 @@ impl SwitchTable {
         self.codes.get(code.to_ascii_uppercase().as_str())
     }
 
+    pub(crate) fn entries(&self) -> impl Iterator<Item = &CodeSwitch> {
+        self.codes.values()
+    }
+
     pub(crate) fn id_for_property(&self, property: &str) -> Option<&str> {
         self.properties
             .get(&property.to_ascii_lowercase())

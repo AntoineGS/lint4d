@@ -5,7 +5,7 @@ use pascal_core::directive_fragment_rewrite::DirectivePatch;
 use pascal_core::{FileInfo, parser};
 #[cfg(test)]
 use pascal_project::CompilerVersion;
-use pascal_project::ConditionalContext;
+use pascal_project::{ConditionalContext, PropertyValue};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::cell::Cell;
@@ -118,6 +118,7 @@ pub(crate) use symbols::{
     WorkspaceSymbolList, lsp_kind_for_shape, too_many_workspace_symbols, workspace_symbol_cap,
 };
 mod type_hierarchy;
+mod warning_switches;
 #[cfg(test)]
 pub(crate) use assistance::CompletionResolutionSeed;
 pub(crate) use assistance::completion_prefix_at_position;
@@ -861,6 +862,7 @@ pub(crate) enum SemanticDiagnosticKind {
     IncompatibleArgument,
     #[allow(dead_code)]
     Dcc(DccMessage),
+    PromotedDcc(DccMessage),
 }
 
 impl SemanticDiagnosticKind {
@@ -869,12 +871,16 @@ impl SemanticDiagnosticKind {
             Self::TypeMismatch => "pascal-type-mismatch",
             Self::IncompatibleArgument => "pascal-incompatible-argument",
             Self::Dcc(message) => message.code(),
+            Self::PromotedDcc(message) => message
+                .promoted_error_code()
+                .unwrap_or_else(|| message.code()),
         }
     }
 
     pub(crate) fn severity(self) -> DccSeverity {
         match self {
             Self::Dcc(message) => message.severity(),
+            Self::PromotedDcc(_) => DccSeverity::Error,
             Self::TypeMismatch | Self::IncompatibleArgument => DccSeverity::Error,
         }
     }
@@ -914,7 +920,7 @@ fn semantic_diagnostic_kind_rank(kind: SemanticDiagnosticKind) -> u8 {
         SemanticDiagnosticKind::Dcc(DccMessage::E2003) => 0,
         SemanticDiagnosticKind::TypeMismatch => 2,
         SemanticDiagnosticKind::IncompatibleArgument => 3,
-        SemanticDiagnosticKind::Dcc(_) => 6,
+        SemanticDiagnosticKind::Dcc(_) | SemanticDiagnosticKind::PromotedDcc(_) => 6,
     }
 }
 
@@ -1390,9 +1396,10 @@ impl NavigationIndex {
         cached: Option<Arc<ParsedDocument>>,
         cancel: &AtomicBool,
     ) -> Result<(), String> {
-        self.update_with_session(uri, source, context, cached, cancel, None)
+        self.update_with_session(uri, source, context, cached, cancel, None, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn update_with_session(
         &mut self,
         uri: Url,
@@ -1401,6 +1408,7 @@ impl NavigationIndex {
         cached: Option<Arc<ParsedDocument>>,
         cancel: &AtomicBool,
         expansion: Option<&crate::include_expansion::ExpandedSource>,
+        warning_properties: Option<Arc<BTreeMap<String, PropertyValue>>>,
     ) -> Result<(), String> {
         let previous = self
             .documents
@@ -1426,6 +1434,7 @@ impl NavigationIndex {
             previous.or(cached),
             expansion,
             verified_system_key,
+            warning_properties,
         )?;
         if cancel.load(Ordering::Relaxed) {
             return Err("request cancelled".to_string());
@@ -3259,6 +3268,7 @@ impl NavigationIndex {
         report
             .diagnostics
             .retain(|diagnostic| diagnostic.span.end <= proven_end);
+        warning_switches::filter_report(document, &mut report.diagnostics);
         report.diagnostics.sort_by_key(|diagnostic| {
             (
                 diagnostic.span.start,
@@ -17411,6 +17421,7 @@ pub(crate) struct ParsedDocument {
     source: Arc<str>,
     parser_source: Arc<[u8]>,
     conditional_context: ConditionalContext,
+    warning_properties: Option<Arc<BTreeMap<String, PropertyValue>>>,
     tree: Tree,
     parser_recovery_spans: Vec<Span>,
     unit_name: String,
@@ -17492,6 +17503,19 @@ impl ParsedDocument {
                 )
             },
         );
+        let warning_property_bytes = self.warning_properties.as_ref().map_or(0, |properties| {
+            properties
+                .iter()
+                .fold(std::mem::size_of_val(properties), |bytes, (name, value)| {
+                    bytes
+                        .saturating_add(name.len())
+                        .saturating_add(std::mem::size_of::<PropertyValue>())
+                        .saturating_add(match value {
+                            PropertyValue::Known(value) => value.len(),
+                            PropertyValue::Unknown => 0,
+                        })
+                })
+        });
         self.source
             .len()
             .saturating_mul(PER_SOURCE_BYTE)
@@ -17503,6 +17527,7 @@ impl ParsedDocument {
             )
             .saturating_add(self.symbols.len().saturating_mul(PER_SYMBOL))
             .saturating_add(binding_keys)
+            .saturating_add(warning_property_bytes)
     }
 
     /// Whether symbol `index` can be an unqualified name: it has no owner
@@ -17905,9 +17930,10 @@ impl Document {
         cancel: &AtomicBool,
         previous: Option<Arc<ParsedDocument>>,
     ) -> Result<Self, String> {
-        Self::parse_with_session(uri, source, context, cancel, previous, None, None)
+        Self::parse_with_session(uri, source, context, cancel, previous, None, None, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn parse_with_session(
         uri: Url,
         source: String,
@@ -17916,10 +17942,12 @@ impl Document {
         previous: Option<Arc<ParsedDocument>>,
         expansion: Option<&crate::include_expansion::ExpandedSource>,
         verified_system_surface: Option<dcc_surface::SurfaceKey>,
+        warning_properties: Option<Arc<BTreeMap<String, PropertyValue>>>,
     ) -> Result<Self, String> {
         if let Some(previous) = previous.as_ref()
             && previous.source.as_ref() == source.as_str()
             && previous.conditional_context == *context
+            && previous.warning_properties.as_deref() == warning_properties.as_deref()
             && expansion
                 .and_then(|e| e.conditionals.as_ref())
                 .is_none_or(|c| *c == previous.conditionals)
@@ -18378,6 +18406,7 @@ impl Document {
             source: Arc::from(source),
             parser_source: Arc::from(parser_source.into_boxed_slice()),
             conditional_context: context.clone(),
+            warning_properties,
             tree,
             parser_recovery_spans,
             unit_name,

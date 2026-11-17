@@ -46,6 +46,14 @@ impl DccMessage {
         }
     }
 
+    pub(crate) fn promoted_error_code(self) -> Option<&'static str> {
+        match self {
+            Self::W1009 => Some("E1009"),
+            Self::W1010 => Some("E1010"),
+            _ => None,
+        }
+    }
+
     pub(crate) fn severity(self) -> DccSeverity {
         match self {
             Self::E2004
@@ -117,6 +125,8 @@ mod tests {
         assert_eq!(DccMessage::W1010.severity(), DccSeverity::Warning);
         assert_eq!(DccMessage::E2003.severity(), DccSeverity::Error);
         assert_eq!(DccMessage::E2037.severity(), DccSeverity::Error);
+        assert_eq!(DccMessage::W1009.promoted_error_code(), Some("E1009"));
+        assert_eq!(DccMessage::W1010.promoted_error_code(), Some("E1010"));
     }
 
     #[test]

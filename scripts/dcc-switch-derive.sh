@@ -79,10 +79,10 @@ sed -n '/<DCC DelphiCompile=/,/^[[:space:]]*\/>/p' "$targets" > "$task_block"
 
 properties_raw="$tmpdir/properties.raw"
 properties_file="$tmpdir/properties.txt"
-if grep -oE '[A-Za-z_][A-Za-z0-9_]*="\$\(DCC_[A-Za-z_][A-Za-z0-9_]*\)"' "$task_block" \
+if grep -oE '[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=[[:space:]]*"\$\(DCC_[A-Za-z_][A-Za-z0-9_]*\)"' "$task_block" \
   > "$tmpdir/property-attributes.raw"; then
   sed -E \
-    's/^([A-Za-z_][A-Za-z0-9_]*)="\$\(DCC_([A-Za-z_][A-Za-z0-9_]*)\)"$/DCC_\2 \1/' \
+    's/^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*"\$\(DCC_([A-Za-z_][A-Za-z0-9_]*)\)"$/DCC_\2 \1/' \
     "$tmpdir/property-attributes.raw" > "$properties_raw"
 else
   grep_status=$?
@@ -473,12 +473,15 @@ for code in "${codes[@]}"; do
       specific_suppressors+=("$suppressor")
     fi
   done
-  if (( ${#property_suppressors[@]} > 1 )); then
-    fail "$code is controlled by multiple DCC task properties: ${property_suppressors[*]}"
+  non_umbrella_suppressor_count=$((
+    ${#property_suppressors[@]} + ${#specific_suppressors[@]}
+  ))
+  if ((non_umbrella_suppressor_count > 1)); then
+    fail "$code has multiple non-umbrella suppressors: ${property_suppressors[*]} ${specific_suppressors[*]}"
+  elif ((non_umbrella_suppressor_count == 0)) && [[ $code != H2219 ]]; then
+    fail "$code has no non-umbrella suppressor"
   elif (( ${#property_suppressors[@]} == 1 )); then
     identifiers[$code]=${property_suppressors[0]}
-  elif (( ${#specific_suppressors[@]} > 1 )); then
-    fail "$code is suppressed by multiple non-umbrella IDs: ${specific_suppressors[*]}"
   elif (( ${#specific_suppressors[@]} == 1 )); then
     identifiers[$code]=${specific_suppressors[0]}
   else

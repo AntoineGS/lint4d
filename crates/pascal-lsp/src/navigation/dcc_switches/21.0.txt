@@ -44,6 +44,7 @@ DCC_DebugInformation DebugInformation
 DCC_DefaultNamespace DefaultNamespace
 DCC_Define Define
 DCC_DelaySign DelaySign
+DCC_DependencyCheckOutputName DependencyCheckOutputName
 DCC_Description Description
 DCC_DUPLICATE_CTOR_DTOR DUPLICATE_CTOR_DTOR
 DCC_DUPLICATES_IGNORED DUPLICATES_IGNORED

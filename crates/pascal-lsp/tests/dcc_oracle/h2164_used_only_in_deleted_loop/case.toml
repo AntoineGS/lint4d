@@ -1,0 +1,4 @@
+unit = "DeletedLoop.pas"
+compilers = ["21.0", "24.0", "37.0"]
+recall = false
+reason = "Task 4 H2135 deleted-loop activity filtering is not implemented yet; the CFG still treats this body as possibly active."

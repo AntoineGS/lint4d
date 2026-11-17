@@ -1,6 +1,7 @@
 #![allow(dead_code)] // Model fields are intentionally consumed by the next flow-analysis tasks.
 
 mod model;
+mod usage;
 
 #[cfg(test)]
 mod tests;
@@ -21,10 +22,20 @@ pub(super) fn flow_diagnostics_with_budget(
     index: &NavigationIndex,
     uri: &Url,
     document: &Document,
+    prior_diagnostics: &[SemanticDiagnostic],
     _capacity: usize,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<Vec<SemanticDiagnostic>, String> {
-    let _ = routine_flows(index, uri, document, cancel, budget)?;
-    Ok(Vec::new())
+    let flows = routine_flows(index, uri, document, cancel, budget)?;
+    usage::flow_diagnostics(
+        index,
+        uri,
+        document,
+        &flows,
+        prior_diagnostics,
+        _capacity,
+        cancel,
+        budget,
+    )
 }

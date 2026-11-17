@@ -13,6 +13,8 @@ pub(crate) enum DccMessage {
     E2254,
     E2291,
     E2301,
+    H2077,
+    H2164,
     H2219,
     W1009,
     W1010,
@@ -40,6 +42,8 @@ impl DccMessage {
             Self::E2254 => "E2254",
             Self::E2291 => "E2291",
             Self::E2301 => "E2301",
+            Self::H2077 => "H2077",
+            Self::H2164 => "H2164",
             Self::H2219 => "H2219",
             Self::W1009 => "W1009",
             Self::W1010 => "W1010",
@@ -59,7 +63,7 @@ impl DccMessage {
             | Self::E2254
             | Self::E2291
             | Self::E2301 => DccSeverity::Error,
-            Self::H2219 => DccSeverity::Hint,
+            Self::H2077 | Self::H2164 | Self::H2219 => DccSeverity::Hint,
             Self::W1009 | Self::W1010 => DccSeverity::Warning,
         }
     }
@@ -77,6 +81,8 @@ impl DccMessage {
             Self::E2254 => "Overloaded procedure '%s' must be marked with the 'overload' directive",
             Self::E2291 => "Missing implementation of interface method %s.%s",
             Self::E2301 => "Method '%s' with identical parameters and result type already exists",
+            Self::H2077 => "Value assigned to '%s' never used",
+            Self::H2164 => "Variable '%s' is declared but never used in '%s'",
             Self::H2219 => "Private symbol '%s' declared but never used",
             Self::W1009 => "Redeclaration of '%s' hides a member in the base class",
             Self::W1010 => "Method '%s' hides virtual method of base type '%s'",
@@ -113,6 +119,8 @@ mod tests {
 
     #[test]
     fn severity_follows_the_code_prefix() {
+        assert_eq!(DccMessage::H2077.severity(), DccSeverity::Hint);
+        assert_eq!(DccMessage::H2164.severity(), DccSeverity::Hint);
         assert_eq!(DccMessage::H2219.severity(), DccSeverity::Hint);
         assert_eq!(DccMessage::W1010.severity(), DccSeverity::Warning);
         assert_eq!(DccMessage::E2003.severity(), DccSeverity::Error);
@@ -168,6 +176,16 @@ mod tests {
                 DccMessage::E2301,
                 "E2301",
                 "Method '%s' with identical parameters and result type already exists",
+            ),
+            (
+                DccMessage::H2077,
+                "H2077",
+                "Value assigned to '%s' never used",
+            ),
+            (
+                DccMessage::H2164,
+                "H2164",
+                "Variable '%s' is declared but never used in '%s'",
             ),
             (
                 DccMessage::H2219,

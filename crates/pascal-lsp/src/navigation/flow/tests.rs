@@ -713,7 +713,7 @@ fn flow_budget_exhaustion_is_reported_as_a_coverage_gap() {
     let cancel = AtomicBool::new(false);
     let mut budget = AssistanceBudget::new(1, 8 * 1024 * 1024, "flow test");
     let result =
-        super::flow_diagnostics_with_budget(&index, &uri, document, 10, &cancel, &mut budget);
+        super::flow_diagnostics_with_budget(&index, &uri, document, &[], 10, &cancel, &mut budget);
     let mut report = super::super::SemanticDiagnosticReport::default();
     assert!(
         report
@@ -808,6 +808,7 @@ fn flow_with_target_scan_reports_budget_exclusion() {
         decl_span: SourceSpan { start: 0, end: 0 },
         kind: LocalKind::Local,
         ty: VarType::Scalar,
+        type_resolved: true,
         address_taken: false,
         captured: false,
         absolute: false,
@@ -916,8 +917,15 @@ fn flow_document_precharge_excludes_all_routines_before_cfg_building() {
     assert!(budget.exhausted());
 
     let mut gap_budget = AssistanceBudget::new(work_limit, 8 * 1024 * 1024, "flow test");
-    let result =
-        super::flow_diagnostics_with_budget(&index, &uri, document, 10, &cancel, &mut gap_budget);
+    let result = super::flow_diagnostics_with_budget(
+        &index,
+        &uri,
+        document,
+        &[],
+        10,
+        &cancel,
+        &mut gap_budget,
+    );
     let mut report = super::super::SemanticDiagnosticReport::default();
     assert!(
         report
@@ -1040,26 +1048,247 @@ fn flow_model_fails_closed_for_recovery_unknown_conditionals_asm_goto_and_inline
 }
 
 #[test]
-fn flow_diagnostics_pass_is_wired_but_emits_no_findings_yet() {
+fn flow_diagnostics_report_a_written_only_local_as_h2077() {
     let source = concat!(
-        "program FlowNoFindings;\n",
+        "program FlowWrittenOnly;\n",
         "procedure Demo;\n",
-        "var NeverRead: Integer;\n",
-        "begin NeverRead := 1; end;\n",
+        "var WrittenOnly: Integer;\n",
+        "begin WrittenOnly := 1; end;\n",
         "begin Demo; end.\n",
     );
-    let uri = Url::parse("file:///tmp/flow-no-findings.pas").expect("valid URI");
+    let diagnostics = flow_diagnostics(source);
+    assert_eq!(
+        flow_finding_lines(source, &diagnostics),
+        vec![(
+            "H2077".to_owned(),
+            4,
+            "Value assigned to 'WrittenOnly' never used".to_owned(),
+        )]
+    );
+}
+
+fn flow_diagnostics(source: &str) -> Vec<SemanticDiagnostic> {
+    let uri = Url::parse("file:///tmp/flow-diagnostics.pas").expect("valid URI");
     let mut index = NavigationIndex::new();
     index
         .update(uri.clone(), source.to_owned())
         .expect("fixture parses");
-    let diagnostics = index
-        .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
-        .expect("semantic report");
+    let document = index.documents.get(&uri).expect("indexed document");
+    let cancel = AtomicBool::new(false);
+    let mut budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "flow test");
+    super::flow_diagnostics_with_budget(&index, &uri, document, &[], 100, &cancel, &mut budget)
+        .expect("flow diagnostics build")
+}
+
+#[test]
+fn flow_diagnostics_withhold_findings_when_a_routine_has_an_unresolved_identifier() {
+    let source = concat!(
+        "program FlowUnresolved;\n",
+        "procedure Demo;\n",
+        "var Value: Integer;\n",
+        "begin\n",
+        "  Value := 1;\n",
+        "  Value := Missing;\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+
+    assert!(
+        flow_diagnostics(source).is_empty(),
+        "flow analysis must not publish findings for a routine with an unresolved identifier"
+    );
+}
+
+#[test]
+fn flow_diagnostics_withhold_findings_for_duplicate_local_identities() {
+    let sources = [
+        concat!(
+            "program FlowDuplicateLocals;\n",
+            "procedure Demo;\n",
+            "var Value: Integer;\n",
+            "    Value: string;\n",
+            "begin end;\n",
+            "begin end.\n",
+        ),
+        concat!(
+            "program FlowDuplicateParameter;\n",
+            "procedure Demo(Value: Integer);\n",
+            "var Value: string;\n",
+            "begin end;\n",
+            "begin end.\n",
+        ),
+    ];
+
+    for source in sources {
+        assert!(
+            flow_diagnostics(source).is_empty(),
+            "duplicate local identities must not produce flow findings: {source}"
+        );
+    }
+}
+
+#[test]
+fn flow_diagnostics_withhold_findings_for_an_unresolved_local_type() {
+    let source = concat!(
+        "program FlowUnknownLocalType;\n",
+        "procedure Demo;\n",
+        "var Value: MissingType;\n",
+        "begin end;\n",
+        "begin end.\n",
+    );
+
+    assert!(
+        flow_diagnostics(source).is_empty(),
+        "an unresolved local type must make the routine fail closed"
+    );
+}
+
+fn flow_finding_lines(
+    source: &str,
+    diagnostics: &[SemanticDiagnostic],
+) -> Vec<(String, usize, String)> {
+    let mut findings = diagnostics
+        .iter()
+        .map(|diagnostic| {
+            let line = source[..diagnostic.span.start]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1;
+            (
+                diagnostic.kind.code().to_owned(),
+                line,
+                diagnostic.message.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    findings.sort();
+    findings
+}
+
+#[test]
+fn flow_diagnostics_report_unused_locals_and_dead_assignments_at_dcc_locations() {
+    let source = concat!(
+        "program FlowUsage;\n",
+        "procedure Demo;\n",
+        "var NeverRead, WrittenOnly, Reassigned, Used: Integer;\n",
+        "begin\n",
+        "  WrittenOnly := 1;\n",
+        "  Reassigned := 1;\n",
+        "  Reassigned := 2;\n",
+        "  if Reassigned = 0 then WriteLn('used');\n",
+        "  Used := 3;\n",
+        "  WriteLn(Used);\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+    let expected = vec![
+        (
+            "H2077".to_owned(),
+            5,
+            "Value assigned to 'WrittenOnly' never used".to_owned(),
+        ),
+        (
+            "H2077".to_owned(),
+            6,
+            "Value assigned to 'Reassigned' never used".to_owned(),
+        ),
+        (
+            "H2164".to_owned(),
+            3,
+            "Variable 'NeverRead' is declared but never used in 'Demo'".to_owned(),
+        ),
+    ];
+    let diagnostics = flow_diagnostics(source);
+    assert_eq!(flow_finding_lines(source, &diagnostics), expected);
     assert!(
         diagnostics
             .iter()
-            .all(|diagnostic| !diagnostic.message.contains("declared but never used")),
-        "the scaffolding pass must not publish findings before analysis tasks: {diagnostics:?}"
+            .all(|finding| { finding.kind.severity() == crate::navigation::DccSeverity::Hint })
     );
+}
+
+#[test]
+fn flow_diagnostics_keep_only_the_initial_dead_write_before_a_nonempty_constant_loop() {
+    let source = concat!(
+        "program FlowConstantLoop;\n",
+        "procedure Demo;\n",
+        "var I, Value: Integer;\n",
+        "begin\n",
+        "  Value := 1;\n",
+        "  for I := 1 to 2 do\n",
+        "    Value := I;\n",
+        "  WriteLn(Value);\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+
+    assert_eq!(
+        flow_finding_lines(source, &flow_diagnostics(source)),
+        vec![(
+            "H2077".to_owned(),
+            5,
+            "Value assigned to 'Value' never used".to_owned(),
+        )]
+    );
+}
+
+#[test]
+fn flow_diagnostics_fail_closed_for_address_captured_absolute_and_with_locals() {
+    let source = concat!(
+        "program FlowExclusionDiagnostics;\n",
+        "type TBox = record WithTarget: Integer; end;\n",
+        "procedure TouchAddress(Value: Pointer); begin end;\n",
+        "procedure Demo;\n",
+        "var Addressed, Captured, WithTarget, SafeDead: Integer;\n",
+        "    Box: TBox;\n",
+        "    AbsoluteValue: Integer absolute $1000;\n",
+        "  procedure Inner; begin Captured := 1; end;\n",
+        "begin\n",
+        "  Addressed := 1;\n",
+        "  TouchAddress(@Addressed);\n",
+        "  Addressed := 2;\n",
+        "  AbsoluteValue := 1;\n",
+        "  with Box do WithTarget := 1;\n",
+        "  SafeDead := 1;\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+    let diagnostics = flow_diagnostics(source);
+    assert_eq!(
+        flow_finding_lines(source, &diagnostics),
+        vec![(
+            "H2077".to_owned(),
+            15,
+            "Value assigned to 'SafeDead' never used".to_owned(),
+        )]
+    );
+}
+
+#[test]
+fn flow_diagnostics_withhold_findings_for_excluded_routines() {
+    let positive = concat!(
+        "program FlowUsagePositive;\n",
+        "procedure Demo; var Value: Integer; begin Value := 1; end;\n",
+        "begin Demo; end.\n",
+    );
+    assert!(
+        flow_diagnostics(positive)
+            .iter()
+            .any(|finding| finding.kind.code() == "H2077"),
+        "the positive control must produce a flow hint"
+    );
+
+    let excluded = [
+        "program Recovery; procedure Demo; var Value: Integer; begin Value := ; end; begin end.",
+        "program UnknownBranch; procedure Demo; var Value: Integer; begin {$IFDEF MAYBE} Value := 1; {$ENDIF} end; begin end.",
+        "program Asm; procedure Demo; var Value: Integer; begin Value := 1; asm nop end; end; begin end.",
+        "program Goto; procedure Demo; label Done; var Value: Integer; begin Value := 1; goto Done; Done: end; begin end.",
+    ];
+    for source in excluded {
+        assert!(
+            flow_diagnostics(source).is_empty(),
+            "an excluded routine must not publish partial flow findings: {source}"
+        );
+    }
 }

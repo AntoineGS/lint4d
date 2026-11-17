@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 21.0
+# dcc32 -B -H+ -W+ -Q -U<lib> TryExcept.pas
+TryExcept.pas(11) H2077 Value assigned to 'Value' never used

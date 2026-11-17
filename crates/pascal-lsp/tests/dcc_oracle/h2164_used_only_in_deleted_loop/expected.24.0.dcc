@@ -1,0 +1,5 @@
+# Embarcadero Delphi for Win32 compiler version 24.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem DeletedLoop.pas
+DeletedLoop.pas(7) H2135 FOR or WHILE loop executes zero times - deleted
+DeletedLoop.pas(5) H2164 Variable 'I' is declared but never used in 'Demo'
+DeletedLoop.pas(5) H2164 Variable 'LoopOnly' is declared but never used in 'Demo'

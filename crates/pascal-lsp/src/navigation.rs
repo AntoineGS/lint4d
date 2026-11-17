@@ -3263,6 +3263,7 @@ impl NavigationIndex {
                 self,
                 uri,
                 document,
+                &report.diagnostics,
                 capacity,
                 cancel,
                 &mut budget,
@@ -16464,6 +16465,7 @@ struct RoutineDirectives {
     forward: bool,
     external: bool,
     abstract_: bool,
+    inline: bool,
     calling_convention: Option<CallingConvention>,
     calling_convention_unknown: bool,
 }
@@ -20478,6 +20480,7 @@ fn routine_directives(node: Node<'_>) -> RoutineDirectives {
         "kForward" => directives.forward = true,
         "kExternal" => directives.external = true,
         "kAbstract" => directives.abstract_ = true,
+        "kInline" => directives.inline = true,
         "kCdecl" => directives.calling_convention = Some(CallingConvention::Cdecl),
         "kStdcall" => directives.calling_convention = Some(CallingConvention::Stdcall),
         "kPascal" => directives.calling_convention = Some(CallingConvention::Pascal),
@@ -28062,6 +28065,58 @@ mod tests {
             }]
         );
         assert_eq!(report.gaps, vec![SemanticCoverageGap::ParserRecovery]);
+    }
+
+    #[test]
+    fn semantic_diagnostics_withhold_h2077_only_for_a_routine_with_an_error() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-flow-error-scope.pas")
+            .expect("fixture URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsFlowErrorScope;\n",
+            "interface\n",
+            "implementation\n",
+            "procedure Good;\n",
+            "var Value: Integer;\n",
+            "begin\n",
+            "  Value := 1;\n",
+            "end;\n",
+            "procedure Bad;\n",
+            "var Unused: Integer;\n",
+            "  procedure Nested;\n",
+            "  var Number: Integer; Flag: Boolean;\n",
+            "  begin\n",
+            "    Flag := Number;\n",
+            "  end;\n",
+            "begin\n",
+            "  Unused := 2;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| (diagnostic.kind, diagnostic.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    SemanticDiagnosticKind::Dcc(DccMessage::H2077),
+                    "Value assigned to 'Value' never used",
+                ),
+                (
+                    SemanticDiagnosticKind::TypeMismatch,
+                    "type mismatch: cannot assign 'Integer' to 'Boolean'",
+                ),
+            ]
+        );
     }
 
     #[test]

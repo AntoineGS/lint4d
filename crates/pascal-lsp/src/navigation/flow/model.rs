@@ -79,6 +79,7 @@ pub(crate) struct LocalVar {
     pub(crate) decl_span: SourceSpan,
     pub(crate) kind: LocalKind,
     pub(crate) ty: VarType,
+    pub(crate) type_resolved: bool,
     pub(crate) address_taken: bool,
     pub(crate) captured: bool,
     pub(crate) absolute: bool,
@@ -345,10 +346,15 @@ fn build_routine_flow<'a>(
         note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
     }
 
-    let local_names = locals
-        .iter()
-        .map(|local| canonical_name(&local.name))
-        .collect::<HashSet<_>>();
+    let mut local_names = HashSet::new();
+    for local in &locals {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        budget.require_owned_bytes(local.name.len(), cancel)?;
+        if !local_names.insert(canonical_name(&local.name)) || !local.type_resolved {
+            note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
+        }
+    }
     mark_loop_variables(
         index,
         uri,
@@ -452,10 +458,12 @@ fn build_routine_flow<'a>(
             }
             continue;
         }
-        if !local_names.contains(&key) && !is_result_name {
+        if is_declaration_name(identifier) {
             continue;
         }
-        if is_declaration_name(identifier) {
+        let is_local_occurrence =
+            (local_names.contains(&key) || is_result_name) && !is_right_hand_member(identifier);
+        if !is_local_occurrence && is_call_entity(identifier) {
             continue;
         }
 
@@ -470,6 +478,33 @@ fn build_routine_flow<'a>(
             cancel,
             budget,
         )?;
+        let all_candidates_are_routines = !candidates.is_empty()
+            && candidates.iter().all(|candidate| {
+                index
+                    .documents
+                    .get(&candidate.uri)
+                    .and_then(|document| document.symbols.get(candidate.index))
+                    .is_some_and(|symbol| symbol.kind == SymbolKind::Routine)
+            });
+        let local_resolution_uncertain = candidates.len() != 1
+            || state.receiver_resolution_uncertain()
+            || state.member_lookup_incomplete
+            || state.ambiguous
+            || state.inaccessible_candidate;
+        let external_resolution_uncertain = candidates.is_empty()
+            || state.receiver_resolution_uncertain()
+            || state.member_lookup_incomplete
+            || state.inaccessible_candidate
+            || state.ambiguous && !all_candidates_are_routines;
+        if is_local_occurrence && local_resolution_uncertain
+            || !is_local_occurrence && external_resolution_uncertain
+        {
+            let inside_with = is_inside_with_body(identifier, &body_nodes, cancel, budget)?;
+            if is_local_occurrence && !inside_with || !is_local_occurrence {
+                note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
+            }
+            continue;
+        }
         if candidates.len() == 1 {
             let candidate = &candidates[0];
             if let Some(binding) = bindings
@@ -527,14 +562,6 @@ fn build_routine_flow<'a>(
                     });
                 }
             }
-        } else if (is_result_name
-            || local_names.contains(&key)
-                && !is_right_hand_member(identifier)
-                && !is_inside_with_body(identifier, &body_nodes, cancel, budget)?)
-            && !state.receiver_resolution_uncertain()
-            && !state.member_lookup_incomplete
-        {
-            note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
         }
     }
 
@@ -628,6 +655,9 @@ fn collect_locals(
         let mode = symbol.parameter_mode.map(local_parameter_mode);
         let kind = mode.map_or(LocalKind::Local, LocalKind::Parameter);
         let ty = classify_symbol_type(document, symbol);
+        let type_resolved = symbol.type_shape.as_ref().is_some_and(|shape| {
+            type_shape_is_resolved(document, symbol.scope, shape, &mut HashSet::new())
+        });
         let local_index = locals.len();
         budget.require_owned_bytes(symbol.name.len(), cancel)?;
         budget.require_owned_bytes(
@@ -642,6 +672,7 @@ fn collect_locals(
             },
             kind,
             ty,
+            type_resolved,
             address_taken: false,
             captured: false,
             absolute,
@@ -675,6 +706,13 @@ fn collect_locals(
                 classify_type_ref(document, routine_scope, type_ref, &mut HashSet::new())
             })
             .unwrap_or(VarType::Unknown);
+        let type_resolved = routine_symbol
+            .implementation_result_type_ref
+            .as_ref()
+            .or(routine_symbol.result_type_ref.as_ref())
+            .is_some_and(|type_ref| {
+                type_ref_is_resolved(document, routine_scope, type_ref, &mut HashSet::new())
+            });
         locals.push(LocalVar {
             name: "Result".to_owned(),
             decl_span: SourceSpan {
@@ -683,6 +721,7 @@ fn collect_locals(
             },
             kind: LocalKind::Result,
             ty,
+            type_resolved,
             address_taken: false,
             captured: false,
             absolute: false,
@@ -732,6 +771,121 @@ fn classify_symbol_type(document: &Document, symbol: &Symbol) -> VarType {
         .as_ref()
         .map(|shape| classify_type_shape(document, symbol.scope, shape, &mut HashSet::new()))
         .unwrap_or(VarType::Unknown)
+}
+
+fn type_shape_is_resolved(
+    document: &Document,
+    scope: usize,
+    shape: &TypeShape,
+    visited: &mut HashSet<(usize, String)>,
+) -> bool {
+    match shape {
+        TypeShape::Named(type_ref) => type_ref_is_resolved(document, scope, type_ref, visited),
+        TypeShape::Pointer(inner) | TypeShape::Array { element: inner, .. } => {
+            type_shape_is_resolved(document, scope, inner, visited)
+        }
+        TypeShape::Callable => true,
+        TypeShape::Unknown => false,
+    }
+}
+
+fn type_ref_is_resolved(
+    document: &Document,
+    scope: usize,
+    type_ref: &TypeRef,
+    visited: &mut HashSet<(usize, String)>,
+) -> bool {
+    if type_ref
+        .args
+        .iter()
+        .any(|argument| !type_ref_is_resolved(document, scope, argument, visited))
+    {
+        return false;
+    }
+    let Some(name) = type_ref.path.last() else {
+        return false;
+    };
+    let key = canonical_name(name);
+    if is_builtin_type_name(&key) {
+        return true;
+    }
+    if !visited.insert((scope, key.clone())) {
+        return false;
+    }
+    let resolved = document
+        .symbols
+        .iter()
+        .filter(|candidate| {
+            candidate.kind == SymbolKind::Type
+                && candidate.key == key
+                && scope_is_within(document, scope, candidate.scope)
+        })
+        .max_by_key(|candidate| scope_depth(document, candidate.scope))
+        .is_some_and(|candidate| {
+            if matches!(
+                candidate.type_kind,
+                TypeKind::Class
+                    | TypeKind::Record
+                    | TypeKind::Interface
+                    | TypeKind::Enum
+                    | TypeKind::File
+                    | TypeKind::String
+            ) {
+                return true;
+            }
+            candidate
+                .type_shape
+                .as_ref()
+                .map(|shape| type_shape_is_resolved(document, candidate.scope, shape, visited))
+                .or_else(|| {
+                    candidate.type_ref.as_ref().map(|underlying| {
+                        type_ref_is_resolved(document, candidate.scope, underlying, visited)
+                    })
+                })
+                .unwrap_or(true)
+        });
+    visited.remove(&(scope, key));
+    resolved
+}
+
+fn is_builtin_type_name(key: &str) -> bool {
+    matches!(
+        key,
+        "integer"
+            | "smallint"
+            | "shortint"
+            | "byte"
+            | "word"
+            | "longword"
+            | "cardinal"
+            | "longint"
+            | "int64"
+            | "uint64"
+            | "nativeint"
+            | "nativeuint"
+            | "boolean"
+            | "bytebool"
+            | "wordbool"
+            | "longbool"
+            | "char"
+            | "widechar"
+            | "ansichar"
+            | "real"
+            | "single"
+            | "double"
+            | "extended"
+            | "currency"
+            | "comp"
+            | "string"
+            | "ansistring"
+            | "widestring"
+            | "unicodestring"
+            | "shortstring"
+            | "pointer"
+            | "variant"
+            | "olevariant"
+            | "tobject"
+    )
 }
 
 fn classify_type_shape(

@@ -1,0 +1,11 @@
+<Project>
+  <PropertyGroup>
+    <MainSource>DprojPlatformOffDebugOnly.pas</MainSource>
+    <Config Condition="'$(Config)'==''">Release</Config>
+    <Platform Condition="'$(Platform)'==''">Win32</Platform>
+    <DCC_Warnings>true</DCC_Warnings>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Debug' and '$(Platform)'=='Win32'">
+    <DCC_Warnings>false</DCC_Warnings>
+  </PropertyGroup>
+</Project>

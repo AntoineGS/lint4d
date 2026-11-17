@@ -3,15 +3,22 @@
 //! recorded (precision always; recall unless a case needs the RTL and
 //! `PASCAL_RTL_<version>` is unset).
 use super::dcc_surface::{SurfaceKey, SurfacePlatform, table_for, verified_system_context};
+use super::dcc_switches::{SwitchTable, switch_table};
 use super::*;
-use pascal_project::{CompilerVersion, ConditionalFact};
+use pascal_project::delphi_overrides::OverrideSession;
+use pascal_project::{
+    CompilerVersion, ConditionalFact, ProjectContext, ProjectOptions, PropertyValue,
+};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// dcc codes whose findings are compared. Grows as each rule lands.
 const ENABLED_CODES: &[&str] = &[
+    "E1000", "E1001", "E1002", "E1003", "E1004", "E1005", "E1006", "E1007", "E1009", "E1010",
     "E2003", "E2004", "E2037", "E2065", "E2137", "E2170", "E2211", "E2252", "E2254", "E2291",
-    "E2301", "H2219", "W1009", "W1010",
+    "E2301", "H2219", "W1000", "W1001", "W1002", "W1003", "W1004", "W1005", "W1006", "W1007",
+    "W1009", "W1010",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -20,6 +27,7 @@ struct Finding {
     line: usize,
     code: String,
     message: String,
+    severity: &'static str,
 }
 
 struct Case {
@@ -27,9 +35,16 @@ struct Case {
     dir: PathBuf,
     unit: String,
     compilers: Vec<String>,
+    config: Option<String>,
+    platform: Option<String>,
     requires_rtl: bool,
     recall: bool,
     silent_codes: Vec<String>,
+}
+
+struct CaseInitialState {
+    conditional_context: ConditionalContext,
+    project: Option<Arc<ProjectContext>>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -112,6 +127,8 @@ fn load_case_from_toml(name: &str, dir: &Path, toml: &str) -> Case {
     Case {
         unit: value("unit").unwrap_or_else(|| panic!("{name}: case.toml has no unit")),
         compilers,
+        config: value("config"),
+        platform: value("platform"),
         requires_rtl: value("requires_rtl").as_deref() == Some("true"),
         recall,
         silent_codes,
@@ -162,18 +179,178 @@ fn parse_expected(case: &Case, version: &str) -> Vec<Finding> {
                 line: line_no.parse().expect("line number"),
                 code: code.to_owned(),
                 message: message.to_owned(),
+                severity: severity_for_code(code),
             }
         })
         .collect()
+}
+
+fn severity_for_code(code: &str) -> &'static str {
+    match code.as_bytes().first() {
+        Some(b'E') => "Error",
+        Some(b'W') => "Warning",
+        Some(b'H') => "Hint",
+        _ => "Unknown",
+    }
 }
 
 fn line_of(source: &str, offset: usize) -> usize {
     source[..offset.min(source.len())].matches('\n').count() + 1
 }
 
+fn project_context_for_case(
+    case: &Case,
+    version: &str,
+    config: Option<String>,
+    platform: Option<String>,
+) -> Option<Arc<ProjectContext>> {
+    let mut projects = std::fs::read_dir(&case.dir)
+        .unwrap_or_else(|error| panic!("{}: case directory: {error}", case.name))
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("dproj"))
+        })
+        .collect::<Vec<_>>();
+    projects.sort();
+    assert!(
+        projects.len() <= 1,
+        "{}: expected at most one .dproj, found {:?}",
+        case.name,
+        projects
+    );
+    let project_file = projects.into_iter().next()?;
+    assert!(
+        config
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()),
+        "{}: .dproj case.toml must set config",
+        case.name
+    );
+    assert!(
+        platform
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()),
+        "{}: .dproj case.toml must set platform",
+        case.name
+    );
+    let source = case.dir.join(&case.unit);
+    let options = ProjectOptions {
+        project_file: Some(project_file),
+        build_config: config,
+        platform,
+        conditional_context: oracle_context(version),
+        ..ProjectOptions::default()
+    };
+    Some(
+        ProjectContext::discover_with_overrides(
+            &source,
+            std::slice::from_ref(&case.dir),
+            &options,
+            &OverrideSession::new(None),
+        )
+        .unwrap_or_else(|error| panic!("{}: .dproj discovery: {error}", case.name))
+        .context,
+    )
+}
+
+fn project_switch_flags(
+    warning_properties: &BTreeMap<String, PropertyValue>,
+    table: &SwitchTable,
+) -> Result<Vec<String>, String> {
+    let mut flags = Vec::new();
+    for (property, prefix) in [("DCC_Hints", "-H"), ("DCC_Warnings", "-W")] {
+        if let Some(value) = warning_properties.get(property) {
+            let PropertyValue::Known(value) = value else {
+                return Err(format!("{property} is unevaluable"));
+            };
+            let sign = match value.trim().to_ascii_lowercase().as_str() {
+                "true" => "+",
+                "false" => "-",
+                _ => return Err(format!("{property} must be true or false, got {value:?}")),
+            };
+            flags.push(format!("{prefix}{sign}"));
+        }
+    }
+
+    for (property, value) in warning_properties {
+        let Some(id) = table.warning_id_for_property(property) else {
+            continue;
+        };
+        let PropertyValue::Known(value) = value else {
+            return Err(format!("{property} is unevaluable"));
+        };
+        let sign = match value.trim().to_ascii_lowercase().as_str() {
+            "true" => "+",
+            "false" => "-",
+            "error" => "^",
+            _ => {
+                return Err(format!(
+                    "{property} must be true, false, or error, got {value:?}"
+                ));
+            }
+        };
+        flags.push(format!("-W{sign}{id}"));
+    }
+
+    flags.sort();
+    Ok(flags)
+}
+
+fn compare_switch_manifest(recorded: &str, evaluated: &[String]) -> Result<(), String> {
+    let recorded = recorded.lines().map(str::to_owned).collect::<Vec<_>>();
+    let mut evaluated = evaluated.to_vec();
+    evaluated.sort();
+    if recorded == evaluated {
+        Ok(())
+    } else {
+        Err(format!(
+            "dproj-switches.txt mismatch: recorded {recorded:?}, pascal-project evaluated {evaluated:?}"
+        ))
+    }
+}
+
+fn verify_project_switch_manifest(case: &Case, version: &str) {
+    let Some(project) =
+        project_context_for_case(case, version, case.config.clone(), case.platform.clone())
+    else {
+        return;
+    };
+    let compiler = CompilerVersion::parse(version)
+        .unwrap_or_else(|| panic!("unsupported Delphi compiler version {version:?}"));
+    let table = switch_table(compiler.major, compiler.minor)
+        .unwrap_or_else(|| panic!("no dcc switch table for compiler {version}"));
+    let evaluated = project_switch_flags(project.warning_properties(), &table)
+        .unwrap_or_else(|error| panic!("{}: .dproj switch mapping failed: {error}", case.name));
+    let manifest_path = case.dir.join("dproj-switches.txt");
+    let recorded = std::fs::read_to_string(&manifest_path).unwrap_or_else(|error| {
+        panic!(
+            "{}: missing or unreadable {}: {error}",
+            case.name,
+            manifest_path.display()
+        )
+    });
+    compare_switch_manifest(&recorded, &evaluated)
+        .unwrap_or_else(|error| panic!("{}: {error}", case.name));
+}
+
+fn initial_state_for_case(case: &Case, version: &str) -> CaseInitialState {
+    let conditional_context = oracle_context(version);
+    let project =
+        project_context_for_case(case, version, case.config.clone(), case.platform.clone());
+    CaseInitialState {
+        conditional_context,
+        project,
+    }
+}
+
 fn actual_findings(case: &Case, version: &str) -> Vec<Finding> {
     let mut index = NavigationIndex::new();
-    let context = oracle_context(version);
+    // Only warning switches come from the project. The compiler-specific
+    // conditional context remains closed exactly as oracle_context established.
+    let case_state = initial_state_for_case(case, version);
+    let context = case_state.conditional_context;
+    let project = case_state.project;
     let cancel = AtomicBool::new(false);
     let mut unit_uri = None;
     let mut sources = HashMap::new();
@@ -198,8 +375,20 @@ fn actual_findings(case: &Case, version: &str) -> Vec<Finding> {
     for path in entries {
         let source = std::fs::read_to_string(&path).unwrap();
         let uri = Url::from_file_path(&path).unwrap();
+        let warning_properties = project
+            .as_ref()
+            .filter(|project| project.owns_unit_source(&path))
+            .map(|project| Arc::new(project.warning_properties().clone()));
         index
-            .update_with_context_with_cancel(uri.clone(), source.clone(), &context, &cancel)
+            .update_with_session(
+                uri.clone(),
+                source.clone(),
+                &context,
+                None,
+                &cancel,
+                None,
+                warning_properties,
+            )
             .expect("fixture parses");
         if path.file_name().unwrap().to_string_lossy() == case.unit {
             unit_uri = Some(uri.clone());
@@ -223,6 +412,11 @@ fn actual_findings(case: &Case, version: &str) -> Vec<Finding> {
             line: line_of(source, diagnostic.span.start),
             code: diagnostic.kind.code().to_owned(),
             message: diagnostic.message,
+            severity: match diagnostic.kind.severity() {
+                DccSeverity::Error => "Error",
+                DccSeverity::Warning => "Warning",
+                DccSeverity::Hint => "Hint",
+            },
         })
         .collect()
 }
@@ -318,6 +512,7 @@ fn finding_differences_compare_duplicate_occurrences() {
         line: 12,
         code: "E2065".to_owned(),
         message: "Unsatisfied forward or external declaration: 'TFoo.Missing'".to_owned(),
+        severity: "Error",
     };
     let one = vec![finding.clone()];
     let two = vec![finding.clone(), finding.clone()];
@@ -338,6 +533,8 @@ fn silent_case_codes_override_matching_dcc_and_linter_findings() {
         dir: PathBuf::new(),
         unit: "Synthetic.pas".to_owned(),
         compilers: vec!["37.0".to_owned()],
+        config: None,
+        platform: None,
         requires_rtl: false,
         recall: true,
         silent_codes: vec!["E2065".to_owned()],
@@ -347,6 +544,7 @@ fn silent_case_codes_override_matching_dcc_and_linter_findings() {
         line: 12,
         code: "E2065".to_owned(),
         message: "Unsatisfied forward or external declaration: 'TFoo.Hidden'".to_owned(),
+        severity: "Error",
     };
 
     let (invented, missed) = finding_differences(
@@ -382,6 +580,239 @@ fn semantic_diagnostics_stay_silent_for_e2065_in_an_unknown_conditional() {
         !diagnostics
             .iter()
             .any(|diagnostic| diagnostic.kind.code() == "E2065")
+    );
+}
+
+fn switch_filter_source(prefix: &str) -> String {
+    format!(
+        "unit SwitchFilterProbe;\ninterface\n{prefix}\
+         type TObject = class end;\n\
+         TBase = class(TObject) protected Value: Integer; end;\n\
+         TChild = class(TBase) private FChild: Integer; public property Value: Integer read FChild; end;\n\
+         implementation\nend.\n"
+    )
+}
+
+#[test]
+fn switch_filter_uses_agreed_defaults_without_a_known_switch_table() {
+    let source = switch_filter_source("");
+    for (uri, context) in [
+        (
+            Url::parse("file:///tmp/switch-filter-no-version.pas").unwrap(),
+            ConditionalContext::default(),
+        ),
+        (
+            Url::parse("file:///tmp/switch-filter-unsupported-version.pas").unwrap(),
+            ConditionalContext::default().with_compiler_version(CompilerVersion::new(22, 0)),
+        ),
+    ] {
+        let mut index = NavigationIndex::new();
+        index
+            .update_with_context_with_cancel(
+                uri.clone(),
+                source.clone(),
+                &context,
+                &AtomicBool::new(false),
+            )
+            .expect("probe parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind.code() == "W1009"),
+            "the unanimous default applies for {uri}"
+        );
+    }
+}
+
+#[test]
+fn unrecorded_warn_all_makes_id_switches_unknown_without_affecting_hints() {
+    let source = "\
+unit UnknownWarnAll;
+interface
+{$WARN ALL OFF}
+type
+  TObject = class
+  end;
+  TBase = class(TObject)
+  protected
+    Value: Integer;
+  end;
+  TChild = class(TBase)
+  private
+    FChild: Integer;
+  public
+    property Value: Integer read FChild;
+  end;
+  TUnused = class(TObject)
+  private
+    FUnused: Integer;
+  end;
+implementation
+end.
+";
+    let uri = Url::parse("file:///tmp/unknown-warn-all.pas").unwrap();
+    let context = ConditionalContext::default().with_compiler_version(CompilerVersion::new(22, 0));
+    let mut index = NavigationIndex::new();
+    index
+        .update_with_context_with_cancel(
+            uri.clone(),
+            source.to_owned(),
+            &context,
+            &AtomicBool::new(false),
+        )
+        .expect("probe parses");
+
+    let diagnostics = index
+        .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+        .expect("semantic diagnostics complete");
+
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.kind.code() != "W1009"),
+        "an unrecorded ALL directive leaves warning-ID state unknown"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind.code() == "H2219"),
+        "the unrecorded umbrella must not affect the hint row without a WARN ID"
+    );
+}
+
+#[test]
+fn unknown_conditional_warning_switch_makes_later_warning_unknown() {
+    let source = switch_filter_source("{$IFDEF SWITCH_MAYBE_DEFINED}\n{$WARNINGS OFF}\n{$ENDIF}\n");
+    let uri = Url::parse("file:///tmp/switch-filter-unknown-conditional.pas").unwrap();
+    let mut index = NavigationIndex::new();
+    let context = ConditionalContext::default().with_compiler_version(CompilerVersion::new(37, 0));
+    let warning_offset = source.find("type TObject").expect("warning probe position");
+    index
+        .update_with_context_with_cancel(uri.clone(), source, &context, &AtomicBool::new(false))
+        .expect("probe parses");
+
+    let document = index.documents.get(&uri).expect("probe document indexed");
+    let switches = super::warning_switches::WarningSwitches::new(document);
+    assert_eq!(
+        switches.effective_switch(document, "W1009", warning_offset),
+        None,
+        "an unknown conditional switch must leave the warning state unknown"
+    );
+
+    let diagnostics = index
+        .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+        .expect("semantic diagnostics complete");
+
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.kind.code() != "W1009")
+    );
+}
+
+#[test]
+fn expanded_include_warning_switch_filters_only_following_finding() {
+    let case = cases_root().join("switch_in_include");
+    let source = std::fs::read_to_string(case.join("SwitchInInclude.pas")).unwrap();
+    let include = std::fs::read_to_string(case.join("Switches.inc")).unwrap();
+    let include_directive = "{$I Switches.inc}";
+    let include_start = source.find(include_directive).expect("include directive");
+    let include_end = include_start + include_directive.len();
+    let masked_directive = source[include_start..include_end]
+        .chars()
+        .map(|character| {
+            if matches!(character, '\r' | '\n') {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+    let expanded_source = format!(
+        "{}{}{}{}",
+        &source[..include_start],
+        masked_directive,
+        include,
+        &source[include_end..]
+    );
+    let context = oracle_context("37.0");
+    let cancel = AtomicBool::new(false);
+    let mut expansion = crate::include_expansion::ExpandedSource::default();
+    expansion.conditionals = Some(pascal_core::conditional::analyze_with_context_and_cancel(
+        &expanded_source,
+        &context,
+        &cancel,
+    ));
+
+    let uri = Url::parse("file:///tmp/switch-filter-expanded-include.pas").unwrap();
+    let mut index = NavigationIndex::new();
+    index
+        .update_with_session(
+            uri.clone(),
+            expanded_source.clone(),
+            &context,
+            None,
+            &cancel,
+            Some(&expansion),
+            None,
+        )
+        .expect("expanded probe parses");
+
+    let document = index.documents.get(&uri).expect("probe document indexed");
+    let switches = super::warning_switches::WarningSwitches::new(document);
+    let after_include = expanded_source
+        .rfind("property Value")
+        .expect("post-include warning position");
+    assert_eq!(
+        switches.effective_switch(document, "W1009", after_include),
+        Some(super::dcc_switches::SwitchState::Off)
+    );
+
+    let diagnostics = index
+        .semantic_diagnostics_with_cancel(&uri, &cancel)
+        .expect("semantic diagnostics complete");
+    let w1009 = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.kind.code() == "W1009")
+        .collect::<Vec<_>>();
+    assert_eq!(w1009.len(), 1, "{diagnostics:?}");
+    assert!(
+        w1009[0].span.start < include_start,
+        "the pre-include finding remains enabled: {w1009:?}"
+    );
+}
+
+#[test]
+fn warning_switches_do_not_filter_error_diagnostics() {
+    let source = concat!(
+        "unit SwitchFilterError;\ninterface\n{$WARNINGS OFF}\n",
+        "const DuplicateName = 1;\nvar DuplicateName: Integer;\n",
+        "implementation\nend.\n",
+    );
+    let uri = Url::parse("file:///tmp/switch-filter-error.pas").unwrap();
+    let mut index = NavigationIndex::new();
+    index
+        .update_with_context_with_cancel(
+            uri.clone(),
+            source.to_owned(),
+            &oracle_context("37.0"),
+            &AtomicBool::new(false),
+        )
+        .expect("probe parses");
+
+    let diagnostics = index
+        .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+        .expect("semantic diagnostics complete");
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind.code() == "E2004")
     );
 }
 
@@ -459,6 +890,190 @@ fn oracle_context_closes_the_define_set() {
 }
 
 #[test]
+fn dproj_oracle_context_uses_selected_warning_properties_and_oracle_defines() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let dir = directory.path();
+    std::fs::write(
+        dir.join("Configured.pas"),
+        "unit Configured;\ninterface\nimplementation\nend.\n",
+    )
+    .expect("Pascal fixture");
+    std::fs::write(
+        dir.join("Configured.dproj"),
+        r#"<Project>
+  <PropertyGroup><MainSource>Configured.pas</MainSource></PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Debug'">
+    <DCC_SYMBOL_DEPRECATED>false</DCC_SYMBOL_DEPRECATED>
+  </PropertyGroup>
+</Project>"#,
+    )
+    .expect("project fixture");
+    let case = Case {
+        name: "synthetic_dproj".to_owned(),
+        dir: dir.to_path_buf(),
+        unit: "Configured.pas".to_owned(),
+        compilers: vec!["37.0".to_owned()],
+        config: Some("Debug".to_owned()),
+        platform: Some("Win32".to_owned()),
+        requires_rtl: false,
+        recall: true,
+        silent_codes: Vec::new(),
+    };
+
+    let project =
+        project_context_for_case(&case, "37.0", case.config.clone(), case.platform.clone())
+            .expect("case has one project file");
+    let initial_state = initial_state_for_case(&case, "37.0");
+
+    assert_eq!(project.config(), Some("Debug"));
+    assert_eq!(
+        initial_state
+            .project
+            .as_ref()
+            .expect("case has one project file")
+            .warning_properties()
+            .get("DCC_SYMBOL_DEPRECATED"),
+        Some(&PropertyValue::Known("false".to_owned()))
+    );
+    assert_eq!(
+        initial_state.conditional_context.define("MSWINDOWS"),
+        ConditionalFact::True
+    );
+    assert_eq!(
+        initial_state.conditional_context.absent_define,
+        ConditionalFact::False,
+        "the dcc oracle's closed define set must survive project discovery"
+    );
+}
+
+#[test]
+fn configured_dproj_oracle_cases_select_warning_properties() {
+    for (name, property, value) in [
+        ("dproj_warning_switches", "DCC_SYMBOL_DEPRECATED", "false"),
+        ("dproj_warnings_off", "DCC_Warnings", "false"),
+    ] {
+        let case = load_case(&cases_root().join(name));
+        let project =
+            project_context_for_case(&case, "37.0", case.config.clone(), case.platform.clone())
+                .expect("fixture has one .dproj");
+
+        assert_eq!(project.config(), Some("Debug"), "{name}");
+        assert_eq!(
+            project.warning_properties().get(property),
+            Some(&PropertyValue::Known(value.to_owned())),
+            "{name}"
+        );
+        if name == "dproj_warning_switches" {
+            assert_eq!(
+                project.warning_properties().get("DCC_Hints"),
+                Some(&PropertyValue::Known("false".to_owned())),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dproj_oracle_cases_require_explicit_config_and_platform() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let dir = directory.path();
+    std::fs::write(
+        dir.join("Configured.pas"),
+        "unit Configured;\ninterface\nimplementation\nend.\n",
+    )
+    .expect("Pascal fixture");
+    std::fs::write(
+        dir.join("Configured.dproj"),
+        "<Project><PropertyGroup><MainSource>Configured.pas</MainSource></PropertyGroup></Project>",
+    )
+    .expect("project fixture");
+
+    for (config, platform, missing) in [
+        (None, Some("Win32"), "config"),
+        (Some(""), Some("Win32"), "config"),
+        (Some("Debug"), None, "platform"),
+        (Some("Debug"), Some(" \t"), "platform"),
+    ] {
+        let case = Case {
+            name: "synthetic_dproj".to_owned(),
+            dir: dir.to_path_buf(),
+            unit: "Configured.pas".to_owned(),
+            compilers: vec!["37.0".to_owned()],
+            config: config.map(str::to_owned),
+            platform: platform.map(str::to_owned),
+            requires_rtl: false,
+            recall: true,
+            silent_codes: Vec::new(),
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            project_context_for_case(&case, "37.0", case.config.clone(), case.platform.clone())
+        }));
+        let panic = match result {
+            Err(panic) => panic,
+            Ok(_) => panic!("missing {missing} selection should be rejected"),
+        };
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            message.contains(&format!("case.toml must set {missing}")),
+            "expected a clear missing-{missing} error, got {message:?}"
+        );
+    }
+}
+
+#[test]
+fn dproj_switch_manifest_comparison_rejects_mismatched_flags() {
+    let recorded = "-H-\n-W-\n";
+    let evaluated = vec!["-H-".to_owned(), "-W-SYMBOL_DEPRECATED".to_owned()];
+
+    assert!(compare_switch_manifest(recorded, &evaluated).is_err());
+}
+
+#[test]
+fn dproj_switch_mapping_supports_error_promotion() {
+    let properties = BTreeMap::from([(
+        "DCC_SYMBOL_DEPRECATED".to_owned(),
+        PropertyValue::Known("error".to_owned()),
+    )]);
+    let table = switch_table(37, 0).expect("37.0 switch table");
+
+    assert_eq!(
+        project_switch_flags(&properties, &table).unwrap(),
+        ["-W^SYMBOL_DEPRECATED"]
+    );
+}
+
+#[test]
+fn dproj_recordings_document_the_compiler_switches_used() {
+    for version in ["21.0", "24.0", "37.0"] {
+        let warning_case = load_case(&cases_root().join("dproj_warning_switches"));
+        let warning_record = std::fs::read_to_string(expected_path(&warning_case.dir, version))
+            .expect("recorded .dproj warning case");
+        assert!(
+            warning_record
+                .lines()
+                .nth(1)
+                .is_some_and(|header| header.contains("-H- -W-SYMBOL_DEPRECATED")),
+            "{version}: missing configured hint/code switches in recording header"
+        );
+
+        let global_case = load_case(&cases_root().join("dproj_warnings_off"));
+        let global_record = std::fs::read_to_string(expected_path(&global_case.dir, version))
+            .expect("recorded .dproj global warning case");
+        assert!(
+            global_record
+                .lines()
+                .nth(1)
+                .is_some_and(|header| header.contains("-W-")),
+            "{version}: missing configured global warning switch in recording header"
+        );
+    }
+}
+
+#[test]
 fn case_compilers_default_to_37() {
     let case = load_case(&cases_root().join("clean_unit"));
 
@@ -474,6 +1089,18 @@ fn case_compilers_parse_multiple_versions() {
     );
 
     assert_eq!(case.compilers, ["21.0", "24.0"]);
+}
+
+#[test]
+fn case_build_selection_is_optional_and_parsed() {
+    let case = load_case_from_toml(
+        "synthetic",
+        Path::new("synthetic"),
+        "unit = \"Synthetic.pas\"\nconfig = \"Debug\"\nplatform = \"Win32\"\n",
+    );
+
+    assert_eq!(case.config.as_deref(), Some("Debug"));
+    assert_eq!(case.platform.as_deref(), Some("Win32"));
 }
 
 #[test]
@@ -506,18 +1133,21 @@ fn summary_formats_synthetic_findings_and_waivers_per_code() {
             line: 2,
             code: "E2004".to_owned(),
             message: "Duplicate identifier: 'Foo'".to_owned(),
+            severity: "Error",
         },
         Finding {
             file: "Probe.pas".to_owned(),
             line: 3,
             code: "E2004".to_owned(),
             message: "Duplicate identifier: 'Bar'".to_owned(),
+            severity: "Error",
         },
         Finding {
             file: "Probe.pas".to_owned(),
             line: 4,
             code: "E2065".to_owned(),
             message: "Unsatisfied forward or external declaration: 'TFoo.Missing'".to_owned(),
+            severity: "Error",
         },
     ];
     let actual = vec![
@@ -527,6 +1157,7 @@ fn summary_formats_synthetic_findings_and_waivers_per_code() {
             line: 5,
             code: "E2004".to_owned(),
             message: "Duplicate identifier: 'Baz'".to_owned(),
+            severity: "Error",
         },
     ];
 
@@ -561,6 +1192,7 @@ fn dcc_oracle_cases_match_recorded_dcc_output() {
         let case = load_case(&dir);
         let enabled = |finding: &Finding| ENABLED_CODES.contains(&finding.code.as_str());
         for version in &case.compilers {
+            verify_project_switch_manifest(&case, version);
             let expected = parse_expected(&case, version)
                 .into_iter()
                 .filter(|finding| enabled(finding) && finding.file.eq_ignore_ascii_case(&case.unit))

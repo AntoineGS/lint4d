@@ -1,0 +1,4 @@
+unit = "W1000MixedOverloads.pas"
+compilers = ["21.0", "24.0", "37.0"]
+recall = false
+reason = "The semantic resolver returns the overload group without selecting by argument type; a mixed deprecated/non-deprecated group cannot prove dcc's per-call overload choice."

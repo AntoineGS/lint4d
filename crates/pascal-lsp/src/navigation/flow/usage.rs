@@ -1,6 +1,7 @@
 use super::super::{
-    AssistanceBudget, DccMessage, DccSeverity, Document, NavigationIndex, ResolutionState,
-    SemanticDiagnostic, SourceSpan, check_navigation_cancel, node_text,
+    AssistanceBudget, Candidate, DccMessage, DccSeverity, Document, NavigationIndex,
+    ResolutionState, SemanticDiagnostic, SourceSpan, SymbolKind, check_navigation_cancel,
+    node_text,
 };
 use super::model::{RoutineFlow, VarOccurrence, collect_nodes};
 use super::{Access, LocalKind, VarType};
@@ -12,6 +13,30 @@ use tree_sitter::Node;
 
 const USE: u8 = 1;
 const DEF: u8 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopKind {
+    For,
+    While,
+    ForIn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstantValue {
+    Integer(i128),
+    Boolean(bool),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LoopFact<'tree> {
+    node: Node<'tree>,
+    body: Node<'tree>,
+    kind: LoopKind,
+    zero_iterations: Option<bool>,
+    iterator: Option<Node<'tree>>,
+    iterator_span: Option<SourceSpan>,
+    body_has_break: bool,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn flow_diagnostics(
@@ -32,9 +57,12 @@ pub(super) fn flow_diagnostics(
         if flow.excluded.is_some() || flow.cfg.is_none() {
             continue;
         }
+        let loop_facts = collect_loop_facts(index, uri, document, flow, cancel, budget)?;
         let mut active_occurrences = Vec::new();
         for occurrence in &flow.occurrences {
-            if !is_inactive(document, occurrence.span, cancel, budget)? {
+            if !is_inactive(document, occurrence.span, cancel, budget)?
+                && !occurrence_in_deleted_loop(occurrence, &loop_facts)
+            {
                 active_occurrences.push(occurrence);
             }
         }
@@ -72,6 +100,23 @@ pub(super) fn flow_diagnostics(
             continue;
         }
 
+        append_loop_diagnostics(
+            index,
+            uri,
+            document,
+            flow,
+            &loop_facts,
+            &active_occurrences,
+            &mut diagnostics,
+            capacity,
+            diagnostic_cap_reached,
+            cancel,
+            budget,
+        )?;
+        if *diagnostic_cap_reached {
+            return Ok(diagnostics);
+        }
+
         let eligible_vars = locals
             .iter()
             .enumerate()
@@ -104,8 +149,7 @@ pub(super) fn flow_diagnostics(
             cancel,
             budget,
         )?;
-        let forced_for_exits =
-            definitely_nonempty_for_exits(flow, document, &routine_nodes, cancel, budget)?;
+        let forced_for_exits = definitely_nonempty_for_exits(flow, &loop_facts, cancel, budget)?;
         let dead_writes = dead_write_spans(
             flow.cfg.as_ref().expect("checked CFG"),
             locals.len(),
@@ -131,6 +175,564 @@ pub(super) fn flow_diagnostics(
     }
     diagnostics.sort_by_key(|diagnostic| (diagnostic.span.start, diagnostic.span.end));
     Ok(diagnostics)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_loop_facts<'tree>(
+    index: &NavigationIndex,
+    uri: &Url,
+    document: &Document,
+    flow: &RoutineFlow<'tree>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Vec<LoopFact<'tree>>, String> {
+    let Some(body) = flow.node.child_by_field_name("body") else {
+        return Ok(Vec::new());
+    };
+    let mut facts = Vec::new();
+    let mut pending = vec![body];
+    while let Some(node) = pending.pop() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if node.id() != body.id() && matches!(node.kind(), "defProc" | "lambda") {
+            continue;
+        }
+        let kind = match node.kind() {
+            "for" => Some(LoopKind::For),
+            "while" => Some(LoopKind::While),
+            "foreach" => Some(LoopKind::ForIn),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            let Some(loop_body) = node.child_by_field_name("body") else {
+                continue;
+            };
+            let loop_span = SourceSpan {
+                start: node.start_byte(),
+                end: node.end_byte(),
+            };
+            if is_inactive(document, loop_span, cancel, budget)? {
+                continue;
+            }
+            let (zero_iterations, iterator) = match kind {
+                LoopKind::For => {
+                    let start = node
+                        .child_by_field_name("start")
+                        .and_then(|assignment| assignment.child_by_field_name("rhs"));
+                    let end = node.child_by_field_name("end");
+                    let zero = match (start, end) {
+                        (Some(start), Some(end)) => {
+                            let (start, end) = (
+                                constant_value(index, uri, document, start, cancel, budget)?,
+                                constant_value(index, uri, document, end, cancel, budget)?,
+                            );
+                            match (start, end) {
+                                (
+                                    Some(ConstantValue::Integer(start)),
+                                    Some(ConstantValue::Integer(end)),
+                                ) => Some(if for_is_descending(node) {
+                                    start < end
+                                } else {
+                                    start > end
+                                }),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    (
+                        zero,
+                        node.child_by_field_name("start")
+                            .and_then(|assignment| assignment.child_by_field_name("lhs")),
+                    )
+                }
+                LoopKind::While => {
+                    let zero = node
+                        .child_by_field_name("condition")
+                        .map(|condition| {
+                            constant_value(index, uri, document, condition, cancel, budget)
+                        })
+                        .transpose()?
+                        .flatten()
+                        .and_then(|value| match value {
+                            ConstantValue::Boolean(false) => Some(true),
+                            ConstantValue::Boolean(true) => Some(false),
+                            ConstantValue::Integer(_) => None,
+                        });
+                    (zero, None)
+                }
+                LoopKind::ForIn => (
+                    None,
+                    node.child_by_field_name("iterator")
+                        .filter(|iterator| iterator.kind() == "identifier"),
+                ),
+            };
+            let iterator_span = iterator.map(|iterator| SourceSpan {
+                start: iterator.start_byte(),
+                end: iterator.end_byte(),
+            });
+            let body_has_break = if matches!(kind, LoopKind::For | LoopKind::ForIn) {
+                loop_body_has_break(loop_body, &document.source, cancel, budget)?
+            } else {
+                false
+            };
+            budget.require_owned_bytes(std::mem::size_of::<LoopFact<'tree>>(), cancel)?;
+            facts.push(LoopFact {
+                node,
+                body: loop_body,
+                kind,
+                zero_iterations,
+                iterator,
+                iterator_span,
+                body_has_break,
+            });
+        }
+        let mut cursor = node.walk();
+        let mut children = Vec::new();
+        for child in node.children(&mut cursor) {
+            check_navigation_cancel(cancel)?;
+            budget.require_owned_bytes(std::mem::size_of::<Node<'tree>>(), cancel)?;
+            children.push(child);
+        }
+        pending.extend(children.into_iter().rev());
+    }
+    Ok(facts)
+}
+
+fn for_is_descending(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| child.kind() == "kDownto")
+}
+
+fn loop_body_has_break(
+    body: Node<'_>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    let mut pending = vec![body];
+    while let Some(node) = pending.pop() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if node.id() != body.id() && matches!(node.kind(), "for" | "foreach" | "while" | "repeat") {
+            continue;
+        }
+        if node.kind() == "identifier" && node_text(node, source).eq_ignore_ascii_case("break") {
+            return Ok(true);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            check_navigation_cancel(cancel)?;
+            budget.require_owned_bytes(std::mem::size_of::<Node<'_>>(), cancel)?;
+            pending.push(child);
+        }
+    }
+    Ok(false)
+}
+
+fn occurrence_in_deleted_loop(occurrence: &VarOccurrence, facts: &[LoopFact<'_>]) -> bool {
+    facts.iter().any(|fact| {
+        fact.zero_iterations == Some(true)
+            && (fact.body.start_byte() <= occurrence.span.start
+                && occurrence.span.end <= fact.body.end_byte()
+                || fact.iterator_span == Some(occurrence.span))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_loop_diagnostics(
+    index: &NavigationIndex,
+    uri: &Url,
+    document: &Document,
+    flow: &RoutineFlow<'_>,
+    facts: &[LoopFact<'_>],
+    occurrences: &[&VarOccurrence],
+    diagnostics: &mut Vec<SemanticDiagnostic>,
+    capacity: usize,
+    diagnostic_cap_reached: &mut bool,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<(), String> {
+    for &fact in facts {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if fact.zero_iterations != Some(true) {
+            continue;
+        }
+        let Some(span) = h2135_span(document, fact) else {
+            continue;
+        };
+        if diagnostics.len() >= capacity {
+            *diagnostic_cap_reached = true;
+            return Ok(());
+        }
+        diagnostics.push(SemanticDiagnostic {
+            kind: super::super::SemanticDiagnosticKind::Dcc(DccMessage::H2135),
+            span,
+            message: DccMessage::H2135.format(&[]),
+        });
+    }
+
+    let compiler_version = document.conditional_context.compiler_version;
+    let mut reported = HashSet::new();
+    for &fact in facts {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if !w1037_supported(fact.kind, compiler_version) || fact.body_has_break {
+            continue;
+        }
+        let Some(iterator) = fact.iterator else {
+            continue;
+        };
+        let Some(variable) =
+            resolve_local_loop_variable(index, uri, document, flow, iterator, cancel, budget)?
+        else {
+            continue;
+        };
+        let first_access = occurrences
+            .iter()
+            .filter(|occurrence| {
+                occurrence.var == variable && occurrence.span.start > fact.node.end_byte()
+            })
+            .min_by_key(|occurrence| (occurrence.span.start, occurrence.span.end));
+        let Some(first_access) = first_access else {
+            continue;
+        };
+        if !access_reads(first_access.access) || reported.contains(&first_access.span) {
+            continue;
+        }
+        budget.require_owned_bytes(std::mem::size_of::<SourceSpan>(), cancel)?;
+        reported.insert(first_access.span);
+        if diagnostics.len() >= capacity {
+            *diagnostic_cap_reached = true;
+            return Ok(());
+        }
+        let name = &flow.locals[variable].name;
+        diagnostics.push(SemanticDiagnostic {
+            kind: super::super::SemanticDiagnosticKind::Dcc(DccMessage::W1037),
+            span: first_access.span,
+            message: DccMessage::W1037.format(&[name]),
+        });
+    }
+    Ok(())
+}
+
+fn w1037_supported(
+    kind: LoopKind,
+    compiler_version: Option<pascal_project::CompilerVersion>,
+) -> bool {
+    matches!(
+        (
+            kind,
+            compiler_version.map(|version| (version.major, version.minor))
+        ),
+        (LoopKind::For, Some((21, 0) | (24, 0) | (37, 0)))
+            | (LoopKind::ForIn, Some((21, 0) | (24, 0)))
+    )
+}
+
+fn h2135_span(document: &Document, fact: LoopFact<'_>) -> Option<SourceSpan> {
+    let start = if fact.kind == LoopKind::While {
+        let version = document.conditional_context.compiler_version?;
+        match (version.major, version.minor) {
+            (21, 0) | (24, 0) => fact.body.start_byte(),
+            (37, 0) => fact.node.start_byte(),
+            _ => return None,
+        }
+    } else {
+        fact.node.start_byte()
+    };
+    Some(SourceSpan { start, end: start })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_local_loop_variable(
+    index: &NavigationIndex,
+    uri: &Url,
+    document: &Document,
+    flow: &RoutineFlow<'_>,
+    identifier: Node<'_>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<usize>, String> {
+    let mut state = ResolutionState::new();
+    let candidates = index.resolve_candidates_at_with_state_and_budget(
+        uri,
+        document,
+        identifier.start_byte(),
+        identifier,
+        &mut state,
+        0,
+        cancel,
+        budget,
+    )?;
+    if candidates.len() != 1
+        || state.receiver_resolution_uncertain()
+        || state.member_lookup_incomplete
+        || state.ambiguous
+        || state.inaccessible_candidate
+    {
+        return Ok(None);
+    }
+    let candidate = &candidates[0];
+    if &candidate.uri != uri {
+        return Ok(None);
+    }
+    let Some(symbol) = document.symbols.get(candidate.index) else {
+        return Ok(None);
+    };
+    if !matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Parameter) {
+        return Ok(None);
+    }
+    let selection_span = SourceSpan {
+        start: symbol.span.start,
+        end: symbol.span.end,
+    };
+    Ok(flow
+        .locals
+        .iter()
+        .position(|local| local.decl_span == selection_span))
+}
+
+fn constant_value(
+    index: &NavigationIndex,
+    uri: &Url,
+    document: &Document,
+    node: Node<'_>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<ConstantValue>, String> {
+    constant_value_with_visited(
+        index,
+        uri,
+        document,
+        node,
+        &mut HashSet::new(),
+        cancel,
+        budget,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn constant_value_with_visited(
+    index: &NavigationIndex,
+    uri: &Url,
+    document: &Document,
+    node: Node<'_>,
+    visited: &mut HashSet<Candidate>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<ConstantValue>, String> {
+    check_navigation_cancel(cancel)?;
+    budget.require_work(1, cancel)?;
+    match node.kind() {
+        "literalNumber" => {
+            Ok(parse_radix_integer(&node_text(node, &document.source)).map(ConstantValue::Integer))
+        }
+        "literalChar" => Ok(node_text(node, &document.source)
+            .strip_prefix('#')
+            .and_then(parse_radix_integer)
+            .map(ConstantValue::Integer)),
+        "literalString" => Ok(
+            parse_single_char_literal(&node_text(node, &document.source))
+                .map(|value| ConstantValue::Integer(value as i128)),
+        ),
+        "kTrue" => Ok(Some(ConstantValue::Boolean(true))),
+        "kFalse" => Ok(Some(ConstantValue::Boolean(false))),
+        "exprParens" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| !matches!(child.kind(), "kLParen" | "kRParen"))
+                .map(|child| {
+                    constant_value_with_visited(
+                        index, uri, document, child, visited, cancel, budget,
+                    )
+                })
+                .transpose()
+                .map(Option::flatten)
+        }
+        "exprUnary" => {
+            let Some(operand) = node.child_by_field_name("operand") else {
+                return Ok(None);
+            };
+            let Some(ConstantValue::Integer(value)) = constant_value_with_visited(
+                index, uri, document, operand, visited, cancel, budget,
+            )?
+            else {
+                return Ok(None);
+            };
+            let operator = node
+                .child_by_field_name("operator")
+                .map(|operator| node_text(operator, &document.source));
+            Ok(match operator.as_deref() {
+                Some("+") => Some(ConstantValue::Integer(value)),
+                Some("-") => value.checked_neg().map(ConstantValue::Integer),
+                _ => None,
+            })
+        }
+        "exprBinary" => {
+            let (Some(lhs), Some(rhs), Some(operator)) = (
+                node.child_by_field_name("lhs"),
+                node.child_by_field_name("rhs"),
+                node.child_by_field_name("operator"),
+            ) else {
+                return Ok(None);
+            };
+            let (Some(ConstantValue::Integer(lhs)), Some(ConstantValue::Integer(rhs))) = (
+                constant_value_with_visited(index, uri, document, lhs, visited, cancel, budget)?,
+                constant_value_with_visited(index, uri, document, rhs, visited, cancel, budget)?,
+            ) else {
+                return Ok(None);
+            };
+            let operator = node_text(operator, &document.source);
+            Ok(match operator.to_ascii_lowercase().as_str() {
+                "+" => lhs.checked_add(rhs),
+                "-" => lhs.checked_sub(rhs),
+                "*" => lhs.checked_mul(rhs),
+                "div" if rhs != 0 => lhs.checked_div(rhs),
+                "mod" if rhs != 0 => lhs.checked_rem(rhs),
+                _ => None,
+            }
+            .map(ConstantValue::Integer))
+        }
+        "identifier" => {
+            let mut state = ResolutionState::new();
+            let candidates = index.resolve_candidates_at_with_state_and_budget(
+                uri,
+                document,
+                node.start_byte(),
+                node,
+                &mut state,
+                0,
+                cancel,
+                budget,
+            )?;
+            if candidates.len() != 1
+                || state.receiver_resolution_uncertain()
+                || state.member_lookup_incomplete
+                || state.ambiguous
+                || state.inaccessible_candidate
+            {
+                return Ok(None);
+            }
+            budget.require_owned_bytes(
+                std::mem::size_of::<Candidate>().saturating_add(candidates[0].uri.as_str().len()),
+                cancel,
+            )?;
+            let candidate = candidates[0].clone();
+            if !visited.insert(candidate.clone()) {
+                return Ok(None);
+            }
+            let result = if let Some(constant_document) = index.documents.get(&candidate.uri) {
+                let Some(symbol) = constant_document.symbols.get(candidate.index) else {
+                    visited.remove(&candidate);
+                    return Ok(None);
+                };
+                if symbol.kind != SymbolKind::Constant {
+                    None
+                } else {
+                    let declaration_span = symbol.declaration_span;
+                    let Some(declaration) = node_at_range(
+                        constant_document.tree.root_node(),
+                        declaration_span.start..declaration_span.end,
+                        cancel,
+                        budget,
+                    )?
+                    else {
+                        visited.remove(&candidate);
+                        return Ok(None);
+                    };
+                    if declaration.kind() != "declConst"
+                        || declaration.child_by_field_name("type").is_some()
+                    {
+                        None
+                    } else {
+                        declaration
+                            .child_by_field_name("defaultValue")
+                            .and_then(constant_initializer)
+                            .filter(|initializer| is_literal_initializer(*initializer))
+                            .map(|initializer| {
+                                constant_value_with_visited(
+                                    index,
+                                    &candidate.uri,
+                                    constant_document,
+                                    initializer,
+                                    visited,
+                                    cancel,
+                                    budget,
+                                )
+                            })
+                            .transpose()?
+                            .flatten()
+                    }
+                }
+            } else {
+                None
+            };
+            visited.remove(&candidate);
+            Ok(result)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn constant_initializer(default_value: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = default_value.walk();
+    default_value
+        .named_children(&mut cursor)
+        .find(|child| child.kind() != "kEq")
+}
+
+fn is_literal_initializer(node: Node<'_>) -> bool {
+    match node.kind() {
+        "literalNumber" | "literalString" | "literalChar" | "kTrue" | "kFalse" => true,
+        "exprParens" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| !matches!(child.kind(), "kLParen" | "kRParen"))
+                .is_some_and(is_literal_initializer)
+        }
+        _ => false,
+    }
+}
+
+fn node_at_range<'tree>(
+    root: Node<'tree>,
+    range: std::ops::Range<usize>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<Node<'tree>>, String> {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if node.start_byte() == range.start && node.end_byte() == range.end {
+            return Ok(Some(node));
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            check_navigation_cancel(cancel)?;
+            budget.require_owned_bytes(std::mem::size_of::<Node<'tree>>(), cancel)?;
+            pending.push(child);
+        }
+    }
+    Ok(None)
+}
+
+fn parse_single_char_literal(text: &str) -> Option<char> {
+    let contents = text.strip_prefix('\'')?.strip_suffix('\'')?;
+    let mut chars = contents.chars().peekable();
+    let mut value = None;
+    while let Some(character) = chars.next() {
+        if character == '\'' && chars.next_if_eq(&'\'').is_none() {
+            return None;
+        }
+        if value.replace(character).is_some() {
+            return None;
+        }
+    }
+    value
 }
 
 // DCC withholds H2077 for an erroneous routine; nested-routine errors are
@@ -291,8 +893,7 @@ fn is_inline_call(
 
 fn definitely_nonempty_for_exits(
     flow: &RoutineFlow<'_>,
-    document: &Document,
-    routine_nodes: &[Node<'_>],
+    facts: &[LoopFact<'_>],
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<HashSet<usize>, String> {
@@ -300,49 +901,17 @@ fn definitely_nonempty_for_exits(
         return Ok(HashSet::new());
     };
     let mut blocks = HashSet::new();
-    for &node in routine_nodes {
+    for &fact in facts {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
-        if node.kind() != "for"
-            || is_inactive(
-                document,
-                SourceSpan {
-                    start: node.start_byte(),
-                    end: node.end_byte(),
-                },
-                cancel,
-                budget,
-            )?
-        {
-            continue;
-        }
-        let Some(start) = node.child_by_field_name("start") else {
-            continue;
-        };
-        let Some(start_value) = start.child_by_field_name("rhs") else {
-            continue;
-        };
-        let Some(end_value) = node.child_by_field_name("end") else {
-            continue;
-        };
-        let (Some(start), Some(end)) = (
-            constant_integer(start_value, &document.source, cancel, budget)?,
-            constant_integer(end_value, &document.source, cancel, budget)?,
-        ) else {
-            continue;
-        };
-        let mut cursor = node.walk();
-        let descending = node
-            .children(&mut cursor)
-            .any(|child| child.kind() == "kDownto");
-        if (descending && start < end) || (!descending && start > end) {
+        if fact.kind != LoopKind::For || fact.zero_iterations != Some(false) {
             continue;
         }
         for block in cfg.graph.node_indices() {
             check_navigation_cancel(cancel)?;
             budget.require_work(1, cancel)?;
             if cfg.graph[block].stmts.iter().any(|statement| {
-                statement.node_kind == "for" && statement.byte_range.start == node.start_byte()
+                statement.node_kind == "for" && statement.byte_range.start == fact.node.start_byte()
             }) {
                 blocks.insert(block.index());
                 break;
@@ -350,64 +919,6 @@ fn definitely_nonempty_for_exits(
         }
     }
     Ok(blocks)
-}
-
-fn constant_integer(
-    node: Node<'_>,
-    source: &str,
-    cancel: &AtomicBool,
-    budget: &mut AssistanceBudget,
-) -> Result<Option<i128>, String> {
-    check_navigation_cancel(cancel)?;
-    budget.require_work(1, cancel)?;
-    match node.kind() {
-        "literalNumber" => Ok(parse_radix_integer(&node_text(node, source))),
-        "exprParens" => node
-            .named_child(0)
-            .map(|child| constant_integer(child, source, cancel, budget))
-            .unwrap_or(Ok(None)),
-        "exprUnary" => {
-            let Some(operand) = node.child_by_field_name("operand") else {
-                return Ok(None);
-            };
-            let Some(value) = constant_integer(operand, source, cancel, budget)? else {
-                return Ok(None);
-            };
-            let operator = node
-                .child_by_field_name("operator")
-                .map(|operator| node_text(operator, source));
-            Ok(match operator.as_deref() {
-                Some("+") => Some(value),
-                Some("-") => value.checked_neg(),
-                _ => None,
-            })
-        }
-        "exprBinary" => {
-            let (Some(lhs), Some(rhs), Some(operator)) = (
-                node.child_by_field_name("lhs"),
-                node.child_by_field_name("rhs"),
-                node.child_by_field_name("operator"),
-            ) else {
-                return Ok(None);
-            };
-            let (Some(lhs), Some(rhs)) = (
-                constant_integer(lhs, source, cancel, budget)?,
-                constant_integer(rhs, source, cancel, budget)?,
-            ) else {
-                return Ok(None);
-            };
-            let operator = node_text(operator, source);
-            Ok(match operator.to_ascii_lowercase().as_str() {
-                "+" => lhs.checked_add(rhs),
-                "-" => lhs.checked_sub(rhs),
-                "*" => lhs.checked_mul(rhs),
-                "div" if rhs != 0 => lhs.checked_div(rhs),
-                "mod" if rhs != 0 => lhs.checked_rem(rhs),
-                _ => None,
-            })
-        }
-        _ => Ok(None),
-    }
 }
 
 fn parse_radix_integer(text: &str) -> Option<i128> {

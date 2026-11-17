@@ -258,6 +258,12 @@ crates/pascal-lsp/tests/dcc_oracle/h2077_overwritten/Overwritten.pas 76fcfb85760
 crates/pascal-lsp/tests/dcc_oracle/h2077_overwritten_in_constant_loop/OverwrittenInConstantLoop.pas 453b2ef487854b68 4
 crates/pascal-lsp/tests/dcc_oracle/h2077_try_except/TryExcept.pas 36c99f7f414f54f5 4
 crates/pascal-lsp/tests/dcc_oracle/h2077_var_arg_not_dead/VarArgNotDead.pas a71f07bc28ff92c1 5
+crates/pascal-lsp/tests/dcc_oracle/h2135_const_identifier_bounds/ConstBounds.pas 1974fcd24bfe0516 2
+crates/pascal-lsp/tests/dcc_oracle/h2135_const_identifier_bounds/ConstIdentifierBounds.pas b8aebfc4d0a12f80 5
+crates/pascal-lsp/tests/dcc_oracle/h2135_for_constant_empty/ForConstantEmpty.pas 1d0da04750fb157f 4
+crates/pascal-lsp/tests/dcc_oracle/h2135_for_downto_empty/ForDowntoEmpty.pas 35e20de5da65920f 3
+crates/pascal-lsp/tests/dcc_oracle/h2135_nonconstant_bounds_silent/NonconstantBounds.pas a5f081472d62dc74 6
+crates/pascal-lsp/tests/dcc_oracle/h2135_while_false/WhileFalse.pas 1933f47c86cfe9cc 2
 crates/pascal-lsp/tests/dcc_oracle/h2164_method_local/MethodLocal.pas f828a27c83a431a9 5
 crates/pascal-lsp/tests/dcc_oracle/h2164_nested_routine_local/NestedRoutineLocal.pas 89d613b2d2aaba40 4
 crates/pascal-lsp/tests/dcc_oracle/h2164_unused_local/UnusedLocal.pas b3b4d1b75463ba8c 3
@@ -292,6 +298,11 @@ crates/pascal-lsp/tests/dcc_oracle/w1010_overload/W1010Overload.pas 36cfab9b2c92
 crates/pascal-lsp/tests/dcc_oracle/w1010_private_ancestor/PrivateAncestor.pas 1a0c2df76f23041f 5
 crates/pascal-lsp/tests/dcc_oracle/w1010_private_ancestor/W1010PrivateAncestor.pas 090f0b5b28e6feab 4
 crates/pascal-lsp/tests/dcc_oracle/w1010_reintroduce/W1010Reintroduce.pas 06c20b697a980888 8
+crates/pascal-lsp/tests/dcc_oracle/w1037_assigned_after_loop_ok/AssignedAfterLoop.pas f8b8390281aa779d 4
+crates/pascal-lsp/tests/dcc_oracle/w1037_break_exit/BreakExit.pas e8a8fbb682de68f2 5
+crates/pascal-lsp/tests/dcc_oracle/w1037_for_in/ForIn.pas 0ad535baef311c31 5
+crates/pascal-lsp/tests/dcc_oracle/w1037_loop_exit_boundaries/LoopExitBoundaries.pas 6db2b0c75c6a110f 6
+crates/pascal-lsp/tests/dcc_oracle/w1037_read_after_loop/ReadAfterLoop.pas 0d3f2f5b5d345883 4
 crates/tree-sitter-pascal/examples/anon.pas b2649af375b8d031 8
 crates/tree-sitter-pascal/examples/codetoolmanager.pas d8e3ac5e1d9c0849 2891
 crates/tree-sitter-pascal/examples/foo.pas ac003f687cfbbd5c 90

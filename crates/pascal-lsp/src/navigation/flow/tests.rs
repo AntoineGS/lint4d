@@ -1109,11 +1109,23 @@ fn flow_diagnostics_withhold_h2077_for_a_local_with_an_unresolved_call_mode() {
 }
 
 fn flow_diagnostics(source: &str) -> Vec<SemanticDiagnostic> {
+    flow_diagnostics_with_version(source, None)
+}
+
+fn flow_diagnostics_with_version(
+    source: &str,
+    compiler_version: Option<pascal_project::CompilerVersion>,
+) -> Vec<SemanticDiagnostic> {
     let uri = Url::parse("file:///tmp/flow-diagnostics.pas").expect("valid URI");
     let mut index = NavigationIndex::new();
     index
         .update(uri.clone(), source.to_owned())
         .expect("fixture parses");
+    let document = index.documents.get_mut(&uri).expect("indexed document");
+    std::sync::Arc::get_mut(&mut document.parsed)
+        .expect("document is uniquely owned")
+        .conditional_context
+        .compiler_version = compiler_version;
     let document = index.documents.get(&uri).expect("indexed document");
     let cancel = AtomicBool::new(false);
     let mut budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "flow test");
@@ -1129,6 +1141,44 @@ fn flow_diagnostics(source: &str) -> Vec<SemanticDiagnostic> {
         &mut budget,
     )
     .expect("flow diagnostics build")
+}
+
+#[test]
+fn flow_diagnostics_withhold_w1037_for_unrecorded_compiler_versions() {
+    let classic_for = concat!(
+        "program FlowForVersion;\n",
+        "procedure Demo(Last: Integer);\n",
+        "var I: Integer;\n",
+        "begin for I := 1 to Last do ; WriteLn(I); end;\n",
+        "begin Demo(2); end.\n",
+    );
+    let for_in = concat!(
+        "program FlowForInVersion;\n",
+        "type TNumbers = set of 1..2;\n",
+        "procedure Demo(Values: TNumbers);\n",
+        "var I: Integer;\n",
+        "begin for I in Values do WriteLn(I); WriteLn(I); end;\n",
+        "begin Demo([1, 2]); end.\n",
+    );
+    let cases = [
+        (classic_for, None),
+        (
+            classic_for,
+            Some(pascal_project::CompilerVersion::new(24, 1)),
+        ),
+        (for_in, None),
+        (for_in, Some(pascal_project::CompilerVersion::new(24, 1))),
+        (for_in, Some(pascal_project::CompilerVersion::new(37, 0))),
+    ];
+
+    for (source, compiler_version) in cases {
+        assert!(
+            flow_diagnostics_with_version(source, compiler_version)
+                .iter()
+                .all(|finding| finding.kind.code() != "W1037"),
+            "unrecorded compiler version {compiler_version:?} must not produce W1037"
+        );
+    }
 }
 
 #[test]

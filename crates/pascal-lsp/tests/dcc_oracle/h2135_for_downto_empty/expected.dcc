@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem ForDowntoEmpty.pas
+ForDowntoEmpty.pas(7) H2135 FOR or WHILE loop executes zero times - deleted
+ForDowntoEmpty.pas(5) H2164 Variable 'I' is declared but never used in 'Demo'

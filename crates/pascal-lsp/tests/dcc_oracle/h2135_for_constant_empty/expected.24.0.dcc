@@ -1,0 +1,7 @@
+# Embarcadero Delphi for Win32 compiler version 24.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem ForConstantEmpty.pas
+ForConstantEmpty.pas(8) H2135 FOR or WHILE loop executes zero times - deleted
+ForConstantEmpty.pas(10) H2135 FOR or WHILE loop executes zero times - deleted
+ForConstantEmpty.pas(12) H2135 FOR or WHILE loop executes zero times - deleted
+ForConstantEmpty.pas(5) H2164 Variable 'I' is declared but never used in 'Demo'
+ForConstantEmpty.pas(6) H2164 Variable 'C' is declared but never used in 'Demo'

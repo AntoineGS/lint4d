@@ -478,8 +478,6 @@ for code in "${codes[@]}"; do
   ))
   if ((non_umbrella_suppressor_count > 1)); then
     fail "$code has multiple non-umbrella suppressors: ${property_suppressors[*]} ${specific_suppressors[*]}"
-  elif ((non_umbrella_suppressor_count == 0)) && [[ $code != H2219 ]]; then
-    fail "$code has no non-umbrella suppressor"
   elif (( ${#property_suppressors[@]} == 1 )); then
     identifiers[$code]=${property_suppressors[0]}
   elif (( ${#specific_suppressors[@]} == 1 )); then

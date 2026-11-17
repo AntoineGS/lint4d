@@ -97,7 +97,7 @@ class DeriveScriptTests(unittest.TestCase):
         self.assertIn("SYMBOL_DEPRECATED", result.stderr)
         self.assertIn("OTHER_SPECIFIC_ID", result.stderr)
 
-    def test_warning_without_a_specific_suppressor_fails(self):
+    def test_code_without_a_specific_suppressor_records_no_id(self):
         lines = DERIVE_SCRIPT.read_text().splitlines()
         start = next(
             index
@@ -144,8 +144,9 @@ class DeriveScriptTests(unittest.TestCase):
                 text=True,
             )
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("has no non-umbrella suppressor", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "identifier=-\n")
+        self.assertEqual(result.stderr, "")
 
 
 if __name__ == "__main__":

@@ -452,10 +452,13 @@ thread_local! {
 /// Tests compare a lazy walk with the eager one (l4d-fpyu).
 fn eager_imports_for_test() -> bool {
     #[cfg(test)]
-    if TEST_EAGER_SNAPSHOT_IMPORTS.with(std::cell::Cell::get) {
-        return true;
+    {
+        TEST_EAGER_SNAPSHOT_IMPORTS.with(std::cell::Cell::get)
     }
-    false
+    #[cfg(not(test))]
+    {
+        false
+    }
 }
 
 fn navigation_walk_byte_limit() -> usize {

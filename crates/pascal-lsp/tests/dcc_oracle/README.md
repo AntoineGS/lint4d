@@ -21,6 +21,19 @@ semantic model makes even a matching dcc diagnostic unsafe. The recording has
 `#` header lines followed by normalized messages in the form
 `<File>.pas(<line>) <code> <message>`.
 
+A case may contain one sibling `.dproj`. Optional `config = "Debug"` and
+`platform = "Win32"` entries in `case.toml` select its build configuration and
+platform; when omitted, the project's evaluated defaults are used. The oracle
+loads that project through `pascal-project`, retaining the selected compiler's
+closed conditional context and taking project warning properties from the
+selected `.dproj` configuration. The recorder applies those same configured
+warning properties to its dcc invocation. It evaluates root-level
+`PropertyGroup`s and property `Condition` comparisons with `Config` and
+`Platform` plus `and`/`or`; unsupported conditions, nested property groups, and
+unevaluable warning properties fail recording instead of silently guessing.
+Imported MSBuild files are not evaluated by the recorder and therefore fail
+recording. Cases without a `.dproj` keep the original projectless behavior.
+
 The recorder compiles the unit with sibling resources such as `.dfm`; the
 semantic oracle indexes only `.pas` files. A DFM event binding is therefore not
 counted as a Pascal identifier use by the H2219 scan, and its behavior must be
@@ -45,6 +58,13 @@ Headless-Delphi Wine prefix and accepts `DCC_ORACLE_WINEPREFIX` and
 missing because Wine would otherwise create an empty one. Never hand-edit an
 `expected*.dcc` file: it is the compiler's recording, not a hand-authored
 expectation.
+
+Usage output from dcc32 21.0, 24.0, and 37.0 (run with no arguments) reports
+`-W[+|-|^][warn_id]`; all three versions accept `-W-<ID>`, `-W+<ID>`, and
+`-W^<ID>` for a warning property. The same usage output lists `-H` as the hint
+output switch; `-H+` and `-H-` are accepted to enable/disable hints. The
+recorder keeps the defaults `-H+ -W+`, then appends configured `.dproj`
+switches so project values take precedence.
 
 The unit test in `src/navigation/dcc_oracle_tests.rs` compares only codes in
 `ENABLED_CODES`; add a code there as the corresponding lint rule is implemented.

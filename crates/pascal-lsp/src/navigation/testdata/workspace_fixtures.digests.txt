@@ -169,6 +169,8 @@ crates/lint4d/tests/fixtures/use_after_free/good_nil_checks_after_freeandnil.pas
 crates/lint4d/tests/fixtures/use_after_free/good_no_use_after_free.pas c90d770049a92b50 3
 crates/lint4d/tests/fixtures/use_after_free/good_reassign_after_free.pas 129376ac8f2191ac 3
 crates/pascal-lsp/tests/dcc_oracle/clean_unit/Clean.pas be2bd41795dedee4 10
+crates/pascal-lsp/tests/dcc_oracle/dproj_warning_switches/DprojWarningSwitches.pas 811918ac4530da97 5
+crates/pascal-lsp/tests/dcc_oracle/dproj_warnings_off/DprojWarningsOff.pas 107be51f9c639eab 5
 crates/pascal-lsp/tests/dcc_oracle/e2003_asm_block/E2003AsmBlock.pas 3181b2bac4d8fe4c 2
 crates/pascal-lsp/tests/dcc_oracle/e2003_attributes/E2003Attributes.pas 4a06fbc859102e58 6
 crates/pascal-lsp/tests/dcc_oracle/e2003_builtins_ok/E2003BuiltinsOk.pas fb2f2cf64128c0f8 4

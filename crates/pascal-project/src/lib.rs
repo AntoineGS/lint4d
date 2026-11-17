@@ -106,7 +106,7 @@ mod discovery_cache;
 pub use context::ProjectContextParts;
 pub use context::{
     ProjectCandidateMembership, ProjectCandidates, ProjectContext, ProjectOptions,
-    ProjectSelections,
+    ProjectSelections, PropertyValue,
 };
 mod context;
 pub use observations::{DiscoveredProject, ProjectObservations};

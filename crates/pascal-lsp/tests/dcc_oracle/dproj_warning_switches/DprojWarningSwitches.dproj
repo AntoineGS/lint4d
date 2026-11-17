@@ -1,0 +1,11 @@
+<Project>
+  <PropertyGroup>
+    <MainSource>DprojWarningSwitches.pas</MainSource>
+    <Config Condition="'$(Config)'==''">Release</Config>
+    <Platform Condition="'$(Platform)'==''">Win32</Platform>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Debug'">
+    <DCC_Hints>false</DCC_Hints>
+    <DCC_SYMBOL_DEPRECATED>false</DCC_SYMBOL_DEPRECATED>
+  </PropertyGroup>
+</Project>

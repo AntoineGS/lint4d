@@ -101,10 +101,32 @@ for name in "${cases[@]}"; do
     echo "$name: skipped (not configured for $compiler)"
     continue
   fi
+  mapfile -d '' -t dproj_files < <(find "$dir" -mindepth 1 -maxdepth 1 -type f -iname '*.dproj' -print0)
+  if ((${#dproj_files[@]} > 1)); then
+    echo "$name: expected at most one .dproj, found ${#dproj_files[@]}" >&2
+    status=1
+    continue
+  fi
+  project_switch_flags=()
+  if ((${#dproj_files[@]} == 1)); then
+    switch_table="$root/crates/pascal-lsp/src/navigation/dcc_switches/$compiler.txt"
+    config=$(sed -nE 's/^[[:space:]]*config[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$dir/case.toml" | head -n1)
+    platform=$(sed -nE 's/^[[:space:]]*platform[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$dir/case.toml" | head -n1)
+    if ! switch_output=$(python3 "$root/scripts/dcc-oracle-project-switches.py" \
+      "${dproj_files[0]}" "$switch_table" "$config" "$platform"); then
+      echo "$name: could not evaluate .dproj warning switches" >&2
+      status=1
+      continue
+    fi
+    while IFS= read -r flag; do
+      [[ -n $flag ]] && project_switch_flags+=("$flag")
+    done <<< "$switch_output"
+  fi
   output="$dir/expected.dcc"
   if [[ $compiler != 37.0 ]]; then output="$dir/expected.$compiler.dcc"; fi
   out=$(mktemp -d)
   dcc_args=(-B -H+ -W+ -Q "-U$lib")
+  dcc_args+=("${project_switch_flags[@]}")
   if [[ $use_unit_scopes == true ]]; then dcc_args+=(-NSSystem); fi
   dcc_args+=(-N0"$(winpath "$out")" -E"$(winpath "$out")" "$unit")
   if raw=$(cd "$dir" && WINEPREFIX="$prefix" WINEDEBUG=-all timeout 300 \
@@ -147,6 +169,7 @@ for name in "${cases[@]}"; do
   {
     echo "# $version"
     header="# dcc32 -B -H+ -W+ -Q -U<$lib_header>"
+    for flag in "${project_switch_flags[@]}"; do header+=" $flag"; done
     if [[ $use_unit_scopes == true ]]; then header+=" -NSSystem"; fi
     echo "$header $unit"
     grep -E '^[^ ].*\([0-9]+\) (Error|Warning|Hint): [EWH][0-9]{4} ' <<<"$raw" \

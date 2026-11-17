@@ -4,9 +4,13 @@
 //! `PASCAL_RTL_<version>` is unset).
 use super::dcc_surface::{SurfaceKey, SurfacePlatform, table_for, verified_system_context};
 use super::*;
-use pascal_project::{CompilerVersion, ConditionalFact};
+use pascal_project::delphi_overrides::OverrideSession;
+use pascal_project::{
+    CompilerVersion, ConditionalFact, ProjectContext, ProjectOptions, PropertyValue,
+};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// dcc codes whose findings are compared. Grows as each rule lands.
 const ENABLED_CODES: &[&str] = &[
@@ -27,9 +31,16 @@ struct Case {
     dir: PathBuf,
     unit: String,
     compilers: Vec<String>,
+    config: Option<String>,
+    platform: Option<String>,
     requires_rtl: bool,
     recall: bool,
     silent_codes: Vec<String>,
+}
+
+struct CaseInitialState {
+    conditional_context: ConditionalContext,
+    warning_properties: BTreeMap<String, PropertyValue>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -112,6 +123,8 @@ fn load_case_from_toml(name: &str, dir: &Path, toml: &str) -> Case {
     Case {
         unit: value("unit").unwrap_or_else(|| panic!("{name}: case.toml has no unit")),
         compilers,
+        config: value("config"),
+        platform: value("platform"),
         requires_rtl: value("requires_rtl").as_deref() == Some("true"),
         recall,
         silent_codes,
@@ -171,9 +184,67 @@ fn line_of(source: &str, offset: usize) -> usize {
     source[..offset.min(source.len())].matches('\n').count() + 1
 }
 
+fn project_context_for_case(
+    case: &Case,
+    version: &str,
+    config: Option<String>,
+    platform: Option<String>,
+) -> Option<Arc<ProjectContext>> {
+    let mut projects = std::fs::read_dir(&case.dir)
+        .unwrap_or_else(|error| panic!("{}: case directory: {error}", case.name))
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("dproj"))
+        })
+        .collect::<Vec<_>>();
+    projects.sort();
+    assert!(
+        projects.len() <= 1,
+        "{}: expected at most one .dproj, found {:?}",
+        case.name,
+        projects
+    );
+    let project_file = projects.into_iter().next()?;
+    let source = case.dir.join(&case.unit);
+    let options = ProjectOptions {
+        project_file: Some(project_file),
+        build_config: config,
+        platform,
+        conditional_context: oracle_context(version),
+        ..ProjectOptions::default()
+    };
+    Some(
+        ProjectContext::discover_with_overrides(
+            &source,
+            std::slice::from_ref(&case.dir),
+            &options,
+            &OverrideSession::new(None),
+        )
+        .unwrap_or_else(|error| panic!("{}: .dproj discovery: {error}", case.name))
+        .context,
+    )
+}
+
+fn initial_state_for_case(case: &Case, version: &str) -> CaseInitialState {
+    let conditional_context = oracle_context(version);
+    let warning_properties =
+        project_context_for_case(case, version, case.config.clone(), case.platform.clone())
+            .map_or_else(BTreeMap::new, |project| {
+                project.warning_properties().clone()
+            });
+    CaseInitialState {
+        conditional_context,
+        warning_properties,
+    }
+}
+
 fn actual_findings(case: &Case, version: &str) -> Vec<Finding> {
     let mut index = NavigationIndex::new();
-    let context = oracle_context(version);
+    // Only warning switches come from the project. The compiler-specific
+    // conditional context remains closed exactly as oracle_context established.
+    let case_state = initial_state_for_case(case, version);
+    let context = case_state.conditional_context;
     let cancel = AtomicBool::new(false);
     let mut unit_uri = None;
     let mut sources = HashMap::new();
@@ -338,6 +409,8 @@ fn silent_case_codes_override_matching_dcc_and_linter_findings() {
         dir: PathBuf::new(),
         unit: "Synthetic.pas".to_owned(),
         compilers: vec!["37.0".to_owned()],
+        config: None,
+        platform: None,
         requires_rtl: false,
         recall: true,
         silent_codes: vec!["E2065".to_owned()],
@@ -459,6 +532,114 @@ fn oracle_context_closes_the_define_set() {
 }
 
 #[test]
+fn dproj_oracle_context_uses_selected_warning_properties_and_oracle_defines() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let dir = directory.path();
+    std::fs::write(
+        dir.join("Configured.pas"),
+        "unit Configured;\ninterface\nimplementation\nend.\n",
+    )
+    .expect("Pascal fixture");
+    std::fs::write(
+        dir.join("Configured.dproj"),
+        r#"<Project>
+  <PropertyGroup><MainSource>Configured.pas</MainSource></PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Debug'">
+    <DCC_SYMBOL_DEPRECATED>false</DCC_SYMBOL_DEPRECATED>
+  </PropertyGroup>
+</Project>"#,
+    )
+    .expect("project fixture");
+    let case = Case {
+        name: "synthetic_dproj".to_owned(),
+        dir: dir.to_path_buf(),
+        unit: "Configured.pas".to_owned(),
+        compilers: vec!["37.0".to_owned()],
+        config: Some("Debug".to_owned()),
+        platform: Some("Win32".to_owned()),
+        requires_rtl: false,
+        recall: true,
+        silent_codes: Vec::new(),
+    };
+
+    let project =
+        project_context_for_case(&case, "37.0", case.config.clone(), case.platform.clone())
+            .expect("case has one project file");
+    let initial_state = initial_state_for_case(&case, "37.0");
+
+    assert_eq!(project.config(), Some("Debug"));
+    assert_eq!(
+        initial_state
+            .warning_properties
+            .get("DCC_SYMBOL_DEPRECATED"),
+        Some(&PropertyValue::Known("false".to_owned()))
+    );
+    assert_eq!(
+        initial_state.conditional_context.define("MSWINDOWS"),
+        ConditionalFact::True
+    );
+    assert_eq!(
+        initial_state.conditional_context.absent_define,
+        ConditionalFact::False,
+        "the dcc oracle's closed define set must survive project discovery"
+    );
+}
+
+#[test]
+fn configured_dproj_oracle_cases_select_warning_properties() {
+    for (name, property, value) in [
+        ("dproj_warning_switches", "DCC_SYMBOL_DEPRECATED", "false"),
+        ("dproj_warnings_off", "DCC_Warnings", "false"),
+    ] {
+        let case = load_case(&cases_root().join(name));
+        let project =
+            project_context_for_case(&case, "37.0", case.config.clone(), case.platform.clone())
+                .expect("fixture has one .dproj");
+
+        assert_eq!(project.config(), Some("Debug"), "{name}");
+        assert_eq!(
+            project.warning_properties().get(property),
+            Some(&PropertyValue::Known(value.to_owned())),
+            "{name}"
+        );
+        if name == "dproj_warning_switches" {
+            assert_eq!(
+                project.warning_properties().get("DCC_Hints"),
+                Some(&PropertyValue::Known("false".to_owned())),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dproj_recordings_document_the_compiler_switches_used() {
+    for version in ["21.0", "24.0", "37.0"] {
+        let warning_case = load_case(&cases_root().join("dproj_warning_switches"));
+        let warning_record = std::fs::read_to_string(expected_path(&warning_case.dir, version))
+            .expect("recorded .dproj warning case");
+        assert!(
+            warning_record
+                .lines()
+                .nth(1)
+                .is_some_and(|header| header.contains("-H- -W-SYMBOL_DEPRECATED")),
+            "{version}: missing configured hint/code switches in recording header"
+        );
+
+        let global_case = load_case(&cases_root().join("dproj_warnings_off"));
+        let global_record = std::fs::read_to_string(expected_path(&global_case.dir, version))
+            .expect("recorded .dproj global warning case");
+        assert!(
+            global_record
+                .lines()
+                .nth(1)
+                .is_some_and(|header| header.contains("-W-")),
+            "{version}: missing configured global warning switch in recording header"
+        );
+    }
+}
+
+#[test]
 fn case_compilers_default_to_37() {
     let case = load_case(&cases_root().join("clean_unit"));
 
@@ -474,6 +655,18 @@ fn case_compilers_parse_multiple_versions() {
     );
 
     assert_eq!(case.compilers, ["21.0", "24.0"]);
+}
+
+#[test]
+fn case_build_selection_is_optional_and_parsed() {
+    let case = load_case_from_toml(
+        "synthetic",
+        Path::new("synthetic"),
+        "unit = \"Synthetic.pas\"\nconfig = \"Debug\"\nplatform = \"Win32\"\n",
+    );
+
+    assert_eq!(case.config.as_deref(), Some("Debug"));
+    assert_eq!(case.platform.as_deref(), Some("Win32"));
 }
 
 #[test]

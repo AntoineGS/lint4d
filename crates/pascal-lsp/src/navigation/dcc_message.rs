@@ -14,6 +14,10 @@ pub(crate) enum DccMessage {
     E2291,
     E2301,
     H2219,
+    W1000,
+    W1001,
+    W1002,
+    W1003,
     W1009,
     W1010,
 }
@@ -41,6 +45,10 @@ impl DccMessage {
             Self::E2291 => "E2291",
             Self::E2301 => "E2301",
             Self::H2219 => "H2219",
+            Self::W1000 => "W1000",
+            Self::W1001 => "W1001",
+            Self::W1002 => "W1002",
+            Self::W1003 => "W1003",
             Self::W1009 => "W1009",
             Self::W1010 => "W1010",
         }
@@ -48,6 +56,10 @@ impl DccMessage {
 
     pub(crate) fn promoted_error_code(self) -> Option<&'static str> {
         match self {
+            Self::W1000 => Some("E1000"),
+            Self::W1001 => Some("E1001"),
+            Self::W1002 => Some("E1002"),
+            Self::W1003 => Some("E1003"),
             Self::W1009 => Some("E1009"),
             Self::W1010 => Some("E1010"),
             _ => None,
@@ -68,7 +80,9 @@ impl DccMessage {
             | Self::E2291
             | Self::E2301 => DccSeverity::Error,
             Self::H2219 => DccSeverity::Hint,
-            Self::W1009 | Self::W1010 => DccSeverity::Warning,
+            Self::W1000 | Self::W1001 | Self::W1002 | Self::W1003 | Self::W1009 | Self::W1010 => {
+                DccSeverity::Warning
+            }
         }
     }
 
@@ -86,6 +100,10 @@ impl DccMessage {
             Self::E2291 => "Missing implementation of interface method %s.%s",
             Self::E2301 => "Method '%s' with identical parameters and result type already exists",
             Self::H2219 => "Private symbol '%s' declared but never used",
+            Self::W1000 => "Symbol '%s' is deprecated%s",
+            Self::W1001 => "Symbol '%s' is specific to a library",
+            Self::W1002 => "Symbol '%s' is specific to a platform",
+            Self::W1003 => "Symbol '%s' is experimental",
             Self::W1009 => "Redeclaration of '%s' hides a member in the base class",
             Self::W1010 => "Method '%s' hides virtual method of base type '%s'",
         }
@@ -184,6 +202,18 @@ mod tests {
                 "H2219",
                 "Private symbol '%s' declared but never used",
             ),
+            (DccMessage::W1000, "W1000", "Symbol '%s' is deprecated%s"),
+            (
+                DccMessage::W1001,
+                "W1001",
+                "Symbol '%s' is specific to a library",
+            ),
+            (
+                DccMessage::W1002,
+                "W1002",
+                "Symbol '%s' is specific to a platform",
+            ),
+            (DccMessage::W1003, "W1003", "Symbol '%s' is experimental"),
             (
                 DccMessage::W1009,
                 "W1009",

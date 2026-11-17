@@ -99,6 +99,7 @@ pub(crate) use dcc_message::{DccMessage, DccSeverity};
 mod documentation;
 mod facts;
 mod folding;
+mod hint_directives;
 #[cfg(test)]
 mod index_characterization;
 mod inlay;
@@ -3263,6 +3264,23 @@ impl NavigationIndex {
                 if declaration_cap_reached {
                     report.note(SemanticCoverageGap::DiagnosticCap);
                 }
+            }
+            if !report.has_capacity() {
+                break 'analysis;
+            }
+            let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
+            match self.append_hint_directive_diagnostics_with_budget(
+                uri,
+                document,
+                capacity,
+                &mut report,
+                cancel,
+                &mut budget,
+            ) {
+                Err(error) if error == SEMANTIC_DIAGNOSTICS_LIMIT => {
+                    report.note(SemanticCoverageGap::DiagnosticCap);
+                }
+                result => result?,
             }
         }
         report
@@ -30822,6 +30840,7 @@ mod tests {
             "  TExperimental = Integer experimental;\n",
             "  TObj = class\n",
             "    FDeprecated: Integer; deprecated 'field''s';\n",
+            "    FSuffixDeprecated: Integer deprecated;\n",
             "    property PExperimental: Integer read FDeprecated; experimental;\n",
             "    procedure Method; deprecated 'method''s';\n",
             "  end;\n",
@@ -30909,6 +30928,11 @@ mod tests {
             )
         );
         assert_eq!(
+            &symbol(&document, "FSuffixDeprecated").hint_directives,
+            &expected(Some(None), None, false, false, false, false),
+            "a deprecated suffix on a field is a declaration hint"
+        );
+        assert_eq!(
             &symbol(&document, "PExperimental").hint_directives,
             &expected(None, None, false, false, true, false)
         );
@@ -30929,8 +30953,8 @@ mod tests {
         );
         assert_eq!(
             &symbol(&document, "VTypeHint").hint_directives,
-            &HintDirectives::default(),
-            "a deprecated type reference is not a declaration hint"
+            &expected(Some(None), None, false, false, false, false),
+            "a deprecated suffix on a variable is a declaration hint"
         );
         assert_eq!(
             &symbol(&document, "CDeprecated").hint_directives,

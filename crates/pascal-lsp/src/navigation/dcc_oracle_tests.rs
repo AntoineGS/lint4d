@@ -15,8 +15,9 @@ use std::sync::Arc;
 
 /// dcc codes whose findings are compared. Grows as each rule lands.
 const ENABLED_CODES: &[&str] = &[
-    "E1009", "E1010", "E2003", "E2004", "E2037", "E2065", "E2137", "E2170", "E2211", "E2252",
-    "E2254", "E2291", "E2301", "H2219", "W1009", "W1010",
+    "E1000", "E1001", "E1002", "E1003", "E1009", "E1010", "E2003", "E2004", "E2037", "E2065",
+    "E2137", "E2170", "E2211", "E2252", "E2254", "E2291", "E2301", "H2219", "W1000", "W1001",
+    "W1002", "W1003", "W1009", "W1010",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

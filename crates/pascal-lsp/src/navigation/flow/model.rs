@@ -7,10 +7,25 @@ use cfg_pascal::cfg_core::types::{BlockId, Cfg, EdgeKind};
 use lsp_types::Url;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tree_sitter::Node;
 
 type StatementLocations = Vec<(BlockId, Range<usize>)>;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CFG_BUILDER_CALL_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_test_cfg_builder_call_count() {
+    TEST_CFG_BUILDER_CALL_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn test_cfg_builder_call_count() -> usize {
+    TEST_CFG_BUILDER_CALL_COUNT.with(std::cell::Cell::get)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalVarParameterMode {
@@ -98,23 +113,36 @@ pub(crate) fn routine_flows<'a>(
 ) -> Result<Vec<RoutineFlow<'a>>, String> {
     check_navigation_cancel(cancel)?;
     let root = document.tree.root_node();
-    budget.require_work(root.descendant_count().saturating_add(1), cancel)?;
     budget.require_owned_bytes(document.source.len(), cancel)?;
 
-    let all_nodes = collect_nodes(root, cancel, budget)?;
-    let mut routines = Vec::new();
-    for node in all_nodes {
-        check_navigation_cancel(cancel)?;
-        budget.require_work(1, cancel)?;
-        if node.kind() == "defProc" && node.child_by_field_name("body").is_some() {
-            routines.push(node);
-        }
+    let (document_node_count, routines) =
+        collect_document_routines(root, &document.source, cancel, budget)?;
+    let flow_bytes = routines
+        .len()
+        .saturating_mul(std::mem::size_of::<RoutineFlow<'a>>());
+    budget.require_owned_bytes(flow_bytes, cancel)?;
+    if !budget.take_work(document_node_count, cancel)? {
+        return Ok(routines
+            .into_iter()
+            .map(|(node, name)| RoutineFlow {
+                name,
+                cfg: None,
+                locals: Vec::new(),
+                occurrences: Vec::new(),
+                excluded: Some(FlowExclusion::Budget),
+                node,
+            })
+            .collect());
     }
+
     let mut budget_excluded = HashMap::new();
     let mut build_error = None;
-    let mut cfgs = cfg_pascal::build_routine_cfgs_with_filter(
+    #[cfg(test)]
+    TEST_CFG_BUILDER_CALL_COUNT.with(|count| count.set(count.get() + 1));
+    let mut cfgs = cfg_pascal::build_routine_cfgs_with_filter_and_cancel(
         &document.tree,
         document.source.as_bytes(),
+        || cancel.load(Ordering::Relaxed),
         |proc_name, node| {
             if let Err(error) = check_navigation_cancel(cancel) {
                 build_error = Some(error);
@@ -145,7 +173,7 @@ pub(crate) fn routine_flows<'a>(
                 }
             }
         },
-    );
+    )?;
     if let Some(error) = build_error {
         return Err(error);
     }
@@ -162,7 +190,7 @@ pub(crate) fn routine_flows<'a>(
     }
 
     let mut flows = Vec::with_capacity(routines.len());
-    for node in routines {
+    for (node, _) in routines {
         check_navigation_cancel(cancel)?;
         let range = (node.start_byte(), node.end_byte());
         if let Some(name) = budget_excluded.remove(&range) {
@@ -195,6 +223,40 @@ pub(crate) fn routine_flows<'a>(
         )?);
     }
     Ok(flows)
+}
+
+fn collect_document_routines<'a>(
+    root: Node<'a>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<(usize, Vec<(Node<'a>, String)>), String> {
+    let mut node_count = 0usize;
+    let mut routines = Vec::new();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        budget.require_owned_bytes(std::mem::size_of::<Node<'a>>(), cancel)?;
+        node_count = node_count.saturating_add(1);
+        if node.kind() == "defProc" && node.child_by_field_name("body").is_some() {
+            let name = node
+                .child_by_field_name("header")
+                .and_then(|header| header.child_by_field_name("name"))
+                .map(|name_node| node_text(name_node, source))
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| format!("<routine@{}>", node.start_byte()));
+            budget.require_owned_bytes(name.len(), cancel)?;
+            routines.push((node, name));
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            check_navigation_cancel(cancel)?;
+            budget.require_owned_bytes(std::mem::size_of::<Node<'a>>(), cancel)?;
+            pending.push(child);
+        }
+    }
+    Ok((node_count, routines))
 }
 
 #[derive(Debug, Clone)]

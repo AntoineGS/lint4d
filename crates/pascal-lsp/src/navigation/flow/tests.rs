@@ -64,6 +64,29 @@ fn routine(source: &str, name: &str) -> FlowSnapshot {
         .unwrap_or_else(|| panic!("routine model for {name:?}"))
 }
 
+fn syntax_node_count(root: tree_sitter::Node<'_>) -> usize {
+    let mut count = 0;
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        count += 1;
+        let mut cursor = node.walk();
+        pending.extend(node.children(&mut cursor));
+    }
+    count
+}
+
+fn first_executable_routine(root: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "defProc" && node.child_by_field_name("body").is_some() {
+            return node;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.children(&mut cursor));
+    }
+    panic!("expected executable routine in fixture")
+}
+
 fn occurrences<'a>(
     flow: &'a FlowSnapshot,
     variable: &str,
@@ -759,23 +782,56 @@ fn flow_with_target_scan_reports_budget_exclusion() {
         .expect("fixture parses");
     let document = index.documents.get(&uri).expect("indexed document");
     let cancel = AtomicBool::new(false);
-    let mut budget = AssistanceBudget::new(535, 8 * 1024 * 1024, "flow test");
-    let flows = routine_flows(&index, &uri, document, &cancel, &mut budget)
-        .expect("budget exhaustion in a with scan excludes the routine");
-    let flow = flows
-        .into_iter()
-        .find(|flow| flow.name == "Demo")
-        .expect("Demo flow");
+    let routine_node = first_executable_routine(document.tree.root_node());
+    let mut collection_budget = AssistanceBudget::new(10_000, 8 * 1024 * 1024, "flow test");
+    let body_nodes = super::model::collect_nodes(routine_node, &cancel, &mut collection_budget)
+        .expect("routine syntax nodes are collected");
+    let with_node = body_nodes
+        .iter()
+        .copied()
+        .find(|node| node.kind() == "with")
+        .expect("fixture with node");
+    let with_body = with_node.child_by_field_name("body").expect("with body");
+    let value_identifier = body_nodes
+        .iter()
+        .copied()
+        .find(|node| {
+            node.kind() == "identifier"
+                && with_body.start_byte() <= node.start_byte()
+                && node.end_byte() <= with_body.end_byte()
+                && source.get(node.start_byte()..node.end_byte()) == Some("Value")
+        })
+        .expect("Value identifier inside with body");
+    let scan_nodes = [with_node, value_identifier];
+    let mut locals = vec![LocalVar {
+        name: "Value".to_string(),
+        decl_span: SourceSpan { start: 0, end: 0 },
+        kind: LocalKind::Local,
+        ty: VarType::Scalar,
+        address_taken: false,
+        captured: false,
+        absolute: false,
+        possible_with_target: false,
+    }];
+    let local_names = HashSet::from(["value".to_string()]);
+    let mut excluded = None;
+    let mut scan_budget = AssistanceBudget::new(2, 8 * 1024 * 1024, "flow test");
 
-    assert_eq!(flow.excluded, Some(FlowExclusion::Budget));
-    assert!(flow.cfg.is_some(), "the CFG was built before the with scan");
     assert!(
-        flow.locals
-            .iter()
-            .any(|local| local.name.eq_ignore_ascii_case("Value")),
-        "routine modeling reached its locals pass before the with scan exhausted"
+        !super::model::mark_possible_with_targets(
+            document,
+            &scan_nodes,
+            &mut locals,
+            &local_names,
+            &mut excluded,
+            &cancel,
+            &mut scan_budget,
+        )
+        .expect("budget exhaustion in a with scan excludes the routine")
     );
-    assert!(budget.exhausted());
+    assert_eq!(excluded, Some(FlowExclusion::Budget));
+    assert!(!locals[0].possible_with_target);
+    assert!(scan_budget.exhausted());
 }
 
 #[test]
@@ -794,7 +850,16 @@ fn flow_cfg_build_precharge_excludes_a_routine_when_it_cannot_fit() {
         .expect("fixture parses");
     let document = index.documents.get(&uri).expect("indexed document");
     let cancel = AtomicBool::new(false);
-    let mut budget = AssistanceBudget::new(150, 8 * 1024 * 1024, "flow test");
+    let root = document.tree.root_node();
+    let work_limit = syntax_node_count(root)
+        .saturating_mul(2)
+        .saturating_add(
+            first_executable_routine(root)
+                .descendant_count()
+                .saturating_add(1),
+        )
+        .saturating_sub(1);
+    let mut budget = AssistanceBudget::new(work_limit, 8 * 1024 * 1024, "flow test");
     let flows = routine_flows(&index, &uri, document, &cancel, &mut budget)
         .expect("an over-budget routine is excluded instead of built");
     let flow = flows
@@ -805,6 +870,91 @@ fn flow_cfg_build_precharge_excludes_a_routine_when_it_cannot_fit() {
     assert_eq!(flow.excluded, Some(FlowExclusion::Budget));
     assert!(flow.cfg.is_none(), "the CFG builder must skip the routine");
     assert!(budget.exhausted());
+}
+
+#[test]
+fn flow_document_precharge_excludes_all_routines_before_cfg_building() {
+    let source = concat!(
+        "program FlowDocumentBudget;\n",
+        "procedure First; begin end;\n",
+        "procedure Second; begin end;\n",
+        "begin First; Second; end.\n",
+    );
+    let uri = Url::parse("file:///tmp/flow-document-budget.pas").expect("valid URI");
+    let mut index = NavigationIndex::new();
+    index
+        .update(uri.clone(), source.to_owned())
+        .expect("fixture parses");
+    let document = index.documents.get(&uri).expect("indexed document");
+    let node_count = syntax_node_count(document.tree.root_node());
+    let work_limit = node_count.saturating_mul(2).saturating_sub(1);
+    let cancel = AtomicBool::new(false);
+    let mut budget = AssistanceBudget::new(work_limit, 8 * 1024 * 1024, "flow test");
+    super::model::reset_test_cfg_builder_call_count();
+    let flows = routine_flows(&index, &uri, document, &cancel, &mut budget)
+        .expect("a document precharge miss excludes routines");
+
+    assert_eq!(flows.len(), 2, "both executable routines are represented");
+    assert!(
+        flows
+            .iter()
+            .all(|flow| flow.excluded == Some(FlowExclusion::Budget) && flow.cfg.is_none()),
+        "no routine should retain a CFG or partial flow facts: {flows:?}"
+    );
+    assert_eq!(
+        flows
+            .iter()
+            .map(|flow| flow.name.as_str())
+            .collect::<HashSet<_>>(),
+        HashSet::from(["First", "Second"])
+    );
+    assert_eq!(
+        super::model::test_cfg_builder_call_count(),
+        0,
+        "document precharge must stop before invoking cfg-pascal"
+    );
+    assert!(budget.exhausted());
+
+    let mut gap_budget = AssistanceBudget::new(work_limit, 8 * 1024 * 1024, "flow test");
+    let result =
+        super::flow_diagnostics_with_budget(&index, &uri, document, 10, &cancel, &mut gap_budget);
+    let mut report = super::super::SemanticDiagnosticReport::default();
+    assert!(
+        report
+            .checked_candidate(result, &gap_budget)
+            .expect("budget exhaustion is not cancellation")
+            .is_none()
+    );
+    assert_eq!(report.gaps, vec![super::super::SemanticCoverageGap::Budget]);
+    assert_eq!(
+        super::model::test_cfg_builder_call_count(),
+        0,
+        "coverage-gap reporting must not invoke cfg-pascal either"
+    );
+}
+
+#[test]
+fn flow_model_cancellation_before_document_preprocessing_is_reported() {
+    let source = concat!(
+        "program FlowDocumentCancel;\n",
+        "procedure First; begin end;\n",
+        "procedure Second; begin end;\n",
+        "begin First; Second; end.\n",
+    );
+    let uri = Url::parse("file:///tmp/flow-document-cancel.pas").expect("valid URI");
+    let mut index = NavigationIndex::new();
+    index
+        .update(uri.clone(), source.to_owned())
+        .expect("fixture parses");
+    let document = index.documents.get(&uri).expect("indexed document");
+    let cancel = AtomicBool::new(true);
+    let mut budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "flow test");
+
+    assert_eq!(
+        routine_flows(&index, &uri, document, &cancel, &mut budget)
+            .expect_err("pre-cancelled routine modeling must stop"),
+        "request cancelled"
+    );
 }
 
 #[test]

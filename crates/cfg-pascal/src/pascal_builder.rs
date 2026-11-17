@@ -50,7 +50,8 @@ use crate::project::{ProjectBuildError, ProjectSnapshot, ProjectUnitId};
 /// disable resolution.
 ///
 pub fn build_file_cfgs(tree: &tree_sitter::Tree, source: &[u8]) -> Vec<Cfg> {
-    build_cfgs_with_routine_filter(tree, source, true, |_: &str, _: Node<'_>| true)
+    build_cfgs_with_routine_filter(tree, source, true, || false, |_: &str, _: Node<'_>| true)
+        .expect("the default cancellation probe never cancels")
 }
 
 /// Build routine CFGs while allowing callers to skip selected executable routines.
@@ -64,17 +65,36 @@ pub fn build_routine_cfgs_with_filter(
     source: &[u8],
     include_routine: impl FnMut(&str, Node<'_>) -> bool,
 ) -> Vec<Cfg> {
-    build_cfgs_with_routine_filter(tree, source, false, include_routine)
+    build_routine_cfgs_with_filter_and_cancel(tree, source, || false, include_routine)
+        .expect("the default cancellation probe never cancels")
+}
+
+/// Build routine CFGs with a cooperative cancellation probe and a routine filter.
+///
+/// The probe is checked before and after whole-file exception-type preparation,
+/// and while discovering routines. A cancelled build returns
+/// `Err("request cancelled")`; callers that do not need cancellation should use
+/// [`build_routine_cfgs_with_filter`].
+pub fn build_routine_cfgs_with_filter_and_cancel(
+    tree: &tree_sitter::Tree,
+    source: &[u8],
+    is_cancelled: impl FnMut() -> bool,
+    include_routine: impl FnMut(&str, Node<'_>) -> bool,
+) -> Result<Vec<Cfg>, String> {
+    build_cfgs_with_routine_filter(tree, source, false, is_cancelled, include_routine)
 }
 
 fn build_cfgs_with_routine_filter(
     tree: &tree_sitter::Tree,
     source: &[u8],
     include_module_cfgs: bool,
+    mut is_cancelled: impl FnMut() -> bool,
     mut include_routine: impl FnMut(&str, Node<'_>) -> bool,
-) -> Vec<Cfg> {
+) -> Result<Vec<Cfg>, String> {
     let root = tree.root_node();
+    check_builder_cancel(&mut is_cancelled)?;
     let exception_types = ExceptionTypeIndex::build(root, source);
+    check_builder_cancel(&mut is_cancelled)?;
     let unit_key = ExceptionTypeIndex::singleton_unit_key();
     let mut cfgs = Vec::new();
     collect_def_proc_cfgs(
@@ -83,14 +103,16 @@ fn build_cfgs_with_routine_filter(
         None,
         &unit_key,
         &exception_types,
+        &mut is_cancelled,
         &mut include_routine,
         &mut cfgs,
-    );
+    )?;
+    check_builder_cancel(&mut is_cancelled)?;
     if include_module_cfgs {
         collect_module_cfgs(root, source, &unit_key, &exception_types, &mut cfgs);
     }
     cfgs.sort_by_key(|cfg| cfg.byte_range.start);
-    cfgs
+    Ok(cfgs)
 }
 
 /// Build CFGs for one unit selected from an immutable project snapshot.
@@ -133,6 +155,7 @@ pub fn build_file_cfgs_in_project(
     let unit_key = UnitKey::from_project(unit_id);
     let root = unit.tree().root_node();
     let mut cfgs = Vec::new();
+    let mut is_cancelled = || false;
     let mut include_routine = |_: &str, _: Node<'_>| true;
     collect_def_proc_cfgs(
         root,
@@ -140,28 +163,35 @@ pub fn build_file_cfgs_in_project(
         None,
         &unit_key,
         &exception_types,
+        &mut is_cancelled,
         &mut include_routine,
         &mut cfgs,
-    );
+    )
+    .expect("the default cancellation probe never cancels");
     collect_module_cfgs(root, unit.source(), &unit_key, &exception_types, &mut cfgs);
     cfgs.sort_by_key(|cfg| cfg.byte_range.start);
     Ok(cfgs)
 }
 
-fn collect_def_proc_cfgs<'tree, F>(
+#[allow(clippy::too_many_arguments)]
+fn collect_def_proc_cfgs<'tree, C, F>(
     node: Node<'tree>,
     source: &[u8],
     parent_qualified_name: Option<&str>,
     unit_key: &UnitKey,
     exception_types: &ExceptionTypeIndex,
+    is_cancelled: &mut C,
     include_routine: &mut F,
     out: &mut Vec<Cfg>,
-) where
+) -> Result<(), String>
+where
+    C: FnMut() -> bool,
     F: FnMut(&str, Node<'tree>) -> bool,
 {
+    check_builder_cancel(is_cancelled)?;
     if node.kind() == "defProc" {
         let Some(local_name) = extract_proc_name(node, source) else {
-            return;
+            return Ok(());
         };
         let full_local_name =
             extract_full_proc_name(node, source).unwrap_or_else(|| local_name.clone());
@@ -183,31 +213,45 @@ fn collect_def_proc_cfgs<'tree, F>(
         // definitions stored in `local`; in particular, never recurse into
         // the routine body while collecting descendants, or its statements
         // would be mistaken for part of the containing routine.
-        for child in field_children(node, "local") {
+        let mut cursor = node.walk();
+        for child in node.children_by_field_name("local", &mut cursor) {
+            check_builder_cancel(is_cancelled)?;
             collect_def_proc_cfgs(
                 child,
                 source,
                 Some(&qualified_name),
                 unit_key,
                 exception_types,
+                is_cancelled,
                 include_routine,
                 out,
-            );
+            )?;
         }
-        return;
+        return Ok(());
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        check_builder_cancel(is_cancelled)?;
         collect_def_proc_cfgs(
             child,
             source,
             parent_qualified_name,
             unit_key,
             exception_types,
+            is_cancelled,
             include_routine,
             out,
-        );
+        )?;
+    }
+    Ok(())
+}
+
+fn check_builder_cancel(is_cancelled: &mut impl FnMut() -> bool) -> Result<(), String> {
+    if is_cancelled() {
+        Err("request cancelled".to_string())
+    } else {
+        Ok(())
     }
 }
 

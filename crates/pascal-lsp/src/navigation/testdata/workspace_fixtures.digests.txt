@@ -329,6 +329,7 @@ crates/pascal-lsp/tests/dcc_oracle/w1000_type_in_var_decl/W1000TypeInVarDecl.pas
 crates/pascal-lsp/tests/dcc_oracle/w1000_with/W1000With.pas 43d7c25d7182a6af 7
 crates/pascal-lsp/tests/dcc_oracle/w1001_library_var/W1001LibraryVar.pas 89351c5bec4fe001 5
 crates/pascal-lsp/tests/dcc_oracle/w1002_platform_routine/W1002PlatformRoutine.pas b0b437ab59bf82c6 5
+crates/pascal-lsp/tests/dcc_oracle/w1002_symbol_switch_regions/W1002SymbolSwitchRegions.pas b82a691dbaa8f9b2 5
 crates/pascal-lsp/tests/dcc_oracle/w1003_experimental/W1003Experimental.pas 128f35017ee99020 5
 crates/pascal-lsp/tests/dcc_oracle/w1004_library_unit/HintProv.pas bf34de2bf11b890a 1
 crates/pascal-lsp/tests/dcc_oracle/w1004_library_unit/W1004LibraryUnit.pas ea983ea489d159ab 1
@@ -341,6 +342,9 @@ crates/pascal-lsp/tests/dcc_oracle/w1005_namespaced_unit/Vcl.Probe.pas 2ff05a65e
 crates/pascal-lsp/tests/dcc_oracle/w1005_platform_unit/HintProv.pas c93e7a7a171f7bd5 1
 crates/pascal-lsp/tests/dcc_oracle/w1005_platform_unit/HintUse.pas e18af1644b07e979 1
 crates/pascal-lsp/tests/dcc_oracle/w1005_unit_not_indexed/HintUse.pas 579ce21925184d10 1
+crates/pascal-lsp/tests/dcc_oracle/w1005_unit_switch_regions/OffPlatformUnit.pas a04fa47601b45a2a 1
+crates/pascal-lsp/tests/dcc_oracle/w1005_unit_switch_regions/OnPlatformUnit.pas 4982d5caa2ada230 1
+crates/pascal-lsp/tests/dcc_oracle/w1005_unit_switch_regions/W1005UnitSwitchRegions.pas 6e9faf644a324092 1
 crates/pascal-lsp/tests/dcc_oracle/w1006_deprecated_unit/HintProv.pas 41a3c9bf86077513 1
 crates/pascal-lsp/tests/dcc_oracle/w1006_deprecated_unit/HintUse.pas 75c121fc8ff1c264 1
 crates/pascal-lsp/tests/dcc_oracle/w1007_experimental_unit/HintProv.pas 26b468c2e004a85c 1

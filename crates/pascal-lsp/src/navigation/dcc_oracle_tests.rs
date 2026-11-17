@@ -1,7 +1,7 @@
 //! dcc-recorded fixtures (`crates/pascal-lsp/tests/dcc_oracle`): for the
 //! codes in `ENABLED_CODES`, the semantic pass must report exactly what dcc
-//! recorded (precision always; recall unless a case needs the RTL and
-//! `PASCAL_RTL_<version>` is unset).
+//! recorded (precision always; recall unless a case or code has a documented
+//! waiver, or a required RTL source is unavailable).
 use super::dcc_surface::{SurfaceKey, SurfacePlatform, table_for, verified_system_context};
 use super::dcc_switches::{SwitchTable, switch_table};
 use super::*;
@@ -39,7 +39,19 @@ struct Case {
     platform: Option<String>,
     requires_rtl: bool,
     recall: bool,
+    recall_exempt: Vec<String>,
     silent_codes: Vec<String>,
+}
+
+impl Case {
+    fn recall_enforced_for(&self, code: &str, rtl_available: bool) -> bool {
+        self.recall
+            && (!self.requires_rtl || rtl_available)
+            && !self
+                .recall_exempt
+                .iter()
+                .any(|exempt| exempt.eq_ignore_ascii_case(code))
+    }
 }
 
 struct CaseInitialState {
@@ -113,9 +125,17 @@ fn load_case_from_toml(name: &str, dir: &Path, toml: &str) -> Case {
         })
     };
     let recall = value("recall").as_deref() != Some("false");
+    let recall_exempt = value("recall_exempt")
+        .map(|raw| parse_string_array(&raw, name, "recall_exempt"))
+        .unwrap_or_default();
+    let reason = value("reason");
     assert!(
-        recall || value("reason").is_some(),
+        recall || reason.is_some(),
         "{name}: recall = false requires a reason"
+    );
+    assert!(
+        recall_exempt.is_empty() || reason.is_some(),
+        "{name}: recall_exempt requires a reason"
     );
     let compilers = value("compilers")
         .map(|raw| parse_string_array(&raw, name, "compilers"))
@@ -131,6 +151,7 @@ fn load_case_from_toml(name: &str, dir: &Path, toml: &str) -> Case {
         platform: value("platform"),
         requires_rtl: value("requires_rtl").as_deref() == Some("true"),
         recall,
+        recall_exempt,
         silent_codes,
         name: name.to_owned(),
         dir: dir.to_path_buf(),
@@ -537,6 +558,7 @@ fn silent_case_codes_override_matching_dcc_and_linter_findings() {
         platform: None,
         requires_rtl: false,
         recall: true,
+        recall_exempt: Vec::new(),
         silent_codes: vec!["E2065".to_owned()],
     };
     let finding = Finding {
@@ -625,6 +647,42 @@ fn switch_filter_uses_agreed_defaults_without_a_known_switch_table() {
                 .iter()
                 .any(|diagnostic| diagnostic.kind.code() == "W1009"),
             "the unanimous default applies for {uri}"
+        );
+    }
+}
+
+#[test]
+fn warning_switches_require_position_rules_for_every_enabled_code() {
+    let source = "\
+unit WarningSwitchPositionRules;
+interface
+{$WARNINGS OFF}
+{$HINTS OFF}
+implementation
+end.
+";
+    let uri = Url::parse("file:///tmp/warning-switch-position-rules.pas").unwrap();
+    let mut index = NavigationIndex::new();
+    index
+        .update_with_context_with_cancel(
+            uri.clone(),
+            source.to_owned(),
+            &oracle_context("37.0"),
+            &AtomicBool::new(false),
+        )
+        .expect("probe parses");
+
+    let document = index.documents.get(&uri).expect("probe document indexed");
+    let switches = super::warning_switches::WarningSwitches::new(document);
+    for code in ENABLED_CODES
+        .iter()
+        .copied()
+        .filter(|code| matches!(code.as_bytes().first(), Some(b'W' | b'H')))
+    {
+        assert_eq!(
+            switches.effective_switch(document, code, source.len()),
+            Some(super::dcc_switches::SwitchState::Off),
+            "{code} has no recorded switch-position rule"
         );
     }
 }
@@ -917,6 +975,7 @@ fn dproj_oracle_context_uses_selected_warning_properties_and_oracle_defines() {
         platform: Some("Win32".to_owned()),
         requires_rtl: false,
         recall: true,
+        recall_exempt: Vec::new(),
         silent_codes: Vec::new(),
     };
 
@@ -1003,6 +1062,7 @@ fn dproj_oracle_cases_require_explicit_config_and_platform() {
             platform: platform.map(str::to_owned),
             requires_rtl: false,
             recall: true,
+            recall_exempt: Vec::new(),
             silent_codes: Vec::new(),
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1089,6 +1149,16 @@ fn case_compilers_parse_multiple_versions() {
     );
 
     assert_eq!(case.compilers, ["21.0", "24.0"]);
+}
+
+#[test]
+#[should_panic(expected = "recall_exempt requires a reason")]
+fn case_recall_exempt_requires_a_reason() {
+    let _ = load_case_from_toml(
+        "synthetic",
+        Path::new("synthetic"),
+        "unit = \"Synthetic.pas\"\nrecall_exempt = [\"W1000\"]\n",
+    );
 }
 
 #[test]
@@ -1201,9 +1271,9 @@ fn dcc_oracle_cases_match_recorded_dcc_output() {
                 .into_iter()
                 .filter(enabled)
                 .collect::<Vec<_>>();
-            let recall_enforced =
-                case.recall && (!case.requires_rtl || rtl_root(version).is_some());
+            let rtl_available = rtl_root(version).is_some();
             for code in ENABLED_CODES {
+                let recall_enforced = case.recall_enforced_for(code, rtl_available);
                 let case_summary = summarize_code(
                     code,
                     &expected,
@@ -1211,6 +1281,19 @@ fn dcc_oracle_cases_match_recorded_dcc_output() {
                     recall_enforced,
                     &case.silent_codes,
                 );
+                if case.name == "w1000_type_in_var_decl" {
+                    match *code {
+                        "W1000" => assert_eq!(
+                            case_summary.waived, case_summary.expected,
+                            "only W1000 recall is waived in its duplicate-reporting case"
+                        ),
+                        "W1036" => assert_eq!(
+                            case_summary.waived, 0,
+                            "the W1000 duplicate waiver must not waive W1036 recall"
+                        ),
+                        _ => {}
+                    }
+                }
                 let summary = summaries
                     .get_mut(*code)
                     .expect("summary initialized for every enabled code");
@@ -1228,10 +1311,14 @@ fn dcc_oracle_cases_match_recorded_dcc_output() {
                     case.name
                 ));
             }
-            if recall_enforced && !missed.is_empty() {
+            let missed_with_recall_enforced = missed
+                .into_iter()
+                .filter(|finding| case.recall_enforced_for(&finding.code, rtl_available))
+                .collect::<Vec<_>>();
+            if !missed_with_recall_enforced.is_empty() {
                 failures.push(format!(
-                    "{} under {version}: dcc reported, we missed: {missed:?}",
-                    case.name
+                    "{} under {version}: dcc reported, we missed: {missed_with_recall_enforced:?}",
+                    case.name,
                 ));
             }
         }

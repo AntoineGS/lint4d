@@ -16407,6 +16407,7 @@ struct Symbol {
     type_kind: TypeKind,
     routine_kind: RoutineKind,
     routine_directives: RoutineDirectives,
+    hint_directives: HintDirectives,
     parameter_mode: Option<ParameterMode>,
     scope: usize,
     owner_type: Option<String>,
@@ -16461,6 +16462,18 @@ struct RoutineDirectives {
     abstract_: bool,
     calling_convention: Option<CallingConvention>,
     calling_convention_unknown: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HintDirectives {
+    /// `None` means no deprecated directive; `Some(None)` is bare deprecated.
+    deprecated: Option<Option<String>>,
+    /// The source spelling of the deprecated message literal, including quotes.
+    deprecated_raw: Option<String>,
+    platform: bool,
+    library: bool,
+    experimental: bool,
+    unknown: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17426,6 +17439,8 @@ pub(crate) struct ParsedDocument {
     parser_recovery_spans: Vec<Span>,
     unit_name: String,
     unit_display_name: String,
+    #[allow(dead_code)] // Consumed by the unit-use diagnostics in parity tier 1B.
+    unit_hint_directives: HintDirectives,
     interface_range: Option<Span>,
     implementation_range: Option<Span>,
     uses_clauses: Vec<UsesClauseMetadata>,
@@ -18119,6 +18134,12 @@ impl Document {
             .map(|node| identifier_texts(node, &source).join("."))
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| unit_name.clone());
+        let unit_node = unit_module
+            .and_then(|node| node.tree_parent())
+            .filter(|node| node.kind() == "unit");
+        let unit_hint_directives = unit_node
+            .map(|node| hint_directives(node, &source, &conditionals))
+            .unwrap_or_default();
 
         let interface_range = sections
             .iter()
@@ -18202,6 +18223,7 @@ impl Document {
                 type_kind: TypeKind::Other,
                 routine_kind: RoutineKind::Procedure,
                 routine_directives: RoutineDirectives::default(),
+                hint_directives: unit_hint_directives.clone(),
                 parameter_mode: None,
                 scope: ROOT_SCOPE,
                 owner_type: None,
@@ -18233,7 +18255,14 @@ impl Document {
             });
         }
 
-        collect_symbols(root, &source, &scopes, &scope_by_span, &mut symbols);
+        collect_symbols(
+            root,
+            &source,
+            &scopes,
+            &scope_by_span,
+            &conditionals,
+            &mut symbols,
+        );
         pair_omitted_generic_constraints(&mut symbols);
         pair_abbreviated_definitions(root, &source, &scope_by_span, &mut symbols);
         let documentation = documentation::collect(&source, &symbols, cancel)?;
@@ -18411,6 +18440,7 @@ impl Document {
             parser_recovery_spans,
             unit_name,
             unit_display_name,
+            unit_hint_directives,
             interface_range,
             implementation_range,
             uses_clauses,
@@ -19048,18 +19078,35 @@ fn collect_symbols(
     source: &str,
     scopes: &[Scope],
     scope_by_span: &HashMap<Span, usize>,
+    conditionals: &ConditionalAnalysis,
     symbols: &mut Vec<Symbol>,
 ) {
     collect_nodes_with_ancestors(root, &mut |node, ancestors| match node.kind() {
-        "defProc" => add_definition_symbol(node, ancestors, source, scopes, scope_by_span, symbols),
+        "defProc" => add_definition_symbol(
+            node,
+            ancestors,
+            source,
+            scopes,
+            scope_by_span,
+            conditionals,
+            symbols,
+        ),
         "declProc" if !is_definition_header_under(node, ancestors.last().copied()) => {
-            add_routine_symbol(node, ancestors, source, scope_by_span, symbols);
+            add_routine_symbol(
+                node,
+                ancestors,
+                source,
+                scope_by_span,
+                conditionals,
+                symbols,
+            );
         }
         "declType" => add_named_symbol(
             node,
             ancestors,
             source,
             scope_by_span,
+            conditionals,
             symbols,
             SymbolKind::Type,
             None,
@@ -19073,6 +19120,7 @@ fn collect_symbols(
                 ancestors,
                 source,
                 scope_by_span,
+                conditionals,
                 symbols,
                 SymbolKind::Variable,
                 type_name,
@@ -19083,6 +19131,7 @@ fn collect_symbols(
             ancestors,
             source,
             scope_by_span,
+            conditionals,
             symbols,
             SymbolKind::Constant,
             None,
@@ -19096,6 +19145,7 @@ fn collect_symbols(
                 ancestors,
                 source,
                 scope_by_span,
+                conditionals,
                 symbols,
                 SymbolKind::Field,
                 type_name,
@@ -19110,6 +19160,7 @@ fn collect_symbols(
                 ancestors,
                 source,
                 scope_by_span,
+                conditionals,
                 symbols,
                 SymbolKind::Property,
                 type_name,
@@ -19124,6 +19175,7 @@ fn collect_symbols(
                 ancestors,
                 source,
                 scope_by_span,
+                conditionals,
                 symbols,
                 SymbolKind::Parameter,
                 type_name,
@@ -19138,6 +19190,7 @@ fn collect_symbols(
                 ancestors,
                 source,
                 scope_by_span,
+                conditionals,
                 symbols,
                 SymbolKind::Variable,
                 type_name,
@@ -19148,6 +19201,7 @@ fn collect_symbols(
             ancestors,
             source,
             scope_by_span,
+            conditionals,
             symbols,
             SymbolKind::EnumValue,
             None,
@@ -19157,6 +19211,7 @@ fn collect_symbols(
             ancestors,
             source,
             scope_by_span,
+            conditionals,
             symbols,
             SymbolKind::Label,
             None,
@@ -19230,6 +19285,8 @@ fn pair_omitted_generic_constraints(symbols: &mut [Symbol]) {
             symbols[declaration_index].generic_parameters.clone();
         symbols[definition_index].routine_directives =
             symbols[declaration_index].routine_directives;
+        symbols[definition_index].hint_directives =
+            symbols[declaration_index].hint_directives.clone();
         symbols[definition_index].result_type_name =
             symbols[declaration_index].result_type_name.clone();
         symbols[definition_index].result_type_ref =
@@ -19382,6 +19439,8 @@ fn pair_abbreviated_definitions(
         symbols[definition_index].routine_key = Some(routine_key.clone());
         symbols[definition_index].routine_directives =
             symbols[declaration_index].routine_directives;
+        symbols[definition_index].hint_directives =
+            symbols[declaration_index].hint_directives.clone();
         symbols[definition_index].result_type_name =
             symbols[declaration_index].result_type_name.clone();
         symbols[definition_index].result_type_ref =
@@ -19440,6 +19499,8 @@ fn pair_abbreviated_definitions(
             symbols[declaration_index].generic_parameters.clone();
         symbols[definition_index].routine_directives =
             symbols[declaration_index].routine_directives;
+        symbols[definition_index].hint_directives =
+            symbols[declaration_index].hint_directives.clone();
     }
 }
 
@@ -19480,6 +19541,7 @@ fn inject_abbreviated_parameters(
                 type_kind: TypeKind::Other,
                 routine_kind: RoutineKind::Procedure,
                 routine_directives: RoutineDirectives::default(),
+                hint_directives: HintDirectives::default(),
                 parameter_mode: Some(parameter_mode(node)),
                 scope: body_scope,
                 owner_type: None,
@@ -19519,6 +19581,7 @@ fn add_definition_symbol<'a>(
     source: &str,
     scopes: &[Scope],
     scope_by_span: &HashMap<Span, usize>,
+    conditionals: &ConditionalAnalysis,
     symbols: &mut Vec<Symbol>,
 ) {
     let Some(header) = node.child_by_field_name("header") else {
@@ -19561,6 +19624,7 @@ fn add_definition_symbol<'a>(
         type_kind: TypeKind::Other,
         routine_kind: routine_kind(header),
         routine_directives: routine_directives(header),
+        hint_directives: hint_directives(header, source, conditionals),
         parameter_mode: None,
         scope,
         owner_type: owner_type.clone(),
@@ -19607,6 +19671,7 @@ fn add_routine_symbol<'a>(
     ancestors: &[Node<'a>],
     source: &str,
     scope_by_span: &HashMap<Span, usize>,
+    conditionals: &ConditionalAnalysis,
     symbols: &mut Vec<Symbol>,
 ) {
     let Some((name, span, owner_type)) = routine_name_among(node, nearest_first(ancestors), source)
@@ -19640,6 +19705,7 @@ fn add_routine_symbol<'a>(
         type_kind: TypeKind::Other,
         routine_kind: routine_kind(node),
         routine_directives: routine_directives(node),
+        hint_directives: hint_directives(node, source, conditionals),
         parameter_mode: None,
         scope,
         owner_type: owner_type.clone(),
@@ -19699,6 +19765,7 @@ fn push_routine_generic_parameter_symbols(
             type_kind: TypeKind::Other,
             routine_kind: RoutineKind::Procedure,
             routine_directives: RoutineDirectives::default(),
+            hint_directives: HintDirectives::default(),
             parameter_mode: None,
             scope,
             owner_type: None,
@@ -19731,11 +19798,13 @@ fn push_routine_generic_parameter_symbols(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_named_symbol<'a>(
     node: Node<'a>,
     ancestors: &[Node<'a>],
     source: &str,
     scope_by_span: &HashMap<Span, usize>,
+    conditionals: &ConditionalAnalysis,
     symbols: &mut Vec<Symbol>,
     kind: SymbolKind,
     type_name: Option<String>,
@@ -19804,6 +19873,7 @@ fn add_named_symbol<'a>(
             type_kind,
             routine_kind: RoutineKind::Procedure,
             routine_directives: RoutineDirectives::default(),
+            hint_directives: hint_directives(node, source, conditionals),
             parameter_mode: (kind == SymbolKind::Parameter).then(|| parameter_mode(node)),
             scope,
             owner_type: owner_type.clone(),
@@ -19850,6 +19920,7 @@ fn add_named_symbol<'a>(
                 type_kind: TypeKind::Other,
                 routine_kind: RoutineKind::Procedure,
                 routine_directives: RoutineDirectives::default(),
+                hint_directives: HintDirectives::default(),
                 parameter_mode: None,
                 scope,
                 owner_type: declared_type_key.clone(),
@@ -20503,6 +20574,120 @@ fn routine_directives(node: Node<'_>) -> RoutineDirectives {
         _ => {}
     });
     directives
+}
+
+fn hint_directives(
+    node: Node<'_>,
+    source: &str,
+    conditionals: &ConditionalAnalysis,
+) -> HintDirectives {
+    let mut directives = HintDirectives::default();
+    let mut node_cursor = node.walk();
+    for attribute in node.children_by_field_name("attribute", &mut node_cursor) {
+        let mut attribute_cursor = attribute.walk();
+        let children: Vec<_> = attribute.children(&mut attribute_cursor).collect();
+        for child in &children {
+            let is_hint = match child.kind() {
+                "kDeprecated" => {
+                    let raw = children
+                        .iter()
+                        .find(|sibling| sibling.kind() == "literalString")
+                        .map(|literal| node_text(*literal, source));
+                    directives.deprecated =
+                        Some(raw.as_deref().and_then(decode_pascal_string_literal));
+                    directives.deprecated_raw = raw;
+                    true
+                }
+                "kPlatform" => {
+                    directives.platform = true;
+                    true
+                }
+                "kLibrary" => {
+                    directives.library = true;
+                    true
+                }
+                "kExperimental" => {
+                    directives.experimental = true;
+                    true
+                }
+                _ => false,
+            };
+            if is_hint
+                && conditionals.unknown_spans.iter().any(|unknown| {
+                    unknown.start <= child.start_byte() && child.end_byte() <= unknown.end
+                })
+            {
+                directives.unknown = true;
+            }
+        }
+    }
+    directives
+}
+
+/// Decode the literal-string syntax used by a deprecated directive.
+///
+/// Tree-sitter represents a doubled Pascal quote as adjacent quoted tokens,
+/// e.g. `'it''s'`; the raw source remains separately available for dcc's
+/// message formatting.
+fn decode_pascal_string_literal(raw: &str) -> Option<String> {
+    let mut decoded = String::new();
+    let mut cursor = 0;
+    let bytes = raw.as_bytes();
+    while cursor < bytes.len() {
+        let character = raw[cursor..].chars().next()?;
+        if character.is_whitespace() {
+            cursor += character.len_utf8();
+            continue;
+        }
+        match character {
+            '\'' => {
+                cursor += 1;
+                let content_start = cursor;
+                let closing_quote = raw[cursor..].find('\'')? + cursor;
+                decoded.push_str(&raw[content_start..closing_quote]);
+                cursor = closing_quote + 1;
+                if cursor < bytes.len() && bytes[cursor] == b'\'' {
+                    decoded.push('\'');
+                }
+            }
+            '#' => {
+                cursor += 1;
+                let number_start = cursor;
+                let hexadecimal = bytes.get(cursor) == Some(&b'$');
+                if hexadecimal {
+                    cursor += 1;
+                }
+                while cursor < bytes.len()
+                    && (bytes[cursor] == b'_'
+                        || if hexadecimal {
+                            bytes[cursor].is_ascii_hexdigit()
+                        } else {
+                            bytes[cursor].is_ascii_digit()
+                        })
+                {
+                    cursor += 1;
+                }
+                if cursor == number_start + usize::from(hexadecimal) {
+                    return None;
+                }
+                let digits = raw[number_start + usize::from(hexadecimal)..cursor].replace('_', "");
+                let radix = if hexadecimal { 16 } else { 10 };
+                let value = u32::from_str_radix(&digits, radix).ok()?;
+                decoded.push(char::from_u32(value)?);
+            }
+            '^' => {
+                cursor += 1;
+                let control = raw[cursor..].chars().next()?;
+                if !control.is_ascii() {
+                    return None;
+                }
+                decoded.push(char::from_u32((control as u32) & 0x1f)?);
+                cursor += control.len_utf8();
+            }
+            _ => return None,
+        }
+    }
+    Some(decoded)
 }
 
 fn routine_result_type(node: Node<'_>, source: &str) -> Option<(String, Span)> {
@@ -30623,6 +30808,198 @@ mod tests {
             uri,
             index: visible
         }));
+    }
+
+    #[test]
+    fn hint_directives_are_recorded_on_declarations_and_unit_header() {
+        let source = concat!(
+            "unit HintFacts platform;\n",
+            "interface\n",
+            "type\n",
+            "  TDeprecated = class end deprecated 'it''s';\n",
+            "  TBareDeprecated = class end deprecated;\n",
+            "  TLibrary = Integer library;\n",
+            "  TExperimental = Integer experimental;\n",
+            "  TObj = class\n",
+            "    FDeprecated: Integer; deprecated 'field''s';\n",
+            "    property PExperimental: Integer read FDeprecated; experimental;\n",
+            "    procedure Method; deprecated 'method''s';\n",
+            "  end;\n",
+            "var VPlatform: Integer platform;\n",
+            "var VTypeHint: Integer deprecated;\n",
+            "const CDeprecated = 1 deprecated 'const''s';\n",
+            "procedure Routine; experimental;\n",
+            "implementation\n",
+            "procedure Routine; begin end;\n",
+            "procedure TObj.Method; begin end;\n",
+            "end.\n",
+        );
+        let uri = Url::parse("file:///tmp/hint-facts.pas").expect("fixture URI");
+        let document = Document::parse_with_cancel(
+            uri,
+            source.to_owned(),
+            &ConditionalContext::default(),
+            &AtomicBool::new(false),
+            None,
+        )
+        .expect("hint facts fixture parses");
+
+        fn symbol<'a>(document: &'a ParsedDocument, name: &str) -> &'a Symbol {
+            document
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name.eq_ignore_ascii_case(name))
+                .unwrap_or_else(|| panic!("missing {name} symbol"))
+        }
+        fn expected(
+            deprecated: Option<Option<&str>>,
+            deprecated_raw: Option<&str>,
+            platform: bool,
+            library: bool,
+            experimental: bool,
+            unknown: bool,
+        ) -> HintDirectives {
+            HintDirectives {
+                deprecated: deprecated.map(|message| message.map(str::to_owned)),
+                deprecated_raw: deprecated_raw.map(str::to_owned),
+                platform,
+                library,
+                experimental,
+                unknown,
+            }
+        }
+
+        assert_eq!(
+            &symbol(&document, "TDeprecated").hint_directives,
+            &expected(
+                Some(Some("it's")),
+                Some("'it''s'"),
+                false,
+                false,
+                false,
+                false
+            )
+        );
+        assert_eq!(
+            &symbol(&document, "TBareDeprecated").hint_directives,
+            &expected(Some(None), None, false, false, false, false)
+        );
+        assert_eq!(
+            &symbol(&document, "TLibrary").hint_directives,
+            &expected(None, None, false, true, false, false)
+        );
+        assert_eq!(
+            &symbol(&document, "TExperimental").hint_directives,
+            &expected(None, None, false, false, true, false)
+        );
+        assert_eq!(
+            &symbol(&document, "TObj").hint_directives,
+            &HintDirectives::default(),
+            "a type must not inherit hints from nested members"
+        );
+        assert_eq!(
+            &symbol(&document, "FDeprecated").hint_directives,
+            &expected(
+                Some(Some("field's")),
+                Some("'field''s'"),
+                false,
+                false,
+                false,
+                false
+            )
+        );
+        assert_eq!(
+            &symbol(&document, "PExperimental").hint_directives,
+            &expected(None, None, false, false, true, false)
+        );
+        assert_eq!(
+            &symbol(&document, "Method").hint_directives,
+            &expected(
+                Some(Some("method's")),
+                Some("'method''s'"),
+                false,
+                false,
+                false,
+                false
+            )
+        );
+        assert_eq!(
+            &symbol(&document, "VPlatform").hint_directives,
+            &expected(None, None, true, false, false, false)
+        );
+        assert_eq!(
+            &symbol(&document, "VTypeHint").hint_directives,
+            &HintDirectives::default(),
+            "a deprecated type reference is not a declaration hint"
+        );
+        assert_eq!(
+            &symbol(&document, "CDeprecated").hint_directives,
+            &expected(
+                Some(Some("const's")),
+                Some("'const''s'"),
+                false,
+                false,
+                false,
+                false
+            )
+        );
+        assert_eq!(
+            &symbol(&document, "Routine").hint_directives,
+            &expected(None, None, false, false, true, false)
+        );
+        for name in ["Routine", "Method"] {
+            let definition = document
+                .symbols
+                .iter()
+                .find(|symbol| {
+                    symbol.name.eq_ignore_ascii_case(name) && symbol.origin == Origin::Definition
+                })
+                .unwrap_or_else(|| panic!("missing {name} definition"));
+            assert_eq!(
+                definition.hint_directives,
+                symbol(&document, name).hint_directives,
+                "{name} definition should carry the paired declaration's hints"
+            );
+        }
+        let unit_hints = expected(None, None, true, false, false, false);
+        assert_eq!(document.unit_hint_directives, unit_hints);
+        assert_eq!(symbol(&document, "HintFacts").hint_directives, unit_hints);
+    }
+
+    #[test]
+    fn hint_directive_in_unknown_conditional_is_marked_unknown() {
+        let source = concat!(
+            "unit UnknownHint;\n",
+            "interface\n",
+            "{$IFDEF MAYBE}\n",
+            "const Hidden = 1 deprecated 'conditional';\n",
+            "{$ENDIF}\n",
+            "const Visible = 2 platform;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let uri = Url::parse("file:///tmp/unknown-hint.pas").expect("fixture URI");
+        let document = Document::parse_with_cancel(
+            uri,
+            source.to_owned(),
+            &ConditionalContext::default(),
+            &AtomicBool::new(false),
+            None,
+        )
+        .expect("unknown hint fixture parses");
+
+        let hidden = document
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name.eq_ignore_ascii_case("Hidden"))
+            .expect("hidden declaration");
+        let visible = document
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name.eq_ignore_ascii_case("Visible"))
+            .expect("visible declaration");
+        assert!(hidden.hint_directives.unknown);
+        assert!(!visible.hint_directives.unknown);
     }
 
     #[test]

@@ -38,7 +38,7 @@ case "$example" in
       incomplete)
         printf '{"incomplete":true}\n'
         ;;
-      failed-lsp)
+      failed-lsp|timeout-lsp)
         python3 - "$DCC_FAKE_ROOT" "$DCC_FAKE_DCC" "$DCC_FAKE_SOURCE" <<'PY'
 import json
 import os
@@ -74,9 +74,27 @@ PY
   lsp_corpus_diagnostics)
     output_index=$((separator + 3))
     printf 'stale diagnostics written before shutdown failure\n' >"${args[output_index]}"
+    if [[ $DCC_FAKE_MODE == timeout-lsp ]]; then
+      meta_path="${args[output_index]%.*}.meta.json"
+      printf '{"index_timed_out":true,"unanalysed_files":[]}\n' >"$meta_path"
+    fi
     exit 7
     ;;
   corpus_compare)
+    if [[ $DCC_FAKE_MODE == timeout-lsp ]]; then
+      report_index=$((separator + 4))
+      cat >"${args[report_index]}" <<'MD'
+# Corpus comparison
+
+## Per-code parity
+
+Parity counts unavailable: index timeout.
+
+## Excluded
+
+- index timeout
+MD
+    fi
     touch "$DCC_FAKE_COMPARE_MARKER"
     ;;
   *)
@@ -158,6 +176,26 @@ if "$script" --compare synthetic >"$tmp/compare-after-failure.log" 2>&1; then
 fi
 [[ ! -e $DCC_FAKE_COMPARE_MARKER ]] || {
   echo "comparison ran against diagnostics from a failed LSP collection" >&2
+  exit 1
+}
+
+export DCC_FAKE_MODE=timeout-lsp
+export LINT4D_CORPUS_OUT="$tmp/out-timeout-lsp"
+timeout_project_out="$LINT4D_CORPUS_OUT/synthetic"
+rm -f -- "$DCC_FAKE_COMPARE_MARKER"
+if "$script" --lsp "$tmp/bin/pascal-lsp" --compare synthetic \
+  >"$tmp/timeout-lsp.log" 2>&1; then
+  echo "index timeout unexpectedly produced a successful corpus status" >&2
+  exit 1
+fi
+[[ $(<"$timeout_project_out/lsp.validation") == "index-timeout" ]] || {
+  echo "index timeout was not distinguished from other LSP failures" >&2
+  exit 1
+}
+grep -q '## Excluded' "$timeout_project_out/report.md"
+grep -q 'index timeout' "$timeout_project_out/report.md"
+[[ -e $DCC_FAKE_COMPARE_MARKER ]] || {
+  echo "index-timeout exclusion report was not generated" >&2
   exit 1
 }
 

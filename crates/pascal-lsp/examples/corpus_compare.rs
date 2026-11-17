@@ -73,6 +73,14 @@ fn run() -> Result<(), String> {
         report.unanalysed_files.sort();
         report.unanalysed_files.dedup();
     }
+    if report.index_timed_out {
+        report.per_code.clear();
+        report.invented.clear();
+        report.non_dcc.clear();
+        report.non_dcc_samples.clear();
+        report.error_severity_on_clean_files.clear();
+        report.friction.clear();
+    }
 
     let markdown = render_markdown(&report);
     if let Some(parent) = arguments
@@ -95,18 +103,22 @@ fn run() -> Result<(), String> {
         .values()
         .map(|counts| counts.lint4d)
         .sum::<usize>();
-    eprintln!(
-        "compared {} DCC finding(s) with {} dcc-coded lint4d finding(s); {} invented, {} missed, {} non-DCC",
-        dcc_count,
-        lint_count,
-        report.invented.len(),
-        report
-            .per_code
-            .values()
-            .map(|counts| counts.missed)
-            .sum::<usize>(),
-        report.non_dcc.values().sum::<usize>()
-    );
+    if report.index_timed_out {
+        eprintln!("parity counts unavailable: project excluded because index timed out");
+    } else {
+        eprintln!(
+            "compared {} DCC finding(s) with {} dcc-coded lint4d finding(s); {} invented, {} missed, {} non-DCC",
+            dcc_count,
+            lint_count,
+            report.invented.len(),
+            report
+                .per_code
+                .values()
+                .map(|counts| counts.missed)
+                .sum::<usize>(),
+            report.non_dcc.values().sum::<usize>()
+        );
+    }
     if !skipped_dcc_lines.is_empty() {
         eprintln!(
             "ignored {} unlocated or unmapped DCC output line(s)",

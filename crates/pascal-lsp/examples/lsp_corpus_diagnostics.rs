@@ -112,18 +112,7 @@ fn run() -> Result<(), String> {
             "processId": null,
             "rootUri": file_uri(&root)?,
             "initializationOptions": initialization_options,
-            "capabilities": {
-                "textDocument": {
-                    "diagnostic": {
-                        "dynamicRegistration": false,
-                        "relatedDocumentSupport": true
-                    }
-                },
-                "workspace": {
-                    "diagnostics": { "refreshSupport": true },
-                    "workspaceFolders": true
-                }
-            }
+            "capabilities": initialize_capabilities()
         }),
         arguments.timeout,
     )?;
@@ -149,52 +138,59 @@ fn run() -> Result<(), String> {
     let (index_status, index_timed_out) =
         client.wait_for_index(arguments.timeout, !documents.is_empty())?;
     let mut unanalysed_files = HashSet::new();
-    if pull_supported {
-        for (path, uri, _) in &documents {
-            let result = client.request(
-                "textDocument/diagnostic",
-                json!({
-                    "textDocument": { "uri": uri },
-                    "previousResultId": null
-                }),
-                arguments.timeout,
-            );
-            match result {
-                Ok(result) => {
-                    if !client.record_pull_diagnostics(uri, &result) {
+    if index_timed_out {
+        unanalysed_files.extend(documents.iter().map(|(path, _, _)| path.clone()));
+    } else {
+        if pull_supported {
+            for (path, uri, _) in &documents {
+                let result = client.request(
+                    "textDocument/diagnostic",
+                    json!({
+                        "textDocument": { "uri": uri },
+                        "previousResultId": null
+                    }),
+                    arguments.timeout,
+                );
+                match result {
+                    Ok(result) => {
+                        if !client.record_pull_diagnostics(uri, &result) {
+                            unanalysed_files.insert(path.clone());
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "diagnostic pull failed for {}: {error}",
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        );
                         unanalysed_files.insert(path.clone());
                     }
                 }
-                Err(error) => {
-                    eprintln!(
-                        "diagnostic pull failed for {}: {error}",
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    );
+            }
+        } else {
+            let deadline = Instant::now() + arguments.timeout;
+            let expected = documents
+                .iter()
+                .map(|(_, uri, _)| uri.clone())
+                .collect::<HashSet<_>>();
+            while !expected.is_subset(&client.pushed_uris) && Instant::now() < deadline {
+                if !client.receive_one(deadline.saturating_duration_since(Instant::now()))? {
+                    break;
+                }
+            }
+            for (path, uri, _) in &documents {
+                if !client.pushed_uris.contains(uri) {
                     unanalysed_files.insert(path.clone());
                 }
             }
         }
-    } else {
-        let deadline = Instant::now() + arguments.timeout;
-        let expected = documents
-            .iter()
-            .map(|(_, uri, _)| uri.clone())
-            .collect::<HashSet<_>>();
-        while !expected.is_subset(&client.pushed_uris) && Instant::now() < deadline {
-            if !client.receive_one(deadline.saturating_duration_since(Instant::now()))? {
-                break;
-            }
-        }
-        for (path, uri, _) in &documents {
-            if !client.pushed_uris.contains(uri) {
-                unanalysed_files.insert(path.clone());
-            }
-        }
+        client.drain_pushes();
     }
-    client.drain_pushes();
 
     let mut output = Vec::new();
     for (path, uri, _) in &documents {
+        if index_timed_out {
+            continue;
+        }
         let Some(diagnostics) = client.latest_diagnostics.get(uri) else {
             unanalysed_files.insert(path.clone());
             continue;
@@ -237,6 +233,7 @@ fn run() -> Result<(), String> {
             "pascal/indexStatus did not become idle within {} seconds",
             arguments.timeout.as_secs()
         );
+        return Err("index timeout; parity diagnostics are unavailable".to_string());
     }
     eprintln!(
         "opened {} file(s), recorded {} diagnostic(s), {} unanalysed file(s)",
@@ -245,6 +242,22 @@ fn run() -> Result<(), String> {
         unanalysed_count
     );
     Ok(())
+}
+
+fn initialize_capabilities() -> Value {
+    json!({
+        "textDocument": {
+            "diagnostic": {
+                "dynamicRegistration": false,
+                "relatedDocumentSupport": true
+            },
+            "publishDiagnostics": {}
+        },
+        "workspace": {
+            "diagnostics": { "refreshSupport": true },
+            "workspaceFolders": true
+        }
+    })
 }
 
 fn parse_arguments(args: &[String]) -> Result<Arguments, String> {
@@ -675,7 +688,7 @@ fn read_message(reader: &mut impl BufRead) -> io::Result<Option<Value>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{diagnostic_finding, index_status_idle};
+    use super::{diagnostic_finding, index_status_idle, initialize_capabilities};
     use serde_json::json;
     use std::path::Path;
 
@@ -709,5 +722,16 @@ mod tests {
         assert_eq!(finding.code, "parse-error");
         assert_eq!(finding.source, "tree-sitter");
         assert_eq!(finding.text, "unexpected token");
+    }
+
+    #[test]
+    fn advertises_publish_diagnostics_capabilities() {
+        let capabilities = initialize_capabilities();
+
+        assert!(
+            capabilities
+                .pointer("/textDocument/publishDiagnostics")
+                .is_some()
+        );
     }
 }

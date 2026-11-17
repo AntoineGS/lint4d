@@ -360,9 +360,28 @@ PY
         "$lsp_binary" "$command_json" "$project_out/lsp.txt" \
         --timeout-secs "$lsp_timeout_seconds"
     ) >"$project_out/lsp-driver.log" 2>&1; then
-      printf 'valid\n' >"$project_out/lsp.validation"
+      lsp_exit=0
     else
       lsp_exit=$?
+    fi
+
+    if [[ -f $project_out/lsp.meta.json ]] && "$python_bin" - "$project_out/lsp.meta.json" \
+      2>/dev/null <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    metadata = json.load(source)
+raise SystemExit(0 if metadata.get("index_timed_out") is True else 1)
+PY
+    then
+      printf '%s\n' "$lsp_exit" >"$project_out/lsp.status"
+      printf 'index-timeout\n' >"$project_out/lsp.validation"
+      echo "$name: index timeout; parity counts unavailable" >&2
+      status=1
+    elif [[ $lsp_exit -eq 0 ]]; then
+      printf 'valid\n' >"$project_out/lsp.validation"
+    else
       printf '%s\n' "$lsp_exit" >"$project_out/lsp.status"
       printf 'failed: diagnostics driver exited %s\n' "$lsp_exit" >"$project_out/lsp.validation"
       rm -f -- "$project_out/lsp.txt" "$project_out/lsp.meta.json" "$project_out/report.md"
@@ -373,9 +392,21 @@ PY
 
   if ((run_compare)); then
     lsp_ready=0
-    if [[ -f $project_out/lsp.txt && -f $project_out/lsp.validation && \
-        $(<"$project_out/lsp.validation") == "valid" ]]; then
-      lsp_ready=1
+    lsp_validation=""
+    if [[ -f $project_out/lsp.validation ]]; then
+      lsp_validation=$(<"$project_out/lsp.validation")
+      case $lsp_validation in
+        valid)
+          lsp_ready=1
+          ;;
+        index-timeout)
+          lsp_ready=1
+          status=1
+          ;;
+      esac
+    fi
+    if [[ ! -f $project_out/lsp.txt ]]; then
+      lsp_ready=0
     fi
     if ((lsp_ready)); then
       echo "$name: comparing DCC and pascal-lsp diagnostics"

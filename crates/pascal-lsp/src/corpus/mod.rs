@@ -442,64 +442,80 @@ fn friction_categories(report: &Report) -> Vec<FrictionCategory> {
 pub fn render_markdown(report: &Report) -> String {
     let mut markdown = String::from("# Corpus comparison\n\n");
     markdown.push_str("## Per-code parity\n\n");
-    markdown
-        .push_str("| Code | DCC | lint4d | Matched | Invented | Missed | Precision | Recall |\n");
-    markdown.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
-    if report.per_code.is_empty() {
-        markdown.push_str("| _none_ | 0 | 0 | 0 | 0 | 0 | — | — |\n");
+    if report.index_timed_out {
+        markdown.push_str("Parity counts unavailable: index timeout.\n");
+        markdown.push_str("\n## Excluded\n\n- index timeout\n");
     } else {
-        for (code, counts) in &report.per_code {
-            markdown.push_str(&format!(
-                "| {code} | {} | {} | {} | {} | {} | {} | {} |\n",
-                counts.dcc,
-                counts.lint4d,
-                counts.matched,
-                counts.invented,
-                counts.missed,
-                format_percentage(counts.matched, counts.lint4d),
-                format_percentage(counts.matched, counts.dcc)
-            ));
+        markdown.push_str(
+            "| Code | DCC | lint4d | Matched | Invented | Missed | Precision | Recall |\n",
+        );
+        markdown.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+        if report.per_code.is_empty() {
+            markdown.push_str("| _none_ | 0 | 0 | 0 | 0 | 0 | — | — |\n");
+        } else {
+            for (code, counts) in &report.per_code {
+                markdown.push_str(&format!(
+                    "| {code} | {} | {} | {} | {} | {} | {} | {} |\n",
+                    counts.dcc,
+                    counts.lint4d,
+                    counts.matched,
+                    counts.invented,
+                    counts.missed,
+                    format_percentage(counts.matched, counts.lint4d),
+                    format_percentage(counts.matched, counts.dcc)
+                ));
+            }
         }
     }
 
     markdown.push_str("\n## Friction\n\n");
-    markdown.push_str("| Category | Count | Example |\n");
-    markdown.push_str("| --- | ---: | --- |\n");
-    if report.friction.is_empty() {
-        markdown.push_str("| _none_ | 0 | — |\n");
+    if report.index_timed_out {
+        markdown.push_str("Unavailable: index timeout.\n");
     } else {
-        for category in &report.friction {
-            markdown.push_str(&format!(
-                "| {} | {} | {} |\n",
-                category.category,
-                category.count,
-                finding_example(&category.example)
-            ));
+        markdown.push_str("| Category | Count | Example |\n");
+        markdown.push_str("| --- | ---: | --- |\n");
+        if report.friction.is_empty() {
+            markdown.push_str("| _none_ | 0 | — |\n");
+        } else {
+            for category in &report.friction {
+                markdown.push_str(&format!(
+                    "| {} | {} | {} |\n",
+                    category.category,
+                    category.count,
+                    finding_example(&category.example)
+                ));
+            }
         }
     }
 
     markdown.push_str("\n## Non-DCC diagnostics\n\n");
-    markdown.push_str("| Source | Code | Severity | Count | Sample |\n");
-    markdown.push_str("| --- | --- | --- | ---: | --- |\n");
-    if report.non_dcc.is_empty() {
-        markdown.push_str("| _none_ | — | — | 0 | — |\n");
+    if report.index_timed_out {
+        markdown.push_str("Unavailable: index timeout.\n");
     } else {
-        for ((source, code, severity), count) in &report.non_dcc {
-            let sample = report
-                .non_dcc_samples
-                .get(&(source.clone(), code.clone(), *severity))
-                .and_then(|findings| findings.first())
-                .map(finding_example)
-                .unwrap_or_else(|| "—".to_string());
-            markdown.push_str(&format!(
-                "| {source} | {code} | {} | {count} | {sample} |\n",
-                severity.as_str()
-            ));
+        markdown.push_str("| Source | Code | Severity | Count | Sample |\n");
+        markdown.push_str("| --- | --- | --- | ---: | --- |\n");
+        if report.non_dcc.is_empty() {
+            markdown.push_str("| _none_ | — | — | 0 | — |\n");
+        } else {
+            for ((source, code, severity), count) in &report.non_dcc {
+                let sample = report
+                    .non_dcc_samples
+                    .get(&(source.clone(), code.clone(), *severity))
+                    .and_then(|findings| findings.first())
+                    .map(finding_example)
+                    .unwrap_or_else(|| "—".to_string());
+                markdown.push_str(&format!(
+                    "| {source} | {code} | {} | {count} | {sample} |\n",
+                    severity.as_str()
+                ));
+            }
         }
     }
 
     markdown.push_str("\n## Error severity on DCC-clean files\n\n");
-    if report.error_severity_on_clean_files.is_empty() {
+    if report.index_timed_out {
+        markdown.push_str("Unavailable: index timeout.\n");
+    } else if report.error_severity_on_clean_files.is_empty() {
         markdown.push_str("None.\n");
     } else {
         for finding in &report.error_severity_on_clean_files {
@@ -1150,5 +1166,30 @@ initialization_options_json = '{"sourcePaths":["C:/DelphiSources/rtl"]}'
         assert!(markdown.contains("| W1001 | 4 | 5 | 3 | 2 | 1 | 60.0% | 75.0% |"));
         assert!(markdown.contains("| W1002 | 2 | 0 | 0 | 0 | 2 | — | 0.0% |"));
         assert!(markdown.contains("| W1003 | 0 | 2 | 0 | 2 | 0 | 0.0% | — |"));
+    }
+
+    #[test]
+    fn index_timeout_marks_parity_unavailable_and_excludes_partial_counts() {
+        let report = Report {
+            per_code: BTreeMap::from([(
+                "W9999".into(),
+                CodeCounts {
+                    dcc: 1,
+                    lint4d: 1,
+                    matched: 1,
+                    invented: 0,
+                    missed: 0,
+                },
+            )]),
+            index_timed_out: true,
+            ..Report::default()
+        };
+
+        let markdown = render_markdown(&report);
+
+        assert!(markdown.contains("Parity counts unavailable: index timeout."));
+        assert!(markdown.contains("## Excluded\n\n- index timeout"));
+        assert!(!markdown.contains("| Code | DCC |"));
+        assert!(!markdown.contains("W9999"));
     }
 }

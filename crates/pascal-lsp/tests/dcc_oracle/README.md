@@ -133,6 +133,8 @@ scripts/dcc-corpus.sh --compare <manifest-entry>
 
 For one project, add its manifest `name` after the options. Set
 `LINT4D_LSP_TIMEOUT` to adjust the default 600-second index-settle limit. The
+script exits nonzero if indexing times out; the comparison report marks parity
+counts unavailable and lists the project under the timeout exclusion. The
 per-project `report.md` lists per-code match, invented, and missed counts,
 precision and recall percentages (`—` when a denominator is zero), non-DCC
 diagnostics, include-located DCC messages, and files the server could not

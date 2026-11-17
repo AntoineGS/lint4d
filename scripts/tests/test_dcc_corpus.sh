@@ -80,13 +80,19 @@ PY
     output_file="${args[output_index]}"
     printf 'fresh diagnostics\n' >"$output_file"
     init_options=""
+    timeout_seconds=NONE
     for ((index = separator + 4; index < ${#args[@]}; index += 1)); do
-      if [[ ${args[index]} == --init-options ]]; then
-        init_options="$(<"${args[index + 1]}")"
-        break
-      fi
+      case ${args[index]} in
+        --init-options)
+          init_options="$(<"${args[index + 1]}")"
+          ;;
+        --timeout-secs)
+          timeout_seconds=${args[index + 1]}
+          ;;
+      esac
     done
     printf '%s\n' "${init_options:-NONE}" >"$DCC_FAKE_INIT_OPTIONS_RECORD"
+    printf '%s\n' "$timeout_seconds" >"${DCC_FAKE_TIMEOUT_RECORD:-/dev/null}"
     meta_path="${output_file%.*}.meta.json"
     if [[ $DCC_FAKE_MODE == timeout-lsp ]]; then
       printf '{"index_timed_out":true,"unanalysed_files":[],"run_fingerprint":"%s","server_binary":"%s"}\n' \
@@ -399,6 +405,26 @@ rm -f -- "$DCC_FAKE_COMPARE_MARKER" "$DCC_FAKE_INIT_OPTIONS_RECORD"
   >"$tmp/default-init-options.log" 2>&1
 [[ $(<"$DCC_FAKE_INIT_OPTIONS_RECORD") == NONE ]] || {
   echo "script overrode the LSP driver's default initialization options" >&2
+  exit 1
+}
+
+export LINT4D_LSP_TIMEOUT=73
+export DCC_FAKE_TIMEOUT_RECORD="$tmp/lsp-timeout-record"
+export LINT4D_CORPUS_OUT="$tmp/out-lsp-timeout-option"
+rm -f -- "$DCC_FAKE_COMPARE_MARKER" "$DCC_FAKE_TIMEOUT_RECORD"
+"$script" --lsp "$tmp/bin/pascal-lsp" --compare --lsp-timeout-secs 1800 synthetic \
+  >"$tmp/lsp-timeout-option.log" 2>&1
+[[ $(<"$DCC_FAKE_TIMEOUT_RECORD") == 1800 ]] || {
+  echo "script did not pass the CLI LSP timeout to the diagnostics driver" >&2
+  exit 1
+}
+
+export LINT4D_CORPUS_OUT="$tmp/out-lsp-timeout-env"
+rm -f -- "$DCC_FAKE_COMPARE_MARKER" "$DCC_FAKE_TIMEOUT_RECORD"
+"$script" --lsp "$tmp/bin/pascal-lsp" --compare synthetic \
+  >"$tmp/lsp-timeout-env.log" 2>&1
+[[ $(<"$DCC_FAKE_TIMEOUT_RECORD") == 73 ]] || {
+  echo "script did not retain LINT4D_LSP_TIMEOUT as its default" >&2
   exit 1
 }
 

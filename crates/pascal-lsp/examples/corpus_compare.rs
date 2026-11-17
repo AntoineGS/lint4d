@@ -305,6 +305,30 @@ mod tests {
     }
 
     #[test]
+    fn compares_relative_dcc_paths_under_project_roots_containing_at_signs() {
+        let root = Path::new("/home/a.simard@multidev.local/gits/multidev/Projects/QueryToHtml");
+        let (dcc, skipped) = parse_dcc_output(
+            "QueryToHtml.pas(276) Warning: W1036 variable may be uninitialized",
+            &|path| resolve_dcc_path(path, root),
+        );
+        let lsp = [LspFinding {
+            path: root.join("QueryToHtml.pas"),
+            line: 276,
+            severity: Severity::Warning,
+            code: "W1036".into(),
+            source: "pascal-lsp".into(),
+            text: "variable may be uninitialized".into(),
+        }];
+
+        let report = compare(&dcc, &lsp, root, &HashSet::new());
+
+        assert!(skipped.is_empty());
+        assert_eq!(report.per_code["W1036"].matched, 1);
+        assert_eq!(report.per_code["W1036"].invented, 0);
+        assert_eq!(report.per_code["W1036"].missed, 0);
+    }
+
+    #[test]
     fn rejects_unmapped_windows_drive_paths() {
         assert_eq!(
             resolve_dcc_path(r"C:\work\Unit.pas", Path::new("/corpus/project")),

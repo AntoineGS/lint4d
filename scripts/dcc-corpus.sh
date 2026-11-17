@@ -21,7 +21,8 @@ dcc_runs=0
 skipped_projects=()
 
 usage() {
-  printf 'Usage: %s [--lsp <pascal-lsp-binary>] [--compare] [name ...]\n' "${BASH_SOURCE[0]}"
+  printf 'Usage: %s [--lsp <pascal-lsp-binary>] [--lsp-timeout-secs N] [--compare] [name ...]\n' \
+    "${BASH_SOURCE[0]}"
 }
 
 while (($#)); do
@@ -40,6 +41,11 @@ while (($#)); do
       run_compare=1
       shift
       ;;
+    --lsp-timeout-secs)
+      (($# >= 2)) || { echo "--lsp-timeout-secs requires a positive integer" >&2; exit 2; }
+      lsp_timeout_seconds=$2
+      shift 2
+      ;;
     --)
       shift
       requested_names+=("$@")
@@ -51,6 +57,11 @@ while (($#)); do
       ;;
   esac
 done
+
+if [[ ! $lsp_timeout_seconds =~ ^[0-9]+$ || ! $lsp_timeout_seconds =~ [1-9] ]]; then
+  echo "LSP timeout must be a positive integer: $lsp_timeout_seconds" >&2
+  exit 2
+fi
 
 command -v "$cargo_bin" >/dev/null || { echo "cargo not found: $cargo_bin" >&2; exit 2; }
 command -v "$python_bin" >/dev/null || { echo "python3 is required to read command JSON" >&2; exit 2; }

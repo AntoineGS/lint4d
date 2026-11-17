@@ -304,6 +304,8 @@ crates/pascal-lsp/tests/dcc_oracle/w1005_conditional_header/HintConditionalUse.p
 crates/pascal-lsp/tests/dcc_oracle/w1005_conditional_header/HintProv.pas f8a842211245d635 1
 crates/pascal-lsp/tests/dcc_oracle/w1005_implementation_uses/HintImplementationUse.pas 277893052c5642db 1
 crates/pascal-lsp/tests/dcc_oracle/w1005_implementation_uses/HintProv.pas 2267ffb33bd406eb 1
+crates/pascal-lsp/tests/dcc_oracle/w1005_namespaced_unit/NamespacedUse.pas 06f149b647019425 1
+crates/pascal-lsp/tests/dcc_oracle/w1005_namespaced_unit/Vcl.Probe.pas bba1c24a4d76b38f 1
 crates/pascal-lsp/tests/dcc_oracle/w1005_platform_unit/HintProv.pas 2267ffb33bd406eb 1
 crates/pascal-lsp/tests/dcc_oracle/w1005_platform_unit/HintUse.pas ce06c70f4ed217cb 1
 crates/pascal-lsp/tests/dcc_oracle/w1005_unit_not_indexed/HintUse.pas 7ab8e8bf1bb97324 1

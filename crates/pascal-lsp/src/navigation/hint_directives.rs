@@ -726,6 +726,75 @@ mod tests {
     }
 
     #[test]
+    fn namespace_qualified_unit_header_hint_reports_its_dcc_display_name() {
+        let source = concat!(
+            "unit NamespacedHintUse;\n",
+            "interface\n",
+            "uses Vcl.Probe;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let providers = [(
+            "vcl-probe",
+            "unit Vcl.Probe platform;\ninterface\nimplementation\nend.\n",
+        )];
+
+        let diagnostics = diagnostics_with_imported_units(source, &providers);
+        let findings = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.kind.code() == "W1005")
+            .collect::<Vec<_>>();
+        let start = source.find("Vcl.Probe").expect("qualified import entry");
+
+        assert_eq!(findings.len(), 1, "{diagnostics:#?}");
+        assert_eq!(
+            findings[0].message,
+            "Unit 'Vcl.Probe' is specific to a platform"
+        );
+        assert_eq!(
+            findings[0].span,
+            SourceSpan {
+                start,
+                end: start + "Vcl.Probe".len(),
+            }
+        );
+    }
+
+    #[test]
+    fn program_uses_in_path_reports_at_the_unit_entry() {
+        let source = concat!(
+            "program ProgramUsesPlatform;\n",
+            "uses Provider in 'Provider.pas';\n",
+            "begin\n",
+            "end.\n",
+        );
+        let providers = [(
+            "provider",
+            "unit Provider platform;\ninterface\nimplementation\nend.\n",
+        )];
+
+        let diagnostics = diagnostics_with_imported_units(source, &providers);
+        let findings = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.kind.code() == "W1005")
+            .collect::<Vec<_>>();
+        let start = source.find("Provider").expect("program uses entry");
+
+        assert_eq!(findings.len(), 1, "{diagnostics:#?}");
+        assert_eq!(
+            findings[0].message,
+            "Unit 'Provider' is specific to a platform"
+        );
+        assert_eq!(
+            findings[0].span,
+            SourceSpan {
+                start,
+                end: start + "Provider".len(),
+            }
+        );
+    }
+
+    #[test]
     fn unknown_unit_header_hint_state_is_withheld() {
         let source = concat!(
             "unit UnknownUnitHintUse;\n",

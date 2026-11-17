@@ -165,25 +165,29 @@ pub fn parse_lsp_findings(text: &str) -> Vec<LspFinding> {
 }
 
 fn parse_lsp_line(line: &str) -> Option<LspFinding> {
-    let open = line.rfind('(')?;
-    let path = &line[..open];
-    let (line_text, rest) = line[open + 1..].split_once(") ")?;
-    let line_number = line_text.parse().ok()?;
-    let (severity_text, rest) = take_token(rest)?;
-    let severity = Severity::parse(severity_text)?;
-    let (code, rest) = take_token(rest)?;
-    let (source, text) = take_token(rest)?;
-    if !valid_message_code(code) || source.is_empty() {
-        return None;
-    }
+    line.match_indices('(').find_map(|(open, _)| {
+        let path = &line[..open];
+        let (line_text, rest) = line[open + 1..].split_once(") ")?;
+        if line_text.is_empty() || !line_text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let line_number = line_text.parse().ok()?;
+        let (severity_text, rest) = take_token(rest)?;
+        let severity = Severity::parse(severity_text)?;
+        let (code, rest) = take_token(rest)?;
+        let (source, text) = take_token(rest)?;
+        if !valid_message_code(code) || source.is_empty() {
+            return None;
+        }
 
-    Some(LspFinding {
-        path: PathBuf::from(path),
-        line: line_number,
-        severity,
-        code: code.to_owned(),
-        source: source.to_owned(),
-        text: text.to_owned(),
+        Some(LspFinding {
+            path: PathBuf::from(path),
+            line: line_number,
+            severity,
+            code: code.to_owned(),
+            source: source.to_owned(),
+            text: text.to_owned(),
+        })
     })
 }
 
@@ -497,6 +501,21 @@ mod tests {
             formatted,
             "/home/Case Sensitive/Project/Unit1.pas(12) Warning W1036 pascal-lsp Variable 'X' might not have been initialized"
         );
+        assert_eq!(parse_lsp_findings(&formatted), vec![finding]);
+    }
+
+    #[test]
+    fn parses_lsp_finding_with_parentheses_in_path_and_text() {
+        let finding = LspFinding {
+            path: PathBuf::from("/home/Case (old)/Project/Unit(1).pas"),
+            line: 12,
+            severity: Severity::Warning,
+            code: "W1036".into(),
+            source: "pascal-lsp".into(),
+            text: "Variable 'X' might not be initialized (see docs)".into(),
+        };
+        let formatted = format_lsp_finding(&finding);
+
         assert_eq!(parse_lsp_findings(&formatted), vec![finding]);
     }
 

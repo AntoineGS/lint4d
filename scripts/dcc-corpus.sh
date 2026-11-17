@@ -13,9 +13,11 @@ python_bin="${PYTHON:-python3}"
 requested_names=("$@")
 status=0
 selected_count=0
+dcc_runs=0
+skipped_projects=()
 
 usage() {
-  sed -n '2p' "${BASH_SOURCE[0]}"
+  printf 'Usage: %s [name ...]\n' "${BASH_SOURCE[0]}"
 }
 
 if [[ ${#requested_names[@]} -eq 1 && ${requested_names[0]} == -h || \
@@ -177,11 +179,14 @@ with open(sys.argv[1], encoding="utf-8") as source:
     command = json.load(source)
 if "skip" in command:
     print(command["skip"])
+elif command.get("incomplete") is not False:
+    print("project source closure is incomplete or unverified")
 PY
 )
   if [[ -n $skip_reason ]]; then
     printf 'skipped\n' >"$project_out/dcc.status"
     printf 'skipped: %s\n' "$skip_reason" >"$project_out/dcc.validation"
+    skipped_projects+=("$name ($skip_reason)")
     echo "$name: skipped ($skip_reason)"
     continue
   fi
@@ -262,6 +267,7 @@ PY
   fi
 
   dcc_exit=0
+  dcc_runs=$((dcc_runs + 1))
   if raw=$(
     cd "$source_dir"
     WINEPREFIX="$prefix" WINEDEBUG=-all timeout "$timeout_seconds" \
@@ -317,5 +323,13 @@ done <<<"$records"
 if [[ $selected_count -eq 0 ]]; then
   echo "no manifest projects matched the requested name(s)" >&2
   exit 2
+fi
+printf 'summary: %s selected project(s), %s dcc run(s)\n' "$selected_count" "$dcc_runs"
+if ((${#skipped_projects[@]})); then
+  printf 'skipped projects: %s\n' "${skipped_projects[*]}"
+fi
+if [[ $dcc_runs -eq 0 ]]; then
+  echo "no project was compiled; all selected projects were skipped or failed command extraction" >&2
+  status=1
 fi
 exit "$status"

@@ -4185,15 +4185,12 @@ fn interface_post_edit_proves_obligation(
             && remaining.interface_owner == candidate.interface_owner
             && remaining.interface_method == candidate.interface_method
     });
-    if diagnostics.iter().any(|diagnostic| {
+    Ok(!diagnostics.iter().any(|diagnostic| {
         diagnostic.kind == SemanticDiagnosticKind::Dcc(DccMessage::E2291)
             && diagnostic.span.start == anchor_start
             && diagnostic.message.contains(&candidate.interface_method)
             && !same_named_obligation_remains
-    }) {
-        return Ok(false);
-    }
-    Ok(true)
+    }))
 }
 
 fn has_one_generated_interface_definition(

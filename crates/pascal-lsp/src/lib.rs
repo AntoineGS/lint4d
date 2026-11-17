@@ -9,6 +9,8 @@ pub mod analysis_metrics;
 pub mod cache_admin;
 mod catalogue;
 pub(crate) mod configuration;
+#[doc(hidden)]
+pub mod corpus;
 pub(crate) mod coverage;
 pub(crate) mod file_watch;
 #[cfg(test)]

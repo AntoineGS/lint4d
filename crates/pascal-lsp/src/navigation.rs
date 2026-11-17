@@ -97,6 +97,7 @@ mod system_trust_tests;
 pub(crate) use dcc_message::{DccMessage, DccSeverity};
 mod documentation;
 mod facts;
+mod flow;
 mod folding;
 #[cfg(test)]
 mod index_characterization;
@@ -3253,6 +3254,21 @@ impl NavigationIndex {
                 if declaration_cap_reached {
                     report.note(SemanticCoverageGap::DiagnosticCap);
                 }
+            }
+            if !report.has_capacity() {
+                break 'analysis;
+            }
+            let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
+            let result = flow::flow_diagnostics_with_budget(
+                self,
+                uri,
+                document,
+                capacity,
+                cancel,
+                &mut budget,
+            );
+            if let Some(flow_diagnostics) = report.checked_candidate(result, &budget)? {
+                report.diagnostics.extend(flow_diagnostics);
             }
         }
         report

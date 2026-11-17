@@ -31003,6 +31003,157 @@ mod tests {
     }
 
     #[test]
+    fn multi_name_variable_hint_directive_attaches_to_each_name() {
+        let source = concat!(
+            "unit MultiNameHint;\n",
+            "interface\n",
+            "var A, B: Integer platform;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let uri = Url::parse("file:///tmp/multi-name-hint.pas").expect("fixture URI");
+        let document = Document::parse_with_cancel(
+            uri,
+            source.to_owned(),
+            &ConditionalContext::default(),
+            &AtomicBool::new(false),
+            None,
+        )
+        .expect("multi-name hint fixture parses");
+
+        for name in ["A", "B"] {
+            let symbol = document
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name.eq_ignore_ascii_case(name))
+                .unwrap_or_else(|| panic!("missing {name} symbol"));
+            assert!(
+                symbol.hint_directives.platform,
+                "{name} did not receive the shared platform hint"
+            );
+            assert!(!symbol.hint_directives.unknown);
+        }
+    }
+
+    #[test]
+    fn overloads_keep_their_own_hint_directives() {
+        let source = concat!(
+            "unit OverloadHint;\n",
+            "interface\n",
+            "procedure P(I: Integer); overload; deprecated;\n",
+            "procedure P(S: string); overload;\n",
+            "implementation\n",
+            "procedure P(I: Integer); begin end;\n",
+            "procedure P(S: string); begin end;\n",
+            "end.\n",
+        );
+        let uri = Url::parse("file:///tmp/overload-hint.pas").expect("fixture URI");
+        let document = Document::parse_with_cancel(
+            uri,
+            source.to_owned(),
+            &ConditionalContext::default(),
+            &AtomicBool::new(false),
+            None,
+        )
+        .expect("overload hint fixture parses");
+        let mut declarations: Vec<_> = document
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.name.eq_ignore_ascii_case("P") && symbol.origin == Origin::Declaration
+            })
+            .collect();
+        declarations.sort_by_key(|symbol| symbol.span.start);
+
+        assert_eq!(
+            declarations.len(),
+            2,
+            "both overload declarations are indexed"
+        );
+        assert_eq!(declarations[0].hint_directives.deprecated, Some(None));
+        assert!(!declarations[0].hint_directives.platform);
+        assert_eq!(declarations[1].hint_directives, HintDirectives::default());
+    }
+
+    #[test]
+    fn forward_declaration_hint_directive_is_propagated_to_its_definition() {
+        let source = concat!(
+            "unit ForwardHint;\n",
+            "interface\n",
+            "implementation\n",
+            "procedure Forwarded; forward; deprecated;\n",
+            "procedure Forwarded; begin end;\n",
+            "end.\n",
+        );
+        let uri = Url::parse("file:///tmp/forward-hint.pas").expect("fixture URI");
+        let document = Document::parse_with_cancel(
+            uri,
+            source.to_owned(),
+            &ConditionalContext::default(),
+            &AtomicBool::new(false),
+            None,
+        )
+        .expect("forward hint fixture parses");
+        let declaration = document
+            .symbols
+            .iter()
+            .find(|symbol| {
+                symbol.name.eq_ignore_ascii_case("Forwarded")
+                    && symbol.origin == Origin::Declaration
+            })
+            .expect("forward declaration symbol");
+        let definition = document
+            .symbols
+            .iter()
+            .find(|symbol| {
+                symbol.name.eq_ignore_ascii_case("Forwarded") && symbol.origin == Origin::Definition
+            })
+            .expect("forward definition symbol");
+
+        assert_eq!(declaration.hint_directives.deprecated, Some(None));
+        assert_eq!(
+            definition.hint_directives, declaration.hint_directives,
+            "the paired definition carries the forward declaration's hint"
+        );
+    }
+
+    #[test]
+    fn hint_directive_token_alone_in_unknown_conditional_is_unknown() {
+        let source = concat!(
+            "unit ConditionalHintToken;\n",
+            "interface\n",
+            "procedure Q; {$IFDEF UNKNOWN_X} deprecated; {$ENDIF}\n",
+            "procedure Outside; platform;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let uri = Url::parse("file:///tmp/conditional-hint-token.pas").expect("fixture URI");
+        let document = Document::parse_with_cancel(
+            uri,
+            source.to_owned(),
+            &ConditionalContext::default(),
+            &AtomicBool::new(false),
+            None,
+        )
+        .expect("conditional hint token fixture parses");
+        let q = document
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name.eq_ignore_ascii_case("Q"))
+            .expect("Q declaration");
+        let outside = document
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name.eq_ignore_ascii_case("Outside"))
+            .expect("outside declaration");
+
+        assert_eq!(q.hint_directives.deprecated, Some(None));
+        assert!(q.hint_directives.unknown);
+        assert!(outside.hint_directives.platform);
+        assert!(!outside.hint_directives.unknown);
+    }
+
+    #[test]
     fn unknown_class_owner_cache_survives_a_large_method_body() {
         let mut source = String::from(
             "unit CachedUnknownOwner;\ninterface\ntype\n  TObj = class(TUnknown)\n    procedure Caller;\n  end;\nconst\n  GlobalName = 1;\nimplementation\nprocedure TObj.Caller;\nbegin\n  Glo;\n",

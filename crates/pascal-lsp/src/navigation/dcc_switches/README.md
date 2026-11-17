@@ -101,3 +101,13 @@ The code row fields are `<code> <default ON|OFF> <WARNINGS|HINTS>
 duplicate, or unsorted rows with a source line number. `switch_table(major,
 minor)` lazily parses the checked-in files and returns `None` for unsupported
 versions or invalid table data, so callers fail closed.
+
+When the compiler version is absent or has no checked-in table, warning and
+hint analysis uses a consensus table across all valid checked-in versions. A
+code is included only when every table agrees on its default, governing global,
+warning ID, and error-promotion capability; otherwise that code's state is
+unknown and its warning or hint finding is withheld. Property mappings are
+likewise retained only when all tables agree. For example, all checked-in
+tables agree that W1009 defaults to ON under WARNINGS and is controlled by
+`HIDING_MEMBER`, so that default remains usable without a known compiler
+version.

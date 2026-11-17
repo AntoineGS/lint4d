@@ -192,6 +192,37 @@ impl SwitchTable {
         Ok(Self { codes, properties })
     }
 
+    pub(crate) fn consensus(tables: &[&Self]) -> Option<Self> {
+        let first = *tables.first()?;
+        let codes = first
+            .codes
+            .iter()
+            .filter_map(|(code, entry)| {
+                let agrees = tables.iter().skip(1).all(|table| {
+                    table.codes.get(code).is_some_and(|other| {
+                        other.default == entry.default
+                            && other.global == entry.global
+                            && other.id == entry.id
+                            && other.error_capable == entry.error_capable
+                    })
+                });
+                agrees.then_some((*code, entry.clone()))
+            })
+            .collect();
+        let properties = first
+            .properties
+            .iter()
+            .filter_map(|(property, attribute)| {
+                let agrees = tables
+                    .iter()
+                    .skip(1)
+                    .all(|table| table.properties.get(property) == Some(attribute));
+                agrees.then_some((property.clone(), attribute.clone()))
+            })
+            .collect();
+        Some(Self { codes, properties })
+    }
+
     pub(crate) fn code(&self, code: &str) -> Option<&CodeSwitch> {
         self.codes.get(code.to_ascii_uppercase().as_str())
     }
@@ -287,21 +318,35 @@ const CHECKED_IN_TABLES: &[((u32, u32), &str)] = &[
 ];
 
 static PARSED_TABLES: OnceLock<BTreeMap<(u32, u32), Arc<SwitchTable>>> = OnceLock::new();
+static CONSENSUS_TABLE: OnceLock<Option<Arc<SwitchTable>>> = OnceLock::new();
+
+fn parsed_tables() -> &'static BTreeMap<(u32, u32), Arc<SwitchTable>> {
+    PARSED_TABLES.get_or_init(|| {
+        CHECKED_IN_TABLES
+            .iter()
+            .filter_map(|(version, text)| {
+                SwitchTable::parse(text)
+                    .ok()
+                    .map(|table| (*version, Arc::new(table)))
+            })
+            .collect()
+    })
+}
 
 pub(crate) fn switch_table(major: u32, minor: u32) -> Option<Arc<SwitchTable>> {
-    PARSED_TABLES
+    parsed_tables().get(&(major, minor)).cloned()
+}
+
+pub(crate) fn common_switch_table() -> Option<Arc<SwitchTable>> {
+    CONSENSUS_TABLE
         .get_or_init(|| {
-            CHECKED_IN_TABLES
-                .iter()
-                .filter_map(|(version, text)| {
-                    SwitchTable::parse(text)
-                        .ok()
-                        .map(|table| (*version, Arc::new(table)))
-                })
-                .collect()
+            let tables = parsed_tables()
+                .values()
+                .map(|table| table.as_ref())
+                .collect::<Vec<_>>();
+            SwitchTable::consensus(&tables).map(Arc::new)
         })
-        .get(&(major, minor))
-        .cloned()
+        .clone()
 }
 
 #[cfg(test)]
@@ -440,5 +485,41 @@ DCC_Warnings Warnings\n";
             );
         }
         assert!(switch_table(22, 0).is_none());
+    }
+
+    #[test]
+    fn consensus_keeps_only_rows_that_agree_across_tables() {
+        let first = SwitchTable::parse(
+            "# dcc-switches v1\n\
+             # banner: synthetic first\n\
+             # script-version: 1\n\
+             [codes]\n\
+             W1000 ON WARNINGS SYMBOL_DEPRECATED yes\n\
+             W1009 ON WARNINGS HIDING_MEMBER yes\n\
+             [properties]\n\
+             DCC_SYMBOL_DEPRECATED SYMBOL_DEPRECATED\n\
+             DCC_Warnings Warnings\n",
+        )
+        .unwrap();
+        let second = SwitchTable::parse(
+            "# dcc-switches v1\n\
+             # banner: synthetic second\n\
+             # script-version: 1\n\
+             [codes]\n\
+             W1000 ON WARNINGS SYMBOL_DEPRECATED yes\n\
+             W1009 ON WARNINGS OTHER_MEMBER yes\n\
+             [properties]\n\
+             DCC_SYMBOL_DEPRECATED SYMBOL_DEPRECATED\n\
+             DCC_Warnings Warnings\n",
+        )
+        .unwrap();
+
+        let consensus = SwitchTable::consensus(&[&first, &second]).unwrap();
+
+        assert!(consensus.code("W1000").is_some());
+        assert!(
+            consensus.code("W1009").is_none(),
+            "a code with differing warning IDs is not safe to infer"
+        );
     }
 }

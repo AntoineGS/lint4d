@@ -87,9 +87,11 @@ leaves the affected state unknown from that point; a direct switch-state test
 covers this independently of whether semantic analysis produced a candidate
 diagnostic.
 
-If the document has no recognized compiler-version switch table, warning and
-hint findings are withheld because their effective state cannot be proven.
-Error diagnostics are not filtered by warning or hint switches.
+If the document has no compiler version or its version has no recognized
+switch table, warning and hint analysis uses only the per-code defaults,
+governing globals, and warning IDs shared by all checked-in tables. Findings
+whose switch rows disagree across versions remain withheld. Error diagnostics
+are not filtered by warning or hint switches.
 
 The unit test in `src/navigation/dcc_oracle_tests.rs` compares only codes in
 `ENABLED_CODES`; add a code there as the corresponding lint rule is implemented.

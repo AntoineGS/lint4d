@@ -1,4 +1,6 @@
-use super::dcc_switches::{CodeSwitch, GlobalSwitch, SwitchState, SwitchTable, switch_table};
+use super::dcc_switches::{
+    CodeSwitch, GlobalSwitch, SwitchState, SwitchTable, common_switch_table, switch_table,
+};
 use super::{Document, SemanticDiagnostic, SemanticDiagnosticKind};
 use pascal_core::conditional::{DirectiveKind, Truth};
 use pascal_project::PropertyValue;
@@ -80,10 +82,12 @@ pub(crate) struct WarningSwitches {
 
 impl WarningSwitches {
     pub(crate) fn new(document: &Document) -> Self {
-        let Some(version) = document.conditional_context.compiler_version else {
-            return Self::default();
-        };
-        let Some(table) = switch_table(version.major, version.minor) else {
+        let table = document
+            .conditional_context
+            .compiler_version
+            .and_then(|version| switch_table(version.major, version.minor))
+            .or_else(common_switch_table);
+        let Some(table) = table else {
             return Self::default();
         };
         Self::from_document(document, &table)
@@ -460,5 +464,51 @@ fn unresolved_include_offsets(document: &Document) -> Vec<usize> {
         markers
     } else {
         vec![0]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SwitchTable, WarningSwitches};
+    use crate::navigation::NavigationIndex;
+    use lsp_types::Url;
+
+    fn synthetic_table(warning_id: &str) -> SwitchTable {
+        let text = format!(
+            "# dcc-switches v1\n\
+             # banner: synthetic\n\
+             # script-version: 1\n\
+             [codes]\n\
+             W1000 ON WARNINGS SYMBOL_DEPRECATED yes\n\
+             W1009 ON WARNINGS {warning_id} yes\n\
+             [properties]\n\
+             DCC_SYMBOL_DEPRECATED SYMBOL_DEPRECATED\n\
+             DCC_Warnings Warnings\n"
+        );
+        SwitchTable::parse(&text).expect("synthetic switch table")
+    }
+
+    #[test]
+    fn disagreeing_switch_rows_leave_that_warning_state_unknown() {
+        let first = synthetic_table("HIDING_MEMBER");
+        let second = synthetic_table("OTHER_MEMBER");
+        let table = SwitchTable::consensus(&[&first, &second]).expect("W1000 agrees across tables");
+        let uri = Url::parse("file:///tmp/switch-filter-table-disagreement.pas").unwrap();
+        let mut index = NavigationIndex::new();
+        index
+            .update(
+                uri.clone(),
+                "unit Probe; interface implementation end.".to_owned(),
+            )
+            .expect("probe parses");
+        let document = index.documents.get(&uri).expect("probe document");
+
+        let switches = WarningSwitches::from_document(document, &table);
+
+        assert_eq!(
+            switches.effective_switch(document, "W1009", 0),
+            None,
+            "a code that disagrees between synthetic tables remains unknown"
+        );
     }
 }

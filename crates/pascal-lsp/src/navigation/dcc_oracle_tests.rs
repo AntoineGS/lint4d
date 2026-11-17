@@ -592,21 +592,39 @@ fn switch_filter_source(prefix: &str) -> String {
 }
 
 #[test]
-fn switch_filter_fails_closed_without_a_compiler_switch_table() {
+fn switch_filter_uses_agreed_defaults_without_a_known_switch_table() {
     let source = switch_filter_source("");
-    let uri = Url::parse("file:///tmp/switch-filter-no-version.pas").unwrap();
-    let mut index = NavigationIndex::new();
-    index.update(uri.clone(), source).expect("probe parses");
+    for (uri, context) in [
+        (
+            Url::parse("file:///tmp/switch-filter-no-version.pas").unwrap(),
+            ConditionalContext::default(),
+        ),
+        (
+            Url::parse("file:///tmp/switch-filter-unsupported-version.pas").unwrap(),
+            ConditionalContext::default().with_compiler_version(CompilerVersion::new(22, 0)),
+        ),
+    ] {
+        let mut index = NavigationIndex::new();
+        index
+            .update_with_context_with_cancel(
+                uri.clone(),
+                source.clone(),
+                &context,
+                &AtomicBool::new(false),
+            )
+            .expect("probe parses");
 
-    let diagnostics = index
-        .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
-        .expect("semantic diagnostics complete");
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
 
-    assert!(
-        diagnostics
-            .iter()
-            .all(|diagnostic| diagnostic.kind.code() != "W1009")
-    );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind.code() == "W1009"),
+            "the unanimous default applies for {uri}"
+        );
+    }
 }
 
 #[test]

@@ -7496,6 +7496,11 @@ fn build_snapshot_with_policy(
         if let Some(held) = held {
             listed.insert(uri.clone(), held);
         } else if !reused {
+            let warning_properties = loader
+                .contexts
+                .get(&source_context_key)
+                .filter(|state| state.context.owns_unit_source(&path))
+                .map(|state| Arc::new(state.context.warning_properties().clone()));
             index
                 .update_with_session(
                     uri.clone(),
@@ -7504,7 +7509,7 @@ fn build_snapshot_with_policy(
                     cached,
                     cancel,
                     loader.expansions.get(&uri).map(|e| &e.expanded),
-                    None,
+                    warning_properties,
                 )
                 .map_err(|error| format!("rename workspace scan could not index {uri}: {error}"))?;
             if let Some(content_hash) = content_hash

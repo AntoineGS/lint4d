@@ -20602,6 +20602,55 @@ mod tests {
         Workspace::with_override_session(roots, options, OverrideSession::new(None))
     }
 
+    #[test]
+    fn published_semantic_diagnostics_honor_project_warning_properties() {
+        let source = "unit Main;\n\
+                      interface\n\
+                      type TObject = class end;\n\
+                      TBase = class(TObject) protected Value: Integer; end;\n\
+                      TChild = class(TBase) private FChild: Integer; public property Value: Integer read FChild; end;\n\
+                      implementation\n\
+                      end.\n";
+        for (property, expected_w1009) in [
+            ("<DCC_HIDING_MEMBER>false</DCC_HIDING_MEMBER>", false),
+            ("", true),
+        ] {
+            let temp = tempfile::tempdir().expect("workspace root");
+            let root = temp.path().to_path_buf();
+            fs::write(
+                root.join("App.dproj"),
+                format!(
+                    "<Project><PropertyGroup><MainSource>Main.pas</MainSource><CompilerVersion>37.0</CompilerVersion>{property}</PropertyGroup></Project>"
+                ),
+            )
+            .unwrap();
+            fs::write(root.join("Main.pas"), source).unwrap();
+            pascal_project::backdate_tree_for_test(&root);
+
+            let uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+            let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+            workspace
+                .open_document(uri.clone(), source.to_owned(), 1)
+                .expect("open project unit");
+            let publications = workspace
+                .diagnostics_for_with_cancel(&uri, &AtomicBool::new(false))
+                .expect("published diagnostics");
+            let diagnostics = publications
+                .iter()
+                .find(|publication| publication.uri == uri)
+                .expect("unit publication");
+            let has_w1009 = diagnostics.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code.as_ref()
+                    == Some(&lsp_types::NumberOrString::String("W1009".to_owned()))
+            });
+
+            assert_eq!(
+                has_w1009, expected_w1009,
+                "DCC_HIDING_MEMBER property {property:?}"
+            );
+        }
+    }
+
     fn worker_view(main: &Workspace) -> Workspace {
         Workspace::from_analysis_input(&main.analysis_input())
     }

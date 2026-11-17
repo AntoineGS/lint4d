@@ -201,6 +201,14 @@ impl SwitchTable {
             .get(&property.to_ascii_lowercase())
             .map(String::as_str)
     }
+
+    pub(crate) fn warning_id_for_property(&self, property: &str) -> Option<&str> {
+        let id = self.id_for_property(property)?;
+        self.codes
+            .values()
+            .any(|switch| switch.id.as_deref() == Some(id))
+            .then_some(id)
+    }
 }
 
 const SUPPORTED_CODES: &[&str] = &[
@@ -328,6 +336,11 @@ DCC_Warnings Warnings\n";
         );
         assert_eq!(table.id_for_property("DCC_Hints"), Some("Hints"));
         assert_eq!(table.id_for_property("DCC_Warnings"), Some("Warnings"));
+        assert_eq!(
+            table.warning_id_for_property("DCC_SYMBOL_DEPRECATED"),
+            Some("SYMBOL_DEPRECATED")
+        );
+        assert_eq!(table.warning_id_for_property("DCC_Hints"), None);
         assert_eq!(
             table.id_for_property("dcc_symbol_deprecated"),
             Some("SYMBOL_DEPRECATED")

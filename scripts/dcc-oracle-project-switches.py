@@ -157,6 +157,11 @@ def condition_value(
 def read_case_properties(
     project_path: Path, selected_config: str, selected_platform: str
 ) -> tuple[dict[str, str], set[str]]:
+    if not selected_config.strip():
+        raise ValueError(f"{project_path}: .dproj case.toml must set config")
+    if not selected_platform.strip():
+        raise ValueError(f"{project_path}: .dproj case.toml must set platform")
+
     root = ET.parse(project_path).getroot()
     if any(
         local_name(element.tag) in {"Import", "ImportGroup"}
@@ -261,7 +266,7 @@ def dcc_flags(
     # two global switches. Keep this assertion next to the table-derived list
     # so the recorder cannot silently start accepting unrelated DCC settings.
     assert warning_ids | {"dcc_hints", "dcc_warnings"} == allowed
-    return flags
+    return sorted(flags)
 
 
 def main(argv: list[str]) -> int:

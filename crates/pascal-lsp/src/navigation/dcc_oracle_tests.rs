@@ -3,6 +3,7 @@
 //! recorded (precision always; recall unless a case needs the RTL and
 //! `PASCAL_RTL_<version>` is unset).
 use super::dcc_surface::{SurfaceKey, SurfacePlatform, table_for, verified_system_context};
+use super::dcc_switches::{SwitchTable, switch_table};
 use super::*;
 use pascal_project::delphi_overrides::OverrideSession;
 use pascal_project::{
@@ -206,6 +207,20 @@ fn project_context_for_case(
         projects
     );
     let project_file = projects.into_iter().next()?;
+    assert!(
+        config
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()),
+        "{}: .dproj case.toml must set config",
+        case.name
+    );
+    assert!(
+        platform
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()),
+        "{}: .dproj case.toml must set platform",
+        case.name
+    );
     let source = case.dir.join(&case.unit);
     let options = ProjectOptions {
         project_file: Some(project_file),
@@ -224,6 +239,86 @@ fn project_context_for_case(
         .unwrap_or_else(|error| panic!("{}: .dproj discovery: {error}", case.name))
         .context,
     )
+}
+
+fn project_switch_flags(
+    warning_properties: &BTreeMap<String, PropertyValue>,
+    table: &SwitchTable,
+) -> Result<Vec<String>, String> {
+    let mut flags = Vec::new();
+    for (property, prefix) in [("DCC_Hints", "-H"), ("DCC_Warnings", "-W")] {
+        if let Some(value) = warning_properties.get(property) {
+            let PropertyValue::Known(value) = value else {
+                return Err(format!("{property} is unevaluable"));
+            };
+            let sign = match value.trim().to_ascii_lowercase().as_str() {
+                "true" => "+",
+                "false" => "-",
+                _ => return Err(format!("{property} must be true or false, got {value:?}")),
+            };
+            flags.push(format!("{prefix}{sign}"));
+        }
+    }
+
+    for (property, value) in warning_properties {
+        let Some(id) = table.warning_id_for_property(property) else {
+            continue;
+        };
+        let PropertyValue::Known(value) = value else {
+            return Err(format!("{property} is unevaluable"));
+        };
+        let sign = match value.trim().to_ascii_lowercase().as_str() {
+            "true" => "+",
+            "false" => "-",
+            "error" => "^",
+            _ => {
+                return Err(format!(
+                    "{property} must be true, false, or error, got {value:?}"
+                ));
+            }
+        };
+        flags.push(format!("-W{sign}{id}"));
+    }
+
+    flags.sort();
+    Ok(flags)
+}
+
+fn compare_switch_manifest(recorded: &str, evaluated: &[String]) -> Result<(), String> {
+    let recorded = recorded.lines().map(str::to_owned).collect::<Vec<_>>();
+    let mut evaluated = evaluated.to_vec();
+    evaluated.sort();
+    if recorded == evaluated {
+        Ok(())
+    } else {
+        Err(format!(
+            "dproj-switches.txt mismatch: recorded {recorded:?}, pascal-project evaluated {evaluated:?}"
+        ))
+    }
+}
+
+fn verify_project_switch_manifest(case: &Case, version: &str) {
+    let Some(project) =
+        project_context_for_case(case, version, case.config.clone(), case.platform.clone())
+    else {
+        return;
+    };
+    let compiler = CompilerVersion::parse(version)
+        .unwrap_or_else(|| panic!("unsupported Delphi compiler version {version:?}"));
+    let table = switch_table(compiler.major, compiler.minor)
+        .unwrap_or_else(|| panic!("no dcc switch table for compiler {version}"));
+    let evaluated = project_switch_flags(project.warning_properties(), &table)
+        .unwrap_or_else(|error| panic!("{}: .dproj switch mapping failed: {error}", case.name));
+    let manifest_path = case.dir.join("dproj-switches.txt");
+    let recorded = std::fs::read_to_string(&manifest_path).unwrap_or_else(|error| {
+        panic!(
+            "{}: missing or unreadable {}: {error}",
+            case.name,
+            manifest_path.display()
+        )
+    });
+    compare_switch_manifest(&recorded, &evaluated)
+        .unwrap_or_else(|error| panic!("{}: {error}", case.name));
 }
 
 fn initial_state_for_case(case: &Case, version: &str) -> CaseInitialState {
@@ -613,6 +708,79 @@ fn configured_dproj_oracle_cases_select_warning_properties() {
 }
 
 #[test]
+fn dproj_oracle_cases_require_explicit_config_and_platform() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let dir = directory.path();
+    std::fs::write(
+        dir.join("Configured.pas"),
+        "unit Configured;\ninterface\nimplementation\nend.\n",
+    )
+    .expect("Pascal fixture");
+    std::fs::write(
+        dir.join("Configured.dproj"),
+        "<Project><PropertyGroup><MainSource>Configured.pas</MainSource></PropertyGroup></Project>",
+    )
+    .expect("project fixture");
+
+    for (config, platform, missing) in [
+        (None, Some("Win32"), "config"),
+        (Some(""), Some("Win32"), "config"),
+        (Some("Debug"), None, "platform"),
+        (Some("Debug"), Some(" \t"), "platform"),
+    ] {
+        let case = Case {
+            name: "synthetic_dproj".to_owned(),
+            dir: dir.to_path_buf(),
+            unit: "Configured.pas".to_owned(),
+            compilers: vec!["37.0".to_owned()],
+            config: config.map(str::to_owned),
+            platform: platform.map(str::to_owned),
+            requires_rtl: false,
+            recall: true,
+            silent_codes: Vec::new(),
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            project_context_for_case(&case, "37.0", case.config.clone(), case.platform.clone())
+        }));
+        let panic = match result {
+            Err(panic) => panic,
+            Ok(_) => panic!("missing {missing} selection should be rejected"),
+        };
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            message.contains(&format!("case.toml must set {missing}")),
+            "expected a clear missing-{missing} error, got {message:?}"
+        );
+    }
+}
+
+#[test]
+fn dproj_switch_manifest_comparison_rejects_mismatched_flags() {
+    let recorded = "-H-\n-W-\n";
+    let evaluated = vec!["-H-".to_owned(), "-W-SYMBOL_DEPRECATED".to_owned()];
+
+    assert!(compare_switch_manifest(recorded, &evaluated).is_err());
+}
+
+#[test]
+fn dproj_switch_mapping_supports_error_promotion() {
+    let properties = BTreeMap::from([(
+        "DCC_SYMBOL_DEPRECATED".to_owned(),
+        PropertyValue::Known("error".to_owned()),
+    )]);
+    let table = switch_table(37, 0).expect("37.0 switch table");
+
+    assert_eq!(
+        project_switch_flags(&properties, &table).unwrap(),
+        ["-W^SYMBOL_DEPRECATED"]
+    );
+}
+
+#[test]
 fn dproj_recordings_document_the_compiler_switches_used() {
     for version in ["21.0", "24.0", "37.0"] {
         let warning_case = load_case(&cases_root().join("dproj_warning_switches"));
@@ -754,6 +922,7 @@ fn dcc_oracle_cases_match_recorded_dcc_output() {
         let case = load_case(&dir);
         let enabled = |finding: &Finding| ENABLED_CODES.contains(&finding.code.as_str());
         for version in &case.compilers {
+            verify_project_switch_manifest(&case, version);
             let expected = parse_expected(&case, version)
                 .into_iter()
                 .filter(|finding| enabled(finding) && finding.file.eq_ignore_ascii_case(&case.unit))

@@ -112,6 +112,16 @@ for name in "${cases[@]}"; do
     switch_table="$root/crates/pascal-lsp/src/navigation/dcc_switches/$compiler.txt"
     config=$(sed -nE 's/^[[:space:]]*config[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$dir/case.toml" | head -n1)
     platform=$(sed -nE 's/^[[:space:]]*platform[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$dir/case.toml" | head -n1)
+    if [[ -z ${config//[[:space:]]/} ]]; then
+      echo "$name: .dproj case.toml must set config" >&2
+      status=1
+      continue
+    fi
+    if [[ -z ${platform//[[:space:]]/} ]]; then
+      echo "$name: .dproj case.toml must set platform" >&2
+      status=1
+      continue
+    fi
     if ! switch_output=$(python3 "$root/scripts/dcc-oracle-project-switches.py" \
       "${dproj_files[0]}" "$switch_table" "$config" "$platform"); then
       echo "$name: could not evaluate .dproj warning switches" >&2
@@ -176,6 +186,13 @@ for name in "${cases[@]}"; do
       | grep -v ' H2675 ' \
       | sed -E 's/^(.*[\\/])?([^\\/(]+)\(([0-9]+)\) (Error|Warning|Hint): /\2(\3) /' || true
   } > "$output"
+  if ((${#dproj_files[@]} == 1)); then
+    {
+      for flag in "${project_switch_flags[@]}"; do
+        printf '%s\n' "$flag"
+      done
+    } > "$dir/dproj-switches.txt"
+  fi
   echo "$name: recorded $(grep -vc '^#' "$output" || true) message(s) for Delphi $compiler"
 done
 exit "$status"

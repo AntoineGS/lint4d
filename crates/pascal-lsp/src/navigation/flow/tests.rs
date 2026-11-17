@@ -567,7 +567,7 @@ fn unresolved_and_intrinsic_call_effects_are_classified_independently() {
             .find(|occurrence| occurrence.span.start == unknown_value)
             .expect("unknown call argument")
             .access,
-        Access::ReadWrite
+        Access::UnknownCallEffect
     );
 
     let intrinsic_source = concat!(
@@ -607,8 +607,8 @@ fn flow_call_effects_conservatively_cover_ambiguous_compound_arguments() {
         .find(|occurrence| occurrence.span.start > argument)
         .expect("second variable in ambiguous expression");
 
-    assert_eq!(value.access, Access::ReadWrite);
-    assert_eq!(other.access, Access::ReadWrite);
+    assert_eq!(value.access, Access::UnknownCallEffect);
+    assert_eq!(other.access, Access::UnknownCallEffect);
 }
 
 #[test]
@@ -712,8 +712,17 @@ fn flow_budget_exhaustion_is_reported_as_a_coverage_gap() {
     let document = index.documents.get(&uri).expect("indexed document");
     let cancel = AtomicBool::new(false);
     let mut budget = AssistanceBudget::new(1, 8 * 1024 * 1024, "flow test");
-    let result =
-        super::flow_diagnostics_with_budget(&index, &uri, document, &[], 10, &cancel, &mut budget);
+    let mut diagnostic_cap_reached = false;
+    let result = super::flow_diagnostics_with_budget(
+        &index,
+        &uri,
+        document,
+        &[],
+        10,
+        &mut diagnostic_cap_reached,
+        &cancel,
+        &mut budget,
+    );
     let mut report = super::super::SemanticDiagnosticReport::default();
     assert!(
         report
@@ -722,6 +731,7 @@ fn flow_budget_exhaustion_is_reported_as_a_coverage_gap() {
             .is_none()
     );
     assert_eq!(report.gaps, vec![super::super::SemanticCoverageGap::Budget]);
+    assert!(!diagnostic_cap_reached);
 }
 
 #[test]
@@ -809,6 +819,8 @@ fn flow_with_target_scan_reports_budget_exclusion() {
         kind: LocalKind::Local,
         ty: VarType::Scalar,
         type_resolved: true,
+        unresolved_local_generic_argument: false,
+        unknown_call_effect: false,
         address_taken: false,
         captured: false,
         absolute: false,
@@ -917,12 +929,14 @@ fn flow_document_precharge_excludes_all_routines_before_cfg_building() {
     assert!(budget.exhausted());
 
     let mut gap_budget = AssistanceBudget::new(work_limit, 8 * 1024 * 1024, "flow test");
+    let mut diagnostic_cap_reached = false;
     let result = super::flow_diagnostics_with_budget(
         &index,
         &uri,
         document,
         &[],
         10,
+        &mut diagnostic_cap_reached,
         &cancel,
         &mut gap_budget,
     );
@@ -934,6 +948,7 @@ fn flow_document_precharge_excludes_all_routines_before_cfg_building() {
             .is_none()
     );
     assert_eq!(report.gaps, vec![super::super::SemanticCoverageGap::Budget]);
+    assert!(!diagnostic_cap_reached);
     assert_eq!(
         super::model::test_cfg_builder_call_count(),
         0,
@@ -1067,6 +1082,32 @@ fn flow_diagnostics_report_a_written_only_local_as_h2077() {
     );
 }
 
+#[test]
+fn flow_diagnostics_withhold_h2077_for_a_local_with_an_unresolved_call_mode() {
+    let source = concat!(
+        "program FlowUnknownCallMode;\n",
+        "procedure Demo;\n",
+        "var UnknownEffect, SafeDead: Integer;\n",
+        "begin\n",
+        "  UnknownEffect := 1;\n",
+        "  Mystery(UnknownEffect);\n",
+        "  UnknownEffect := 2;\n",
+        "  SafeDead := 3;\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+
+    assert_eq!(
+        flow_finding_lines(source, &flow_diagnostics(source)),
+        vec![(
+            "H2077".to_owned(),
+            8,
+            "Value assigned to 'SafeDead' never used".to_owned(),
+        )],
+        "an unresolved argument mode makes only that variable ineligible for H2077"
+    );
+}
+
 fn flow_diagnostics(source: &str) -> Vec<SemanticDiagnostic> {
     let uri = Url::parse("file:///tmp/flow-diagnostics.pas").expect("valid URI");
     let mut index = NavigationIndex::new();
@@ -1076,8 +1117,18 @@ fn flow_diagnostics(source: &str) -> Vec<SemanticDiagnostic> {
     let document = index.documents.get(&uri).expect("indexed document");
     let cancel = AtomicBool::new(false);
     let mut budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "flow test");
-    super::flow_diagnostics_with_budget(&index, &uri, document, &[], 100, &cancel, &mut budget)
-        .expect("flow diagnostics build")
+    let mut diagnostic_cap_reached = false;
+    super::flow_diagnostics_with_budget(
+        &index,
+        &uri,
+        document,
+        &[],
+        100,
+        &mut diagnostic_cap_reached,
+        &cancel,
+        &mut budget,
+    )
+    .expect("flow diagnostics build")
 }
 
 #[test]
@@ -1128,18 +1179,46 @@ fn flow_diagnostics_withhold_findings_for_duplicate_local_identities() {
 }
 
 #[test]
-fn flow_diagnostics_withhold_findings_for_an_unresolved_local_type() {
+fn flow_type_uncertainty_is_scoped_to_the_local_and_rules_that_need_its_type() {
     let source = concat!(
-        "program FlowUnknownLocalType;\n",
+        "unit FlowImportedLocalType;\n",
+        "interface\n",
+        "implementation\n",
+        "uses ExternalTypes;\n",
         "procedure Demo;\n",
-        "var Value: MissingType;\n",
-        "begin end;\n",
-        "begin end.\n",
+        "var ExternalValue: ExternalTypes.TExternal;\n",
+        "    NeverRead: Integer;\n",
+        "begin\n",
+        "  ExternalValue := 1;\n",
+        "end;\n",
+        "end.\n",
+    );
+
+    assert_eq!(
+        flow_finding_lines(source, &flow_diagnostics(source)),
+        vec![(
+            "H2164".to_owned(),
+            7,
+            "Variable 'NeverRead' is declared but never used in 'Demo'".to_owned(),
+        )],
+        "the unresolved type must not hide independent H2164 or make its own write eligible for H2077"
+    );
+}
+
+#[test]
+fn flow_withholds_a_routine_when_a_local_generic_type_argument_is_unresolved() {
+    let source = concat!(
+        "program FlowUnknownGenericArgument;\n",
+        "type TBox<T> = record Value: T; end;\n",
+        "procedure Demo;\n",
+        "var Bad: TBox<U>; WrittenOnly: Integer;\n",
+        "begin WrittenOnly := 1; end;\n",
+        "begin Demo; end.\n",
     );
 
     assert!(
         flow_diagnostics(source).is_empty(),
-        "an unresolved local type must make the routine fail closed"
+        "a missing argument to a locally resolved generic type is an unresolved identity, not an imported type gap"
     );
 }
 

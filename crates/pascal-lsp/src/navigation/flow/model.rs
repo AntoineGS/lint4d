@@ -57,6 +57,7 @@ pub(crate) enum Access {
     Read,
     Write,
     ReadWrite,
+    UnknownCallEffect,
     OutArg,
     VarArg,
     AddressOf,
@@ -80,6 +81,8 @@ pub(crate) struct LocalVar {
     pub(crate) kind: LocalKind,
     pub(crate) ty: VarType,
     pub(crate) type_resolved: bool,
+    pub(crate) unresolved_local_generic_argument: bool,
+    pub(crate) unknown_call_effect: bool,
     pub(crate) address_taken: bool,
     pub(crate) captured: bool,
     pub(crate) absolute: bool,
@@ -351,7 +354,10 @@ fn build_routine_flow<'a>(
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
         budget.require_owned_bytes(local.name.len(), cancel)?;
-        if !local_names.insert(canonical_name(&local.name)) || !local.type_resolved {
+        if !local_names.insert(canonical_name(&local.name)) {
+            note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
+        }
+        if local.unresolved_local_generic_argument {
             note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
         }
     }
@@ -574,6 +580,11 @@ fn build_routine_flow<'a>(
             occurrence.span.end,
         )
     });
+    for occurrence in &pending {
+        if occurrence.access == Access::UnknownCallEffect {
+            locals[occurrence.var].unknown_call_effect = true;
+        }
+    }
     let mut orders_by_block = HashMap::<BlockId, usize>::new();
     let occurrences = pending
         .into_iter()
@@ -658,6 +669,9 @@ fn collect_locals(
         let type_resolved = symbol.type_shape.as_ref().is_some_and(|shape| {
             type_shape_is_resolved(document, symbol.scope, shape, &mut HashSet::new())
         });
+        let unresolved_local_generic_argument = symbol.type_shape.as_ref().is_some_and(|shape| {
+            type_shape_has_unresolved_local_generic_argument(document, symbol.scope, shape)
+        });
         let local_index = locals.len();
         budget.require_owned_bytes(symbol.name.len(), cancel)?;
         budget.require_owned_bytes(
@@ -673,6 +687,8 @@ fn collect_locals(
             kind,
             ty,
             type_resolved,
+            unresolved_local_generic_argument,
+            unknown_call_effect: false,
             address_taken: false,
             captured: false,
             absolute,
@@ -713,6 +729,13 @@ fn collect_locals(
             .is_some_and(|type_ref| {
                 type_ref_is_resolved(document, routine_scope, type_ref, &mut HashSet::new())
             });
+        let unresolved_local_generic_argument = routine_symbol
+            .implementation_result_type_ref
+            .as_ref()
+            .or(routine_symbol.result_type_ref.as_ref())
+            .is_some_and(|type_ref| {
+                type_ref_has_unresolved_local_generic_argument(document, routine_scope, type_ref)
+            });
         locals.push(LocalVar {
             name: "Result".to_owned(),
             decl_span: SourceSpan {
@@ -722,6 +745,8 @@ fn collect_locals(
             kind: LocalKind::Result,
             ty,
             type_resolved,
+            unresolved_local_generic_argument,
+            unknown_call_effect: false,
             address_taken: false,
             captured: false,
             absolute: false,
@@ -846,6 +871,64 @@ fn type_ref_is_resolved(
         });
     visited.remove(&(scope, key));
     resolved
+}
+
+fn type_shape_has_unresolved_local_generic_argument(
+    document: &Document,
+    scope: usize,
+    shape: &TypeShape,
+) -> bool {
+    match shape {
+        TypeShape::Named(type_ref) => {
+            type_ref_has_unresolved_local_generic_argument(document, scope, type_ref)
+        }
+        TypeShape::Pointer(inner) | TypeShape::Array { element: inner, .. } => {
+            type_shape_has_unresolved_local_generic_argument(document, scope, inner)
+        }
+        TypeShape::Callable | TypeShape::Unknown => false,
+    }
+}
+
+fn type_ref_has_unresolved_local_generic_argument(
+    document: &Document,
+    scope: usize,
+    type_ref: &TypeRef,
+) -> bool {
+    let Some(name) = type_ref.path.last() else {
+        return false;
+    };
+    let key = canonical_name(name);
+    let local_type = document
+        .symbols
+        .iter()
+        .filter(|candidate| {
+            candidate.kind == SymbolKind::Type
+                && candidate.key == key
+                && scope_is_within(document, scope, candidate.scope)
+        })
+        .max_by_key(|candidate| scope_depth(document, candidate.scope));
+    let has_unresolved_argument = local_type.is_some_and(|candidate| {
+        !candidate.generic_parameters.is_empty()
+            && type_ref.args.iter().any(|argument| {
+                !type_ref_is_resolved(document, scope, argument, &mut HashSet::new())
+                    && !type_ref_is_generic_parameter(document, argument)
+            })
+    });
+    has_unresolved_argument
+        || type_ref.args.iter().any(|argument| {
+            type_ref_has_unresolved_local_generic_argument(document, scope, argument)
+        })
+}
+
+fn type_ref_is_generic_parameter(document: &Document, type_ref: &TypeRef) -> bool {
+    let Some(name) = type_ref.path.last() else {
+        return false;
+    };
+    let key = canonical_name(name);
+    document
+        .generic_parameter_contexts
+        .iter()
+        .any(|context| context.span.contains(type_ref.span) && context.names.contains(&key))
 }
 
 fn is_builtin_type_name(key: &str) -> bool {
@@ -1386,16 +1469,26 @@ fn call_argument_accesses(
             if access != Access::Read {
                 if target_is_local {
                     let target = lvalue_base.expect("a local call target is an lvalue base");
-                    accesses.insert((target.start_byte(), target.end_byte()), access);
+                    insert_call_argument_access(
+                        &mut accesses,
+                        (target.start_byte(), target.end_byte()),
+                        access,
+                    );
                 } else {
                     // The argument is not a recognized variable lvalue. Preserve
                     // soundness by assigning a conservative variable-level effect
                     // to every local it references rather than silently treating
                     // the whole expression as a read.
                     for identifier in fallback_targets {
-                        accesses.insert(
+                        let fallback_access = if access == Access::UnknownCallEffect {
+                            Access::UnknownCallEffect
+                        } else {
+                            Access::ReadWrite
+                        };
+                        insert_call_argument_access(
+                            &mut accesses,
                             (identifier.start_byte(), identifier.end_byte()),
-                            Access::ReadWrite,
+                            fallback_access,
                         );
                     }
                 }
@@ -1418,9 +1511,26 @@ fn call_argument_access_for_mode(mode: super::super::overload::ParameterModeReso
         }
         super::super::overload::ParameterModeResolution::Unresolved
         | super::super::overload::ParameterModeResolution::Resolved(None)
-        | super::super::overload::ParameterModeResolution::Intrinsic(None) => Access::ReadWrite,
+        | super::super::overload::ParameterModeResolution::Intrinsic(None) => {
+            Access::UnknownCallEffect
+        }
         _ => Access::Read,
     }
+}
+
+fn insert_call_argument_access(
+    accesses: &mut HashMap<(usize, usize), Access>,
+    span: (usize, usize),
+    access: Access,
+) {
+    accesses
+        .entry(span)
+        .and_modify(|existing| {
+            if *existing != Access::UnknownCallEffect || access == Access::UnknownCallEffect {
+                *existing = access;
+            }
+        })
+        .or_insert(access);
 }
 
 fn call_argument_lvalue_base<'tree>(

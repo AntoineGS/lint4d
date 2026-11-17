@@ -244,7 +244,11 @@ crates/pascal-lsp/tests/dcc_oracle/e2291_missing_method/MissingMethod.pas e73dde
 crates/pascal-lsp/tests/dcc_oracle/e2291_resolution_clause/ResolutionClause.pas 3c2c08dae8652a92 8
 crates/pascal-lsp/tests/dcc_oracle/e2301_identical_procedure/IdenticalProcedure.pas 9d3c763069f83324 6
 crates/pascal-lsp/tests/dcc_oracle/e2301_identical_result/IdenticalResult.pas 7fccb80451c1a809 6
+crates/pascal-lsp/tests/dcc_oracle/h2077_except_handler_read/ExceptHandlerRead.pas 488b76da1c25ee06 3
 crates/pascal-lsp/tests/dcc_oracle/h2077_field_assignment/FieldAssignment.pas 921e3e3fcebee464 5
+crates/pascal-lsp/tests/dcc_oracle/h2077_finally_handler_read/FinallyHandlerRead.pas f81d49224a49b786 3
+crates/pascal-lsp/tests/dcc_oracle/h2077_inline_argument_in_write_call/InlineArgumentInWriteCall.pas 96c895d4d9a70a8d 9
+crates/pascal-lsp/tests/dcc_oracle/h2077_inline_argument_to_other_result/InlineArgumentToOtherResult.pas ea393a30d46b2de6 8
 crates/pascal-lsp/tests/dcc_oracle/h2077_inline_call_quirk/InlHelper.pas 256b99b9ba837d1b 5
 crates/pascal-lsp/tests/dcc_oracle/h2077_inline_call_quirk/InlProv.pas d4e35e95a4b36520 10
 crates/pascal-lsp/tests/dcc_oracle/h2077_inline_call_quirk/InlUse.pas 718102c4af34c5d7 3

@@ -21,6 +21,7 @@ pub(super) fn flow_diagnostics(
     flows: &[RoutineFlow<'_>],
     prior_diagnostics: &[SemanticDiagnostic],
     capacity: usize,
+    diagnostic_cap_reached: &mut bool,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<Vec<SemanticDiagnostic>, String> {
@@ -55,6 +56,7 @@ pub(super) fn flow_diagnostics(
                 .any(|occurrence| occurrence.var == local_index);
             if !has_occurrence {
                 if diagnostics.len() >= capacity {
+                    *diagnostic_cap_reached = true;
                     return Ok(diagnostics);
                 }
                 let message = DccMessage::H2164.format(&[&local.name, &flow.name]);
@@ -76,6 +78,8 @@ pub(super) fn flow_diagnostics(
             .filter_map(|(var, local)| {
                 (local.kind == LocalKind::Local
                     && local.ty == VarType::Scalar
+                    && local.type_resolved
+                    && !local.unknown_call_effect
                     && !local.address_taken
                     && !local.captured
                     && !local.absolute
@@ -114,6 +118,7 @@ pub(super) fn flow_diagnostics(
         )?;
         for (var, span) in dead_writes {
             if diagnostics.len() >= capacity {
+                *diagnostic_cap_reached = true;
                 return Ok(diagnostics);
             }
             let local = &locals[var];
@@ -177,8 +182,8 @@ fn inline_argument_reads(
     let reads = occurrences
         .iter()
         .filter(|occurrence| occurrence.access == Access::Read)
-        .map(|occurrence| occurrence.span)
-        .collect::<HashSet<_>>();
+        .map(|occurrence| (occurrence.span, occurrence.var))
+        .collect::<HashMap<_, _>>();
     if reads.is_empty() {
         return Ok(HashSet::new());
     }
@@ -191,6 +196,32 @@ fn inline_argument_reads(
         {
             continue;
         }
+        let Some(assignment) = call.parent().filter(|parent| parent.kind() == "assignment") else {
+            continue;
+        };
+        let Some(rhs) = assignment.child_by_field_name("rhs") else {
+            continue;
+        };
+        if rhs.start_byte() != call.start_byte() || rhs.end_byte() != call.end_byte() {
+            continue;
+        }
+        let Some(lhs) = assignment
+            .child_by_field_name("lhs")
+            .filter(|lhs| lhs.kind() == "identifier")
+        else {
+            continue;
+        };
+        let lhs_span = SourceSpan {
+            start: lhs.start_byte(),
+            end: lhs.end_byte(),
+        };
+        let Some(lhs_var) = occurrences
+            .iter()
+            .find(|occurrence| occurrence.span == lhs_span && occurrence.access == Access::Write)
+            .map(|occurrence| occurrence.var)
+        else {
+            continue;
+        };
         let Some(arguments) = call.child_by_field_name("args") else {
             continue;
         };
@@ -203,21 +234,16 @@ fn inline_argument_reads(
             } else {
                 argument
             };
-            let mut pending = vec![expression];
-            while let Some(node) = pending.pop() {
-                check_navigation_cancel(cancel)?;
-                budget.require_work(1, cancel)?;
-                if node.kind() == "identifier" {
-                    let span = SourceSpan {
-                        start: node.start_byte(),
-                        end: node.end_byte(),
-                    };
-                    if reads.contains(&span) {
-                        inline_reads.insert(span);
-                    }
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            if expression.kind() == "identifier" {
+                let span = SourceSpan {
+                    start: expression.start_byte(),
+                    end: expression.end_byte(),
+                };
+                if reads.get(&span) == Some(&lhs_var) {
+                    inline_reads.insert(span);
                 }
-                let mut cursor = node.walk();
-                pending.extend(node.named_children(&mut cursor));
             }
         }
     }
@@ -626,7 +652,9 @@ fn dead_write_spans(
                 }
                 access if inline_read && access == Access::Read => {}
                 Access::Read | Access::AddressOf => live[column] = true,
-                Access::ReadWrite | Access::VarArg => live[column] = true,
+                Access::ReadWrite | Access::UnknownCallEffect | Access::VarArg => {
+                    live[column] = true
+                }
                 Access::OutArg => live[column] = false,
             }
         }
@@ -640,13 +668,21 @@ fn dead_write_spans(
 fn access_reads(access: Access) -> bool {
     matches!(
         access,
-        Access::Read | Access::ReadWrite | Access::VarArg | Access::AddressOf
+        Access::Read
+            | Access::ReadWrite
+            | Access::UnknownCallEffect
+            | Access::VarArg
+            | Access::AddressOf
     )
 }
 
 fn access_writes(access: Access) -> bool {
     matches!(
         access,
-        Access::Write | Access::ReadWrite | Access::VarArg | Access::OutArg
+        Access::Write
+            | Access::ReadWrite
+            | Access::UnknownCallEffect
+            | Access::VarArg
+            | Access::OutArg
     )
 }

@@ -3259,17 +3259,22 @@ impl NavigationIndex {
                 break 'analysis;
             }
             let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
+            let mut flow_diagnostic_cap_reached = false;
             let result = flow::flow_diagnostics_with_budget(
                 self,
                 uri,
                 document,
                 &report.diagnostics,
                 capacity,
+                &mut flow_diagnostic_cap_reached,
                 cancel,
                 &mut budget,
             );
             if let Some(flow_diagnostics) = report.checked_candidate(result, &budget)? {
                 report.diagnostics.extend(flow_diagnostics);
+            }
+            if flow_diagnostic_cap_reached {
+                report.note(SemanticCoverageGap::DiagnosticCap);
             }
         }
         report
@@ -28014,6 +28019,36 @@ mod tests {
         assert_eq!(
             report.diagnostics[0].span.start,
             source.find("Missing0").expect("first missing method")
+        );
+        assert_eq!(report.gaps, vec![SemanticCoverageGap::DiagnosticCap]);
+    }
+
+    #[test]
+    fn semantic_diagnostics_report_flow_findings_truncated_by_the_cap() {
+        let uri =
+            Url::parse("file:///tmp/semantic-diagnostics-flow-cap.pas").expect("flow cap URI");
+        let mut source = String::from(
+            "unit SemanticDiagnosticsFlowCap;\ninterface\nimplementation\nprocedure Run;\nvar\n",
+        );
+        for index in 0..=MAX_SEMANTIC_DIAGNOSTICS {
+            writeln!(&mut source, "  Value{index}: Integer;").expect("write local");
+        }
+        source.push_str("begin end;\nend.\n");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source)
+            .expect("flow cap fixture parses");
+
+        let report = index
+            .semantic_diagnostic_report_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("capped flow diagnostics complete");
+
+        assert_eq!(report.diagnostics.len(), MAX_SEMANTIC_DIAGNOSTICS);
+        assert!(
+            report.diagnostics.iter().all(|diagnostic| {
+                diagnostic.kind == SemanticDiagnosticKind::Dcc(DccMessage::H2164)
+            }),
+            "{report:?}"
         );
         assert_eq!(report.gaps, vec![SemanticCoverageGap::DiagnosticCap]);
     }

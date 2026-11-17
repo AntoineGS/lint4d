@@ -36,6 +36,7 @@ struct LoopFact<'tree> {
     iterator: Option<Node<'tree>>,
     iterator_span: Option<SourceSpan>,
     body_has_break: bool,
+    body_has_continue: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -271,11 +272,27 @@ fn collect_loop_facts<'tree>(
                 start: iterator.start_byte(),
                 end: iterator.end_byte(),
             });
-            let body_has_break = if matches!(kind, LoopKind::For | LoopKind::ForIn) {
-                loop_body_has_break(loop_body, &document.source, cancel, budget)?
-            } else {
-                false
-            };
+            let (body_has_break, body_has_continue) =
+                if matches!(kind, LoopKind::For | LoopKind::ForIn) {
+                    (
+                        loop_body_has_control_transfer(
+                            loop_body,
+                            &document.source,
+                            "break",
+                            cancel,
+                            budget,
+                        )?,
+                        loop_body_has_control_transfer(
+                            loop_body,
+                            &document.source,
+                            "continue",
+                            cancel,
+                            budget,
+                        )?,
+                    )
+                } else {
+                    (false, false)
+                };
             budget.require_owned_bytes(std::mem::size_of::<LoopFact<'tree>>(), cancel)?;
             facts.push(LoopFact {
                 node,
@@ -285,6 +302,7 @@ fn collect_loop_facts<'tree>(
                 iterator,
                 iterator_span,
                 body_has_break,
+                body_has_continue,
             });
         }
         let mut cursor = node.walk();
@@ -305,9 +323,10 @@ fn for_is_descending(node: Node<'_>) -> bool {
         .any(|child| child.kind() == "kDownto")
 }
 
-fn loop_body_has_break(
+fn loop_body_has_control_transfer(
     body: Node<'_>,
     source: &str,
+    transfer: &str,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<bool, String> {
@@ -318,7 +337,7 @@ fn loop_body_has_break(
         if node.id() != body.id() && matches!(node.kind(), "for" | "foreach" | "while" | "repeat") {
             continue;
         }
-        if node.kind() == "identifier" && node_text(node, source).eq_ignore_ascii_case("break") {
+        if node.kind() == "identifier" && node_text(node, source).eq_ignore_ascii_case(transfer) {
             return Ok(true);
         }
         let mut cursor = node.walk();
@@ -402,18 +421,31 @@ fn append_loop_diagnostics(
         if !access_reads(first_access.access) || reported.contains(&first_access.span) {
             continue;
         }
-        budget.require_owned_bytes(std::mem::size_of::<SourceSpan>(), cancel)?;
         reported.insert(first_access.span);
-        if diagnostics.len() >= capacity {
-            *diagnostic_cap_reached = true;
-            return Ok(());
-        }
         let name = &flow.locals[variable].name;
-        diagnostics.push(SemanticDiagnostic {
-            kind: super::super::SemanticDiagnosticKind::Dcc(DccMessage::W1037),
-            span: first_access.span,
-            message: DccMessage::W1037.format(&[name]),
-        });
+        // Delphi 37.0 reports this same W1037 twice when the loop body
+        // contains Continue; preserve that recorded compiler behavior.
+        let warning_count = if fact.body_has_continue
+            && matches!(
+                compiler_version.map(|version| (version.major, version.minor)),
+                Some((37, 0))
+            ) {
+            2
+        } else {
+            1
+        };
+        for _ in 0..warning_count {
+            if diagnostics.len() >= capacity {
+                *diagnostic_cap_reached = true;
+                return Ok(());
+            }
+            budget.require_owned_bytes(std::mem::size_of::<SourceSpan>(), cancel)?;
+            diagnostics.push(SemanticDiagnostic {
+                kind: super::super::SemanticDiagnosticKind::Dcc(DccMessage::W1037),
+                span: first_access.span,
+                message: DccMessage::W1037.format(&[name]),
+            });
+        }
     }
     Ok(())
 }
@@ -433,15 +465,13 @@ fn w1037_supported(
 }
 
 fn h2135_span(document: &Document, fact: LoopFact<'_>) -> Option<SourceSpan> {
-    let start = if fact.kind == LoopKind::While {
-        let version = document.conditional_context.compiler_version?;
-        match (version.major, version.minor) {
-            (21, 0) | (24, 0) => fact.body.start_byte(),
-            (37, 0) => fact.node.start_byte(),
-            _ => return None,
-        }
-    } else {
-        fact.node.start_byte()
+    let version = document.conditional_context.compiler_version?;
+    let version = (version.major, version.minor);
+    let start = match (fact.kind, version) {
+        (LoopKind::For, (21, 0) | (24, 0) | (37, 0)) => fact.node.start_byte(),
+        (LoopKind::While, (21, 0) | (24, 0)) => fact.body.start_byte(),
+        (LoopKind::While, (37, 0)) => fact.node.start_byte(),
+        _ => return None,
     };
     Some(SourceSpan { start, end: start })
 }

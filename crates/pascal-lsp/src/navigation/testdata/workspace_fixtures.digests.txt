@@ -300,8 +300,12 @@ crates/pascal-lsp/tests/dcc_oracle/w1010_private_ancestor/W1010PrivateAncestor.p
 crates/pascal-lsp/tests/dcc_oracle/w1010_reintroduce/W1010Reintroduce.pas 06c20b697a980888 8
 crates/pascal-lsp/tests/dcc_oracle/w1037_assigned_after_loop_ok/AssignedAfterLoop.pas f8b8390281aa779d 4
 crates/pascal-lsp/tests/dcc_oracle/w1037_break_exit/BreakExit.pas e8a8fbb682de68f2 5
+crates/pascal-lsp/tests/dcc_oracle/w1037_continue/ContinueInLoop.pas c80387de5bce1e9d 3
+crates/pascal-lsp/tests/dcc_oracle/w1037_exit_conditional/ExitConditional.pas 505ffd7ad90cad47 4
+crates/pascal-lsp/tests/dcc_oracle/w1037_exit_unconditional/ExitUnconditional.pas fa713ea43828e5c8 3
 crates/pascal-lsp/tests/dcc_oracle/w1037_for_in/ForIn.pas 0ad535baef311c31 5
 crates/pascal-lsp/tests/dcc_oracle/w1037_loop_exit_boundaries/LoopExitBoundaries.pas 6db2b0c75c6a110f 6
+crates/pascal-lsp/tests/dcc_oracle/w1037_raise/RaiseInLoop.pas 582be8c1a5ced0ae 3
 crates/pascal-lsp/tests/dcc_oracle/w1037_read_after_loop/ReadAfterLoop.pas 0d3f2f5b5d345883 4
 crates/tree-sitter-pascal/examples/anon.pas b2649af375b8d031 8
 crates/tree-sitter-pascal/examples/codetoolmanager.pas d8e3ac5e1d9c0849 2891

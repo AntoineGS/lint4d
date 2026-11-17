@@ -1182,6 +1182,102 @@ fn flow_diagnostics_withhold_w1037_for_unrecorded_compiler_versions() {
 }
 
 #[test]
+fn flow_model_keeps_routines_with_known_control_transfers_analyzable() {
+    let sources = [
+        concat!(
+            "program FlowExit;\n",
+            "procedure Demo;\n",
+            "var I: Integer;\n",
+            "begin for I := 1 to 3 do Exit; WriteLn(I); end;\n",
+            "begin Demo; end.\n",
+        ),
+        concat!(
+            "program FlowContinue;\n",
+            "procedure Demo;\n",
+            "var I: Integer;\n",
+            "begin for I := 1 to 3 do Continue; WriteLn(I); end;\n",
+            "begin Demo; end.\n",
+        ),
+        concat!(
+            "program FlowRaise;\n",
+            "uses SysUtils;\n",
+            "procedure Demo;\n",
+            "var I: Integer;\n",
+            "begin\n",
+            "  for I := 1 to 3 do begin WriteLn(I); raise Exception.Create('stop'); end;\n",
+            "  WriteLn(I);\n",
+            "end;\n",
+            "begin Demo; end.\n",
+        ),
+    ];
+
+    for source in sources {
+        assert_eq!(
+            routine(source, "Demo").excluded,
+            None,
+            "known control transfers must not exclude flow analysis: {source}"
+        );
+    }
+}
+
+#[test]
+fn flow_diagnostics_preserve_delphi_37_duplicate_w1037_after_continue() {
+    let source = concat!(
+        "program FlowContinueDuplicate;\n",
+        "procedure Demo;\n",
+        "var I: Integer;\n",
+        "begin\n",
+        "  for I := 1 to 3 do Continue;\n",
+        "  WriteLn(I);\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+
+    for (major, minor, expected) in [(21, 0, 1), (24, 0, 1), (37, 0, 2)] {
+        let warnings = flow_diagnostics_with_version(
+            source,
+            Some(pascal_project::CompilerVersion::new(major, minor)),
+        )
+        .into_iter()
+        .filter(|finding| finding.kind.code() == "W1037")
+        .count();
+
+        assert_eq!(
+            warnings, expected,
+            "Delphi {major}.{minor} records {expected} W1037 warning(s) for this Continue form"
+        );
+    }
+}
+
+#[test]
+fn flow_diagnostics_withhold_h2135_for_unrecorded_compiler_versions() {
+    let source = concat!(
+        "program FlowH2135Version;\n",
+        "procedure Demo;\n",
+        "var I: Integer;\n",
+        "begin\n",
+        "  for I := 2 to 1 do WriteLn(I);\n",
+        "  while False do WriteLn('unreachable');\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+    let unrecorded_versions = [
+        None,
+        Some(pascal_project::CompilerVersion::new(24, 1)),
+        Some(pascal_project::CompilerVersion::new(36, 0)),
+    ];
+
+    for compiler_version in unrecorded_versions {
+        assert!(
+            flow_diagnostics_with_version(source, compiler_version)
+                .iter()
+                .all(|finding| finding.kind.code() != "H2135"),
+            "unrecorded compiler version {compiler_version:?} must not produce H2135"
+        );
+    }
+}
+
+#[test]
 fn flow_diagnostics_withhold_findings_when_a_routine_has_an_unresolved_identifier() {
     let source = concat!(
         "program FlowUnresolved;\n",

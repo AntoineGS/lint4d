@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 21.0
+# dcc32 -B -H+ -W+ -Q -U<lib> ExitUnconditional.pas
+ExitUnconditional.pas(12) W1037 FOR-Loop variable 'I' may be undefined after loop

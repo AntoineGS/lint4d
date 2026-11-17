@@ -423,7 +423,9 @@ fn build_routine_flow<'a>(
     for identifier in body_nodes.iter().copied() {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
-        if identifier.kind() != "identifier" {
+        if identifier.kind() != "identifier"
+            || is_control_transfer_identifier(identifier, &document.source)
+        {
             continue;
         }
         let name = node_text(identifier, &document.source);
@@ -1738,6 +1740,13 @@ fn is_call_entity(identifier: Node<'_>) -> bool {
         current = parent;
     }
     false
+}
+
+fn is_control_transfer_identifier(identifier: Node<'_>, source: &str) -> bool {
+    let name = node_text(identifier, source);
+    ["exit", "break", "continue", "raise"]
+        .iter()
+        .any(|keyword| name.eq_ignore_ascii_case(keyword))
 }
 
 fn is_declaration_name(identifier: Node<'_>) -> bool {

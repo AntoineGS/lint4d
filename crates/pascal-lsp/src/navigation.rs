@@ -89,6 +89,7 @@ mod dcc_message;
 #[cfg(test)]
 mod dcc_oracle_tests;
 mod dcc_surface;
+mod dcc_switches;
 mod declarations;
 #[cfg(test)]
 mod surface_tests;

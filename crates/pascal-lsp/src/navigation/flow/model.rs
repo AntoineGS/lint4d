@@ -1315,6 +1315,28 @@ fn collect_nested_ranges(
     Ok(ranges)
 }
 
+fn collect_child_routines<'a>(
+    root: Node<'a>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Vec<Node<'a>>, String> {
+    let mut routines = Vec::new();
+    let mut cursor = root.walk();
+    let mut pending = root.children(&mut cursor).collect::<Vec<_>>();
+    while let Some(node) = pending.pop() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if matches!(node.kind(), "defProc" | "lambda") {
+            budget.require_owned_bytes(std::mem::size_of::<Node<'a>>(), cancel)?;
+            routines.push(node);
+            continue;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.children(&mut cursor));
+    }
+    Ok(routines)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn mark_loop_variables(
     index: &NavigationIndex,
@@ -1424,10 +1446,31 @@ fn mark_captured_locals(
     if bindings.is_empty() || nested_ranges.is_empty() {
         return Ok(());
     }
-    let local_names = locals
+    let mut local_names = locals
         .iter()
         .map(|local| canonical_name(&local.name))
         .collect::<HashSet<_>>();
+    let mut result_names = HashSet::new();
+    if let Some(result) = locals
+        .iter()
+        .position(|local| local.kind == LocalKind::Result)
+    {
+        result_names.insert(canonical_name(&locals[result].name));
+    }
+    for binding in bindings.iter().filter(|binding| binding.synthetic_result) {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if let Some(symbol) = index
+            .documents
+            .get(&binding.candidate.uri)
+            .and_then(|document| document.symbols.get(binding.candidate.index))
+        {
+            budget.require_owned_bytes(symbol.name.len(), cancel)?;
+            let name = canonical_name(&symbol.name);
+            local_names.insert(name.clone());
+            result_names.insert(name);
+        }
+    }
     let mut pending = vec![routine_node];
     while let Some(node) = pending.pop() {
         check_navigation_cancel(cancel)?;
@@ -1435,7 +1478,11 @@ fn mark_captured_locals(
         let is_nested =
             node.id() != routine_node.id() && matches!(node.kind(), "defProc" | "lambda");
         if is_nested {
-            let nested_nodes = collect_nodes(node, cancel, budget)?;
+            let nested_has_own_result = node.kind() == "defProc"
+                && routine_has_function_result(document, node, cancel, budget)?;
+            let child_routines = collect_child_routines(node, cancel, budget)?;
+            pending.extend(child_routines);
+            let nested_nodes = collect_owned_nodes(node, node.id(), cancel, budget)?;
             for identifier in nested_nodes {
                 check_navigation_cancel(cancel)?;
                 budget.require_work(1, cancel)?;
@@ -1449,26 +1496,41 @@ fn mark_captured_locals(
                 let candidates =
                     resolve_identifier(index, uri, document, identifier, cancel, budget)?;
                 if candidates.len() == 1
-                    && let Some(binding) = bindings.iter().find(|binding| {
-                        binding.candidate == candidates[0] && !binding.synthetic_result
-                    })
+                    && let Some(binding) = bindings
+                        .iter()
+                        .find(|binding| binding.candidate == candidates[0])
                 {
                     locals[binding.var].captured = true;
                 } else if candidates.iter().any(|candidate| {
                     bindings
                         .iter()
-                        .any(|binding| binding.candidate == *candidate && !binding.synthetic_result)
+                        .any(|binding| binding.candidate == *candidate)
                 }) {
                     for binding in bindings.iter().filter(|binding| {
-                        !binding.synthetic_result
-                            && candidates
-                                .iter()
-                                .any(|candidate| candidate == &binding.candidate)
+                        candidates
+                            .iter()
+                            .any(|candidate| candidate == &binding.candidate)
                     }) {
                         locals[binding.var].captured = true;
                     }
                 } else if candidates.is_empty() {
-                    note_exclusion(excluded, FlowExclusion::UnresolvedIdentity);
+                    let is_result_pseudo = key == "result"
+                        && !nested_has_own_result
+                        && !is_right_hand_member(identifier)
+                        && !is_call_entity(identifier);
+                    let is_result_name = key != "result"
+                        && result_names.contains(&key)
+                        && !is_right_hand_member(identifier)
+                        && !is_call_entity(identifier);
+                    if let Some(result) = locals
+                        .iter_mut()
+                        .find(|local| local.kind == LocalKind::Result)
+                        && (is_result_pseudo || is_result_name)
+                    {
+                        result.captured = true;
+                    } else {
+                        note_exclusion(excluded, FlowExclusion::UnresolvedIdentity);
+                    }
                 }
             }
             continue;
@@ -1477,6 +1539,27 @@ fn mark_captured_locals(
         pending.extend(node.children(&mut cursor));
     }
     Ok(())
+}
+
+fn routine_has_function_result(
+    document: &Document,
+    node: Node<'_>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    let declaration_span = Span::from_node(node);
+    for symbol in &document.symbols {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if symbol.kind == SymbolKind::Routine
+            && symbol.origin == Origin::Definition
+            && symbol.declaration_span == declaration_span
+            && symbol.routine_kind == RoutineKind::Function
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn call_argument_accesses(

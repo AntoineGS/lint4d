@@ -298,10 +298,13 @@ crates/pascal-lsp/tests/dcc_oracle/w1010_overload/W1010Overload.pas 36cfab9b2c92
 crates/pascal-lsp/tests/dcc_oracle/w1010_private_ancestor/PrivateAncestor.pas 1a0c2df76f23041f 5
 crates/pascal-lsp/tests/dcc_oracle/w1010_private_ancestor/W1010PrivateAncestor.pas 090f0b5b28e6feab 4
 crates/pascal-lsp/tests/dcc_oracle/w1010_reintroduce/W1010Reintroduce.pas 06c20b697a980888 8
+crates/pascal-lsp/tests/dcc_oracle/w1035_anonymous_result_capture/AnonymousResultCapture.pas 445b09cd309d9d30 4
 crates/pascal-lsp/tests/dcc_oracle/w1035_exit_value/ExitValue.pas 0a7bf4d7858cccb4 2
 crates/pascal-lsp/tests/dcc_oracle/w1035_function_name_assignment/FunctionNameAssignment.pas faa3cbdda698ee08 2
 crates/pascal-lsp/tests/dcc_oracle/w1035_half_result/HalfResult.pas 6c7e333bf587541e 3
 crates/pascal-lsp/tests/dcc_oracle/w1035_method/Method.pas b9e4140e50be9d44 4
+crates/pascal-lsp/tests/dcc_oracle/w1035_nested_function_name_capture/NestedFunctionNameCapture.pas da8ec3b589d14ec3 3
+crates/pascal-lsp/tests/dcc_oracle/w1035_nested_result_capture/NestedResultCapture.pas 4987e687a75d4c0d 3
 crates/pascal-lsp/tests/dcc_oracle/w1035_no_result/NoResult.pas c5863048217994ab 2
 crates/pascal-lsp/tests/dcc_oracle/w1035_raise_path/RaisePath.pas 52f11c9f5a840934 3
 crates/pascal-lsp/tests/dcc_oracle/w1035_record_result_never/RecordResultNever.pas c178d7976397731f 4

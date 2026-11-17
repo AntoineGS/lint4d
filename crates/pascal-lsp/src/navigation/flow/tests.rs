@@ -672,6 +672,60 @@ fn flow_model_creates_result_local_and_binds_result_assignments() {
 }
 
 #[test]
+fn flow_model_marks_nested_result_assignments_as_captured() {
+    let cases = [
+        (
+            include_str!(
+                "../../../tests/dcc_oracle/w1035_nested_result_capture/NestedResultCapture.pas"
+            ),
+            [21, 24, 37].as_slice(),
+        ),
+        (
+            include_str!(
+                "../../../tests/dcc_oracle/w1035_nested_function_name_capture/NestedFunctionNameCapture.pas"
+            ),
+            [21, 24, 37].as_slice(),
+        ),
+        (
+            include_str!(
+                "../../../tests/dcc_oracle/w1035_anonymous_result_capture/AnonymousResultCapture.pas"
+            ),
+            [37].as_slice(),
+        ),
+    ];
+
+    for (source, versions) in cases {
+        let flow = routine(source, "Answer");
+        let result = flow
+            .locals
+            .iter()
+            .find(|local| local.kind == LocalKind::Result)
+            .expect("synthetic function result");
+        assert!(
+            result.captured,
+            "nested assignment must mark the enclosing result as captured: {flow:?}"
+        );
+        assert_eq!(
+            flow.excluded, None,
+            "recognized result captures must not exclude the enclosing flow: {flow:?}"
+        );
+
+        for version in versions {
+            let findings = flow_diagnostics_with_version(
+                source,
+                Some(pascal_project::CompilerVersion::new(*version, 0)),
+            );
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.kind.code() != "W1035"),
+                "captured result must not produce W1035 under {version}.0: {source}"
+            );
+        }
+    }
+}
+
+#[test]
 fn flow_model_treats_exit_value_as_a_result_write() {
     let source = concat!(
         "program FlowExitResult;\n",

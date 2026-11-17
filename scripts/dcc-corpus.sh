@@ -8,23 +8,48 @@ manifest="${LINT4D_CORPUS_MANIFEST:-$HOME/.config/lint4d/corpus.toml}"
 out="${LINT4D_CORPUS_OUT:-$HOME/.cache/lint4d-corpus}"
 prefix="${DCC_CORPUS_WINEPREFIX:-$HOME/.local/share/Headless-Delphi/state/wine}"
 timeout_seconds="${DCC_CORPUS_TIMEOUT:-600}"
+lsp_timeout_seconds="${LINT4D_LSP_TIMEOUT:-600}"
 cargo_bin="${CARGO:-cargo}"
 python_bin="${PYTHON:-python3}"
-requested_names=("$@")
+requested_names=()
+lsp_binary=""
+run_compare=0
 status=0
 selected_count=0
 dcc_runs=0
 skipped_projects=()
 
 usage() {
-  printf 'Usage: %s [name ...]\n' "${BASH_SOURCE[0]}"
+  printf 'Usage: %s [--lsp <pascal-lsp-binary>] [--compare] [name ...]\n' "${BASH_SOURCE[0]}"
 }
 
-if [[ ${#requested_names[@]} -eq 1 && ${requested_names[0]} == -h || \
-      ${#requested_names[@]} -eq 1 && ${requested_names[0]} == --help ]]; then
-  usage
-  exit 0
-fi
+while (($#)); do
+  case $1 in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --lsp)
+      (($# >= 2)) || { echo "--lsp requires a pascal-lsp binary" >&2; exit 2; }
+      [[ -z $lsp_binary ]] || { echo "--lsp may be specified only once" >&2; exit 2; }
+      lsp_binary=$2
+      shift 2
+      ;;
+    --compare)
+      run_compare=1
+      shift
+      ;;
+    --)
+      shift
+      requested_names+=("$@")
+      break
+      ;;
+    *)
+      requested_names+=("$1")
+      shift
+      ;;
+  esac
+done
 
 command -v "$cargo_bin" >/dev/null || { echo "cargo not found: $cargo_bin" >&2; exit 2; }
 command -v "$python_bin" >/dev/null || { echo "python3 is required to read command JSON" >&2; exit 2; }
@@ -32,6 +57,12 @@ command -v wine >/dev/null || { echo "wine not found" >&2; exit 2; }
 command -v timeout >/dev/null || { echo "timeout not found" >&2; exit 2; }
 [[ -d "$prefix/drive_c" ]] || { echo "Wine prefix not found: $prefix" >&2; exit 2; }
 [[ -f "$manifest" ]] || { echo "corpus manifest not found: $manifest" >&2; exit 2; }
+if [[ -n $lsp_binary ]]; then
+  if [[ $lsp_binary != /* ]]; then
+    lsp_binary="$PWD/$lsp_binary"
+  fi
+  [[ -x $lsp_binary ]] || { echo "pascal-lsp binary is not executable: $lsp_binary" >&2; exit 2; }
+fi
 
 manifest="$(cd "$(dirname "$manifest")" && pwd)/$(basename "$manifest")"
 manifest_dir="$(dirname "$manifest")"
@@ -318,6 +349,50 @@ PY
 
   printf 'valid\n' >"$project_out/dcc.validation"
   echo "$name: Delphi $compiler $selected_platform, $message_count message(s), exit $dcc_exit"
+
+  if [[ -n $lsp_binary ]]; then
+    echo "$name: collecting pascal-lsp diagnostics"
+    rm -f -- "$project_out/lsp.txt" "$project_out/lsp.meta.json" \
+      "$project_out/lsp.status" "$project_out/lsp.validation" "$project_out/report.md"
+    if (
+      cd "$root"
+      "$cargo_bin" run -q -p pascal-lsp --example lsp_corpus_diagnostics -- \
+        "$lsp_binary" "$command_json" "$project_out/lsp.txt" \
+        --timeout-secs "$lsp_timeout_seconds"
+    ) >"$project_out/lsp-driver.log" 2>&1; then
+      printf 'valid\n' >"$project_out/lsp.validation"
+    else
+      lsp_exit=$?
+      printf '%s\n' "$lsp_exit" >"$project_out/lsp.status"
+      printf 'failed: diagnostics driver exited %s\n' "$lsp_exit" >"$project_out/lsp.validation"
+      rm -f -- "$project_out/lsp.txt" "$project_out/lsp.meta.json" "$project_out/report.md"
+      echo "$name: LSP diagnostics driver failed (exit $lsp_exit)" >&2
+      status=1
+    fi
+  fi
+
+  if ((run_compare)); then
+    lsp_ready=0
+    if [[ -f $project_out/lsp.txt && -f $project_out/lsp.validation && \
+        $(<"$project_out/lsp.validation") == "valid" ]]; then
+      lsp_ready=1
+    fi
+    if ((lsp_ready)); then
+      echo "$name: comparing DCC and pascal-lsp diagnostics"
+      if ! (
+        cd "$root"
+        "$cargo_bin" run -q -p pascal-lsp --example corpus_compare -- \
+          "$command_json" "$project_out/dcc.raw" "$project_out/lsp.txt" \
+          "$project_out/report.md" --meta "$project_out/lsp.meta.json"
+      ) >"$project_out/compare.log" 2>&1; then
+        echo "$name: comparison report failed" >&2
+        status=1
+      fi
+    else
+      echo "$name: comparison skipped (no valid LSP diagnostics output)" >&2
+      status=1
+    fi
+  fi
 done <<<"$records"
 
 if [[ $selected_count -eq 0 ]]; then

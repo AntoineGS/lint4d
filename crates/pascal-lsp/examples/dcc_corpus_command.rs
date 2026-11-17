@@ -268,6 +268,9 @@ fn build_project_command(
     Ok(json!({
         "compiler": compiler,
         "platform": selected_platform,
+        "project_file": path_string(&dproj),
+        "project_root": path_string(&project_root),
+        "workspace_root": path_string(&workspace_root),
         "dcc": dcc.display().to_string(),
         "main_source": main_source.display().to_string(),
         "unit_paths": dcc_unit_paths

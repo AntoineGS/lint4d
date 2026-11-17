@@ -102,3 +102,38 @@ E2003 locations, resolved/proven-absent proof counts, and table-backed implicit
 System decisions. `System.Internal.Unwinder` is reported as skipped on these
 Windows keys because its unwinder library binding is only defined for Linux or
 macOS.
+
+## Real-project corpus
+
+The developer-only corpus manifest defaults to
+`~/.config/lint4d/corpus.toml` (override with `LINT4D_CORPUS_MANIFEST`). Outputs
+are kept outside the checkout under `~/.cache/lint4d-corpus/` (override with
+`LINT4D_CORPUS_OUT`). Each manifest entry names a project with `name` and
+`dproj`; optional `config` and `platform` select the Delphi build configuration.
+Never put private project names or source paths in repository files.
+
+Build the server in release mode, then run the DCC, LSP, and comparison steps:
+
+```sh
+cargo build --release -p pascal-lsp
+scripts/dcc-corpus.sh --lsp "$PWD/target/release/pascal-lsp" --compare
+```
+
+The script runs DCC under the configured Headless-Delphi Wine prefix and writes
+temporary compiler outputs and all recorded results outside each project
+checkout. `--lsp <binary>` starts the real server with `--stdio`, the Neovim
+`sourcePaths` initialization options, and the nearest `.lint4d.toml` or `.git`
+root; an optional `--init-options <json-file>` can override those initialization
+options for a direct driver invocation. `--compare` can be run later against
+previously collected LSP findings:
+
+```sh
+scripts/dcc-corpus.sh --compare <manifest-entry>
+```
+
+For one project, add its manifest `name` after the options. Set
+`LINT4D_LSP_TIMEOUT` to adjust the default 600-second index-settle limit. The
+per-project `report.md` lists per-code match, invented, and missed counts,
+precision and recall percentages (`—` when a denominator is zero), non-DCC
+diagnostics, include-located DCC messages, and files the server could not
+analyse; examples use only source basenames and line numbers.

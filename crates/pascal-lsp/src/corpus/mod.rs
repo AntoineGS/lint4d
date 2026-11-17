@@ -1,7 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 
 /// Severity parsed from dcc or emitted by pascal-lsp.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Severity {
     Error,
     Warning,
@@ -26,6 +27,37 @@ pub struct LspFinding {
     pub code: String,
     pub source: String,
     pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CodeCounts {
+    pub dcc: usize,
+    pub lint4d: usize,
+    pub matched: usize,
+    pub invented: usize,
+    pub missed: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrictionCategory {
+    pub category: String,
+    pub count: usize,
+    pub example: LspFinding,
+}
+
+pub type NonDccKey = (String, String, Severity);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Report {
+    pub per_code: BTreeMap<String, CodeCounts>,
+    pub invented: Vec<LspFinding>,
+    pub non_dcc: BTreeMap<NonDccKey, usize>,
+    pub non_dcc_samples: BTreeMap<NonDccKey, Vec<LspFinding>>,
+    pub error_severity_on_clean_files: Vec<LspFinding>,
+    pub include_located: Vec<DccMessage>,
+    pub unanalysed_files: Vec<PathBuf>,
+    pub index_timed_out: bool,
+    pub friction: Vec<FrictionCategory>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -175,8 +207,8 @@ fn parse_lsp_line(line: &str) -> Option<LspFinding> {
         let (severity_text, rest) = take_token(rest)?;
         let severity = Severity::parse(severity_text)?;
         let (code, rest) = take_token(rest)?;
-        let (source, text) = take_token(rest)?;
-        if !valid_message_code(code) || source.is_empty() {
+        let (source, text) = take_token_with_optional_text(rest)?;
+        if code.is_empty() || source.is_empty() {
             return None;
         }
 
@@ -199,11 +231,337 @@ fn take_token(text: &str) -> Option<(&str, &str)> {
     Some((token, rest))
 }
 
+fn take_token_with_optional_text(text: &str) -> Option<(&str, &str)> {
+    let text = text.trim_start();
+    if let Some(end) = text.find(char::is_whitespace) {
+        Some((&text[..end], text[end..].trim_start()))
+    } else if text.is_empty() {
+        None
+    } else {
+        Some((text, ""))
+    }
+}
+
 fn valid_message_code(code: &str) -> bool {
     let bytes = code.as_bytes();
     bytes.len() == 5
         && matches!(bytes[0], b'E' | b'W' | b'H' | b'F')
         && bytes[1..].iter().all(u8::is_ascii_digit)
+}
+
+/// Compare compiler and language-server findings for source files owned by a
+/// project. Include-file findings are retained separately because their
+/// locations are not necessarily open Pascal documents in the editor.
+pub fn compare(
+    dcc: &[DccMessage],
+    lsp: &[LspFinding],
+    project_root: &Path,
+    dcc_failed_files: &HashSet<PathBuf>,
+) -> Report {
+    let project_root = normalize_path(project_root);
+    let failed_files = dcc_failed_files
+        .iter()
+        .map(|path| normalize_path(path))
+        .collect::<HashSet<_>>();
+    let mut report = Report::default();
+    let mut dcc_errors = HashSet::new();
+    let mut dcc_occurrences = HashMap::<(PathBuf, u32, String), usize>::new();
+
+    for message in dcc {
+        let path = normalize_path(&message.path);
+        if is_include_file(&path) {
+            report.include_located.push(message.clone());
+            continue;
+        }
+        if failed_files.contains(&path) {
+            continue;
+        }
+        if !path.starts_with(&project_root) || !is_pascal_source(&path) {
+            continue;
+        }
+        if matches!(message.severity, Severity::Error | Severity::Fatal) {
+            dcc_errors.insert(path.clone());
+        }
+        let Some(line) = message.line else {
+            continue;
+        };
+        let counts = report.per_code.entry(message.code.clone()).or_default();
+        counts.dcc += 1;
+        *dcc_occurrences
+            .entry((path, line, message.code.clone()))
+            .or_default() += 1;
+    }
+
+    for finding in lsp {
+        let path = normalize_path(&finding.path);
+        if failed_files.contains(&path)
+            || !path.starts_with(&project_root)
+            || !is_pascal_source(&path)
+        {
+            continue;
+        }
+
+        if valid_message_code(&finding.code) {
+            let counts = report.per_code.entry(finding.code.clone()).or_default();
+            counts.lint4d += 1;
+            let key = (path.clone(), finding.line, finding.code.clone());
+            match dcc_occurrences.get_mut(&key) {
+                Some(remaining) if *remaining > 0 => {
+                    *remaining -= 1;
+                    counts.matched += 1;
+                }
+                _ => {
+                    counts.invented += 1;
+                    report.invented.push(finding.clone());
+                }
+            }
+        } else {
+            let key = (
+                finding.source.clone(),
+                finding.code.clone(),
+                finding.severity,
+            );
+            *report.non_dcc.entry(key.clone()).or_default() += 1;
+            let samples = report.non_dcc_samples.entry(key).or_default();
+            if samples.len() < 3 {
+                samples.push(finding.clone());
+            }
+        }
+
+        if finding.severity == Severity::Error && !dcc_errors.contains(&path) {
+            report.error_severity_on_clean_files.push(finding.clone());
+        }
+    }
+
+    for counts in report.per_code.values_mut() {
+        counts.missed = counts.dcc.saturating_sub(counts.matched);
+    }
+    report.invented.sort_by(compare_findings);
+    report
+        .error_severity_on_clean_files
+        .sort_by(compare_findings);
+    report.include_located.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.code.cmp(&right.code))
+    });
+    report.friction = friction_categories(&report);
+    report
+}
+
+fn compare_findings(left: &LspFinding, right: &LspFinding) -> std::cmp::Ordering {
+    left.path
+        .cmp(&right.path)
+        .then_with(|| left.line.cmp(&right.line))
+        .then_with(|| left.code.cmp(&right.code))
+        .then_with(|| left.source.cmp(&right.source))
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().unwrap_or_default().join(path)
+        }
+    });
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn is_include_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "inc" | "inl"))
+}
+
+fn is_pascal_source(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "pas" | "dpr" | "dpk"
+            )
+        })
+}
+
+fn friction_categories(report: &Report) -> Vec<FrictionCategory> {
+    let mut categories = BTreeMap::<String, (usize, LspFinding)>::new();
+    for finding in &report.invented {
+        let category = format!("dcc-coded {}", finding.code);
+        categories
+            .entry(category)
+            .and_modify(|(count, _)| *count += 1)
+            .or_insert((1, finding.clone()));
+    }
+    for ((source, code, severity), samples) in &report.non_dcc_samples {
+        let count = report
+            .non_dcc
+            .get(&(source.clone(), code.clone(), *severity))
+            .copied()
+            .unwrap_or(0);
+        if let Some(example) = samples.first() {
+            let category = format!("non-dcc {source}/{code} ({})", severity.as_str());
+            categories
+                .entry(category)
+                .and_modify(|(category_count, _)| *category_count += count)
+                .or_insert((count, example.clone()));
+        }
+    }
+
+    let mut friction = categories
+        .into_iter()
+        .map(|(category, (count, example))| FrictionCategory {
+            category,
+            count,
+            example,
+        })
+        .collect::<Vec<_>>();
+    friction.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.category.cmp(&right.category))
+    });
+    friction
+}
+
+/// Render a report without exposing diagnostic message text or absolute
+/// project paths; each example contains only a basename, line, and code.
+pub fn render_markdown(report: &Report) -> String {
+    let mut markdown = String::from("# Corpus comparison\n\n");
+    markdown.push_str("## Per-code parity\n\n");
+    markdown
+        .push_str("| Code | DCC | lint4d | Matched | Invented | Missed | Precision | Recall |\n");
+    markdown.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    if report.per_code.is_empty() {
+        markdown.push_str("| _none_ | 0 | 0 | 0 | 0 | 0 | — | — |\n");
+    } else {
+        for (code, counts) in &report.per_code {
+            markdown.push_str(&format!(
+                "| {code} | {} | {} | {} | {} | {} | {} | {} |\n",
+                counts.dcc,
+                counts.lint4d,
+                counts.matched,
+                counts.invented,
+                counts.missed,
+                format_percentage(counts.matched, counts.lint4d),
+                format_percentage(counts.matched, counts.dcc)
+            ));
+        }
+    }
+
+    markdown.push_str("\n## Friction\n\n");
+    markdown.push_str("| Category | Count | Example |\n");
+    markdown.push_str("| --- | ---: | --- |\n");
+    if report.friction.is_empty() {
+        markdown.push_str("| _none_ | 0 | — |\n");
+    } else {
+        for category in &report.friction {
+            markdown.push_str(&format!(
+                "| {} | {} | {} |\n",
+                category.category,
+                category.count,
+                finding_example(&category.example)
+            ));
+        }
+    }
+
+    markdown.push_str("\n## Non-DCC diagnostics\n\n");
+    markdown.push_str("| Source | Code | Severity | Count | Sample |\n");
+    markdown.push_str("| --- | --- | --- | ---: | --- |\n");
+    if report.non_dcc.is_empty() {
+        markdown.push_str("| _none_ | — | — | 0 | — |\n");
+    } else {
+        for ((source, code, severity), count) in &report.non_dcc {
+            let sample = report
+                .non_dcc_samples
+                .get(&(source.clone(), code.clone(), *severity))
+                .and_then(|findings| findings.first())
+                .map(finding_example)
+                .unwrap_or_else(|| "—".to_string());
+            markdown.push_str(&format!(
+                "| {source} | {code} | {} | {count} | {sample} |\n",
+                severity.as_str()
+            ));
+        }
+    }
+
+    markdown.push_str("\n## Error severity on DCC-clean files\n\n");
+    if report.error_severity_on_clean_files.is_empty() {
+        markdown.push_str("None.\n");
+    } else {
+        for finding in &report.error_severity_on_clean_files {
+            markdown.push_str(&format!("- {}\n", finding_example(finding)));
+        }
+    }
+
+    markdown.push_str("\n## Include-located DCC messages\n\n");
+    if report.include_located.is_empty() {
+        markdown.push_str("None.\n");
+    } else {
+        for message in &report.include_located {
+            markdown.push_str(&format!(
+                "- {}:{} {}\n",
+                file_basename(&message.path),
+                message
+                    .line
+                    .map_or_else(|| "?".to_string(), |line| line.to_string()),
+                message.code
+            ));
+        }
+    }
+
+    markdown.push_str("\n## Index settle\n\n");
+    markdown.push_str(if report.index_timed_out {
+        "Timed out before the index became idle.\n"
+    } else {
+        "Index reached idle.\n"
+    });
+
+    markdown.push_str("\n## Unanalysed files\n\n");
+    if report.unanalysed_files.is_empty() {
+        markdown.push_str("None reported.\n");
+    } else {
+        for path in &report.unanalysed_files {
+            markdown.push_str(&format!("- {}\n", file_basename(path)));
+        }
+    }
+    markdown
+}
+
+fn format_percentage(numerator: usize, denominator: usize) -> String {
+    if denominator == 0 {
+        return "—".to_string();
+    }
+    let percentage = numerator as f64 / denominator as f64 * 100.0;
+    format!("{percentage:.1}%")
+}
+
+fn finding_example(finding: &LspFinding) -> String {
+    format!(
+        "{}:{} {}",
+        file_basename(&finding.path),
+        finding.line,
+        finding.code
+    )
+}
+
+fn file_basename(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<unknown>".to_string())
 }
 
 #[derive(Default)]
@@ -371,10 +729,12 @@ fn strip_manifest_comment(line: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        DccMessage, LspFinding, Manifest, ManifestProject, Severity, format_lsp_finding,
-        linux_path_to_wine, parse_dcc_output, parse_lsp_findings, parse_manifest,
-        wine_path_to_linux,
+        CodeCounts, DccMessage, LspFinding, Manifest, ManifestProject, Report, Severity, compare,
+        format_lsp_finding, linux_path_to_wine, parse_dcc_output, parse_lsp_findings,
+        parse_manifest, render_markdown, wine_path_to_linux,
     };
+    use std::collections::BTreeMap;
+    use std::collections::HashSet;
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -591,5 +951,204 @@ initialization_options_json = '{"sourcePaths":["C:/DelphiSources/rtl"]}'
             wine_path_to_linux(r"Z:\home\x\A.pas").as_deref(),
             Some(Path::new("/home/x/A.pas"))
         );
+    }
+
+    #[test]
+    fn lsp_parser_keeps_non_dcc_diagnostic_codes_and_sources() {
+        let parsed = parse_lsp_findings(
+            "/corpus/Unit.pas(4) Error parse-error tree-sitter unexpected token",
+        );
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].code, "parse-error");
+        assert_eq!(parsed[0].source, "tree-sitter");
+        assert_eq!(parsed[0].text, "unexpected token");
+    }
+
+    #[test]
+    fn compares_dcc_findings_and_separates_non_dcc_include_and_failed_files() {
+        let root = Path::new("/corpus/project");
+        let dcc = vec![
+            DccMessage {
+                path: root.join("Unit.pas"),
+                line: Some(3),
+                severity: Severity::Warning,
+                code: "W1036".into(),
+                text: "not initialized".into(),
+            },
+            DccMessage {
+                path: root.join("Unit.pas"),
+                line: Some(7),
+                severity: Severity::Hint,
+                code: "H2164".into(),
+                text: "unused".into(),
+            },
+            DccMessage {
+                path: root.join("Types.inc"),
+                line: Some(5),
+                severity: Severity::Error,
+                code: "E2003".into(),
+                text: "include error".into(),
+            },
+            DccMessage {
+                path: root.join("Broken.pas"),
+                line: Some(9),
+                severity: Severity::Error,
+                code: "E2003".into(),
+                text: "compile error".into(),
+            },
+        ];
+        let lsp = vec![
+            LspFinding {
+                path: root.join("Unit.pas"),
+                line: 3,
+                severity: Severity::Warning,
+                code: "W1036".into(),
+                source: "pascal-lsp".into(),
+                text: "not initialized".into(),
+            },
+            LspFinding {
+                path: root.join("Unit.pas"),
+                line: 11,
+                severity: Severity::Warning,
+                code: "W1036".into(),
+                source: "pascal-lsp".into(),
+                text: "invented warning".into(),
+            },
+            LspFinding {
+                path: root.join("Clean.pas"),
+                line: 2,
+                severity: Severity::Error,
+                code: "parse-error".into(),
+                source: "tree-sitter".into(),
+                text: "unexpected token".into(),
+            },
+            LspFinding {
+                path: root.join("Broken.pas"),
+                line: 9,
+                severity: Severity::Error,
+                code: "E2003".into(),
+                source: "pascal-lsp".into(),
+                text: "compile error".into(),
+            },
+        ];
+
+        let report = compare(
+            &dcc,
+            &lsp,
+            root,
+            &HashSet::from([root.join("Broken.pas"), root.join("Types.inc")]),
+        );
+
+        assert_eq!(
+            report.per_code["W1036"],
+            CodeCounts {
+                dcc: 1,
+                lint4d: 2,
+                matched: 1,
+                invented: 1,
+                missed: 0,
+            }
+        );
+        assert_eq!(report.invented.len(), 1);
+        assert_eq!(report.invented[0].line, 11);
+        assert_eq!(
+            report.per_code["H2164"],
+            CodeCounts {
+                dcc: 1,
+                lint4d: 0,
+                matched: 0,
+                invented: 0,
+                missed: 1,
+            }
+        );
+        assert_eq!(report.non_dcc.len(), 1);
+        assert_eq!(report.error_severity_on_clean_files, vec![lsp[2].clone()]);
+        assert_eq!(report.include_located, vec![dcc[2].clone()]);
+        assert!(
+            !report
+                .invented
+                .iter()
+                .any(|finding| finding.path.ends_with("Broken.pas"))
+        );
+        assert!(!report.per_code.contains_key("E2003"));
+    }
+
+    #[test]
+    fn renders_comparison_table_and_friction_examples() {
+        let root = Path::new("/corpus/project");
+        let dcc = vec![DccMessage {
+            path: root.join("Unit.pas"),
+            line: Some(3),
+            severity: Severity::Warning,
+            code: "W1036".into(),
+            text: "warning".into(),
+        }];
+        let lsp = vec![LspFinding {
+            path: root.join("Unit.pas"),
+            line: 8,
+            severity: Severity::Warning,
+            code: "W1036".into(),
+            source: "pascal-lsp".into(),
+            text: "invented warning".into(),
+        }];
+
+        let report = compare(&dcc, &lsp, root, &HashSet::new());
+        let markdown = render_markdown(&report);
+
+        assert!(markdown.contains(
+            "| Code | DCC | lint4d | Matched | Invented | Missed | Precision | Recall |"
+        ));
+        assert!(markdown.contains("## Friction"));
+        assert!(markdown.contains("Unit.pas:8"));
+        assert!(markdown.contains("W1036"));
+    }
+
+    #[test]
+    fn renders_precision_and_recall_and_handles_zero_denominators() {
+        let report = Report {
+            per_code: BTreeMap::from([
+                (
+                    "W1001".into(),
+                    CodeCounts {
+                        dcc: 4,
+                        lint4d: 5,
+                        matched: 3,
+                        invented: 2,
+                        missed: 1,
+                    },
+                ),
+                (
+                    "W1002".into(),
+                    CodeCounts {
+                        dcc: 2,
+                        lint4d: 0,
+                        matched: 0,
+                        invented: 0,
+                        missed: 2,
+                    },
+                ),
+                (
+                    "W1003".into(),
+                    CodeCounts {
+                        dcc: 0,
+                        lint4d: 2,
+                        matched: 0,
+                        invented: 2,
+                        missed: 0,
+                    },
+                ),
+            ]),
+            ..Report::default()
+        };
+
+        let markdown = render_markdown(&report);
+
+        assert!(markdown.contains(
+            "| Code | DCC | lint4d | Matched | Invented | Missed | Precision | Recall |"
+        ));
+        assert!(markdown.contains("| W1001 | 4 | 5 | 3 | 2 | 1 | 60.0% | 75.0% |"));
+        assert!(markdown.contains("| W1002 | 2 | 0 | 0 | 0 | 2 | — | 0.0% |"));
+        assert!(markdown.contains("| W1003 | 0 | 2 | 0 | 2 | 0 | 0.0% | — |"));
     }
 }

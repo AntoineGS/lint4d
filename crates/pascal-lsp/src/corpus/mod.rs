@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 /// Severity parsed from dcc or emitted by pascal-lsp.
@@ -47,6 +48,155 @@ pub struct FrictionCategory {
 
 pub type NonDccKey = (String, String, Severity);
 
+#[derive(Debug)]
+enum OwnedPathComponent {
+    Prefix(OsString),
+    RootDir,
+    CurDir,
+    ParentDir,
+    Normal(OsString),
+}
+
+fn owned_components(path: &Path) -> VecDeque<OwnedPathComponent> {
+    path.components()
+        .map(|component| match component {
+            Component::Prefix(prefix) => {
+                OwnedPathComponent::Prefix(prefix.as_os_str().to_os_string())
+            }
+            Component::RootDir => OwnedPathComponent::RootDir,
+            Component::CurDir => OwnedPathComponent::CurDir,
+            Component::ParentDir => OwnedPathComponent::ParentDir,
+            Component::Normal(name) => OwnedPathComponent::Normal(name.to_os_string()),
+        })
+        .collect()
+}
+
+/// Resolve symlinks in an output path while allowing the final path not to
+/// exist yet. This includes dangling symlinks, which must not be treated as
+/// ordinary path components.
+pub fn canonicalize_output_path(path: &Path) -> Result<PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("could not resolve current directory: {error}"))?
+            .join(path)
+    };
+    let mut pending = owned_components(&absolute);
+    let mut resolved = PathBuf::new();
+    let mut symlink_count = 0;
+
+    while let Some(component) = pending.pop_front() {
+        match component {
+            OwnedPathComponent::Prefix(prefix) => resolved.push(prefix),
+            OwnedPathComponent::RootDir => resolved.push(Path::new("/")),
+            OwnedPathComponent::CurDir => {}
+            OwnedPathComponent::ParentDir => {
+                resolved.pop();
+            }
+            OwnedPathComponent::Normal(name) => {
+                let candidate = resolved.join(&name);
+                match std::fs::symlink_metadata(&candidate) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        symlink_count += 1;
+                        if symlink_count > 40 {
+                            return Err(format!(
+                                "too many symlinks while resolving {}",
+                                path.display()
+                            ));
+                        }
+                        let target = std::fs::read_link(&candidate).map_err(|error| {
+                            format!(
+                                "could not resolve output symlink {}: {error}",
+                                candidate.display()
+                            )
+                        })?;
+                        if target.is_absolute() {
+                            resolved.clear();
+                        }
+                        let mut target_components = owned_components(&target);
+                        target_components.append(&mut pending);
+                        pending = target_components;
+                    }
+                    Ok(_) => resolved.push(name),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        resolved.push(name);
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "could not resolve output path {}: {error}",
+                            candidate.display()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
+/// Canonicalize an output path and reject it when it falls inside any
+/// protected corpus checkout root.
+pub fn ensure_output_outside_roots(
+    destination: &Path,
+    protected_roots: &[PathBuf],
+) -> Result<PathBuf, String> {
+    let destination_path = canonicalize_output_path(destination)?;
+    for root in protected_roots {
+        let root = std::fs::canonicalize(root).map_err(|error| {
+            format!("could not resolve corpus root {}: {error}", root.display())
+        })?;
+        if destination_path.starts_with(&root) {
+            return Err(format!(
+                "output path {} is inside a corpus project root {}",
+                destination.display(),
+                root.display()
+            ));
+        }
+    }
+    Ok(destination_path)
+}
+
+/// Return the project directory and nearest LSP workspace root that must not
+/// receive corpus output.
+pub fn protected_output_roots(
+    project_directory: &Path,
+    configured_lsp_root: Option<&Path>,
+) -> Result<Vec<PathBuf>, String> {
+    let project_root = std::fs::canonicalize(project_directory).map_err(|error| {
+        format!(
+            "could not resolve corpus project root {}: {error}",
+            project_directory.display()
+        )
+    })?;
+    let lsp_root = project_root
+        .ancestors()
+        .find(|directory| {
+            directory.join(".lint4d.toml").is_file() || directory.join(".git").exists()
+        })
+        .unwrap_or(&project_root)
+        .to_path_buf();
+    let mut roots = vec![project_root];
+    let lsp_root = std::fs::canonicalize(lsp_root)
+        .map_err(|error| format!("could not resolve LSP workspace root: {error}"))?;
+    if !roots.contains(&lsp_root) {
+        roots.push(lsp_root);
+    }
+    if let Some(configured_lsp_root) = configured_lsp_root {
+        let configured_lsp_root = std::fs::canonicalize(configured_lsp_root).map_err(|error| {
+            format!(
+                "could not resolve configured LSP workspace root {}: {error}",
+                configured_lsp_root.display()
+            )
+        })?;
+        if !roots.contains(&configured_lsp_root) {
+            roots.push(configured_lsp_root);
+        }
+    }
+    Ok(roots)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
     pub per_code: BTreeMap<String, CodeCounts>,
@@ -57,6 +207,7 @@ pub struct Report {
     pub include_located: Vec<DccMessage>,
     pub unanalysed_files: Vec<PathBuf>,
     pub index_timed_out: bool,
+    pub dcc_error_count: Option<usize>,
     pub friction: Vec<FrictionCategory>,
 }
 
@@ -258,12 +409,32 @@ pub fn compare(
     project_root: &Path,
     dcc_failed_files: &HashSet<PathBuf>,
 ) -> Report {
+    compare_with_unanalysed(dcc, lsp, project_root, dcc_failed_files, &HashSet::new())
+}
+
+pub fn compare_with_unanalysed(
+    dcc: &[DccMessage],
+    lsp: &[LspFinding],
+    project_root: &Path,
+    dcc_failed_files: &HashSet<PathBuf>,
+    unanalysed_files: &HashSet<PathBuf>,
+) -> Report {
     let project_root = normalize_path(project_root);
     let failed_files = dcc_failed_files
         .iter()
         .map(|path| normalize_path(path))
+        .chain(unanalysed_files.iter().map(|path| normalize_path(path)))
         .collect::<HashSet<_>>();
-    let mut report = Report::default();
+    let mut unanalysed_files: Vec<PathBuf> = unanalysed_files
+        .iter()
+        .map(|path| normalize_path(path))
+        .collect();
+    unanalysed_files.sort();
+    unanalysed_files.dedup();
+    let mut report = Report {
+        unanalysed_files,
+        ..Report::default()
+    };
     let mut dcc_errors = HashSet::new();
     let mut dcc_occurrences = HashMap::<(PathBuf, u32, String), usize>::new();
 
@@ -445,6 +616,13 @@ pub fn render_markdown(report: &Report) -> String {
     if report.index_timed_out {
         markdown.push_str("Parity counts unavailable: index timeout.\n");
         markdown.push_str("\n## Excluded\n\n- index timeout\n");
+    } else if let Some(count) = report.dcc_error_count {
+        markdown.push_str(&format!(
+            "Parity counts unavailable: excluded: dcc errors ({count}).\n"
+        ));
+        markdown.push_str(&format!(
+            "\n## Excluded\n\n- excluded: dcc errors ({count})\n"
+        ));
     } else {
         markdown.push_str(
             "| Code | DCC | lint4d | Matched | Invented | Missed | Precision | Recall |\n",
@@ -471,6 +649,8 @@ pub fn render_markdown(report: &Report) -> String {
     markdown.push_str("\n## Friction\n\n");
     if report.index_timed_out {
         markdown.push_str("Unavailable: index timeout.\n");
+    } else if let Some(count) = report.dcc_error_count {
+        markdown.push_str(&format!("Unavailable: excluded: dcc errors ({count}).\n"));
     } else {
         markdown.push_str("| Category | Count | Example |\n");
         markdown.push_str("| --- | ---: | --- |\n");
@@ -491,6 +671,8 @@ pub fn render_markdown(report: &Report) -> String {
     markdown.push_str("\n## Non-DCC diagnostics\n\n");
     if report.index_timed_out {
         markdown.push_str("Unavailable: index timeout.\n");
+    } else if let Some(count) = report.dcc_error_count {
+        markdown.push_str(&format!("Unavailable: excluded: dcc errors ({count}).\n"));
     } else {
         markdown.push_str("| Source | Code | Severity | Count | Sample |\n");
         markdown.push_str("| --- | --- | --- | ---: | --- |\n");
@@ -515,6 +697,8 @@ pub fn render_markdown(report: &Report) -> String {
     markdown.push_str("\n## Error severity on DCC-clean files\n\n");
     if report.index_timed_out {
         markdown.push_str("Unavailable: index timeout.\n");
+    } else if let Some(count) = report.dcc_error_count {
+        markdown.push_str(&format!("Unavailable: excluded: dcc errors ({count}).\n"));
     } else if report.error_severity_on_clean_files.is_empty() {
         markdown.push_str("None.\n");
     } else {
@@ -542,6 +726,8 @@ pub fn render_markdown(report: &Report) -> String {
     markdown.push_str("\n## Index settle\n\n");
     markdown.push_str(if report.index_timed_out {
         "Timed out before the index became idle.\n"
+    } else if report.dcc_error_count.is_some() {
+        "Not run: the project was excluded because DCC reported errors.\n"
     } else {
         "Index reached idle.\n"
     });
@@ -705,6 +891,12 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let mut project_names = HashSet::new();
+    for project in &projects {
+        if !project_names.insert(project.name.as_str()) {
+            return Err(format!("duplicate project name {:?}", project.name));
+        }
+    }
 
     Ok(Manifest {
         projects,
@@ -746,8 +938,9 @@ fn strip_manifest_comment(line: &str) -> &str {
 mod tests {
     use super::{
         CodeCounts, DccMessage, LspFinding, Manifest, ManifestProject, Report, Severity, compare,
-        format_lsp_finding, linux_path_to_wine, parse_dcc_output, parse_lsp_findings,
-        parse_manifest, render_markdown, wine_path_to_linux,
+        compare_with_unanalysed, ensure_output_outside_roots, format_lsp_finding,
+        linux_path_to_wine, parse_dcc_output, parse_lsp_findings, parse_manifest, render_markdown,
+        wine_path_to_linux,
     };
     use std::collections::BTreeMap;
     use std::collections::HashSet;
@@ -943,6 +1136,139 @@ initialization_options_json = '{"sourcePaths":["C:/DelphiSources/rtl"]}'
             .expect_err("dproj is required");
 
         assert!(error.contains("dproj"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn rejects_duplicate_manifest_project_names() {
+        let text = concat!(
+            "[[project]]\nname = \"duplicate\"\ndproj = \"/src/First.dproj\"\n",
+            "[[project]]\nname = \"duplicate\"\ndproj = \"/src/Second.dproj\"\n",
+        );
+
+        let error = parse_manifest(text).expect_err("duplicate names are ambiguous");
+
+        assert!(
+            error.contains("duplicate project name"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn unanalysed_files_are_listed_but_excluded_from_every_parity_count() {
+        let root = Path::new("/corpus/project");
+        let unanalysed_path = root.join("Unopened.pas");
+        let dcc = vec![
+            DccMessage {
+                path: root.join("Unit.pas"),
+                line: Some(1),
+                severity: Severity::Warning,
+                code: "W1036".into(),
+                text: "analyzed DCC warning".into(),
+            },
+            DccMessage {
+                path: unanalysed_path.clone(),
+                line: Some(2),
+                severity: Severity::Hint,
+                code: "H2164".into(),
+                text: "unanalysed DCC hint".into(),
+            },
+        ];
+        let lsp = vec![
+            LspFinding {
+                path: root.join("Unit.pas"),
+                line: 1,
+                severity: Severity::Warning,
+                code: "W1036".into(),
+                source: "pascal-lsp".into(),
+                text: "analyzed lint4d warning".into(),
+            },
+            LspFinding {
+                path: unanalysed_path.clone(),
+                line: 2,
+                severity: Severity::Error,
+                code: "parse-error".into(),
+                source: "tree-sitter".into(),
+                text: "unanalysed parse error".into(),
+            },
+            LspFinding {
+                path: unanalysed_path.clone(),
+                line: 2,
+                severity: Severity::Warning,
+                code: "W1036".into(),
+                source: "pascal-lsp".into(),
+                text: "unanalysed lint4d warning".into(),
+            },
+        ];
+
+        let report = compare_with_unanalysed(
+            &dcc,
+            &lsp,
+            root,
+            &HashSet::new(),
+            &HashSet::from([unanalysed_path.clone()]),
+        );
+
+        assert_eq!(
+            report.per_code["W1036"],
+            CodeCounts {
+                dcc: 1,
+                lint4d: 1,
+                matched: 1,
+                invented: 0,
+                missed: 0,
+            }
+        );
+        assert!(!report.per_code.contains_key("H2164"));
+        assert!(report.non_dcc.is_empty());
+        assert!(report.invented.is_empty());
+        assert!(report.error_severity_on_clean_files.is_empty());
+        assert_eq!(report.unanalysed_files, vec![unanalysed_path]);
+    }
+
+    #[test]
+    fn output_path_guard_rejects_direct_and_symlinked_destinations() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).expect("project root");
+
+        let direct = project_root.join("generated/report.md");
+        assert!(
+            ensure_output_outside_roots(&direct, std::slice::from_ref(&project_root))
+                .unwrap_err()
+                .contains("inside a corpus project root")
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let alias = temp.path().join("project-alias");
+            symlink(&project_root, &alias).expect("project root symlink");
+            let indirect = alias.join("generated/report.md");
+            assert!(
+                ensure_output_outside_roots(&indirect, std::slice::from_ref(&project_root))
+                    .unwrap_err()
+                    .contains("inside a corpus project root")
+            );
+        }
+    }
+
+    #[test]
+    fn output_path_guard_also_protects_the_nearest_lsp_workspace_root() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let workspace = temp.path().join("workspace");
+        let project = workspace.join("project");
+        std::fs::create_dir_all(&project).expect("project root");
+        std::fs::write(workspace.join(".lint4d.toml"), "").expect("workspace marker");
+        let roots = super::protected_output_roots(&project, None).expect("protected roots");
+
+        let output = workspace.join("generated/report.md");
+
+        assert!(
+            ensure_output_outside_roots(&output, &roots)
+                .unwrap_err()
+                .contains("inside a corpus project root")
+        );
     }
 
     #[test]
@@ -1191,5 +1517,30 @@ initialization_options_json = '{"sourcePaths":["C:/DelphiSources/rtl"]}'
         assert!(markdown.contains("## Excluded\n\n- index timeout"));
         assert!(!markdown.contains("| Code | DCC |"));
         assert!(!markdown.contains("W9999"));
+    }
+
+    #[test]
+    fn dcc_compile_errors_exclude_parity_counts_and_are_reported() {
+        let report = Report {
+            per_code: BTreeMap::from([(
+                "W9999".into(),
+                CodeCounts {
+                    dcc: 1,
+                    lint4d: 1,
+                    matched: 1,
+                    invented: 0,
+                    missed: 0,
+                },
+            )]),
+            dcc_error_count: Some(2),
+            ..Report::default()
+        };
+
+        let markdown = render_markdown(&report);
+
+        assert!(markdown.contains("excluded: dcc errors (2)"));
+        assert!(markdown.contains("Parity counts unavailable"));
+        assert!(!markdown.contains("| W9999 |"));
+        assert!(markdown.contains("Not run: the project was excluded"));
     }
 }

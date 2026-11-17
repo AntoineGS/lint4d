@@ -14,7 +14,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "Usage:\n  dcc_corpus_command <dproj> [--config C] [--platform P]\n  dcc_corpus_command --list [manifest]\n\nPrints a JSON command description, or name<TAB>dproj<TAB>config<TAB>platform rows in --list mode.\n";
+const USAGE: &str = "Usage:\n  dcc_corpus_command <dproj> [--config C] [--platform P]\n  dcc_corpus_command --list [manifest]\n\nPrints a JSON command description, or name<TAB>dproj<TAB>config<TAB>platform<TAB>initialization-options-json rows in --list mode.\n";
 const LSP_CONFIG_MAX_BYTES: usize = 1024 * 1024;
 const CORPUS_MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CORPUS_PROJECT_UNITS: usize = 256;
@@ -140,12 +140,15 @@ fn list_manifest(path: &Path) -> Result<(), String> {
     let text = fs::read_to_string(path)
         .map_err(|error| format!("could not read manifest {}: {error}", path.display()))?;
     let manifest = pascal_lsp::corpus::parse_manifest(&text)?;
+    let initialization_options =
+        encode_initialization_options(manifest.initialization_options.as_ref())?;
     for project in manifest.projects {
         let fields = [
             project.name,
             project.dproj.to_string_lossy().into_owned(),
             project.config.unwrap_or_default(),
             project.platform.unwrap_or_default(),
+            initialization_options.clone(),
         ];
         if fields
             .iter()
@@ -156,6 +159,14 @@ fn list_manifest(path: &Path) -> Result<(), String> {
         println!("{}", fields.join("\t"));
     }
     Ok(())
+}
+
+fn encode_initialization_options(options: Option<&Value>) -> Result<String, String> {
+    options
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| format!("could not encode LSP initialization options: {error}"))
+        .map(|options| options.unwrap_or_default())
 }
 
 fn project_command(dproj: &Path, config: Option<&str>, platform: Option<&str>) -> Value {
@@ -769,6 +780,17 @@ fn path_string(path: &Path) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn manifest_lsp_options_are_serialized_for_the_script_record() {
+        let options = serde_json::json!({"sourcePaths": ["C:/custom/rtl"]});
+
+        assert_eq!(
+            encode_initialization_options(Some(&options)).unwrap(),
+            r#"{"sourcePaths":["C:/custom/rtl"]}"#
+        );
+        assert_eq!(encode_initialization_options(None).unwrap(), "");
+    }
 
     #[test]
     fn project_walk_follows_explicit_and_transitive_uses_but_excludes_external_units() {

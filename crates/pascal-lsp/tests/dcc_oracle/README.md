@@ -111,6 +111,9 @@ are kept outside the checkout under `~/.cache/lint4d-corpus/` (override with
 `LINT4D_CORPUS_OUT`). Each manifest entry names a project with `name` and
 `dproj`; optional `config` and `platform` select the Delphi build configuration.
 Never put private project names or source paths in repository files.
+An optional `[lsp]` table can set `initialization_options_json` to a JSON string;
+the corpus driver passes that value to the server, and uses the Neovim
+`sourcePaths` defaults only when the manifest omits it.
 
 Build the server in release mode, then run the DCC, LSP, and comparison steps:
 
@@ -119,13 +122,17 @@ cargo build --release -p pascal-lsp
 scripts/dcc-corpus.sh --lsp "$PWD/target/release/pascal-lsp" --compare
 ```
 
-The script runs DCC under the configured Headless-Delphi Wine prefix and writes
-temporary compiler outputs and all recorded results outside each project
-checkout. `--lsp <binary>` starts the real server with `--stdio`, the Neovim
-`sourcePaths` initialization options, and the nearest `.lint4d.toml` or `.git`
-root; an optional `--init-options <json-file>` can override those initialization
-options for a direct driver invocation. `--compare` can be run later against
-previously collected LSP findings:
+The script resolves output and temporary paths through symlinks and refuses
+destinations inside any project checkout or nearest LSP workspace root. It runs
+DCC under the configured Headless-Delphi Wine prefix and writes temporary
+compiler outputs and recorded results outside those roots. `--lsp <binary>`
+starts the real server with `--stdio`, the manifest's initialization options
+(or the Neovim `sourcePaths` defaults when none are present), and the nearest
+`.lint4d.toml` or `.git` root. An optional `--init-options <json-file>` can
+override those options for a direct driver invocation. `--compare` can be run
+later against previously collected LSP findings, but refuses cached diagnostics
+when their run fingerprint no longer matches the command, project file contents,
+initialization options, or server binary path/mtime:
 
 ```sh
 scripts/dcc-corpus.sh --compare <manifest-entry>
@@ -134,8 +141,11 @@ scripts/dcc-corpus.sh --compare <manifest-entry>
 For one project, add its manifest `name` after the options. Set
 `LINT4D_LSP_TIMEOUT` to adjust the default 600-second index-settle limit. The
 script exits nonzero if indexing times out; the comparison report marks parity
-counts unavailable and lists the project under the timeout exclusion. The
-per-project `report.md` lists per-code match, invented, and missed counts,
+counts unavailable and lists the project under the timeout exclusion. DCC runs
+with compile errors or a nonzero exit are recorded as `excluded: dcc errors (N)`
+and have no parity counts because DCC may stop before reporting later findings.
+Files that the LSP driver could not analyse are listed but omitted from all
+parity counts. The per-project `report.md` lists per-code match, invented, and missed counts,
 precision and recall percentages (`—` when a denominator is zero), non-DCC
 diagnostics, include-located DCC messages, and files the server could not
 analyse; examples use only source basenames and line numbers.

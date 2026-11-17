@@ -1,5 +1,7 @@
 use lsp_types::Url;
-use pascal_lsp::corpus::{LspFinding, Severity, format_lsp_finding};
+use pascal_lsp::corpus::{
+    LspFinding, Severity, ensure_output_outside_roots, format_lsp_finding, protected_output_roots,
+};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -9,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
 const PUSH_QUIET_PERIOD: Duration = Duration::from_millis(300);
@@ -31,7 +33,7 @@ const NEOVIM_SOURCE_PATHS: &[&str] = &[
     "C:/DelphiSources/xml",
 ];
 
-const USAGE: &str = "Usage:\n  lsp_corpus_diagnostics <pascal-lsp-binary> <command.json> <out-file> [--init-options <json-file>] [--timeout-secs N]\n";
+const USAGE: &str = "Usage:\n  lsp_corpus_diagnostics <pascal-lsp-binary> <command.json> <out-file> [--init-options <json-file>] [--timeout-secs N] [--fingerprint-only]\n";
 
 struct Arguments {
     binary: PathBuf,
@@ -39,6 +41,15 @@ struct Arguments {
     output: PathBuf,
     init_options: Option<PathBuf>,
     timeout: Duration,
+    fingerprint_only: bool,
+}
+
+#[derive(Clone)]
+struct SourceDocument {
+    path: PathBuf,
+    uri: String,
+    text: String,
+    bytes: Vec<u8>,
 }
 
 fn main() {
@@ -56,11 +67,10 @@ fn run() -> Result<(), String> {
             arguments.binary.display()
         ));
     }
-    let command: Value = serde_json::from_slice(
-        &fs::read(&arguments.command_json)
-            .map_err(|error| format!("could not read command JSON: {error}"))?,
-    )
-    .map_err(|error| format!("invalid command JSON: {error}"))?;
+    let command_bytes = fs::read(&arguments.command_json)
+        .map_err(|error| format!("could not read command JSON: {error}"))?;
+    let command: Value = serde_json::from_slice(&command_bytes)
+        .map_err(|error| format!("invalid command JSON: {error}"))?;
     let files = string_array(&command, "files")?;
     let project_file = command
         .get("project_file")
@@ -78,17 +88,7 @@ fn run() -> Result<(), String> {
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace_root(&project_file));
-    let initialization_options = match &arguments.init_options {
-        Some(path) => serde_json::from_slice(&fs::read(path).map_err(|error| {
-            format!(
-                "could not read initialization options {}: {error}",
-                path.display()
-            )
-        })?)
-        .map_err(|error| format!("invalid initialization options JSON: {error}"))?,
-        None => default_initialization_options(),
-    };
-
+    let initialization_options = load_initialization_options(arguments.init_options.as_deref())?;
     let mut documents = Vec::with_capacity(files.len());
     for file in files {
         let path = PathBuf::from(file);
@@ -102,8 +102,39 @@ fn run() -> Result<(), String> {
             .to_string();
         let bytes = fs::read(&path)
             .map_err(|error| format!("could not read source {}: {error}", path.display()))?;
-        documents.push((path, uri, String::from_utf8_lossy(&bytes).into_owned()));
+        documents.push(SourceDocument {
+            path,
+            uri,
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            bytes,
+        });
     }
+
+    let (run_fingerprint, server_binary, server_mtime_ns) = compute_run_fingerprint(
+        &arguments.binary,
+        &command_bytes,
+        &documents,
+        &initialization_options,
+    )?;
+    if arguments.fingerprint_only {
+        println!("{run_fingerprint}");
+        return Ok(());
+    }
+
+    let project_directory = fs::canonicalize(&project_file)
+        .map_err(|error| {
+            format!(
+                "could not resolve project file {}: {error}",
+                project_file.display()
+            )
+        })?
+        .parent()
+        .ok_or_else(|| "project file has no parent directory".to_string())?
+        .to_path_buf();
+    let protected_roots = protected_output_roots(&project_directory, Some(&root))?;
+    let output_path = ensure_output_outside_roots(&arguments.output, &protected_roots)?;
+    let requested_meta_path = arguments.output.with_extension("meta.json");
+    let meta_path = ensure_output_outside_roots(&requested_meta_path, &protected_roots)?;
 
     let mut client = Client::spawn(&arguments.binary)?;
     let initialize_result = client.request(
@@ -121,15 +152,15 @@ fn run() -> Result<(), String> {
         .is_some_and(|provider| !provider.is_null() && provider != &Value::Bool(false));
     client.notify("initialized", json!({}))?;
 
-    for (_, uri, text) in &documents {
+    for document in &documents {
         client.notify(
             "textDocument/didOpen",
             json!({
                 "textDocument": {
-                    "uri": uri,
+                    "uri": document.uri,
                     "languageId": "pascal",
                     "version": 1,
-                    "text": text
+                    "text": document.text
                 }
             }),
         )?;
@@ -139,30 +170,34 @@ fn run() -> Result<(), String> {
         client.wait_for_index(arguments.timeout, !documents.is_empty())?;
     let mut unanalysed_files = HashSet::new();
     if index_timed_out {
-        unanalysed_files.extend(documents.iter().map(|(path, _, _)| path.clone()));
+        unanalysed_files.extend(documents.iter().map(|document| document.path.clone()));
     } else {
         if pull_supported {
-            for (path, uri, _) in &documents {
+            for document in &documents {
                 let result = client.request(
                     "textDocument/diagnostic",
                     json!({
-                        "textDocument": { "uri": uri },
+                        "textDocument": { "uri": document.uri },
                         "previousResultId": null
                     }),
                     arguments.timeout,
                 );
                 match result {
                     Ok(result) => {
-                        if !client.record_pull_diagnostics(uri, &result) {
-                            unanalysed_files.insert(path.clone());
+                        if !client.record_pull_diagnostics(&document.uri, &result) {
+                            unanalysed_files.insert(document.path.clone());
                         }
                     }
                     Err(error) => {
                         eprintln!(
                             "diagnostic pull failed for {}: {error}",
-                            path.file_name().unwrap_or_default().to_string_lossy()
+                            document
+                                .path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
                         );
-                        unanalysed_files.insert(path.clone());
+                        unanalysed_files.insert(document.path.clone());
                     }
                 }
             }
@@ -170,16 +205,16 @@ fn run() -> Result<(), String> {
             let deadline = Instant::now() + arguments.timeout;
             let expected = documents
                 .iter()
-                .map(|(_, uri, _)| uri.clone())
+                .map(|document| document.uri.clone())
                 .collect::<HashSet<_>>();
             while !expected.is_subset(&client.pushed_uris) && Instant::now() < deadline {
                 if !client.receive_one(deadline.saturating_duration_since(Instant::now()))? {
                     break;
                 }
             }
-            for (path, uri, _) in &documents {
-                if !client.pushed_uris.contains(uri) {
-                    unanalysed_files.insert(path.clone());
+            for document in &documents {
+                if !client.pushed_uris.contains(&document.uri) {
+                    unanalysed_files.insert(document.path.clone());
                 }
             }
         }
@@ -187,30 +222,29 @@ fn run() -> Result<(), String> {
     }
 
     let mut output = Vec::new();
-    for (path, uri, _) in &documents {
+    for document in &documents {
         if index_timed_out {
             continue;
         }
-        let Some(diagnostics) = client.latest_diagnostics.get(uri) else {
-            unanalysed_files.insert(path.clone());
+        let Some(diagnostics) = client.latest_diagnostics.get(&document.uri) else {
+            unanalysed_files.insert(document.path.clone());
             continue;
         };
         for diagnostic in diagnostics {
-            if let Some(finding) = diagnostic_finding(path, diagnostic) {
+            if let Some(finding) = diagnostic_finding(&document.path, diagnostic) {
                 output.push(format_lsp_finding(&finding));
             }
         }
     }
     output.sort();
 
-    let mut output_file = fs::File::create(&arguments.output)
+    let mut output_file = fs::File::create(&output_path)
         .map_err(|error| format!("could not create output file: {error}"))?;
     for line in &output {
         writeln!(output_file, "{line}")
             .map_err(|error| format!("could not write output file: {error}"))?;
     }
 
-    let meta_path = arguments.output.with_extension("meta.json");
     let unanalysed_count = unanalysed_files.len();
     let meta = json!({
         "index_timed_out": index_timed_out,
@@ -218,6 +252,9 @@ fn run() -> Result<(), String> {
         "pull_diagnostics": pull_supported,
         "files_opened": documents.len(),
         "diagnostics": output.len(),
+        "run_fingerprint": run_fingerprint,
+        "server_binary": server_binary,
+        "server_mtime_ns": server_mtime_ns,
         "unanalysed_files": sorted_paths(unanalysed_files)
     });
     fs::write(
@@ -260,6 +297,91 @@ fn initialize_capabilities() -> Value {
     })
 }
 
+fn load_initialization_options(path: Option<&Path>) -> Result<Value, String> {
+    match path {
+        Some(path) => serde_json::from_slice(&fs::read(path).map_err(|error| {
+            format!(
+                "could not read initialization options {}: {error}",
+                path.display()
+            )
+        })?)
+        .map_err(|error| format!("invalid initialization options JSON: {error}")),
+        None => Ok(default_initialization_options()),
+    }
+}
+
+fn compute_run_fingerprint(
+    binary: &Path,
+    command_json: &[u8],
+    documents: &[SourceDocument],
+    initialization_options: &Value,
+) -> Result<(String, String, u128), String> {
+    let server_binary = fs::canonicalize(binary)
+        .map_err(|error| format!("could not resolve pascal-lsp binary: {error}"))?;
+    let binary_metadata = fs::metadata(&server_binary)
+        .map_err(|error| format!("could not inspect pascal-lsp binary: {error}"))?;
+    let modified = binary_metadata
+        .modified()
+        .map_err(|error| format!("could not read pascal-lsp binary mtime: {error}"))?;
+    let server_mtime_ns = modified
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    let mut hasher = blake3::Hasher::new();
+    update_fingerprint(&mut hasher, "version", b"lsp-corpus-run-v1");
+    update_fingerprint(&mut hasher, "command.json", command_json);
+    let options = serde_json::to_vec(initialization_options)
+        .map_err(|error| format!("could not encode initialization options: {error}"))?;
+    update_fingerprint(&mut hasher, "initialization-options", &options);
+    update_fingerprint(
+        &mut hasher,
+        "server-binary-path",
+        server_binary.to_string_lossy().as_bytes(),
+    );
+    update_fingerprint(
+        &mut hasher,
+        "server-binary-mtime-ns",
+        server_mtime_ns.to_string().as_bytes(),
+    );
+
+    let mut sorted_documents = documents
+        .iter()
+        .map(|document| {
+            fs::canonicalize(&document.path)
+                .map(|path| (path, document.bytes.as_slice()))
+                .map_err(|error| {
+                    format!(
+                        "could not resolve project file {} for fingerprint: {error}",
+                        document.path.display()
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    sorted_documents.sort_by(|left, right| left.0.cmp(&right.0));
+    for (path, bytes) in sorted_documents {
+        update_fingerprint(
+            &mut hasher,
+            "project-file-path",
+            path.to_string_lossy().as_bytes(),
+        );
+        update_fingerprint(&mut hasher, "project-file-content", bytes);
+    }
+
+    Ok((
+        hasher.finalize().to_hex().to_string(),
+        server_binary.to_string_lossy().into_owned(),
+        server_mtime_ns,
+    ))
+}
+
+fn update_fingerprint(hasher: &mut blake3::Hasher, label: &str, bytes: &[u8]) {
+    hasher.update(&(label.len() as u64).to_le_bytes());
+    hasher.update(label.as_bytes());
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
 fn parse_arguments(args: &[String]) -> Result<Arguments, String> {
     if args == ["--help"] || args == ["-h"] {
         print!("{USAGE}");
@@ -273,6 +395,7 @@ fn parse_arguments(args: &[String]) -> Result<Arguments, String> {
     let output = PathBuf::from(&args[2]);
     let mut init_options = None;
     let mut timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECS);
+    let mut fingerprint_only = false;
     let mut index = 3;
     while index < args.len() {
         let option = args[index].as_str();
@@ -301,6 +424,12 @@ fn parse_arguments(args: &[String]) -> Result<Arguments, String> {
                 timeout = Duration::from_secs(seconds);
                 index += 1;
             }
+            "--fingerprint-only" => {
+                if fingerprint_only {
+                    return Err("--fingerprint-only may be specified only once".to_string());
+                }
+                fingerprint_only = true;
+            }
             other => return Err(format!("unknown option {other:?}")),
         }
     }
@@ -310,6 +439,7 @@ fn parse_arguments(args: &[String]) -> Result<Arguments, String> {
         output,
         init_options,
         timeout,
+        fingerprint_only,
     })
 }
 
@@ -688,9 +818,15 @@ fn read_message(reader: &mut impl BufRead) -> io::Result<Option<Value>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{diagnostic_finding, index_status_idle, initialize_capabilities};
+    use super::{
+        SourceDocument, compute_run_fingerprint, diagnostic_finding, index_status_idle,
+        initialize_capabilities, load_initialization_options,
+    };
+    use pascal_lsp::corpus::{ensure_output_outside_roots, protected_output_roots};
     use serde_json::json;
+    use std::fs;
     use std::path::Path;
+    use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
     fn index_status_waits_for_context_completion() {
@@ -733,5 +869,130 @@ mod tests {
                 .pointer("/textDocument/publishDiagnostics")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn initialization_options_use_neovim_defaults_only_when_not_supplied() {
+        let default = load_initialization_options(None).expect("default options");
+        assert_eq!(default["sourcePaths"], json!(super::NEOVIM_SOURCE_PATHS));
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("init-options.json");
+        fs::write(&path, r#"{"sourcePaths":["C:/custom/rtl"]}"#).expect("write options");
+        let manifest_options = load_initialization_options(Some(&path)).expect("manifest options");
+        assert_eq!(manifest_options, json!({"sourcePaths": ["C:/custom/rtl"]}));
+    }
+
+    #[test]
+    fn run_fingerprint_covers_source_contents_options_and_server_identity() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let binary = temp.path().join("pascal-lsp");
+        let source = temp.path().join("Unit.pas");
+        fs::write(&binary, b"server binary").expect("write binary");
+        fs::write(&source, b"unit Unit;").expect("write source");
+        let document = SourceDocument {
+            path: source.clone(),
+            uri: "file:///Unit.pas".to_string(),
+            text: "unit Unit;".to_string(),
+            bytes: b"unit Unit;".to_vec(),
+        };
+        let options = json!({"sourcePaths": ["C:/rtl"]});
+        let command = b"{\"files\":[\"Unit.pas\"]}";
+        let (original, server_path, mtime_ns) =
+            compute_run_fingerprint(&binary, command, std::slice::from_ref(&document), &options)
+                .expect("fingerprint");
+        assert_eq!(
+            server_path,
+            fs::canonicalize(&binary).unwrap().display().to_string()
+        );
+        assert_ne!(mtime_ns, 0);
+
+        let (changed_command, _, _) = compute_run_fingerprint(
+            &binary,
+            b"{\"files\":[\"Unit.pas\"],\"changed\":true}",
+            std::slice::from_ref(&document),
+            &options,
+        )
+        .expect("command fingerprint");
+        assert_ne!(original, changed_command);
+
+        let mut changed_document = document.clone();
+        changed_document.bytes = b"unit Unit; // changed".to_vec();
+        let (changed_source, _, _) = compute_run_fingerprint(
+            &binary,
+            command,
+            std::slice::from_ref(&changed_document),
+            &options,
+        )
+        .expect("source fingerprint");
+        assert_ne!(original, changed_source);
+
+        let changed_options = json!({"sourcePaths": ["C:/different"]});
+        let (changed_options, _, _) = compute_run_fingerprint(
+            &binary,
+            command,
+            &[SourceDocument {
+                path: source,
+                uri: "file:///Unit.pas".to_string(),
+                text: "unit Unit;".to_string(),
+                bytes: b"unit Unit;".to_vec(),
+            }],
+            &changed_options,
+        )
+        .expect("options fingerprint");
+        assert_ne!(original, changed_options);
+
+        let second_binary = temp.path().join("other-pascal-lsp");
+        fs::write(&second_binary, b"server binary").expect("write second binary");
+        let (changed_server_path, _, _) = compute_run_fingerprint(
+            &second_binary,
+            command,
+            std::slice::from_ref(&document),
+            &options,
+        )
+        .expect("server-path fingerprint");
+        assert_ne!(original, changed_server_path);
+
+        let server = fs::OpenOptions::new()
+            .write(true)
+            .open(&binary)
+            .expect("open server binary");
+        let modified = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        server
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .expect("set server mtime");
+        let (changed_server_mtime, _, _) =
+            compute_run_fingerprint(&binary, command, &[document], &options)
+                .expect("server-mtime fingerprint");
+        assert_ne!(original, changed_server_mtime);
+    }
+
+    #[test]
+    fn diagnostics_output_guard_rejects_direct_and_symlinked_project_paths() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root).expect("project root");
+        let roots = protected_output_roots(&project_root, None).expect("protected roots");
+
+        let direct = project_root.join("generated/lsp.txt");
+        assert!(
+            ensure_output_outside_roots(&direct, &roots)
+                .unwrap_err()
+                .contains("inside a corpus project root")
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let alias = temp.path().join("project-alias");
+            symlink(&project_root, &alias).expect("project root symlink");
+            let indirect = alias.join("generated/lsp.txt");
+            assert!(
+                ensure_output_outside_roots(&indirect, &roots)
+                    .unwrap_err()
+                    .contains("inside a corpus project root")
+            );
+        }
     }
 }

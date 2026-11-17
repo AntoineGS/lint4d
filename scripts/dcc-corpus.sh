@@ -6,6 +6,7 @@ set -Eeuo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 manifest="${LINT4D_CORPUS_MANIFEST:-$HOME/.config/lint4d/corpus.toml}"
 out="${LINT4D_CORPUS_OUT:-$HOME/.cache/lint4d-corpus}"
+tmp_parent="${TMPDIR:-/tmp}"
 prefix="${DCC_CORPUS_WINEPREFIX:-$HOME/.local/share/Headless-Delphi/state/wine}"
 timeout_seconds="${DCC_CORPUS_TIMEOUT:-600}"
 lsp_timeout_seconds="${LINT4D_LSP_TIMEOUT:-600}"
@@ -64,10 +65,17 @@ if [[ -n $lsp_binary ]]; then
   [[ -x $lsp_binary ]] || { echo "pascal-lsp binary is not executable: $lsp_binary" >&2; exit 2; }
 fi
 
-manifest="$(cd "$(dirname "$manifest")" && pwd)/$(basename "$manifest")"
+canonical_path() {
+  "$python_bin" - "$1" <<'PY'
+import os
+import sys
+
+print(os.path.realpath(sys.argv[1]))
+PY
+}
+
+manifest="$(canonical_path "$manifest")"
 manifest_dir="$(dirname "$manifest")"
-mkdir -p "$out"
-out="$(cd "$out" && pwd)"
 
 if ! records=$(
   cd "$root"
@@ -81,6 +89,79 @@ if [[ -z $records ]]; then
   echo "corpus manifest contains no projects: $manifest" >&2
   exit 2
 fi
+
+protected_roots=()
+while IFS= read -r record; do
+  [[ -n $record ]] || continue
+  name="$(cut -f1 <<<"$record")"
+  dproj="$(cut -f2 <<<"$record")"
+  if [[ ! $name =~ ^[[:alnum:]_.-]+$ || $name == "." || $name == ".." ]]; then
+    echo "unsafe corpus project name: $name" >&2
+    exit 2
+  fi
+  if [[ $dproj != /* ]]; then
+    dproj="$manifest_dir/$dproj"
+  fi
+  mapfile -d '' -t project_roots < <("$python_bin" - "$dproj" <<'PY'
+import os
+import sys
+
+dproj = os.path.realpath(sys.argv[1])
+project_root = os.path.dirname(dproj)
+for lsp_root in (
+    os.path.join(project_root, *([".."] * depth))
+    for depth in range(len(os.path.abspath(project_root).split(os.sep)))
+):
+    lsp_root = os.path.realpath(lsp_root)
+    if os.path.exists(os.path.join(lsp_root, ".lint4d.toml")) or os.path.exists(
+        os.path.join(lsp_root, ".git")
+    ):
+        break
+else:
+    lsp_root = project_root
+sys.stdout.buffer.write(os.fsencode(project_root) + b"\0")
+sys.stdout.buffer.write(os.fsencode(lsp_root) + b"\0")
+PY
+  )
+  protected_roots+=("${project_roots[@]}")
+done <<<"$records"
+
+assert_outside_corpus_roots() {
+  local requested=$1
+  local destination root_path
+  destination="$(canonical_path "$requested")"
+  for root_path in "${protected_roots[@]}"; do
+    if "$python_bin" - "$destination" "$root_path" <<'PY'
+import os
+import sys
+
+destination, root = map(os.path.realpath, sys.argv[1:])
+try:
+    inside = os.path.commonpath((destination, root)) == root
+except ValueError:
+    inside = False
+raise SystemExit(0 if inside else 1)
+PY
+    then
+      echo "unsafe output path $requested: inside a corpus project root $root_path" >&2
+      return 1
+    fi
+  done
+}
+
+out="$(canonical_path "$out")"
+tmp_parent="$(canonical_path "$tmp_parent")"
+[[ -d $tmp_parent ]] || { echo "temporary directory does not exist: $tmp_parent" >&2; exit 2; }
+assert_outside_corpus_roots "$out" || exit 2
+assert_outside_corpus_roots "$tmp_parent" || exit 2
+
+while IFS= read -r record; do
+  [[ -n $record ]] || continue
+  name="$(cut -f1 <<<"$record")"
+  assert_outside_corpus_roots "$out/$name" || exit 2
+done <<<"$records"
+
+mkdir -p "$out"
 
 linux_to_wine() {
   local path=$1
@@ -156,12 +237,28 @@ read_json_array() {
   done
 }
 
+read_meta_field() {
+  local metadata=$1
+  local field=$2
+  "$python_bin" - "$metadata" "$field" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    metadata = json.load(source)
+value = metadata.get(sys.argv[2])
+if isinstance(value, str):
+    print(value)
+PY
+}
+
 while IFS= read -r record; do
   [[ -n $record ]] || continue
   name="$(cut -f1 <<<"$record")"
   dproj="$(cut -f2 <<<"$record")"
   config="$(cut -f3 <<<"$record")"
   platform="$(cut -f4 <<<"$record")"
+  init_options_json="$(cut -f5 <<<"$record")"
 
   if [[ ! $name =~ ^[[:alnum:]_.-]+$ || $name == "." || $name == ".." ]]; then
     echo "unsafe corpus project name: $name" >&2
@@ -178,7 +275,13 @@ while IFS= read -r record; do
     dproj="$manifest_dir/$dproj"
   fi
   project_out="$out/$name"
+  assert_outside_corpus_roots "$project_out" || exit 2
   mkdir -p "$project_out"
+  for output_file in command.json dcc.raw dcc.status dcc.validation lsp.txt \
+    lsp.meta.json lsp.status lsp.validation lsp-init-options.json \
+    lsp-driver.log report.md compare.log; do
+    assert_outside_corpus_roots "$project_out/$output_file" || exit 2
+  done
   command_json="$project_out/command.json"
   command_args=("$dproj")
   [[ -n $config ]] && command_args+=(--config "$config")
@@ -202,6 +305,14 @@ while IFS= read -r record; do
     echo "$name: command example returned invalid JSON" >&2
     status=1
     continue
+  fi
+  lsp_init_args=()
+  if [[ -n $init_options_json ]]; then
+    init_options_file="$project_out/lsp-init-options.json"
+    printf '%s\n' "$init_options_json" >"$init_options_file"
+    lsp_init_args+=(--init-options "$init_options_file")
+  else
+    rm -f -- "$project_out/lsp-init-options.json"
   fi
   skip_reason=$("$python_bin" - "$command_json" <<'PY'
 import json
@@ -276,7 +387,12 @@ PY
     compiler_usage=$usage_output
   fi
 
-  tmp="$(mktemp -d "${TMPDIR:-/tmp}/dcc-corpus.XXXXXXXX")"
+  tmp="$(mktemp -d "$tmp_parent/dcc-corpus.XXXXXXXX")"
+  tmp="$(canonical_path "$tmp")"
+  if ! assert_outside_corpus_roots "$tmp"; then
+    rm -rf -- "$tmp"
+    exit 2
+  fi
   tmp_wine="$(linux_to_wine "$tmp")"
   dcc_args=(-B -Q -W+ -H+)
   append_path_argument U unit_paths
@@ -315,6 +431,28 @@ PY
   banner="$(grep -m1 '^Embarcadero Delphi' "$project_out/dcc.raw" || true)"
   message_count="$(grep -Ec '^[^ ].*\([0-9]+\) (Error|Warning|Hint|Fatal): [EWHF][0-9]{4} ' \
     "$project_out/dcc.raw" || true)"
+  dcc_error_count="$(grep -Eic 'Error: [EF][0-9]{4}([[:space:]]|$)|Fatal:' \
+    "$project_out/dcc.raw" || true)"
+  if [[ $dcc_error_count -gt 0 || $dcc_exit -ne 0 ]]; then
+    printf 'excluded: dcc errors (%s)\n' "$dcc_error_count" >"$project_out/dcc.validation"
+    echo "$name: excluded: dcc errors ($dcc_error_count), exit $dcc_exit"
+    rm -f -- "$project_out/lsp.txt" "$project_out/lsp.meta.json" \
+      "$project_out/lsp.status" "$project_out/lsp.validation" \
+      "$project_out/report.md" "$project_out/compare.log"
+    if ((run_compare)); then
+      : >"$project_out/lsp.txt"
+      if ! (
+        cd "$root"
+        "$cargo_bin" run -q -p pascal-lsp --example corpus_compare -- \
+          "$command_json" "$project_out/dcc.raw" "$project_out/lsp.txt" \
+          "$project_out/report.md" --dcc-excluded "$dcc_error_count"
+      ) >"$project_out/compare.log" 2>&1; then
+        echo "$name: exclusion report failed" >&2
+        status=1
+      fi
+    fi
+    continue
+  fi
   if [[ -z $banner ]]; then
     printf 'failed: compiler banner not found\n' >"$project_out/dcc.validation"
     echo "$name: failed (compiler banner missing); $message_count message(s), exit $dcc_exit" >&2
@@ -328,25 +466,6 @@ PY
     status=1
     continue
   fi
-  if grep -qE '(Fatal|Error): F[0-9]{4}' "$project_out/dcc.raw"; then
-    printf 'failed: fatal compiler diagnostic\n' >"$project_out/dcc.validation"
-    echo "$name: failed (fatal compiler diagnostic); $message_count message(s), exit $dcc_exit" >&2
-    status=1
-    continue
-  fi
-  if [[ $dcc_exit -eq 1 ]] && ! grep -qE 'Error: E[0-9]{4} ' "$project_out/dcc.raw"; then
-    printf 'failed: dcc exited 1 without an error diagnostic\n' >"$project_out/dcc.validation"
-    echo "$name: failed (exit 1 without error); $message_count message(s)" >&2
-    status=1
-    continue
-  fi
-  if [[ $dcc_exit -ne 0 && $dcc_exit -ne 1 ]]; then
-    printf 'failed: dcc exited %s\n' "$dcc_exit" >"$project_out/dcc.validation"
-    echo "$name: failed (dcc exit $dcc_exit); $message_count message(s)" >&2
-    status=1
-    continue
-  fi
-
   printf 'valid\n' >"$project_out/dcc.validation"
   echo "$name: Delphi $compiler $selected_platform, $message_count message(s), exit $dcc_exit"
 
@@ -358,7 +477,7 @@ PY
       cd "$root"
       "$cargo_bin" run -q -p pascal-lsp --example lsp_corpus_diagnostics -- \
         "$lsp_binary" "$command_json" "$project_out/lsp.txt" \
-        --timeout-secs "$lsp_timeout_seconds"
+        "${lsp_init_args[@]}" --timeout-secs "$lsp_timeout_seconds"
     ) >"$project_out/lsp-driver.log" 2>&1; then
       lsp_exit=0
     else
@@ -409,15 +528,37 @@ PY
       lsp_ready=0
     fi
     if ((lsp_ready)); then
-      echo "$name: comparing DCC and pascal-lsp diagnostics"
-      if ! (
-        cd "$root"
-        "$cargo_bin" run -q -p pascal-lsp --example corpus_compare -- \
-          "$command_json" "$project_out/dcc.raw" "$project_out/lsp.txt" \
-          "$project_out/report.md" --meta "$project_out/lsp.meta.json"
-      ) >"$project_out/compare.log" 2>&1; then
-        echo "$name: comparison report failed" >&2
+      fingerprint_binary=$lsp_binary
+      if [[ -z $fingerprint_binary && -f $project_out/lsp.meta.json ]]; then
+        fingerprint_binary="$(read_meta_field "$project_out/lsp.meta.json" server_binary)"
+      fi
+      current_fingerprint=""
+      if [[ -n $fingerprint_binary && -x $fingerprint_binary ]]; then
+        current_fingerprint=$(
+          cd "$root"
+          "$cargo_bin" run -q -p pascal-lsp --example lsp_corpus_diagnostics -- \
+            "$fingerprint_binary" "$command_json" "$project_out/lsp.txt" \
+            "${lsp_init_args[@]}" --fingerprint-only
+        ) || current_fingerprint=""
+      fi
+      recorded_fingerprint=""
+      if [[ -f $project_out/lsp.meta.json ]]; then
+        recorded_fingerprint="$(read_meta_field "$project_out/lsp.meta.json" run_fingerprint)"
+      fi
+      if [[ -z $current_fingerprint || $current_fingerprint != "$recorded_fingerprint" ]]; then
+        echo "$name: comparison skipped (LSP run fingerprint mismatch)" >&2
         status=1
+      else
+        echo "$name: comparing DCC and pascal-lsp diagnostics"
+        if ! (
+          cd "$root"
+          "$cargo_bin" run -q -p pascal-lsp --example corpus_compare -- \
+            "$command_json" "$project_out/dcc.raw" "$project_out/lsp.txt" \
+            "$project_out/report.md" --meta "$project_out/lsp.meta.json"
+        ) >"$project_out/compare.log" 2>&1; then
+          echo "$name: comparison report failed" >&2
+          status=1
+        fi
       fi
     else
       echo "$name: comparison skipped (no valid LSP diagnostics output)" >&2

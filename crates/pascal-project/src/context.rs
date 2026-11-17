@@ -297,6 +297,47 @@ impl ProjectContext {
         &self.search_path_entries
     }
 
+    /// Ordered unit paths suitable for a compiler invocation.
+    ///
+    /// Project-owned directories are always first, followed by the remaining
+    /// ordered search entries (normally the selected IDE library path). Entries
+    /// supplied only for source navigation are removed by both path and
+    /// provenance; project-owned paths remain even when they are also present
+    /// in the caller's navigation roots.
+    pub fn compiler_unit_path_entries(
+        &self,
+        navigation_entries: &[ProjectPathEntry],
+    ) -> Vec<ProjectPathEntry> {
+        let mut entries = Vec::new();
+        for directory in &self.project_unit_directories {
+            let entry = self
+                .search_path_entries
+                .iter()
+                .find(|entry| project_paths_equal(&entry.path, directory))
+                .cloned()
+                .unwrap_or_else(|| ProjectPathEntry::legacy(directory.clone()));
+            if !entries
+                .iter()
+                .any(|existing: &ProjectPathEntry| project_paths_equal(&existing.path, directory))
+            {
+                entries.push(entry);
+            }
+        }
+        for entry in &self.search_path_entries {
+            if navigation_entries.iter().any(|navigation| {
+                project_paths_equal(&navigation.path, &entry.path)
+                    && navigation.provenance == entry.provenance
+            }) || entries
+                .iter()
+                .any(|existing| project_paths_equal(&existing.path, &entry.path))
+            {
+                continue;
+            }
+            entries.push(entry.clone());
+        }
+        entries
+    }
+
     pub fn browsing_path_entries(&self) -> &[ProjectPathEntry] {
         &self.browsing_path_entries
     }

@@ -110,6 +110,7 @@ name, and all ranges map back to physical include files. The codes are:
 | Warning | Hides virtual method | `W1010` | A method hides an accessible virtual or dynamic ancestor method. |
 | Warning | Hides base member | `W1009` | A redeclaration hides a base-class member. |
 | Hint | Private symbol unused | `H2219` | A private class member is declared but never used. |
+| Hint | Inline expansion unavailable | `H2443` | A proven inline call uses a source-backed unit absent from the caller's `USES` list. |
 
 Override and interface diagnostics use the same complete source-backed ancestry,
 visibility, conditional-state, generic-substitution, cancellation, and traversal
@@ -127,6 +128,13 @@ delegations (including inherited and derived-interface targets), and inherited
 implementations are followed; interface diamonds are memoized and charged on
 every visit, while cyclic or depth/budget-exhausted ancestry is treated as
 incomplete.
+
+H2443 is limited to uniquely selected, non-generic inline routines whose
+provider and executable body are complete. It examines references in routine
+locals and the body; dependencies appearing only in parameter or result types
+are intentionally unsupported and remain silent. Generic routines, unresolved
+or ambiguous imports, incomplete providers/bodies, and unproven body
+identifiers also remain silent.
 
 Missing-interface diagnostics are emitted for source-declared classes,
 including abstract classes, with complete source-declared interface ancestry,

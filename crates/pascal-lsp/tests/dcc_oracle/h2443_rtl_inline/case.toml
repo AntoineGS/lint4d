@@ -2,3 +2,5 @@ unit = "RtlUse.pas"
 compilers = ["21.0", "24.0", "37.0"]
 requires_rtl = true
 reason = "Uses a real RTL inline routine; recall may be waived when the complete RTL source provider is unavailable."
+recall_exempt = ["H2443"]
+recall_exempt_reason = "Delphi 24.0 and 37.0 Winapi.Windows RTL sources contain parser recovery and unresolved conditional regions; H2443 deliberately fails closed when the inline body resolves references through that incomplete provider. DCC precision remains checked."

@@ -335,6 +335,9 @@ impl NavigationIndex {
         let (Some(declaration), Some(definition)) = (declaration, definition) else {
             return Ok(None);
         };
+        // Generic routines and signature-only dependencies are unsupported:
+        // H2443 proves unit references from a concrete routine's locals/body,
+        // not from parameter or result types in its header.
         if !declaration.routine_directives.inline
             || declaration.unresolved_abbreviated
             || definition.unresolved_abbreviated
@@ -432,6 +435,13 @@ impl NavigationIndex {
                     }
                     if candidates.is_empty() {
                         if state.compiler_surface_resolved {
+                            // A compiler-surface hit cannot disambiguate a
+                            // same-named identifier from an unindexed import.
+                            if !self.imports_are_complete_for_proof(
+                                document, span.start, cancel, budget,
+                            )? {
+                                return Ok(None);
+                            }
                             continue;
                         }
                         return Ok(None);
@@ -847,6 +857,124 @@ mod tests {
                 ("InlineHelper", HELPER),
                 ("InlineProvider", incomplete_provider),
                 ("InlineCaller", CALLER),
+            ],
+            "InlineCaller",
+        );
+
+        assert!(h2443(&diagnostics).is_empty());
+    }
+
+    #[test]
+    fn compiler_surface_miss_with_an_incomplete_provider_import_is_silent() {
+        // MissingProviderImport is deliberately unindexed and may export a
+        // TObject that shadows the compiler-surface name; HelperValue resolves
+        // through indexed InlineHelper and must not leak a claim.
+        let provider = PROVIDER
+            .replace(
+                "uses InlineHelper;",
+                "uses MissingProviderImport, InlineHelper;",
+            )
+            .replace(
+                "Result := HelperValue",
+                "if TObject = nil then Result := HelperValue",
+            );
+        let key = super::super::dcc_surface::SurfaceKey {
+            major: 37,
+            minor: 0,
+            platform: super::super::dcc_surface::SurfacePlatform::Win32,
+        };
+        let table = super::super::dcc_surface::table_for(&key).unwrap();
+        let context = super::super::dcc_surface::verified_system_context(&key, &table);
+        let diagnostics = indexed_diagnostics_with_context(
+            &[
+                ("InlineHelper", HELPER),
+                ("InlineProvider", &provider),
+                ("InlineCaller", CALLER),
+            ],
+            "InlineCaller",
+            &context,
+        );
+
+        assert!(h2443(&diagnostics).is_empty());
+    }
+
+    #[test]
+    fn complete_provider_imports_allow_compiler_surface_misses() {
+        let provider = PROVIDER.replace(
+            "Result := HelperValue",
+            "if TObject = nil then Result := HelperValue",
+        );
+        let key = super::super::dcc_surface::SurfaceKey {
+            major: 37,
+            minor: 0,
+            platform: super::super::dcc_surface::SurfacePlatform::Win32,
+        };
+        let table = super::super::dcc_surface::table_for(&key).unwrap();
+        let context = super::super::dcc_surface::verified_system_context(&key, &table);
+        let diagnostics = indexed_diagnostics_with_context(
+            &[
+                ("InlineHelper", HELPER),
+                ("InlineProvider", &provider),
+                ("InlineCaller", CALLER),
+            ],
+            "InlineCaller",
+            &context,
+        );
+
+        assert_eq!(h2443(&diagnostics).len(), 1);
+    }
+
+    #[test]
+    fn parameter_type_only_dependency_does_not_produce_h2443() {
+        let helper = HELPER.replace(
+            "interface\nfunction HelperValue",
+            "interface\ntype THelperArgument = Integer;\nfunction HelperValue",
+        );
+        let provider = concat!(
+            "unit InlineProvider;\n",
+            "interface\nuses InlineHelper;\n",
+            "procedure UsesHelper(Value: THelperArgument); inline;\n",
+            "implementation\n",
+            "procedure UsesHelper(Value: THelperArgument); begin end;\n",
+            "end.\n",
+        );
+        let caller = concat!(
+            "unit InlineCaller;\n",
+            "interface\nimplementation\nuses InlineProvider;\n",
+            "procedure P;\nbegin UsesHelper(1); end;\nend.\n",
+        );
+        let diagnostics = indexed_diagnostics(
+            &[
+                ("InlineHelper", &helper),
+                ("InlineProvider", provider),
+                ("InlineCaller", caller),
+            ],
+            "InlineCaller",
+        );
+
+        assert!(h2443(&diagnostics).is_empty());
+    }
+
+    #[test]
+    fn generic_inline_routines_do_not_produce_h2443() {
+        let provider = concat!(
+            "unit InlineProvider;\n",
+            "interface\n",
+            "function UsesHelper<T>(Value: T): T; inline;\n",
+            "implementation\n",
+            "function UsesHelper<T>(Value: T): T; begin Result := Value; end;\n",
+            "end.\n",
+        );
+        let caller = concat!(
+            "unit InlineCaller;\n",
+            "interface\nimplementation\nuses InlineProvider;\n",
+            "procedure P;\nvar I: Integer;\nbegin I := UsesHelper<Integer>(1); end;\nend.\n",
+        );
+        let diagnostics = indexed_diagnostics(
+            &[
+                ("InlineHelper", HELPER),
+                ("InlineProvider", provider),
+                ("InlineCaller", caller),
             ],
             "InlineCaller",
         );

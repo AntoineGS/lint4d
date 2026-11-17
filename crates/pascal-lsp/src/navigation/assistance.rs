@@ -1546,11 +1546,26 @@ impl NavigationIndex {
                 }
             }
 
-            if !with_lookup_blocks
-                && !accumulator.exhausted
-                && let Some(owner_type) = current_document
-                    .owner_type_at(offset)
-                    .filter(|_| !current_document.offset_is_in_helper_declaration(offset))
+            let owner_type = if !with_lookup_blocks && !accumulator.exhausted {
+                if let Some(owner_type) = current_document.owner_type_at(offset) {
+                    if current_document.owner_type_is_alias_definition_context_with_budget(
+                        &owner_type,
+                        offset,
+                        cancel,
+                        accumulator.budget,
+                    )? {
+                        None
+                    } else {
+                        Some(owner_type)
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(owner_type) =
+                owner_type.filter(|_| !current_document.offset_is_in_helper_declaration(offset))
             {
                 let (member_uri, member_type, member_scope, member_substitution, helper_owner) =
                     self.helper_target_for_owner_with_budget(
@@ -7175,6 +7190,36 @@ mod tests {
         assert_eq!(seed.candidate_uri(), &uri);
         assert!(seed.candidate_index() < index.documents[&uri].symbols.len());
         assert!(!seed.has_substitution());
+    }
+
+    #[test]
+    fn completion_in_type_alias_rhs_keeps_imported_type_candidates() {
+        let provider_uri = Url::parse("file:///AliasCompletionProvider.pas").expect("provider URI");
+        let consumer_uri = Url::parse("file:///AliasCompletionConsumer.pas").expect("consumer URI");
+        let provider = "unit AliasCompletionProvider;\ninterface\ntype TAliasTarget = class end;\nimplementation\nend.\n";
+        let consumer = "unit AliasCompletionConsumer;\ninterface\nuses AliasCompletionProvider;\ntype TAlias = TAliasTa;\nimplementation\nend.\n";
+        let mut index = NavigationIndex::new();
+        index
+            .update(provider_uri, provider.to_owned())
+            .expect("provider parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("consumer parses");
+
+        let offset = consumer.find("TAliasTa").expect("alias target prefix") + "TAliasTa".len();
+        let position = text::offset_to_position(consumer, offset).expect("completion position");
+        let completion = index
+            .completion(&consumer_uri, position)
+            .expect("alias target completion");
+
+        assert!(
+            completion
+                .items
+                .iter()
+                .any(|item| item.label == "TAliasTarget"),
+            "imported type candidates must remain visible in an alias RHS: {:?}",
+            completion.items
+        );
     }
 
     #[test]

@@ -1,0 +1,3 @@
+unit = "E2003MemberOfSystemRootedClass.pas"
+requires_rtl = true
+compilers = ["21.0", "24.0", "37.0"]

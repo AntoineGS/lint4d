@@ -1,5 +1,4 @@
 unit = "InheritedImplementation.pas"
 requires_rtl = true
 recall = false
-reason = "Needs System for IInterface obligations; loaded RTL conditional/recovery completeness makes interface ancestry unknown to the contract pass."
-silent = ["E2291"]
+reason = "Delphi 13's hash-matching System.pas still has parser-recovery spans and incomplete conditionals under the verified context, so IInterface ancestry is unknown and the E2291 obligations remain silent."

@@ -2042,7 +2042,7 @@ end.
 }
 
 #[test]
-fn unrelated_local_rename_inside_with_body_remains_safe() {
+fn local_rename_inside_class_with_unknown_implicit_root_is_refused() {
     let source = "unit WithSafeLocalRename;
 interface
 type
@@ -2063,9 +2063,39 @@ end.
     let source_uri = update(&mut index, "WithSafeLocalRename", source);
     let declaration = range_in(source, "LocalValue: Integer", "LocalValue", 0);
 
+    assert!(
+        index
+            .rename_edits(&source_uri, declaration.start, "RenamedLocal")
+            .is_err(),
+        "without a surface table, an implicit TObject member could shadow the local"
+    );
+}
+
+#[test]
+fn unrelated_local_rename_inside_with_record_body_remains_safe() {
+    let source = "unit WithSafeLocalRename;
+interface
+type
+  TBox = record
+    Value: Integer;
+  end;
+implementation
+procedure Run(Box: TBox);
+var
+  LocalValue: Integer;
+begin
+  with Box do
+    LocalValue := 1;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "WithSafeLocalRename", source);
+    let declaration = range_in(source, "LocalValue: Integer", "LocalValue", 0);
+
     let edits = index
         .rename_edits(&source_uri, declaration.start, "RenamedLocal")
-        .expect("an unrelated local inside with can be renamed safely");
+        .expect("an unrelated local inside a with-record can be renamed safely");
     assert_exact_edits(
         &edits,
         vec![

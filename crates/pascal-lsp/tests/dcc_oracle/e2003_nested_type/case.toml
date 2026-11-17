@@ -1,0 +1,4 @@
+unit = "E2003NestedType.pas"
+compilers = ["21.0", "24.0", "37.0"]
+recall = false
+reason = "Nested type references such as TOuter.TMissing are not yet proven absent by the semantic model; precision remains enforced."

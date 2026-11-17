@@ -83,10 +83,17 @@ mod assistance;
 mod call_hierarchy;
 pub mod compiled_dcu;
 mod contracts;
+#[cfg(test)]
+mod corpus_precision_tests;
 mod dcc_message;
 #[cfg(test)]
 mod dcc_oracle_tests;
+mod dcc_surface;
 mod declarations;
+#[cfg(test)]
+mod surface_tests;
+#[cfg(test)]
+mod system_trust_tests;
 pub(crate) use dcc_message::{DccMessage, DccSeverity};
 mod documentation;
 mod facts;
@@ -209,6 +216,62 @@ thread_local! {
     static TEST_QUALIFIED_IDENTIFIER_CANCEL_REQUESTED: Cell<bool> = const { Cell::new(false) };
     static TEST_UNIT_PATH_NODE_VISITS: Cell<usize> = const { Cell::new(0) };
     static TEST_CANCEL_AFTER_UNIT_PATH_NODE_VISITS: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SemanticProofCounters {
+    pub(super) resolved: usize,
+    pub(super) proven_absent: usize,
+    pub(super) table_backed_implicit_system: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SEMANTIC_PROOF_COUNTERS: Cell<SemanticProofCounters> = const {
+        Cell::new(SemanticProofCounters {
+            resolved: 0,
+            proven_absent: 0,
+            table_backed_implicit_system: 0,
+        })
+    };
+}
+
+#[cfg(test)]
+pub(super) fn test_reset_semantic_proof_counters() {
+    TEST_SEMANTIC_PROOF_COUNTERS.with(|counters| counters.set(SemanticProofCounters::default()));
+}
+
+#[cfg(test)]
+pub(super) fn test_semantic_proof_counters() -> SemanticProofCounters {
+    TEST_SEMANTIC_PROOF_COUNTERS.with(Cell::get)
+}
+
+#[cfg(test)]
+fn test_record_semantic_proof_status(status: SemanticProofStatus) {
+    TEST_SEMANTIC_PROOF_COUNTERS.with(|slot| {
+        let mut counters = slot.get();
+        match status {
+            SemanticProofStatus::Resolved => {
+                counters.resolved = counters.resolved.saturating_add(1)
+            }
+            SemanticProofStatus::ProvenAbsent => {
+                counters.proven_absent = counters.proven_absent.saturating_add(1)
+            }
+            SemanticProofStatus::Incomplete | SemanticProofStatus::Ambiguous => return,
+        }
+        slot.set(counters);
+    });
+}
+
+#[cfg(test)]
+fn test_record_table_backed_implicit_system_decision() {
+    TEST_SEMANTIC_PROOF_COUNTERS.with(|slot| {
+        let mut counters = slot.get();
+        counters.table_backed_implicit_system =
+            counters.table_backed_implicit_system.saturating_add(1);
+        slot.set(counters);
+    });
 }
 
 #[cfg(test)]
@@ -793,8 +856,6 @@ pub(crate) enum SemanticProofStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SemanticDiagnosticKind {
-    UnresolvedIdentifier,
-    MissingMember,
     TypeMismatch,
     IncompatibleArgument,
     #[allow(dead_code)]
@@ -804,8 +865,6 @@ pub(crate) enum SemanticDiagnosticKind {
 impl SemanticDiagnosticKind {
     pub(crate) fn code(self) -> &'static str {
         match self {
-            Self::UnresolvedIdentifier => "pascal-unresolved-identifier",
-            Self::MissingMember => "pascal-missing-member",
             Self::TypeMismatch => "pascal-type-mismatch",
             Self::IncompatibleArgument => "pascal-incompatible-argument",
             Self::Dcc(message) => message.code(),
@@ -815,10 +874,7 @@ impl SemanticDiagnosticKind {
     pub(crate) fn severity(self) -> DccSeverity {
         match self {
             Self::Dcc(message) => message.severity(),
-            Self::UnresolvedIdentifier
-            | Self::MissingMember
-            | Self::TypeMismatch
-            | Self::IncompatibleArgument => DccSeverity::Error,
+            Self::TypeMismatch | Self::IncompatibleArgument => DccSeverity::Error,
         }
     }
 }
@@ -854,8 +910,7 @@ impl MissingUnitUseKind {
 
 fn semantic_diagnostic_kind_rank(kind: SemanticDiagnosticKind) -> u8 {
     match kind {
-        SemanticDiagnosticKind::UnresolvedIdentifier => 0,
-        SemanticDiagnosticKind::MissingMember => 1,
+        SemanticDiagnosticKind::Dcc(DccMessage::E2003) => 0,
         SemanticDiagnosticKind::TypeMismatch => 2,
         SemanticDiagnosticKind::IncompatibleArgument => 3,
         SemanticDiagnosticKind::Dcc(_) => 6,
@@ -1350,13 +1405,26 @@ impl NavigationIndex {
             .documents
             .get(&uri)
             .map(|document| document.parsed.clone());
+        let verified_system = uri
+            .to_file_path()
+            .ok()
+            .filter(|path| {
+                path.file_stem()
+                    .is_some_and(|stem| stem.to_string_lossy().eq_ignore_ascii_case("system"))
+            })
+            .and_then(|_| dcc_surface::verified_system_key(context, &source));
+        let system_context = verified_system
+            .as_ref()
+            .map(|(key, table)| dcc_surface::verified_system_context(key, table));
+        let verified_system_key = verified_system.map(|(key, _)| key);
         let document = Document::parse_with_session(
             uri.clone(),
             source,
-            context,
+            system_context.as_ref().unwrap_or(context),
             cancel,
             previous.or(cached),
             expansion,
+            verified_system_key,
         )?;
         if cancel.load(Ordering::Relaxed) {
             return Err("request cancelled".to_string());
@@ -1390,10 +1458,24 @@ impl NavigationIndex {
             return false;
         }
         let unit = parsed.unit_name.clone();
+        let verified_system_surface = uri
+            .to_file_path()
+            .ok()
+            .filter(|path| {
+                path.file_stem()
+                    .is_some_and(|stem| stem.to_string_lossy().eq_ignore_ascii_case("system"))
+            })
+            .filter(|_| unit == "system")
+            .and_then(|_| dcc_surface::verified_system_key(context, &parsed.source))
+            .and_then(|(key, table)| {
+                (parsed.conditional_context == dcc_surface::verified_system_context(&key, &table))
+                    .then_some(key)
+            });
         self.documents.insert(
             uri.clone(),
             Document {
                 parsed,
+                verified_system_surface,
                 import_bindings: None,
                 import_binding_fingerprint: None,
                 unbound: None,
@@ -1469,6 +1551,7 @@ impl NavigationIndex {
                 document_uri.clone(),
                 Document {
                     parsed: document.parsed.clone(),
+                    verified_system_surface: document.verified_system_surface.clone(),
                     import_bindings,
                     import_binding_fingerprint: document.import_binding_fingerprint,
                     unbound: document.unbound.clone(),
@@ -2950,6 +3033,7 @@ impl NavigationIndex {
         }
 
         'analysis: {
+            let mut reported_undeclared_names = HashSet::new();
             for identifier in identifiers {
                 if cancel.load(Ordering::Relaxed) {
                     return Err("request cancelled".to_string());
@@ -2973,13 +3057,7 @@ impl NavigationIndex {
                 };
                 let kind = match status {
                     SemanticProofStatus::ProvenAbsent => {
-                        if member_expression_at(identifier)
-                            .is_some_and(|dot| is_right_hand_member(dot, identifier))
-                        {
-                            SemanticDiagnosticKind::MissingMember
-                        } else {
-                            SemanticDiagnosticKind::UnresolvedIdentifier
-                        }
+                        SemanticDiagnosticKind::Dcc(DccMessage::E2003)
                     }
                     SemanticProofStatus::Resolved
                     | SemanticProofStatus::Ambiguous
@@ -2989,17 +3067,12 @@ impl NavigationIndex {
                     break 'analysis;
                 }
                 let name = node_text(identifier, &document.source);
-                let message = match kind {
-                    SemanticDiagnosticKind::UnresolvedIdentifier => {
-                        format!("unresolved identifier '{name}'")
-                    }
-                    SemanticDiagnosticKind::MissingMember => {
-                        format!("missing member '{name}'")
-                    }
-                    SemanticDiagnosticKind::TypeMismatch
-                    | SemanticDiagnosticKind::IncompatibleArgument
-                    | SemanticDiagnosticKind::Dcc(_) => continue,
-                };
+                if !is_qualified_identifier_rhs(identifier)
+                    && !reported_undeclared_names.insert(canonical_name(&name))
+                {
+                    continue;
+                }
+                let message = DccMessage::E2003.format(&[&name]);
                 report.diagnostics.push(SemanticDiagnostic {
                     kind,
                     span: SourceSpan {
@@ -6631,6 +6704,15 @@ impl NavigationIndex {
         if !self.imports_are_complete_for_proof(document, offset, cancel, budget)? {
             return Ok(SemanticProofStatus::Incomplete);
         }
+        if is_implicit_system_unit_qualifier(identifier, &document.source)
+            && dcc_surface::SurfaceKey::from_context(&document.conditional_context)
+                .and_then(|surface| dcc_surface::table_for(&surface))
+                .is_some()
+        {
+            #[cfg(test)]
+            test_record_semantic_proof_status(SemanticProofStatus::Resolved);
+            return Ok(SemanticProofStatus::Resolved);
+        }
 
         let mut state = ResolutionState::new();
         let candidates = self.resolve_candidates_at_with_state_and_budget(
@@ -6643,6 +6725,13 @@ impl NavigationIndex {
             return Ok(SemanticProofStatus::Incomplete);
         }
         if !candidates.is_empty() {
+            #[cfg(test)]
+            test_record_semantic_proof_status(SemanticProofStatus::Resolved);
+            return Ok(SemanticProofStatus::Resolved);
+        }
+        if state.compiler_surface_resolved {
+            #[cfg(test)]
+            test_record_semantic_proof_status(SemanticProofStatus::Resolved);
             return Ok(SemanticProofStatus::Resolved);
         }
         if state.ambiguous {
@@ -6655,6 +6744,8 @@ impl NavigationIndex {
         {
             return Ok(SemanticProofStatus::Incomplete);
         }
+        #[cfg(test)]
+        test_record_semantic_proof_status(SemanticProofStatus::ProvenAbsent);
         Ok(SemanticProofStatus::ProvenAbsent)
     }
 
@@ -6931,6 +7022,10 @@ impl NavigationIndex {
     ) -> Result<bool, String> {
         let region = document.region_at(offset);
         let active_uses = document.active_uses_with_budget(region, cancel, budget)?;
+        let has_system_surface_table =
+            dcc_surface::SurfaceKey::from_context(&document.conditional_context)
+                .and_then(|key| dcc_surface::table_for(&key))
+                .is_some();
         for unit in active_uses {
             check_navigation_cancel(cancel)?;
             let key = canonical_name(unit);
@@ -6944,20 +7039,31 @@ impl NavigationIndex {
             let Some(provider) = urls.first().and_then(|url| self.documents.get(url)) else {
                 return Ok(false);
             };
-            budget.require_work(
-                provider
-                    .parser_recovery_spans
-                    .len()
-                    .saturating_add(provider.conditionals.unknown_spans.len()),
-                cancel,
-            )?;
-            if !provider.parser_recovery_spans.is_empty()
-                || !provider.conditionals.unknown_spans.is_empty()
-            {
+            if provider.unit_name == "system" && has_system_surface_table {
+                budget.require_work(1, cancel)?;
+                continue;
+            }
+            if !Self::document_is_complete_for_proof(provider, cancel, budget)? {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    fn document_is_complete_for_proof(
+        document: &Document,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        budget.require_work(
+            document
+                .parser_recovery_spans
+                .len()
+                .saturating_add(document.conditionals.unknown_spans.len()),
+            cancel,
+        )?;
+        Ok(document.parser_recovery_spans.is_empty()
+            && document.conditionals.unknown_spans.is_empty())
     }
 
     /// Number of retained parsed documents.
@@ -7851,8 +7957,22 @@ impl NavigationIndex {
                 WithLookup::NotFound => {}
             }
         }
-        let owner_type =
-            document.owner_type_at_identifier_with_budget(identifier, scope, cancel, budget)?;
+        let owner_type = if let Some(owner_type) =
+            document.owner_type_at_identifier_with_budget(identifier, scope, cancel, budget)?
+        {
+            if document.owner_type_is_alias_definition_context_with_budget(
+                &owner_type,
+                identifier.start_byte(),
+                cancel,
+                budget,
+            )? {
+                None
+            } else {
+                Some(owner_type)
+            }
+        } else {
+            None
+        };
 
         let scope_chain = self.scope_chain_from_with_budget(document, scope, cancel, budget)?;
         budget.require_bytes(
@@ -7961,8 +8081,11 @@ impl NavigationIndex {
                     budget,
                 )?
             };
+            if members.compiler_surface_resolved {
+                state.mark_compiler_surface_resolved();
+            }
             if !members.ancestry_known
-                || (members.implicit_member_known && members.candidates.is_empty())
+                || (members.proof_incomplete && members.candidates.is_empty())
                 || !members.ambiguous_names.is_empty()
                 || members
                     .candidates
@@ -8084,7 +8207,7 @@ impl NavigationIndex {
         }
 
         let implicit_system =
-            self.implicit_system_references_with_budget(key, state, cancel, budget)?;
+            self.implicit_system_references_with_budget(document, key, state, cancel, budget)?;
         if !implicit_system.is_empty() {
             return Ok(implicit_system);
         }
@@ -8094,23 +8217,25 @@ impl NavigationIndex {
 
     fn implicit_system_references_with_budget(
         &self,
+        document: &Document,
         key: &str,
         state: &mut ResolutionState,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Candidate>, String> {
-        let status = self.implicit_system_namespace_status();
-        let ImplicitSystemNamespaceStatus::SourceBacked { uri } = status else {
-            // The compiler's implicit System namespace is not represented by
-            // a complete source catalogue here.  A failed value lookup,
-            // including an assignment target, therefore cannot prove that
-            // the name is absent: compiler-provided writable globals may be
-            // missing from the retained source index.
-            state.mark_implicit_system_namespace_incomplete();
-            return Ok(Vec::new());
+        let uri = match self.implicit_system_namespace_status() {
+            ImplicitSystemNamespaceStatus::Unavailable => {
+                self.apply_implicit_system_surface_fallback(document, key, state);
+                return Ok(Vec::new());
+            }
+            ImplicitSystemNamespaceStatus::Ambiguous => {
+                state.mark_implicit_system_namespace_incomplete();
+                return Ok(Vec::new());
+            }
+            ImplicitSystemNamespaceStatus::SourceBacked { uri } => uri,
         };
         let Some(provider) = self.documents.get(&uri) else {
-            state.mark_implicit_system_namespace_incomplete();
+            self.apply_implicit_system_surface_fallback(document, key, state);
             return Ok(Vec::new());
         };
         budget.require_work(
@@ -8123,18 +8248,131 @@ impl NavigationIndex {
         if !provider.parser_recovery_spans.is_empty()
             || !provider.conditionals.unknown_spans.is_empty()
         {
-            state.mark_implicit_system_namespace_incomplete();
+            if document.unit_name == "sysinit" && matches!(key, "_startexe" | "_startlib") {
+                let candidates =
+                    self.exported_references_for_key_with_budget(&uri, key, cancel, budget)?;
+                if !candidates.is_empty()
+                    && candidates
+                        .iter()
+                        .all(|candidate| !self.candidate_is_conditionally_unknown(candidate))
+                {
+                    // Known declarations in these exact compiler-hidden
+                    // exports are usable by SysInit even when unrelated
+                    // System source is incomplete.
+                    return Ok(candidates);
+                }
+
+                let verified_key =
+                    dcc_surface::SurfaceKey::from_context(&document.conditional_context);
+                let system_matches_importer = verified_key.as_ref().is_some_and(|surface| {
+                    provider.verified_system_surface.as_ref() == Some(surface)
+                        && dcc_surface::table_for(surface)
+                            .is_some_and(|table| table.is_defined("MSWINDOWS"))
+                });
+                if system_matches_importer {
+                    let declared_by_system = candidates.iter().any(|candidate| {
+                        self.documents
+                            .get(&candidate.uri)
+                            .and_then(|system| system.symbols.get(candidate.index))
+                            .is_some_and(|symbol| {
+                                symbol.kind == SymbolKind::Routine
+                                    && symbol.region == Region::Interface
+                                    && symbol.origin == Origin::Declaration
+                            })
+                    });
+                    if declared_by_system {
+                        // These exact declarations are compiler-hidden from
+                        // ordinary units, but SysInit consumes them. Accept
+                        // them only for the exact System.pas hash and Windows
+                        // key used to derive the table; a failed global
+                        // conditional analysis must not invalidate that
+                        // source-level bootstrap fact (l4d-1m02.3.1).
+                        state.mark_compiler_surface_resolved();
+                        return Ok(Vec::new());
+                    }
+                }
+            }
+            self.apply_implicit_system_surface_fallback(document, key, state);
             return Ok(Vec::new());
         }
 
         let candidates = self.exported_references_for_key_with_budget(&uri, key, cancel, budget)?;
         if candidates.is_empty() {
-            // Source-backed names are usable as positive evidence, but an
-            // arbitrary System.pas does not establish the compiler's full
-            // implicit export surface.
-            state.mark_implicit_system_namespace_incomplete();
+            self.apply_implicit_system_surface_fallback(document, key, state);
         }
         Ok(candidates)
+    }
+
+    fn qualified_system_references_with_budget(
+        &self,
+        document: &Document,
+        key: &str,
+        state: &mut ResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
+        let uri = match self.implicit_system_namespace_status() {
+            ImplicitSystemNamespaceStatus::Unavailable => {
+                self.apply_compiler_surface_fallback(document, key, state);
+                return Ok(Vec::new());
+            }
+            ImplicitSystemNamespaceStatus::Ambiguous => {
+                state.mark_implicit_system_namespace_incomplete();
+                return Ok(Vec::new());
+            }
+            ImplicitSystemNamespaceStatus::SourceBacked { uri } => uri,
+        };
+        let Some(provider) = self.documents.get(&uri) else {
+            self.apply_compiler_surface_fallback(document, key, state);
+            return Ok(Vec::new());
+        };
+        budget.require_work(
+            provider
+                .parser_recovery_spans
+                .len()
+                .saturating_add(provider.conditionals.unknown_spans.len()),
+            cancel,
+        )?;
+
+        let candidates = self.exported_references_for_key_with_budget(&uri, key, cancel, budget)?;
+        if candidates.is_empty() {
+            self.apply_compiler_surface_fallback(document, key, state);
+        }
+        Ok(candidates)
+    }
+
+    fn apply_compiler_surface_fallback(
+        &self,
+        document: &Document,
+        key: &str,
+        state: &mut ResolutionState,
+    ) -> bool {
+        let table = dcc_surface::SurfaceKey::from_context(&document.conditional_context)
+            .and_then(|surface| dcc_surface::table_for(&surface));
+        match table {
+            Some(table) => {
+                if table.has_name(key) {
+                    state.mark_compiler_surface_resolved();
+                }
+                true
+            }
+            None => {
+                state.mark_implicit_system_namespace_incomplete();
+                false
+            }
+        }
+    }
+
+    fn apply_implicit_system_surface_fallback(
+        &self,
+        document: &Document,
+        key: &str,
+        state: &mut ResolutionState,
+    ) {
+        if self.apply_compiler_surface_fallback(document, key, state) {
+            #[cfg(test)]
+            test_record_table_backed_implicit_system_decision();
+        }
     }
 
     fn implicit_system_namespace_status(&self) -> ImplicitSystemNamespaceStatus {
@@ -8196,6 +8434,54 @@ impl NavigationIndex {
         Ok(result)
     }
 
+    fn current_unit_references_for_key_with_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        offset: usize,
+        key: &str,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
+        budget.require_bytes(key.len(), cancel)?;
+        let key = key.to_owned();
+        let Some(indices) = document.symbol_indices_by_scope_key.get(&(ROOT_SCOPE, key)) else {
+            return Ok(Vec::new());
+        };
+        budget.require_work(indices.len(), cancel)?;
+        budget.require_bytes(uri.as_str().len().saturating_mul(indices.len()), cancel)?;
+        budget.require_owned_bytes(
+            indices
+                .len()
+                .saturating_mul(std::mem::size_of::<Candidate>()),
+            cancel,
+        )?;
+        let region = document.region_at(offset);
+        let mut result = Vec::with_capacity(indices.len());
+        for index in indices {
+            check_navigation_cancel(cancel)?;
+            let Some(symbol) = document.symbols.get(*index) else {
+                continue;
+            };
+            if symbol.kind != SymbolKind::Unit
+                && !symbol.local_only
+                && document.has_unqualified_owner(*index, symbol)
+                && symbol.generic_parameter.is_none()
+                && !symbol.unresolved_abbreviated
+                && symbol_is_available_at_with_budget(
+                    document, symbol, uri, uri, offset, cancel, budget,
+                )?
+                && symbol_visible_in_region(symbol, region)
+            {
+                result.push(Candidate {
+                    uri: uri.clone(),
+                    index: *index,
+                });
+            }
+        }
+        Ok(result)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn member_references_with_state_and_budget(
         &self,
@@ -8214,8 +8500,29 @@ impl NavigationIndex {
             state.mark_member_lookup_incomplete();
             return Ok(Vec::new());
         };
+        let system_qualified = lhs.kind() == "identifier"
+            && node_text_with_budget(lhs, &current_document.source, cancel, budget)?
+                .eq_ignore_ascii_case("System");
         budget.require_bytes(member_name.len(), cancel)?;
         let key = canonical_name(member_name);
+        if system_qualified
+            && self.implicit_system_qualifier_is_unshadowed_with_budget(
+                current_uri,
+                current_document,
+                offset,
+                lhs,
+                cancel,
+                budget,
+            )?
+        {
+            return self.qualified_system_references_with_budget(
+                current_document,
+                &key,
+                state,
+                cancel,
+                budget,
+            );
+        }
         let receivers = self.resolve_receivers_with_state_and_budget(
             current_uri,
             current_document,
@@ -8228,7 +8535,16 @@ impl NavigationIndex {
             depth.saturating_add(1),
         )?;
         if receivers.is_empty() {
-            state.mark_member_lookup_incomplete();
+            if system_qualified
+                && !state.receiver_resolution_uncertain()
+                && !state.member_lookup_incomplete
+                && !state.inaccessible_candidate
+                && !state.ambiguous
+            {
+                self.apply_compiler_surface_fallback(current_document, &key, state);
+            } else {
+                state.mark_member_lookup_incomplete();
+            }
             return Ok(Vec::new());
         }
         if receivers.len() != 1 {
@@ -8240,9 +8556,37 @@ impl NavigationIndex {
             budget.require_work(1, cancel)?;
             match receiver {
                 Receiver::Unit(unit_uri) => {
-                    references.extend(self.exported_references_for_key_with_budget(
-                        &unit_uri, &key, cancel, budget,
-                    )?);
+                    if unit_uri == *current_uri {
+                        references.extend(self.current_unit_references_for_key_with_budget(
+                            current_uri,
+                            current_document,
+                            offset,
+                            &key,
+                            cancel,
+                            budget,
+                        )?);
+                        continue;
+                    }
+                    let system_document = self
+                        .documents
+                        .get(&unit_uri)
+                        .filter(|document| document.unit_name == "system");
+                    if let Some(provider) = system_document {
+                        budget.require_work(
+                            provider
+                                .parser_recovery_spans
+                                .len()
+                                .saturating_add(provider.conditionals.unknown_spans.len()),
+                            cancel,
+                        )?;
+                    }
+                    let candidates = self
+                        .exported_references_for_key_with_budget(&unit_uri, &key, cancel, budget)?;
+                    if candidates.is_empty() && system_document.is_some() {
+                        self.apply_compiler_surface_fallback(current_document, &key, state);
+                    } else {
+                        references.extend(candidates);
+                    }
                 }
                 Receiver::Type(instance) => {
                     let lookup = self.member_references_for_instance_with_budget(
@@ -8255,8 +8599,11 @@ impl NavigationIndex {
                         cancel,
                         budget,
                     )?;
+                    if lookup.compiler_surface_resolved {
+                        state.mark_compiler_surface_resolved();
+                    }
                     if !lookup.ancestry_known
-                        || (lookup.implicit_member_known && lookup.candidates.is_empty())
+                        || (lookup.proof_incomplete && lookup.candidates.is_empty())
                         || lookup.ambiguous_names.contains(&key)
                     {
                         state.mark_member_lookup_incomplete();
@@ -8276,6 +8623,51 @@ impl NavigationIndex {
             }
         }
         Ok(references)
+    }
+
+    fn implicit_system_qualifier_is_unshadowed_with_budget(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        identifier: Node<'_>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        let mut state = ResolutionState::new();
+        let references = self.unqualified_references_with_budget_and_state(
+            current_uri,
+            current_document,
+            offset,
+            "System",
+            identifier,
+            &mut state,
+            cancel,
+            budget,
+        )?;
+        let indexed_system_unit = matches!(
+            self.implicit_system_namespace_status(),
+            ImplicitSystemNamespaceStatus::SourceBacked { .. }
+        );
+        if !references.is_empty()
+            || state.ambiguous
+            || state.member_lookup_incomplete
+            || (state.implicit_system_namespace_incomplete && !indexed_system_unit)
+            || state.receiver_resolution_uncertain()
+            || state.inaccessible_candidate
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .visible_unit_urls_with_budget(
+                current_uri,
+                current_document,
+                offset,
+                "System",
+                cancel,
+                budget,
+            )?
+            .is_empty())
     }
 
     /// The type an owner segment of a method heading names. Its first
@@ -8788,7 +9180,11 @@ impl NavigationIndex {
     ) -> WithLookup {
         let key = canonical_name(name);
 
-        let overlay = state.with_receivers.clone();
+        let overlay = if document.has_with_context_at(offset) {
+            state.with_receivers.clone()
+        } else {
+            Vec::new()
+        };
         if !overlay.is_empty() {
             for slot in overlay.iter().rev() {
                 match slot {
@@ -9001,8 +9397,12 @@ impl NavigationIndex {
             key,
             instance.uri == *uri,
         );
+        if lookup.compiler_surface_resolved {
+            state.mark_compiler_surface_resolved();
+        }
         if !lookup.ancestry_known
-            || (lookup.implicit_member_known && lookup.candidates.is_empty())
+            || (lookup.compiler_surface_resolved && lookup.candidates.is_empty())
+            || (lookup.proof_incomplete && lookup.candidates.is_empty())
             || lookup.ambiguous_names.contains(key)
             || lookup
                 .candidates
@@ -9039,7 +9439,11 @@ impl NavigationIndex {
     ) -> Result<WithLookup, String> {
         budget.require_bytes(name.len(), cancel)?;
         let key = canonical_name(name);
-        let overlay = state.with_receivers.clone();
+        let overlay = if document.has_with_context_at(offset) {
+            state.with_receivers.clone()
+        } else {
+            Vec::new()
+        };
         for slot in overlay.iter().rev() {
             match slot {
                 WithReceiverSlot::Known(receivers) => {
@@ -9296,8 +9700,12 @@ impl NavigationIndex {
             cancel,
             budget,
         )?;
+        if lookup.compiler_surface_resolved {
+            state.mark_compiler_surface_resolved();
+        }
         if !lookup.ancestry_known
-            || (lookup.implicit_member_known && lookup.candidates.is_empty())
+            || (lookup.compiler_surface_resolved && lookup.candidates.is_empty())
+            || (lookup.proof_incomplete && lookup.candidates.is_empty())
             || lookup.ambiguous_names.contains(key)
             || lookup
                 .candidates
@@ -9662,6 +10070,36 @@ impl NavigationIndex {
             state.mark_member_lookup_incomplete();
             return Vec::new();
         };
+        if lhs.kind() == "identifier"
+            && node_text(lhs, &current_document.source).eq_ignore_ascii_case("System")
+        {
+            let cancel = AtomicBool::new(false);
+            // The legacy navigation entry point has no request budget. Reuse
+            // the source-first implicit-System lookup with an unbounded one.
+            let mut budget =
+                AssistanceBudget::new(usize::MAX, usize::MAX, "implicit System lookup");
+            if self
+                .implicit_system_qualifier_is_unshadowed_with_budget(
+                    current_uri,
+                    current_document,
+                    offset,
+                    lhs,
+                    &cancel,
+                    &mut budget,
+                )
+                .unwrap_or(false)
+            {
+                return self
+                    .qualified_system_references_with_budget(
+                        current_document,
+                        &canonical_name(member_name),
+                        state,
+                        &cancel,
+                        &mut budget,
+                    )
+                    .unwrap_or_default();
+            }
+        }
         let key = canonical_name(member_name);
         let mut references = Vec::new();
         let receivers =
@@ -9695,7 +10133,10 @@ impl NavigationIndex {
                         &key,
                         instance.uri == *current_uri,
                     );
-                    if !members.ancestry_known || members.ambiguous_names.contains(&key) {
+                    if !members.ancestry_known
+                        || (members.proof_incomplete && members.candidates.is_empty())
+                        || members.ambiguous_names.contains(&key)
+                    {
                         state.mark_member_lookup_incomplete();
                     }
                     if members
@@ -11527,6 +11968,41 @@ impl NavigationIndex {
             let Some(document) = self.documents.get(type_uri) else {
                 return Ok(None);
             };
+            if let Some(indices) = document.type_symbol_indices.get(type_key) {
+                budget.require_work(indices.len(), cancel)?;
+                if indices.len() == 1
+                    && let Some(symbol) = document.symbols.get(indices[0])
+                    && symbol.kind == SymbolKind::Type
+                    && symbol.type_kind == TypeKind::Other
+                    && let Some(alias_ref) = symbol.type_ref.as_ref()
+                {
+                    if alias_ref.path.len() == 1 && alias_ref.args.is_empty() {
+                        let alias_key = canonical_name(&alias_ref.path[0]);
+                        if let Some(alias_indices) = document.type_symbol_indices.get(&alias_key) {
+                            budget.require_work(alias_indices.len(), cancel)?;
+                            if alias_indices.len() == 1
+                                && document
+                                    .symbols
+                                    .get(alias_indices[0])
+                                    .is_some_and(|symbol| symbol.kind == SymbolKind::Type)
+                            {
+                                return self.member_owner_substitution_with_budget_inner(
+                                    type_uri,
+                                    &alias_key,
+                                    substitution,
+                                    owner_uri,
+                                    owner_key,
+                                    state,
+                                    active,
+                                    cancel,
+                                    budget,
+                                );
+                            }
+                        }
+                    }
+                    return Ok(None);
+                }
+            }
             let Some(entries) = document.type_ancestry.get(type_key) else {
                 return Ok(None);
             };
@@ -11646,7 +12122,12 @@ impl NavigationIndex {
                 budget,
             )?
         };
-        if !lookup.ancestry_known || (lookup.implicit_member_known && lookup.candidates.is_empty())
+        if lookup.compiler_surface_resolved {
+            state.mark_compiler_surface_resolved();
+        }
+        if !lookup.ancestry_known
+            || (lookup.compiler_surface_resolved && lookup.candidates.is_empty())
+            || (lookup.proof_incomplete && lookup.candidates.is_empty())
         {
             state.mark_receiver_uncertain();
             state.active_members.remove(&resolution_key);
@@ -12539,6 +13020,17 @@ impl NavigationIndex {
             return Ok(HelperTargetMatch::Yes(0));
         }
 
+        let unresolved_named_alias = self
+            .type_symbol_candidate(&resolved)
+            .and_then(|candidate| self.symbol(&candidate))
+            .is_some_and(|symbol| symbol.type_kind == TypeKind::Other && symbol.type_ref.is_some());
+        if unresolved_named_alias && helper.kind == target.kind {
+            // A named alias may resolve to this helper's target kind, but
+            // until its target is followed it cannot prove the helper does
+            // not apply (l4d-1m02.3.1).
+            return Ok(HelperTargetMatch::Unknown);
+        }
+
         if target.kind != TypeKind::Class {
             return Ok(HelperTargetMatch::No);
         }
@@ -13016,6 +13508,10 @@ impl NavigationIndex {
     ) -> Result<MemberLookup, String> {
         let mut ancestry_state = AncestryResolutionState::new();
         ancestry_state.proven_prefix = proven_prefix;
+        ancestry_state.member_surface = Some(MemberSurfaceContext::for_importer(
+            current_uri,
+            current_document,
+        ));
         let ordinary = self.member_candidates_for_type_with_state_and_budget(
             type_uri,
             type_key,
@@ -13176,7 +13672,12 @@ impl NavigationIndex {
                 allow_implementation,
             )
         };
-        if !lookup.ancestry_known || (lookup.implicit_member_known && lookup.candidates.is_empty())
+        if lookup.compiler_surface_resolved {
+            state.mark_compiler_surface_resolved();
+        }
+        if !lookup.ancestry_known
+            || (lookup.compiler_surface_resolved && lookup.candidates.is_empty())
+            || (lookup.proof_incomplete && lookup.candidates.is_empty())
         {
             state.mark_receiver_uncertain();
             state.active_members.remove(&resolution_key);
@@ -13505,72 +14006,30 @@ impl NavigationIndex {
         allow_implementation: bool,
         state: &mut AncestryResolutionState,
     ) -> MemberLookup {
-        let identity = (
-            type_uri.clone(),
-            type_key.to_owned(),
-            type_scope,
-            member_key.map(str::to_owned),
-            allow_implementation,
-        );
-        if let Some(resolved) = state.resolved_members.get(&identity) {
-            return resolved.clone();
-        }
-        if !state.active_members.insert(identity.clone()) {
+        let Some(current_document) = self.documents.get(type_uri) else {
             return MemberLookup::unknown(Vec::new());
-        }
-
-        let result = if !state.take_work() {
-            MemberLookup::unknown(Vec::new())
-        } else {
-            let direct = self.direct_member_candidates(
-                type_uri,
-                type_key,
-                type_scope,
-                member_key,
-                allow_implementation,
-            );
-            if self.compiled_shell_members_are_opaque(type_uri) {
-                return MemberLookup::unknown(direct);
-            }
-            let implicit_root_member_known =
-                self.implicit_root_member_known(type_uri, type_key, member_key);
-            let ancestry = if self.type_requires_ancestry(type_uri, type_key) {
-                self.resolve_type_ancestry(type_uri, type_key, state)
-            } else {
-                complete_ancestry(Vec::new())
-            };
-            if ancestry.status != AncestryStatus::Complete {
-                MemberLookup::unknown(direct).with_implicit_member_known(implicit_root_member_known)
-            } else {
-                let mut parent_lookups = Vec::with_capacity(ancestry.parents.len());
-                let mut ancestry_known = true;
-                for (parent_uri, parent_key) in ancestry.parents {
-                    let lookup = self.member_candidates_for_type_with_state(
-                        &parent_uri,
-                        &parent_key,
-                        ROOT_SCOPE,
-                        member_key,
-                        allow_implementation,
-                        state,
-                    );
-                    if !lookup.ancestry_known {
-                        ancestry_known = false;
-                        break;
-                    }
-                    parent_lookups.push(lookup);
-                }
-                if ancestry_known {
-                    self.merge_member_candidates(direct, parent_lookups, member_key)
-                        .with_implicit_member_known(implicit_root_member_known)
-                } else {
-                    MemberLookup::unknown(direct)
-                        .with_implicit_member_known(implicit_root_member_known)
-                }
-            }
         };
-        state.active_members.remove(&identity);
-        state.resolved_members.insert(identity, result.clone());
-        result
+        state.member_surface = Some(MemberSurfaceContext::for_importer(
+            type_uri,
+            current_document,
+        ));
+        let cancel = AtomicBool::new(false);
+        let mut budget = AssistanceBudget::new(
+            MAX_NAVIGATION_OVERLOAD_WORK,
+            MAX_NAVIGATION_OVERLOAD_BYTES,
+            "member lookup",
+        );
+        self.member_candidates_for_type_with_state_and_budget(
+            type_uri,
+            type_key,
+            type_scope,
+            member_key,
+            allow_implementation,
+            state,
+            &cancel,
+            &mut budget,
+        )
+        .unwrap_or_else(|_| MemberLookup::unknown(Vec::new()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -13585,6 +14044,11 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<MemberLookup, String> {
+        if state.member_surface.is_none()
+            && let Some(document) = self.documents.get(type_uri)
+        {
+            state.member_surface = Some(MemberSurfaceContext::for_importer(type_uri, document));
+        }
         let identity = (
             type_uri.clone(),
             type_key.to_owned(),
@@ -13613,11 +14077,133 @@ impl NavigationIndex {
                 cancel,
                 budget,
             )?;
-            if self.compiled_shell_members_are_opaque(type_uri) {
-                return Ok(MemberLookup::unknown(direct));
+            if direct.is_empty()
+                && let Some(document) = self.documents.get(type_uri)
+                && let Some(indices) = document.type_symbol_indices.get(type_key)
+            {
+                budget.require_work(indices.len(), cancel)?;
+                if indices.len() == 1
+                    && let Some(symbol) = document.symbols.get(indices[0])
+                {
+                    budget.require_work(1, cancel)?;
+                    if symbol.kind == SymbolKind::Type && symbol.type_kind == TypeKind::Pointer {
+                        // Delphi implicitly dereferences pointers for member
+                        // access. Until that shape is followed, absence on
+                        // the pointer type is not a sound member proof.
+                        return Ok(MemberLookup::unknown(direct));
+                    }
+                    if symbol.kind == SymbolKind::Type
+                        && symbol.type_kind == TypeKind::Other
+                        && let Some(alias_ref) = symbol.type_ref.as_ref()
+                    {
+                        if alias_ref.path.len() == 1 && alias_ref.args.is_empty() {
+                            let alias_name = &alias_ref.path[0];
+                            let alias_key = canonical_name(alias_name);
+                            if let Some(alias_indices) =
+                                document.type_symbol_indices.get(&alias_key)
+                            {
+                                budget.require_work(alias_indices.len(), cancel)?;
+                                if alias_indices.len() == 1
+                                    && let Some(alias_symbol) =
+                                        document.symbols.get(alias_indices[0])
+                                    && alias_symbol.kind == SymbolKind::Type
+                                {
+                                    let resolved = self
+                                        .member_candidates_for_type_with_state_and_budget(
+                                            type_uri,
+                                            &alias_key,
+                                            alias_symbol.scope,
+                                            member_key,
+                                            allow_implementation,
+                                            state,
+                                            cancel,
+                                            budget,
+                                        )?;
+                                    return Ok(resolved);
+                                }
+                                return Ok(MemberLookup::unknown(direct));
+                            }
+                            if overload::builtin_type(alias_name).is_some() {
+                                // A source alias may target a compiler builtin such
+                                // as Integer. There is no local type symbol to
+                                // recurse into; keep the alias's own complete
+                                // ancestry instead of making unrelated type
+                                // inference incomplete.
+                            } else {
+                                return Ok(MemberLookup::unknown(direct));
+                            }
+                        } else {
+                            // Qualified, generic, and otherwise unresolved aliases
+                            // stay incomplete rather than proving absence.
+                            return Ok(MemberLookup::unknown(direct));
+                        }
+                    }
+                }
             }
-            let implicit_root_member_known =
-                self.implicit_root_member_known(type_uri, type_key, member_key);
+            let mut proof_incomplete = false;
+            let type_document = self.documents.get(type_uri);
+            if let Some(type_document) = type_document {
+                if system_root_type_name(&type_document.unit_name, type_key).is_some() {
+                    let root_name = system_root_type_name(&type_document.unit_name, type_key)
+                        .expect("root type name checked");
+                    if !self.system_root_source_is_trusted_with_budget(
+                        type_uri, state, cancel, budget,
+                    )? {
+                        return self.surface_root_member_lookup_with_budget(
+                            root_name, member_key, direct, state, cancel, budget,
+                        );
+                    }
+                } else if state
+                    .member_surface
+                    .as_ref()
+                    .is_some_and(|surface| surface.importer_uri != *type_uri)
+                    && !Self::document_is_complete_for_proof(type_document, cancel, budget)?
+                {
+                    proof_incomplete = true;
+                }
+            }
+
+            if let Some(root_target) =
+                self.system_root_target_for_type_with_budget(type_uri, type_key, cancel, budget)?
+            {
+                match root_target {
+                    SystemRootTarget::Surface(root_name) => {
+                        return Ok(self
+                            .surface_root_member_lookup_with_budget(
+                                root_name, member_key, direct, state, cancel, budget,
+                            )?
+                            .with_proof_incomplete(proof_incomplete));
+                    }
+                    SystemRootTarget::Source { uri, key } => {
+                        let root_lookup = self.member_candidates_for_type_with_state_and_budget(
+                            &uri,
+                            &key,
+                            ROOT_SCOPE,
+                            member_key,
+                            allow_implementation,
+                            state,
+                            cancel,
+                            budget,
+                        )?;
+                        if !root_lookup.ancestry_known {
+                            return Ok(MemberLookup::unknown(direct)
+                                .with_compiler_surface_resolved(
+                                    root_lookup.compiler_surface_resolved,
+                                )
+                                .with_proof_incomplete(
+                                    proof_incomplete || root_lookup.proof_incomplete,
+                                ));
+                        }
+                        return Ok(self
+                            .merge_member_candidates(direct, vec![root_lookup], member_key)
+                            .with_proof_incomplete(proof_incomplete));
+                    }
+                }
+            }
+
+            if self.compiled_shell_members_are_opaque(type_uri) {
+                return Ok(MemberLookup::unknown(direct).with_proof_incomplete(proof_incomplete));
+            }
             let ancestry = if self.type_requires_ancestry(type_uri, type_key) {
                 self.resolve_type_ancestry_with_budget(type_uri, type_key, state, cancel, budget)?
             } else {
@@ -13634,8 +14220,9 @@ impl NavigationIndex {
                     Vec::new()
                 };
                 if parents.is_empty() {
-                    return Ok(MemberLookup::unknown(direct)
-                        .with_implicit_member_known(implicit_root_member_known));
+                    return Ok(
+                        MemberLookup::unknown(direct).with_proof_incomplete(proof_incomplete)
+                    );
                 }
                 let mut parent_lookups = Vec::with_capacity(parents.len());
                 for (parent_uri, parent_key) in parents {
@@ -13652,7 +14239,8 @@ impl NavigationIndex {
                 }
                 let merged = self.merge_member_candidates(direct, parent_lookups, member_key);
                 return Ok(MemberLookup::unknown(merged.candidates)
-                    .with_implicit_member_known(implicit_root_member_known));
+                    .with_compiler_surface_resolved(merged.compiler_surface_resolved)
+                    .with_proof_incomplete(proof_incomplete || merged.proof_incomplete));
             }
 
             let mut parent_lookups = Vec::with_capacity(ancestry.parents.len());
@@ -13679,14 +14267,15 @@ impl NavigationIndex {
             }
             Ok(if ancestry_known {
                 self.merge_member_candidates(direct, parent_lookups, member_key)
-                    .with_implicit_member_known(implicit_root_member_known)
+                    .with_proof_incomplete(proof_incomplete)
             } else {
                 // The proven prefix of the ancestry still supplies its members:
                 // an unknown ancestor further out cannot hide a nearer one's
                 // (l4d-4nbs re-review). The lookup stays unknown.
                 let merged = self.merge_member_candidates(direct, parent_lookups, member_key);
                 MemberLookup::unknown(merged.candidates)
-                    .with_implicit_member_known(implicit_root_member_known)
+                    .with_compiler_surface_resolved(merged.compiler_surface_resolved)
+                    .with_proof_incomplete(proof_incomplete || merged.proof_incomplete)
             })
         })();
         state.active_members.remove(&identity);
@@ -13784,6 +14373,182 @@ impl NavigationIndex {
         Ok(result)
     }
 
+    fn system_root_source_is_trusted_with_budget(
+        &self,
+        type_uri: &Url,
+        state: &AncestryResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        let Some(surface) = state.member_surface.as_ref() else {
+            return Ok(false);
+        };
+        let Some(importer_key) = surface.key.as_ref() else {
+            return Ok(false);
+        };
+        let Some(provider) = self.documents.get(type_uri) else {
+            return Ok(false);
+        };
+        if provider.verified_system_surface.as_ref() != Some(importer_key) {
+            return Ok(false);
+        }
+        Self::document_is_complete_for_proof(provider, cancel, budget)
+    }
+
+    fn surface_root_member_lookup_with_budget(
+        &self,
+        root_name: &'static str,
+        member_key: Option<&str>,
+        direct: Vec<Candidate>,
+        state: &AncestryResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<MemberLookup, String> {
+        let Some(member_key) = member_key else {
+            return Ok(MemberLookup::known(direct).with_proof_incomplete(true));
+        };
+        let Some(surface) = state.member_surface.as_ref() else {
+            return Ok(MemberLookup::known(direct).with_proof_incomplete(true));
+        };
+        let Some(table) = surface.table.as_ref() else {
+            return Ok(MemberLookup::known(direct).with_proof_incomplete(true));
+        };
+        budget.require_work(1, cancel)?;
+        budget.require_bytes(root_name.len().saturating_add(member_key.len()), cancel)?;
+        let Some(members) = table.members(root_name) else {
+            return Ok(MemberLookup::known(direct).with_proof_incomplete(true));
+        };
+        Ok(
+            MemberLookup::known(direct)
+                .with_compiler_surface_resolved(members.contains(member_key)),
+        )
+    }
+
+    fn system_root_target_for_type_with_budget(
+        &self,
+        type_uri: &Url,
+        type_key: &str,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<SystemRootTarget>, String> {
+        let Some(document) = self.documents.get(type_uri) else {
+            return Ok(None);
+        };
+        if document.unit_name == "system" {
+            return Ok(None);
+        }
+        let Some(entries) = document.type_ancestry.get(type_key) else {
+            return Ok(None);
+        };
+        if entries.len() != 1 {
+            return Ok(None);
+        }
+        let entry = &entries[0];
+        check_navigation_cancel(cancel)?;
+        let relevant_relation = match entry.kind {
+            TypeKind::Class => ParentRelation::Superclass,
+            TypeKind::Interface => ParentRelation::InterfaceParent,
+            _ => return Ok(None),
+        };
+        let parents = entry
+            .parents
+            .iter()
+            .filter(|parent| parent.relation == relevant_relation)
+            .collect::<Vec<_>>();
+        if parents.is_empty() {
+            let root_name = match entry.kind {
+                TypeKind::Class => "TObject",
+                TypeKind::Interface => "IInterface",
+                _ => unreachable!(),
+            };
+            let target = self
+                .system_root_source_candidate_with_budget(root_name, cancel, budget)?
+                .map_or(SystemRootTarget::Surface(root_name), |(uri, key)| {
+                    SystemRootTarget::Source { uri, key }
+                });
+            return Ok(Some(target));
+        }
+
+        for parent in parents {
+            check_navigation_cancel(cancel)?;
+            if parent.path.is_empty() || document.conditionals.is_unknown_at(parent.span.start) {
+                continue;
+            }
+            let Some(root_name) = system_root_parent_name(entry.kind, &parent.path) else {
+                continue;
+            };
+            let candidates = dedup_candidates(self.type_parent_candidates_with_budget(
+                type_uri,
+                document,
+                entry.name_span.start,
+                &parent.path,
+                cancel,
+                budget,
+            )?);
+            budget.require_work(candidates.len(), cancel)?;
+            if candidates.len() == 1 {
+                let candidate = &candidates[0];
+                if self.candidate_is_system_root(candidate, root_name) {
+                    return Ok(Some(SystemRootTarget::Source {
+                        uri: candidate.uri.clone(),
+                        key: self
+                            .symbol(candidate)
+                            .expect("root candidate symbol checked")
+                            .key
+                            .clone(),
+                    }));
+                }
+                continue;
+            }
+            if !candidates.is_empty() || !system_root_path_can_be_implicit(&parent.path) {
+                continue;
+            }
+            return Ok(Some(
+                self.system_root_source_candidate_with_budget(root_name, cancel, budget)?
+                    .map_or(SystemRootTarget::Surface(root_name), |(uri, key)| {
+                        SystemRootTarget::Source { uri, key }
+                    }),
+            ));
+        }
+        Ok(None)
+    }
+
+    fn system_root_source_candidate_with_budget(
+        &self,
+        root_name: &'static str,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<(Url, String)>, String> {
+        let Some(providers) = self.units.get("system") else {
+            return Ok(None);
+        };
+        if providers.len() != 1 {
+            return Ok(None);
+        }
+        let uri = &providers[0];
+        let candidates = dedup_candidates(
+            self.type_candidates_in_unit_with_budget(uri, root_name, false, cancel, budget)?,
+        );
+        budget.require_work(candidates.len(), cancel)?;
+        if candidates.len() != 1 || !self.candidate_is_system_root(&candidates[0], root_name) {
+            return Ok(None);
+        }
+        Ok(self
+            .symbol(&candidates[0])
+            .map(|symbol| (candidates[0].uri.clone(), symbol.key.clone())))
+    }
+
+    fn candidate_is_system_root(&self, candidate: &Candidate, root_name: &str) -> bool {
+        self.documents
+            .get(&candidate.uri)
+            .is_some_and(|document| document.unit_name == "system")
+            && self.symbol(candidate).is_some_and(|symbol| {
+                symbol.kind == SymbolKind::Type
+                    && symbol.key == canonical_name(root_name)
+                    && symbol.type_kind == system_root_type_kind(root_name)
+            })
+    }
+
     fn type_requires_ancestry(&self, type_uri: &Url, type_key: &str) -> bool {
         let Some(document) = self.documents.get(type_uri) else {
             return true;
@@ -13792,27 +14557,6 @@ impl NavigationIndex {
             return true;
         };
         entries.len() != 1 || entries[0].parent_declared
-    }
-
-    fn implicit_root_member_known(
-        &self,
-        type_uri: &Url,
-        type_key: &str,
-        member_key: Option<&str>,
-    ) -> bool {
-        let Some(member_key) = member_key else {
-            return false;
-        };
-        let Some(document) = self.documents.get(type_uri) else {
-            return false;
-        };
-        let Some(entries) = document.type_ancestry.get(type_key) else {
-            return false;
-        };
-        entries.len() == 1
-            && entries[0].kind == TypeKind::Class
-            && (!entries[0].parent_declared || superclass_is_tobject(&entries[0]))
-            && is_implicit_tobject_member(member_key)
     }
 
     fn resolve_type_ancestry(
@@ -14392,9 +15136,10 @@ impl NavigationIndex {
         parent_lookups: Vec<MemberLookup>,
         member_key: Option<&str>,
     ) -> MemberLookup {
-        let implicit_member_known = parent_lookups
+        let compiler_surface_resolved = parent_lookups
             .iter()
-            .any(|lookup| lookup.implicit_member_known);
+            .any(|lookup| lookup.compiler_surface_resolved);
+        let proof_incomplete = parent_lookups.iter().any(|lookup| lookup.proof_incomplete);
         if member_key.is_some() {
             let direct_has_routine = direct.iter().any(|candidate| {
                 self.symbol(candidate)
@@ -14402,7 +15147,8 @@ impl NavigationIndex {
             });
             if !direct.is_empty() && !direct_has_routine {
                 return MemberLookup::known(direct)
-                    .with_implicit_member_known(implicit_member_known);
+                    .with_compiler_surface_resolved(compiler_surface_resolved)
+                    .with_proof_incomplete(proof_incomplete);
             }
             let direct_routines = direct
                 .iter()
@@ -14458,7 +15204,8 @@ impl NavigationIndex {
                     .is_some_and(|current| !candidate_sets_equal(current, &candidates))
                 {
                     return MemberLookup::unknown(direct)
-                        .with_implicit_member_known(implicit_member_known);
+                        .with_compiler_surface_resolved(compiler_surface_resolved)
+                        .with_proof_incomplete(proof_incomplete);
                 }
                 selected = Some(candidates);
             }
@@ -14466,7 +15213,9 @@ impl NavigationIndex {
             if let Some(selected) = selected {
                 result.extend(selected);
             }
-            return MemberLookup::known(result).with_implicit_member_known(implicit_member_known);
+            return MemberLookup::known(result)
+                .with_compiler_surface_resolved(compiler_surface_resolved)
+                .with_proof_incomplete(proof_incomplete);
         }
 
         let direct_keys: HashSet<String> = direct
@@ -14531,10 +15280,13 @@ impl NavigationIndex {
             }
         }
         if ambiguous_names.is_empty() {
-            MemberLookup::known(result).with_implicit_member_known(implicit_member_known)
+            MemberLookup::known(result)
+                .with_compiler_surface_resolved(compiler_surface_resolved)
+                .with_proof_incomplete(proof_incomplete)
         } else {
             MemberLookup::ambiguous(result, ambiguous_names)
-                .with_implicit_member_known(implicit_member_known)
+                .with_compiler_surface_resolved(compiler_surface_resolved)
+                .with_proof_incomplete(proof_incomplete)
         }
     }
 
@@ -16300,7 +17052,8 @@ impl NavigationIndex {
 struct MemberLookup {
     candidates: Vec<Candidate>,
     ancestry_known: bool,
-    implicit_member_known: bool,
+    compiler_surface_resolved: bool,
+    proof_incomplete: bool,
     ambiguous_names: HashSet<String>,
 }
 
@@ -16309,7 +17062,8 @@ impl MemberLookup {
         Self {
             candidates,
             ancestry_known: true,
-            implicit_member_known: false,
+            compiler_surface_resolved: false,
+            proof_incomplete: false,
             ambiguous_names: HashSet::new(),
         }
     }
@@ -16318,7 +17072,8 @@ impl MemberLookup {
         Self {
             candidates,
             ancestry_known: false,
-            implicit_member_known: false,
+            compiler_surface_resolved: false,
+            proof_incomplete: false,
             ambiguous_names: HashSet::new(),
         }
     }
@@ -16327,7 +17082,8 @@ impl MemberLookup {
         Self {
             candidates,
             ancestry_known: true,
-            implicit_member_known: false,
+            compiler_surface_resolved: false,
+            proof_incomplete: false,
             ambiguous_names,
         }
     }
@@ -16337,9 +17093,33 @@ impl MemberLookup {
         self
     }
 
-    fn with_implicit_member_known(mut self, implicit_member_known: bool) -> Self {
-        self.implicit_member_known |= implicit_member_known;
+    fn with_compiler_surface_resolved(mut self, resolved: bool) -> Self {
+        self.compiler_surface_resolved |= resolved;
         self
+    }
+
+    fn with_proof_incomplete(mut self, incomplete: bool) -> Self {
+        self.proof_incomplete |= incomplete;
+        self
+    }
+}
+
+#[derive(Clone)]
+struct MemberSurfaceContext {
+    importer_uri: Url,
+    key: Option<dcc_surface::SurfaceKey>,
+    table: Option<Arc<dcc_surface::SurfaceTable>>,
+}
+
+impl MemberSurfaceContext {
+    fn for_importer(importer_uri: &Url, document: &Document) -> Self {
+        let key = dcc_surface::SurfaceKey::from_context(&document.conditional_context);
+        let table = key.as_ref().and_then(dcc_surface::table_for);
+        Self {
+            importer_uri: importer_uri.clone(),
+            key,
+            table,
+        }
     }
 }
 
@@ -16354,6 +17134,7 @@ struct AncestryResolutionState {
     active_members: HashSet<(Url, String, usize, Option<String>, bool)>,
     resolved_members: HashMap<(Url, String, usize, Option<String>, bool), MemberLookup>,
     active_helpers: HashSet<(Url, usize, Option<String>, bool)>,
+    member_surface: Option<MemberSurfaceContext>,
 }
 
 impl AncestryResolutionState {
@@ -16366,6 +17147,7 @@ impl AncestryResolutionState {
             active_members: HashSet::new(),
             resolved_members: HashMap::new(),
             active_helpers: HashSet::new(),
+            member_surface: None,
         }
     }
 
@@ -16515,6 +17297,7 @@ struct ResolutionState {
     receiver_uncertain: bool,
     member_lookup_incomplete: bool,
     implicit_system_namespace_incomplete: bool,
+    compiler_surface_resolved: bool,
     inaccessible_candidate: bool,
     ambiguous: bool,
     with_receivers: Vec<WithReceiverSlot>,
@@ -16527,6 +17310,7 @@ struct ResolutionState {
 #[derive(Clone, Copy)]
 struct ReceiverLookupScope {
     implicit_system_namespace_incomplete: bool,
+    compiler_surface_resolved: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -16546,6 +17330,7 @@ impl ResolutionState {
             receiver_uncertain: false,
             member_lookup_incomplete: false,
             implicit_system_namespace_incomplete: false,
+            compiler_surface_resolved: false,
             inaccessible_candidate: false,
             ambiguous: false,
             with_receivers: Vec::new(),
@@ -16568,9 +17353,14 @@ impl ResolutionState {
         self.implicit_system_namespace_incomplete = true;
     }
 
+    fn mark_compiler_surface_resolved(&mut self) {
+        self.compiler_surface_resolved = true;
+    }
+
     fn begin_receiver_lookup_scope(&self) -> ReceiverLookupScope {
         ReceiverLookupScope {
             implicit_system_namespace_incomplete: self.implicit_system_namespace_incomplete,
+            compiler_surface_resolved: self.compiler_surface_resolved,
         }
     }
 
@@ -16583,6 +17373,7 @@ impl ResolutionState {
         // retained, so unknown with/receiver/helper state cannot be cleared
         // by a unit-shaped fallback.
         self.implicit_system_namespace_incomplete = scope.implicit_system_namespace_incomplete;
+        self.compiler_surface_resolved = scope.compiler_surface_resolved;
     }
 
     fn mark_inaccessible_candidate(&mut self) {
@@ -17084,6 +17875,7 @@ fn visit_generic_substitution_recovery(
 #[derive(Debug, Clone)]
 struct Document {
     parsed: Arc<ParsedDocument>,
+    verified_system_surface: Option<dcc_surface::SurfaceKey>,
     import_bindings: Option<HashMap<String, Url>>,
     import_binding_fingerprint: Option<u64>,
     /// Set while the workspace has fenced this document's imports with an
@@ -17112,7 +17904,7 @@ impl Document {
         cancel: &AtomicBool,
         previous: Option<Arc<ParsedDocument>>,
     ) -> Result<Self, String> {
-        Self::parse_with_session(uri, source, context, cancel, previous, None)
+        Self::parse_with_session(uri, source, context, cancel, previous, None, None)
     }
 
     fn parse_with_session(
@@ -17122,6 +17914,7 @@ impl Document {
         cancel: &AtomicBool,
         previous: Option<Arc<ParsedDocument>>,
         expansion: Option<&crate::include_expansion::ExpandedSource>,
+        verified_system_surface: Option<dcc_surface::SurfaceKey>,
     ) -> Result<Self, String> {
         if let Some(previous) = previous.as_ref()
             && previous.source.as_ref() == source.as_str()
@@ -17143,6 +17936,7 @@ impl Document {
             }
             return Ok(Self {
                 parsed: previous.clone(),
+                verified_system_surface,
                 import_bindings: None,
                 import_binding_fingerprint: None,
                 unbound: None,
@@ -17636,6 +18430,7 @@ impl Document {
         });
         Ok(Self {
             parsed,
+            verified_system_surface,
             import_bindings: None,
             import_binding_fingerprint: None,
             unbound: None,
@@ -17915,6 +18710,43 @@ impl Document {
         Ok(Some(owner_type.owner_type.clone()))
     }
 
+    fn owner_type_is_alias_definition_context_with_budget(
+        &self,
+        owner_type: &str,
+        offset: usize,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        // The RHS of a named alias is not a member namespace belonging to
+        // that alias. Keep real member lookups on unresolved aliases
+        // fail-closed, but don't let this declaration context shadow imports.
+        budget.require_bytes(owner_type.len(), cancel)?;
+        let Some(context_index) = self
+            .owner_type_intervals
+            .at_with_budget(offset, cancel, budget)?
+        else {
+            return Ok(false);
+        };
+        let Some(context) = self.owner_type_contexts.get(context_index) else {
+            return Ok(false);
+        };
+        if context.owner_type != owner_type {
+            return Ok(false);
+        }
+        let Some(indices) = self.type_symbol_indices.get(owner_type) else {
+            return Ok(false);
+        };
+        budget.require_work(indices.len(), cancel)?;
+        if indices.len() != 1 {
+            return Ok(false);
+        }
+        Ok(self.symbols.get(indices[0]).is_some_and(|symbol| {
+            symbol.kind == SymbolKind::Type
+                && symbol.type_kind == TypeKind::Other
+                && symbol.type_ref.is_some()
+        }))
+    }
+
     fn owner_type_at_identifier_with_budget_or_unknown(
         &self,
         identifier: Node<'_>,
@@ -17997,6 +18829,47 @@ fn symbol_is_available_at(
                     && declaration.span.start <= offset
             })
         })
+}
+
+fn symbol_is_available_at_with_budget(
+    document: &Document,
+    symbol: &Symbol,
+    candidate_uri: &Url,
+    current_uri: &Url,
+    offset: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    check_navigation_cancel(cancel)?;
+    if candidate_uri != current_uri
+        || (symbol.owner_type.is_some() && symbol.kind != SymbolKind::EnumValue)
+        || !symbol.declaration_ordered
+    {
+        return Ok(true);
+    }
+    if symbol.span.start <= offset {
+        return Ok(true);
+    }
+    if symbol.kind != SymbolKind::Routine || symbol.origin != Origin::Definition {
+        return Ok(false);
+    }
+    let Some(routine_key) = symbol.routine_key.as_ref() else {
+        return Ok(false);
+    };
+    for declaration in &document.symbols {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        check_navigation_cancel(cancel)?;
+        if declaration.kind == SymbolKind::Routine
+            && declaration.origin == Origin::Declaration
+            && declaration.routine_key.as_ref() == Some(routine_key)
+            && (declaration.region == Region::Interface || declaration.routine_directives.forward)
+            && declaration.span.start <= offset
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The visibility section a member declaration is in, given its ancestors
@@ -18223,6 +19096,20 @@ fn collect_symbols(
                 scope_by_span,
                 symbols,
                 SymbolKind::Parameter,
+                type_name,
+            );
+        }
+        "exceptionHandler" => {
+            let type_name = node
+                .child_by_field_name("exception")
+                .and_then(|exception| simple_type_path(exception, source));
+            add_named_symbol(
+                node,
+                ancestors,
+                source,
+                scope_by_span,
+                symbols,
+                SymbolKind::Variable,
                 type_name,
             );
         }
@@ -18858,6 +19745,8 @@ fn add_named_symbol<'a>(
         .and_then(|type_node| type_shape_from_node(type_node, source));
     let identifiers = if kind == SymbolKind::Type {
         declaration_name_identifiers(node)
+    } else if node.kind() == "exceptionHandler" {
+        node.child_by_field_name("variable").into_iter().collect()
     } else if matches!(node.kind(), "varDef" | "varAssignDef") {
         identifier_nodes(node).into_iter().take(1).collect()
     } else if node.kind() == "declLabel" {
@@ -19219,7 +20108,7 @@ fn helper_target_may_match(helper: &HelperDefinition, target: &TypeInstance) -> 
         .is_some_and(|name| canonical_name(name) == target.key)
         || matches!(
             (helper.kind, target.kind),
-            (TypeKind::Class, TypeKind::Class)
+            (TypeKind::Class, TypeKind::Class) | (TypeKind::Record, TypeKind::Record)
         )
 }
 
@@ -19971,6 +20860,9 @@ fn type_ref_from_node_at_depth(node: Node<'_>, source: &str, depth: usize) -> Op
 
 fn declaration_name_identifiers(node: Node<'_>) -> Vec<Node<'_>> {
     let Some(name) = node.child_by_field_name("name") else {
+        if node.kind() == "exceptionHandler" {
+            return node.child_by_field_name("variable").into_iter().collect();
+        }
         if matches!(node.kind(), "varDef" | "varAssignDef") {
             return (0..node.named_child_count())
                 .filter_map(|index| node.named_child(index))
@@ -20151,14 +21043,15 @@ fn build_scopes(
     root: Node<'_>,
     source: &str,
 ) -> (Vec<Scope>, HashMap<Span, usize>) {
-    // Routine definitions first, then lambdas, then blocks: the stable sort
-    // below keeps that order between scopes with one span.
-    let mut seeds_by_kind: [Vec<(Span, Option<String>)>; 3] = Default::default();
+    // Routine definitions first, then lambdas, exception handlers, and blocks:
+    // the stable sort below keeps that order between scopes with one span.
+    let mut seeds_by_kind: [Vec<(Span, Option<String>)>; 4] = Default::default();
     collect_nodes_with_ancestors(root, &mut |node, ancestors| {
         let seeds = match node.kind() {
             "defProc" => &mut seeds_by_kind[0],
             "lambda" => &mut seeds_by_kind[1],
-            "block" => &mut seeds_by_kind[2],
+            "exceptionHandler" => &mut seeds_by_kind[2],
+            "block" => &mut seeds_by_kind[3],
             _ => return,
         };
         let owner_type = node
@@ -22990,10 +23883,22 @@ fn is_implicit_or_intrinsic_name(name: &str) -> bool {
     )
 }
 
-/// Whether a class names `TObject` or `System.TObject` as its superclass.
-fn superclass_is_tobject(entry: &TypeAncestry) -> bool {
-    entry.parents.iter().any(|parent| {
-        parent.relation == ParentRelation::Superclass && is_tobject_path(&parent.path)
+fn is_implicit_system_unit_qualifier(identifier: Node<'_>, source: &str) -> bool {
+    node_text(identifier, source).eq_ignore_ascii_case("System")
+        && identifier.tree_parent().is_some_and(|parent| {
+            matches!(parent.kind(), "exprDot" | "genericDot" | "typerefDot")
+                && parent
+                    .child_by_field_name("lhs")
+                    .is_some_and(|lhs| Span::from_node(lhs) == Span::from_node(identifier))
+        })
+}
+
+fn is_qualified_identifier_rhs(identifier: Node<'_>) -> bool {
+    identifier.tree_parent().is_some_and(|parent| {
+        matches!(parent.kind(), "exprDot" | "genericDot" | "typerefDot")
+            && parent
+                .child_by_field_name("rhs")
+                .is_some_and(|rhs| Span::from_node(rhs) == Span::from_node(identifier))
     })
 }
 
@@ -23005,43 +23910,52 @@ fn is_tobject_path(path: &[String]) -> bool {
     }
 }
 
-fn is_implicit_tobject_member(name: &str) -> bool {
-    matches!(
-        name,
-        "afterconstruction"
-            | "beforedestruction"
-            | "cleanupinstance"
-            | "classinfo"
-            | "classname"
-            | "classnameis"
-            | "classparent"
-            | "classtype"
-            | "create"
-            | "defaultdie"
-            | "defaulthandler"
-            | "destroy"
-            | "dispatch"
-            | "equals"
-            | "fieldaddress"
-            | "free"
-            | "freeinstance"
-            | "gethashcode"
-            | "getinterface"
-            | "getinterfaceentry"
-            | "getinterfacetable"
-            | "inheritsfrom"
-            | "initinstance"
-            | "instance_size"
-            | "instancesize"
-            | "methodaddress"
-            | "methodname"
-            | "newinstance"
-            | "qualifiedclassname"
-            | "safecallexception"
-            | "tostring"
-            | "unitname"
-            | "unitscope"
-    )
+#[derive(Debug, Clone)]
+enum SystemRootTarget {
+    Source { uri: Url, key: String },
+    Surface(&'static str),
+}
+
+fn system_root_type_name(unit_name: &str, type_key: &str) -> Option<&'static str> {
+    if unit_name != "system" {
+        return None;
+    }
+    match type_key {
+        "tobject" => Some("TObject"),
+        "tinterfacedobject" => Some("TInterfacedObject"),
+        "iinterface" => Some("IInterface"),
+        "iunknown" => Some("IUnknown"),
+        _ => None,
+    }
+}
+
+fn system_root_parent_name(kind: TypeKind, path: &[String]) -> Option<&'static str> {
+    if path.is_empty() || path.len() > 2 {
+        return None;
+    }
+    match (kind, canonical_name(path.last()?).as_str()) {
+        (TypeKind::Class, "tobject") => Some("TObject"),
+        (TypeKind::Class, "tinterfacedobject") => Some("TInterfacedObject"),
+        (TypeKind::Interface, "iinterface") => Some("IInterface"),
+        (TypeKind::Interface, "iunknown") => Some("IUnknown"),
+        _ => None,
+    }
+}
+
+fn system_root_path_can_be_implicit(path: &[String]) -> bool {
+    match path {
+        [_] => true,
+        [unit, _] => canonical_name(unit) == "system",
+        _ => false,
+    }
+}
+
+fn system_root_type_kind(root_name: &str) -> TypeKind {
+    match canonical_name(root_name).as_str() {
+        "tobject" | "tinterfacedobject" => TypeKind::Class,
+        "iinterface" | "iunknown" => TypeKind::Interface,
+        _ => TypeKind::Other,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23139,7 +24053,63 @@ fn location_for_span(uri: &Url, source: &str, span: Span) -> Option<Location> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pascal_project::{ConditionalFact, LayoutContext, TargetPlatform};
     use std::fmt::Write as _;
+
+    fn implicit_root_surface_context() -> ConditionalContext {
+        let version = CompilerVersion::new(37, 0);
+        ConditionalContext {
+            compiler_version: Some(version),
+            layout: LayoutContext::for_target(Some(version), Some(&TargetPlatform::Win32)),
+            ..ConditionalContext::default()
+        }
+        .with_absent_define(ConditionalFact::False)
+    }
+
+    fn with_implicit_root_surface<R>(context: &ConditionalContext, body: impl FnOnce() -> R) -> R {
+        let key = dcc_surface::SurfaceKey::from_context(context)
+            .expect("implicit-root test context has a surface key");
+        let table = dcc_surface::SurfaceTable::parse(
+            "# dcc-surface v1\n\
+             # banner: Embarcadero Delphi for Win32 compiler version 37.0\n\
+             # script-version: 1\n\
+             # system-blake3: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+             # sysinit-blake3: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\
+             # candidates: 3\n\
+             [surface]\n\
+             TObject\n\
+             [defines]\n\
+             [members TObject]\n\
+             Create\n\
+             Destroy\n\
+             Free\n\
+             ToString\n\
+             [members IInterface]\n\
+             QueryInterface\n\
+             [members IUnknown]\n\
+             QueryInterface\n\
+             [members TInterfacedObject]\n\
+             _AddRef\n",
+        )
+        .expect("implicit-root test surface table");
+        dcc_surface::with_test_table(key, table, body)
+    }
+
+    fn update_with_test_context(
+        index: &mut NavigationIndex,
+        uri: &Url,
+        source: &str,
+        context: &ConditionalContext,
+    ) {
+        index
+            .update_with_context_with_cancel(
+                uri.clone(),
+                source.to_owned(),
+                context,
+                &AtomicBool::new(false),
+            )
+            .expect("contextual semantic fixture parses");
+    }
 
     fn is_override_diagnostic(diagnostic: &SemanticDiagnostic) -> bool {
         matches!(
@@ -24065,6 +25035,153 @@ mod tests {
     }
 
     #[test]
+    fn missing_unit_alias_target_is_not_shadowed_by_alias_member_lookup() {
+        let uri = Url::parse("file:///tmp/missing-unit-alias-target.pas").expect("fixture URI");
+        let source = "unit MissingUnitAliasTarget;\ninterface\ntype TAlias = MissingType;\nimplementation\nend.\n";
+        let offset = source.find("MissingType").expect("missing type identifier");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("alias target fixture parses");
+        let document = index.documents.get(&uri).expect("indexed document");
+        let identifier = identifier_at(document.tree.root_node(), offset)
+            .expect("alias target identifier is parsed");
+        let mut budget = AssistanceBudget::new(
+            MAX_MISSING_UNIT_REQUEST_WORK,
+            MAX_MISSING_UNIT_REQUEST_BYTES,
+            "missing-unit alias target test",
+        );
+
+        assert!(
+            index
+                .missing_unit_is_unresolved_at_with_budget(
+                    &uri,
+                    offset,
+                    identifier,
+                    &AtomicBool::new(false),
+                    &mut budget,
+                )
+                .expect("complete alias target lookup")
+        );
+    }
+
+    fn current_unit_reference_budget_fixture() -> (NavigationIndex, Url, usize, usize) {
+        let uri = Url::parse("file:///tmp/current-unit-reference-budget.pas").expect("fixture URI");
+        let source = concat!(
+            "unit CurrentUnitReferenceBudget;\n",
+            "interface\n",
+            "type TBefore = Integer;\n",
+            "procedure Foo;\n",
+            "implementation\n",
+            "procedure Caller;\n",
+            "begin\n",
+            "end;\n",
+            "procedure Foo;\n",
+            "begin\n",
+            "end;\n",
+            "end.\n",
+        );
+        let offset = source.find("procedure Caller").expect("caller declaration");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("current-unit reference fixture parses");
+        let document = index.documents.get(&uri).expect("indexed fixture");
+        let indices = document
+            .symbol_indices_by_scope_key
+            .get(&(ROOT_SCOPE, "foo".to_owned()))
+            .expect("Foo declarations are indexed at unit scope")
+            .len();
+        assert!(
+            indices >= 2,
+            "fixture contains a declaration and definition"
+        );
+        (index, uri, offset, indices)
+    }
+
+    #[test]
+    fn current_unit_references_charge_candidate_storage_before_allocation() {
+        let (index, uri, offset, indices) = current_unit_reference_budget_fixture();
+        let document = index.documents.get(&uri).expect("indexed fixture");
+        let key = "foo";
+        let bytes_without_candidate_storage = key
+            .len()
+            .saturating_add(uri.as_str().len().saturating_mul(indices));
+        let cancel = AtomicBool::new(false);
+        let mut budget = AssistanceBudget::new(
+            usize::MAX,
+            bytes_without_candidate_storage,
+            "current-unit byte budget",
+        );
+
+        let error = index
+            .current_unit_references_for_key_with_budget(
+                &uri,
+                document,
+                offset,
+                key,
+                &cancel,
+                &mut budget,
+            )
+            .expect_err("candidate vector storage must consume the byte budget");
+
+        assert!(
+            error.contains("current-unit byte budget exceeds")
+                && error.contains("byte proof/materialization limit"),
+            "unexpected deterministic budget error: {error}"
+        );
+    }
+
+    #[test]
+    fn current_unit_references_charge_routine_availability_scans() {
+        let (index, uri, offset, indices) = current_unit_reference_budget_fixture();
+        let document = index.documents.get(&uri).expect("indexed fixture");
+        let cancel = AtomicBool::new(false);
+        let mut budget =
+            AssistanceBudget::new(indices, usize::MAX, "current-unit availability budget");
+
+        let error = index
+            .current_unit_references_for_key_with_budget(
+                &uri,
+                document,
+                offset,
+                "foo",
+                &cancel,
+                &mut budget,
+            )
+            .expect_err("routine availability scans must consume the work budget");
+
+        assert!(
+            error.contains("current-unit availability budget exceeds")
+                && error.contains("node traversal limit"),
+            "unexpected deterministic budget error: {error}"
+        );
+    }
+
+    #[test]
+    fn current_unit_references_observe_cancellation_during_routine_availability_scan() {
+        let (index, uri, offset, indices) = current_unit_reference_budget_fixture();
+        let document = index.documents.get(&uri).expect("indexed fixture");
+        let cancel = AtomicBool::new(false);
+        let mut budget =
+            AssistanceBudget::new(usize::MAX, usize::MAX, "current-unit cancellation budget");
+        budget.cancel_after_work(indices.saturating_add(1));
+
+        let error = index
+            .current_unit_references_for_key_with_budget(
+                &uri,
+                document,
+                offset,
+                "foo",
+                &cancel,
+                &mut budget,
+            )
+            .expect_err("cancellation during a routine availability scan must propagate");
+
+        assert_eq!(error, "request cancelled");
+    }
+
+    #[test]
     fn class_field_binding_work_does_not_repeat_root_lookup_per_occurrence() {
         let (small_count, small_root_lookups) = query_repeated_class_field(1);
         let (large_count, large_root_lookups) = query_repeated_class_field(128);
@@ -24409,6 +25526,7 @@ mod tests {
     #[test]
     fn semantic_diagnostics_report_a_missing_member_only_for_a_known_receiver() {
         let uri = Url::parse("file:///tmp/semantic-diagnostics-member.pas").expect("fixture URI");
+        let context = implicit_root_surface_context();
         let source = concat!(
             "unit SemanticDiagnosticsMember;\n",
             "interface\n",
@@ -24425,16 +25543,16 @@ mod tests {
             "end.\n",
         );
         let mut index = NavigationIndex::new();
-        index
-            .update(uri.clone(), source.to_owned())
-            .expect("member diagnostic fixture parses");
+        update_with_test_context(&mut index, &uri, source, &context);
 
-        let diagnostics = index
-            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
-            .expect("semantic diagnostics complete");
+        let diagnostics = with_implicit_root_surface(&context, || {
+            index
+                .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+                .expect("semantic diagnostics complete")
+        });
 
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].kind, SemanticDiagnosticKind::MissingMember);
+        assert_eq!(diagnostics[0].kind.code(), "E2003");
         let start = source.rfind("Missing").expect("missing member");
         assert_eq!(
             diagnostics[0].span,
@@ -24443,7 +25561,7 @@ mod tests {
                 end: start + "Missing".len(),
             }
         );
-        assert_eq!(diagnostics[0].message, "missing member 'Missing'");
+        assert_eq!(diagnostics[0].message, "Undeclared identifier: 'Missing'");
     }
 
     #[test]
@@ -24649,6 +25767,7 @@ mod tests {
     fn semantic_diagnostics_keep_an_implicit_tobject_override_unknown() {
         let uri = Url::parse("file:///tmp/semantic-diagnostics-implicit-tobject-override.pas")
             .expect("implicit TObject URI");
+        let context = implicit_root_surface_context();
         let source = concat!(
             "unit SemanticDiagnosticsImplicitTObjectOverride;\n",
             "interface\n",
@@ -24661,13 +25780,13 @@ mod tests {
             "end.\n",
         );
         let mut index = NavigationIndex::new();
-        index
-            .update(uri.clone(), source.to_owned())
-            .expect("implicit TObject fixture parses");
+        update_with_test_context(&mut index, &uri, source, &context);
 
-        let diagnostics = index
-            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
-            .expect("semantic diagnostics complete");
+        let diagnostics = with_implicit_root_surface(&context, || {
+            index
+                .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+                .expect("semantic diagnostics complete")
+        });
 
         assert!(
             diagnostics
@@ -24681,6 +25800,7 @@ mod tests {
     fn semantic_diagnostics_keep_an_implicit_tobject_interface_absence_unknown() {
         let uri = Url::parse("file:///tmp/semantic-diagnostics-implicit-tobject-interface.pas")
             .expect("implicit TObject interface URI");
+        let context = implicit_root_surface_context();
         let source = concat!(
             "unit SemanticDiagnosticsImplicitTObjectInterface;\n",
             "interface\n",
@@ -24694,13 +25814,13 @@ mod tests {
             "end.\n",
         );
         let mut index = NavigationIndex::new();
-        index
-            .update(uri.clone(), source.to_owned())
-            .expect("implicit TObject interface fixture parses");
+        update_with_test_context(&mut index, &uri, source, &context);
 
-        let diagnostics = index
-            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
-            .expect("semantic diagnostics complete");
+        let diagnostics = with_implicit_root_surface(&context, || {
+            index
+                .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+                .expect("semantic diagnostics complete")
+        });
 
         assert!(
             diagnostics
@@ -25937,12 +27057,12 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.message == "missing member 'UnknownName'")
+                .any(|diagnostic| diagnostic.message == "Undeclared identifier: 'UnknownName'")
         );
         assert!(
             !diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.message == "missing member 'Secret'")
+                .any(|diagnostic| diagnostic.message == "Undeclared identifier: 'Secret'")
         );
     }
 
@@ -26083,7 +27203,7 @@ mod tests {
             diagnostics.iter().all(|diagnostic| {
                 !matches!(
                     diagnostic.message.as_str(),
-                    "unresolved identifier 'Missing'" | "unresolved identifier 'AncestorMethod'"
+                    "Undeclared identifier: 'Missing'" | "Undeclared identifier: 'AncestorMethod'"
                 )
             }),
             "unknown receiver/ancestry must suppress claims: {diagnostics:?}"
@@ -26172,7 +27292,10 @@ mod tests {
 
         assert_eq!(
             messages,
-            vec!["missing member 'Missing'", "missing member 'Integer'"]
+            vec![
+                "Undeclared identifier: 'Missing'",
+                "Undeclared identifier: 'Integer'"
+            ]
         );
     }
 
@@ -26446,8 +27569,11 @@ mod tests {
             .expect("semantic diagnostics complete");
 
         assert_eq!(diagnostics.len(), 1, "only the missing export is absent");
-        assert_eq!(diagnostics[0].kind, SemanticDiagnosticKind::MissingMember);
-        assert_eq!(diagnostics[0].message, "missing member 'MissingExport'");
+        assert_eq!(diagnostics[0].kind.code(), "E2003");
+        assert_eq!(
+            diagnostics[0].message,
+            "Undeclared identifier: 'MissingExport'"
+        );
         let missing_offset = consumer.find("MissingExport").expect("missing export");
         assert_eq!(
             diagnostics[0].span,
@@ -27350,7 +28476,7 @@ mod tests {
         assert_eq!(
             messages,
             vec![
-                "missing member 'Missing'",
+                "Undeclared identifier: 'Missing'",
                 "incompatible argument: expected 'Integer', found 'non-writable expression'",
                 "incompatible argument: expected 'Integer', found 'Boolean'",
             ],
@@ -27586,6 +28712,7 @@ mod tests {
     fn round3_r3_distinguishes_container_access_from_addressed_storage() {
         let uri = Url::parse("file:///tmp/semantic-round3-r3-addressed-storage.pas")
             .expect("R3 addressed-storage URI");
+        let context = implicit_root_surface_context();
         let source = concat!(
             "unit SemanticRound3R3AddressedStorage;\n",
             "interface\n",
@@ -27620,13 +28747,13 @@ mod tests {
             "end.\n",
         );
         let mut index = NavigationIndex::new();
-        index
-            .update(uri.clone(), source.to_owned())
-            .expect("R3 addressed-storage fixture parses");
+        update_with_test_context(&mut index, &uri, source, &context);
 
-        let diagnostics = index
-            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
-            .expect("R3 addressed-storage diagnostics complete");
+        let diagnostics = with_implicit_root_surface(&context, || {
+            index
+                .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+                .expect("R3 addressed-storage diagnostics complete")
+        });
 
         assert_eq!(
             diagnostics_without_declaration_pairing_findings(&diagnostics)
@@ -27646,6 +28773,7 @@ mod tests {
     fn round3_r3_resolves_default_property_result_types_without_container_fallback() {
         let uri = Url::parse("file:///tmp/semantic-round3-r3-default-property.pas")
             .expect("R3 default-property URI");
+        let context = implicit_root_surface_context();
         let source = concat!(
             "unit SemanticRound3R3DefaultProperty;\n",
             "interface\n",
@@ -27678,13 +28806,13 @@ mod tests {
             "end.\n",
         );
         let mut index = NavigationIndex::new();
-        index
-            .update(uri.clone(), source.to_owned())
-            .expect("R3 default-property fixture parses");
+        update_with_test_context(&mut index, &uri, source, &context);
 
-        let diagnostics = index
-            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
-            .expect("R3 default-property diagnostics complete");
+        let diagnostics = with_implicit_root_surface(&context, || {
+            index
+                .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+                .expect("R3 default-property diagnostics complete")
+        });
 
         assert_eq!(
             diagnostics_without_declaration_pairing_findings(&diagnostics)
@@ -27729,7 +28857,10 @@ mod tests {
             diagnostics_without_declaration_pairing_findings(&diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
-            vec!["missing member 'Missing'", "missing member 'Missing'",],
+            vec![
+                "Undeclared identifier: 'Missing'",
+                "Undeclared identifier: 'Missing'",
+            ],
             "an unresolved index child prevents an outer element mismatch cascade: {diagnostics:?}"
         );
     }
@@ -27987,6 +29118,7 @@ mod tests {
     fn round5_r3_public_default_property_ignores_unrelated_inaccessible_members() {
         let local_uri = Url::parse("file:///tmp/semantic-round5-r3-public-default.pas")
             .expect("R5 public-default URI");
+        let context = implicit_root_surface_context();
         let local = concat!(
             "unit SemanticRound5R3PublicDefault;\n",
             "interface\n",
@@ -28049,23 +29181,19 @@ mod tests {
         );
 
         let mut index = NavigationIndex::new();
-        index
-            .update(local_uri.clone(), local.to_owned())
-            .expect("R5 local public-default fixture parses");
-        index
-            .update(provider_uri.clone(), provider.to_owned())
-            .expect("R5 private-getter provider parses");
-        index
-            .update(consumer_uri.clone(), consumer.to_owned())
-            .expect("R5 imported-default fixture parses");
+        update_with_test_context(&mut index, &local_uri, local, &context);
+        update_with_test_context(&mut index, &provider_uri, provider, &context);
+        update_with_test_context(&mut index, &consumer_uri, consumer, &context);
         index.bind_imports(
             &consumer_uri,
             [("SemanticRound5R3PrivateGetter".to_owned(), provider_uri)],
         );
 
-        let local_diagnostics = index
-            .semantic_diagnostics_with_cancel(&local_uri, &AtomicBool::new(false))
-            .expect("R5 local public-default diagnostics complete");
+        let local_diagnostics = with_implicit_root_surface(&context, || {
+            index
+                .semantic_diagnostics_with_cancel(&local_uri, &AtomicBool::new(false))
+                .expect("R5 local public-default diagnostics complete")
+        });
         assert_eq!(
             diagnostics_without_declaration_pairing_findings(&local_diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
@@ -28080,9 +29208,11 @@ mod tests {
             "unrelated private fields and private getters must not poison public default properties: {local_diagnostics:?}"
         );
 
-        let imported_diagnostics = index
-            .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
-            .expect("R5 imported public-default diagnostics complete");
+        let imported_diagnostics = with_implicit_root_surface(&context, || {
+            index
+                .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
+                .expect("R5 imported public-default diagnostics complete")
+        });
         assert_eq!(
             diagnostics_without_declaration_pairing_findings(&imported_diagnostics)
                 .map(|diagnostic| diagnostic.message.as_str())
@@ -28672,6 +29802,7 @@ mod tests {
     fn semantic_diagnostics_follow_inherited_and_helper_call_bindings() {
         let uri = Url::parse("file:///tmp/semantic-diagnostics-inherited-helper.pas")
             .expect("inherited/helper URI");
+        let context = implicit_root_surface_context();
         let source = concat!(
             "unit SemanticDiagnosticsInheritedHelper;\n",
             "interface\n",
@@ -28700,13 +29831,13 @@ mod tests {
             "end.\n",
         );
         let mut index = NavigationIndex::new();
-        index
-            .update(uri.clone(), source.to_owned())
-            .expect("inherited/helper fixture parses");
+        update_with_test_context(&mut index, &uri, source, &context);
 
-        let diagnostics = index
-            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
-            .expect("inherited/helper diagnostics complete");
+        let diagnostics = with_implicit_root_surface(&context, || {
+            index
+                .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+                .expect("inherited/helper diagnostics complete")
+        });
         let messages = diagnostics
             .iter()
             .map(|diagnostic| diagnostic.message.as_str())
@@ -28889,6 +30020,7 @@ mod tests {
     fn semantic_diagnostics_suppress_missing_members_from_an_implicit_class_root() {
         let uri = Url::parse("file:///tmp/semantic-diagnostics-implicit-class-root.pas")
             .expect("fixture URI");
+        let context = implicit_root_surface_context();
         let source = concat!(
             "unit SemanticDiagnosticsImplicitClassRoot;\n",
             "interface\n",
@@ -28903,19 +30035,19 @@ mod tests {
             "end.\n",
         );
         let mut index = NavigationIndex::new();
-        index
-            .update(uri.clone(), source.to_owned())
-            .expect("implicit class root fixture parses");
+        update_with_test_context(&mut index, &uri, source, &context);
 
-        let diagnostics = index
-            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
-            .expect("semantic diagnostics complete");
+        let diagnostics = with_implicit_root_surface(&context, || {
+            index
+                .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+                .expect("semantic diagnostics complete")
+        });
 
         assert!(
             diagnostics.iter().all(|diagnostic| {
                 !matches!(
                     diagnostic.message.as_str(),
-                    "missing member 'Free'" | "missing member 'Create'"
+                    "Undeclared identifier: 'Free'" | "Undeclared identifier: 'Create'"
                 )
             }),
             "implicit class root members are not proven absent: {diagnostics:?}"
@@ -29144,9 +30276,9 @@ mod tests {
             report
                 .diagnostics
                 .iter()
-                .map(|diagnostic| (diagnostic.kind, diagnostic.span.start))
+                .map(|diagnostic| (diagnostic.kind.code(), diagnostic.span.start))
                 .collect::<Vec<_>>(),
-            vec![(SemanticDiagnosticKind::MissingMember, missing_start)]
+            vec![("E2003", missing_start)]
         );
         assert_eq!(report.gaps, vec![SemanticCoverageGap::Budget]);
     }
@@ -30055,6 +31187,32 @@ mod insert_parsed_tests {
         index.parsed_document(uri).unwrap()
     }
 
+    fn system_surface(source: &str) -> (dcc_surface::SurfaceKey, dcc_surface::SurfaceTable) {
+        let key = dcc_surface::SurfaceKey {
+            major: 37,
+            minor: 0,
+            platform: dcc_surface::SurfacePlatform::Win32,
+        };
+        let table = format!(
+            "# dcc-surface v1\n\
+             # banner: Embarcadero Delphi for Win32 compiler version 37.0\n\
+             # script-version: 1\n\
+             # system-blake3: {}\n\
+             # sysinit-blake3: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\
+             # candidates: 1\n\
+             [surface]\n\
+             TObject\n\
+             [defines]\n\
+             MSWINDOWS\n\
+             [members TObject]\n\
+             [members IInterface]\n\
+             [members IUnknown]\n\
+             [members TInterfacedObject]\n",
+            dcc_surface::blake3_hex(source.as_bytes())
+        );
+        (key, dcc_surface::SurfaceTable::parse(&table).unwrap())
+    }
+
     #[test]
     fn insert_parsed_shares_a_cached_document_without_replacing_one() {
         let uri = Url::parse("file:///ws/Base.pas").unwrap();
@@ -30087,5 +31245,36 @@ mod insert_parsed_tests {
 
         assert!(!index.insert_parsed(uri.clone(), document, &other));
         assert!(!index.contains(&uri));
+    }
+
+    #[test]
+    fn insert_parsed_does_not_trust_system_parsed_with_unknown_absent_define() {
+        let uri = Url::parse("file:///ws/System.pas").unwrap();
+        let source = "unit System;\ninterface\ntype TObject = class end;\nimplementation\nend.\n";
+        let (key, table) = system_surface(source);
+        let verified_context = dcc_surface::verified_system_context(&key, &table);
+        let project_context = verified_context
+            .clone()
+            .with_absent_define(pascal_project::ConditionalFact::Unknown);
+        let mut parser = NavigationIndex::new();
+        parser
+            .update_with_context_and_cached_with_cancel(
+                uri.clone(),
+                source.to_owned(),
+                &project_context,
+                None,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let parsed = parser.parsed_document(&uri).unwrap();
+        let mut index = NavigationIndex::new();
+
+        dcc_surface::with_test_table(key, table, || {
+            assert!(index.insert_parsed(uri.clone(), parsed, &project_context));
+            assert_eq!(
+                index.documents[&uri].verified_system_surface, None,
+                "a hash match is not proof that this cached parse used the verified context"
+            );
+        });
     }
 }

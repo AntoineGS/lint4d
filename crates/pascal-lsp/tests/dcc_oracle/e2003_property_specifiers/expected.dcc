@@ -1,0 +1,5 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem E2003PropertySpecifiers.pas
+E2003PropertySpecifiers.pas(10) E2168 Field or method identifier expected
+E2003PropertySpecifiers.pas(11) E2168 Field or method identifier expected
+E2003PropertySpecifiers.pas(8) H2219 Private symbol 'SetB' declared but never used

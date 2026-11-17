@@ -4362,8 +4362,7 @@ fn matching_missing_unit_diagnostic(
         .diagnostics
         .iter()
         .find(|diagnostic| {
-            diagnostic_code(diagnostic) == Some("pascal-unresolved-identifier")
-                && diagnostic.range == candidate.anchor
+            diagnostic_code(diagnostic) == Some("E2003") && diagnostic.range == candidate.anchor
         })
         .cloned()
 }
@@ -7152,15 +7151,19 @@ mod tests {
         FIX_ALL_CONSTANT_CODE_ACTION_KIND, FIX_ALL_SUBSET_VALIDATIONS, FixAllEditIdentity,
         MAX_FIX_ALL_BUDGET_BYTES, MAX_FIX_ALL_CANDIDATES, MAX_FIX_ALL_WORK,
         OrganizeImportsProvider, code_actions_from_input, lint_configuration_for_input,
-        naming_candidates_bounded, normalize_fix_all_edit_identities, resolve_from_input,
-        selected_provider_order_is_safe, set_after_lint_configuration_hook, source_hash,
+        matching_missing_unit_diagnostic, naming_candidates_bounded,
+        normalize_fix_all_edit_identities, resolve_from_input, selected_provider_order_is_safe,
+        set_after_lint_configuration_hook, source_hash,
     };
-    use crate::navigation::UnitOrderSafety;
+    use crate::navigation::{MissingUnitCandidate, MissingUnitUseKind, UnitOrderSafety};
     use crate::workspace::Workspace;
     use crate::workspace::WorkspaceOptions;
     use crate::workspace::rename::revalidate_input;
-    use lsp_types::CodeActionOrCommand;
     use lsp_types::Url;
+    use lsp_types::{
+        CodeActionContext, CodeActionOrCommand, Diagnostic, DiagnosticSeverity, NumberOrString,
+        Position, Range,
+    };
     use pascal_project::delphi_overrides::OverrideSession;
     use serde_json::json;
     use std::fs::{self, File, FileTimes};
@@ -7171,6 +7174,41 @@ mod tests {
 
     fn test_workspace(roots: Vec<std::path::PathBuf>, options: WorkspaceOptions) -> Workspace {
         Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
+
+    #[test]
+    fn add_missing_unit_matches_an_e2003_diagnostic() {
+        let anchor = Range::new(Position::new(3, 2), Position::new(3, 13));
+        let diagnostic = Diagnostic::new(
+            anchor,
+            Some(DiagnosticSeverity::ERROR),
+            Some(NumberOrString::String("E2003".to_string())),
+            Some("pascal-lsp".to_string()),
+            "Undeclared identifier: 'MissingProc'".to_string(),
+            None,
+            None,
+        );
+        let candidate = MissingUnitCandidate {
+            anchor,
+            unit_name: "Provider".to_string(),
+            provider_uri: Url::parse("file:///tmp/Provider.pas").expect("provider URI"),
+            symbol_name: "MissingProc".to_string(),
+            use_kind: MissingUnitUseKind::Callable,
+            provider_source_hash: 0,
+            provider_declaration_fingerprint: 0,
+            provider_context_fingerprint: 0,
+            use_context_fingerprint: 0,
+        };
+        let context = CodeActionContext {
+            diagnostics: vec![diagnostic.clone()],
+            only: None,
+            trigger_kind: None,
+        };
+
+        assert_eq!(
+            matching_missing_unit_diagnostic(&candidate, &context),
+            Some(diagnostic)
+        );
     }
 
     /// Run the eager `source.fixAll` action on `source` and return the

@@ -275,6 +275,36 @@ const WINDOWS_SYMBOLS: &[(&str, bool, bool, Since)] = &[
             present_from: (37, 0),
         },
     ),
+    // Probe-backed: absent from dcc_surface/{21.0-Win32,24.0-Win32,24.0-Win64}.txt
+    // and present in dcc_surface/{37.0-Win32,37.0-Win64}.txt. Leave the
+    // unobserved versions between 24.0 and 37.0 unknown.
+    (
+        "MANAGED_RECORD",
+        true,
+        true,
+        Since::Observed {
+            absent_through: (24, 0),
+            present_from: (37, 0),
+        },
+    ),
+    (
+        "WEAK_NATIVEINT",
+        true,
+        true,
+        Since::Observed {
+            absent_through: (24, 0),
+            present_from: (37, 0),
+        },
+    ),
+    (
+        "WEAKINTFREF",
+        true,
+        true,
+        Since::Observed {
+            absent_through: (24, 0),
+            present_from: (37, 0),
+        },
+    ),
 ];
 
 const NON_WINDOWS_SYMBOLS: &[&str] = &[
@@ -391,13 +421,14 @@ mod tests {
                 37,
                 "Win32",
                 "MSWINDOWS WIN32 CPU386 CPUX86 CPU32BITS ASSEMBLER CONDITIONALEXPRESSIONS UNICODE \
-                 NATIVECODE DCC WEAKREF UNDERSCOREIMPORTNAME VER370",
+                 NATIVECODE DCC WEAKREF UNDERSCOREIMPORTNAME MANAGED_RECORD WEAK_NATIVEINT \
+                 WEAKINTFREF VER370",
             ),
             (
                 37,
                 "Win64",
                 "MSWINDOWS WIN64 CPUX64 CPU64BITS ASSEMBLER CONDITIONALEXPRESSIONS UNICODE \
-                 NATIVECODE DCC WEAKREF VER370",
+                 NATIVECODE DCC WEAKREF MANAGED_RECORD WEAK_NATIVEINT WEAKINTFREF VER370",
             ),
         ];
         // Also probed, and undefined by every compiler above.
@@ -512,6 +543,29 @@ mod tests {
         assert_eq!(win32["CPUINTEL"], F::False);
         assert_eq!(facts(21, 0, "Win32")["DCC"], F::False);
         assert_eq!(win32["DCC"], F::True);
+    }
+
+    #[test]
+    fn modern_delphi_defines_are_absent_through_24_and_true_at_37() {
+        let symbols = ["MANAGED_RECORD", "WEAK_NATIVEINT", "WEAKINTFREF"];
+        let cases = [
+            (21, "Win32", F::False),
+            (24, "Win32", F::False),
+            (24, "Win64", F::False),
+            (37, "Win32", F::True),
+            (37, "Win64", F::True),
+        ];
+
+        for (major, platform, expected) in cases {
+            let defines = facts(major, 0, platform);
+            for symbol in symbols {
+                assert_eq!(
+                    defines.get(symbol),
+                    Some(&expected),
+                    "{major}.0 {platform} {symbol}"
+                );
+            }
+        }
     }
 
     #[test]

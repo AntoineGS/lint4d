@@ -1046,6 +1046,7 @@ dependencies = [
 name = "pascal-lsp"
 version = "0.4.0"
 dependencies = [
+ "blake3",
  "crossbeam-channel",
  "fmt4d",
  "globset",

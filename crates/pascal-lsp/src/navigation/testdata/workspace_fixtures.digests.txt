@@ -321,6 +321,10 @@ crates/pascal-lsp/tests/dcc_oracle/w1010_overload/W1010Overload.pas 640b6ae6280c
 crates/pascal-lsp/tests/dcc_oracle/w1010_private_ancestor/PrivateAncestor.pas 0813645198f6549f 5
 crates/pascal-lsp/tests/dcc_oracle/w1010_private_ancestor/W1010PrivateAncestor.pas e6679d9f2456cc5f 4
 crates/pascal-lsp/tests/dcc_oracle/w1010_reintroduce/W1010Reintroduce.pas c8fe98e7f2c45012 8
+crates/pascal-lsp/tests/dcc_oracle/warn_all_default/WarnAllDefault.pas 42ce586a2a83af63 29
+crates/pascal-lsp/tests/dcc_oracle/warn_all_error/WarnAllError.pas df4d5cece7e860b6 18
+crates/pascal-lsp/tests/dcc_oracle/warn_all_off/WarnAllOff.pas ea6760ce81e67dae 18
+crates/pascal-lsp/tests/dcc_oracle/warn_all_on_after_off/WarnAllOnAfterOff.pas 6d13b0594018895b 29
 crates/tree-sitter-pascal/examples/anon.pas a42f46954e5c7427 8
 crates/tree-sitter-pascal/examples/codetoolmanager.pas cb308931d49ebfed 2891
 crates/tree-sitter-pascal/examples/foo.pas c8fcc28b12a4d452 90

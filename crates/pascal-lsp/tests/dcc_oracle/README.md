@@ -87,6 +87,16 @@ leaves the affected state unknown from that point; a direct switch-state test
 covers this independently of whether semantic analysis produced a candidate
 diagnostic.
 
+Four umbrella-warning cases record `{$WARN ALL OFF}`, `ON` after `OFF`, `ERROR`,
+and `DEFAULT` on Delphi 21.0, 24.0, and 37.0. The older compilers reject `ALL`
+with E1030 and leave warning/hint states unchanged. Delphi 37.0 applies the
+umbrella states to rows with `$WARN` identifiers: OFF suppresses W1000, W1009,
+and W1010; ON after OFF restores them; ERROR promotes them to E1000, E1009, and
+E1010; DEFAULT restores their initial state. H2219 is recorded in every mode,
+so `ALL` does not affect hint rows without a `$WARN` identifier. The switch
+derivation script recognizes no other umbrella form. For an unknown compiler
+version, an `ALL` directive leaves those warning-ID states unknown and silent.
+
 If the document has no compiler version or its version has no recognized
 switch table, warning and hint analysis uses only the per-code defaults,
 governing globals, and warning IDs shared by all checked-in tables. Findings

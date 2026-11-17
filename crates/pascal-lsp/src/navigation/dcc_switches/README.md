@@ -34,10 +34,17 @@ Specific-ID candidates come from uppercase attributes on the `DCC` task in
 The script preflights those tokens through dcc, because many binary strings are
 not valid warning identifiers. It tests accepted IDs in batches of 40 and
 bisects a batch only when the trigger diagnostic disappears. Unknown IDs and
-invalid compiler-directive tokens are not counted as suppressors. dcc's
-compiler-wide `{$WARN ALL OFF}` also suppresses W1000-W1007, W1009, and W1010;
-`ALL` is recorded in the derivation log but is not a per-code switch or a
-`DCC_<ID>` task property, so each table records the specific controlling ID.
+invalid compiler-directive tokens are not counted as suppressors. `ALL` is the
+only umbrella suppressor recognized by the derivation script; it is recorded
+in the derivation log but is not a per-code switch or a `DCC_<ID>` task
+property, so each table records the specific controlling ID.
+
+Oracle recordings show that Delphi 21.0 and 24.0 reject `{$WARN ALL ...}` with
+E1030 and leave warning and hint switches unchanged, while Delphi 37.0 accepts
+it. In 37.0, `ALL OFF`, `ON`, `ERROR`, and `DEFAULT` update every table row
+with a `$WARN` identifier; rows without an identifier are unchanged. In
+particular, H2219 remains governed by `{$HINTS}`. No other umbrella form was
+recognized by the derivation script.
 
 For an identified warning ID, the script compiles once with
 `{$WARN <ID> ERROR}` and stores whether dcc promotes that diagnostic to an

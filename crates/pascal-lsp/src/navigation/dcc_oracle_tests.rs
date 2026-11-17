@@ -630,6 +630,62 @@ fn switch_filter_uses_agreed_defaults_without_a_known_switch_table() {
 }
 
 #[test]
+fn unrecorded_warn_all_makes_id_switches_unknown_without_affecting_hints() {
+    let source = "\
+unit UnknownWarnAll;
+interface
+{$WARN ALL OFF}
+type
+  TObject = class
+  end;
+  TBase = class(TObject)
+  protected
+    Value: Integer;
+  end;
+  TChild = class(TBase)
+  private
+    FChild: Integer;
+  public
+    property Value: Integer read FChild;
+  end;
+  TUnused = class(TObject)
+  private
+    FUnused: Integer;
+  end;
+implementation
+end.
+";
+    let uri = Url::parse("file:///tmp/unknown-warn-all.pas").unwrap();
+    let context = ConditionalContext::default().with_compiler_version(CompilerVersion::new(22, 0));
+    let mut index = NavigationIndex::new();
+    index
+        .update_with_context_with_cancel(
+            uri.clone(),
+            source.to_owned(),
+            &context,
+            &AtomicBool::new(false),
+        )
+        .expect("probe parses");
+
+    let diagnostics = index
+        .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+        .expect("semantic diagnostics complete");
+
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.kind.code() != "W1009"),
+        "an unrecorded ALL directive leaves warning-ID state unknown"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind.code() == "H2219"),
+        "the unrecorded umbrella must not affect the hint row without a WARN ID"
+    );
+}
+
+#[test]
 fn unknown_conditional_warning_switch_makes_later_warning_unknown() {
     let source = switch_filter_source("{$IFDEF SWITCH_MAYBE_DEFINED}\n{$WARNINGS OFF}\n{$ENDIF}\n");
     let uri = Url::parse("file:///tmp/switch-filter-unknown-conditional.pas").unwrap();

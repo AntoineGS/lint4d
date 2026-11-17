@@ -24,8 +24,17 @@ enum CodeAction {
 enum DirectiveAction {
     Global(GlobalSwitch, Option<SwitchState>),
     Code(String, CodeAction),
+    All(CodeAction),
     UnknownWarnings,
+    UnknownWarningIds,
     UnknownAll,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarnAllSupport {
+    Accepted,
+    Rejected,
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +103,15 @@ impl WarningSwitches {
     }
 
     fn from_document(document: &Document, table: &SwitchTable) -> Self {
+        let warn_all_support = match document
+            .conditional_context
+            .compiler_version
+            .map(|version| (version.major, version.minor))
+        {
+            Some((37, 0)) => WarnAllSupport::Accepted,
+            Some((21, 0) | (24, 0)) => WarnAllSupport::Rejected,
+            _ => WarnAllSupport::Unknown,
+        };
         let warning_properties = document.warning_properties.as_deref();
         let initial_warnings = initial_global(warning_properties, GlobalSwitch::Warnings);
         let initial_hints = initial_global(warning_properties, GlobalSwitch::Hints);
@@ -142,7 +160,7 @@ impl WarningSwitches {
             let action = if directive.kind == DirectiveKind::Include {
                 Some(DirectiveAction::UnknownAll)
             } else {
-                directive_action(table, &directive.body)
+                directive_action(table, &directive.body, warn_all_support)
             };
             if let Some(action) = action {
                 events.push(Event {
@@ -172,7 +190,9 @@ impl WarningSwitches {
                 match event.action {
                     DirectiveAction::Global(global, _) => DirectiveAction::Global(global, None),
                     DirectiveAction::Code(id, _) => DirectiveAction::Code(id, CodeAction::Unknown),
+                    DirectiveAction::All(_) => DirectiveAction::UnknownWarningIds,
                     DirectiveAction::UnknownWarnings => DirectiveAction::UnknownWarnings,
+                    DirectiveAction::UnknownWarningIds => DirectiveAction::UnknownWarningIds,
                     DirectiveAction::UnknownAll => DirectiveAction::UnknownAll,
                 }
             } else {
@@ -208,6 +228,20 @@ impl WarningSwitches {
                         state.changes.push((event.offset, effective));
                     }
                 }
+                DirectiveAction::All(code_action) => {
+                    for state in codes.values_mut().filter(|state| state.entry.id.is_some()) {
+                        state.switched = true;
+                        state.source_override = match code_action {
+                            CodeAction::Set(switch) => SourceOverride::State(switch),
+                            CodeAction::Default => state
+                                .initial
+                                .map_or(SourceOverride::Unknown, SourceOverride::State),
+                            CodeAction::Unknown => SourceOverride::Unknown,
+                        };
+                        let effective = state.effective(warnings, hints);
+                        state.changes.push((event.offset, effective));
+                    }
+                }
                 DirectiveAction::UnknownWarnings => {
                     warnings = None;
                     for state in codes
@@ -217,6 +251,13 @@ impl WarningSwitches {
                         state.switched = true;
                         let effective = state.effective(warnings, hints);
                         state.changes.push((event.offset, effective));
+                    }
+                }
+                DirectiveAction::UnknownWarningIds => {
+                    for state in codes.values_mut().filter(|state| state.entry.id.is_some()) {
+                        state.switched = true;
+                        state.source_override = SourceOverride::Unknown;
+                        state.changes.push((event.offset, None));
                     }
                 }
                 DirectiveAction::UnknownAll => {
@@ -302,7 +343,7 @@ pub(crate) fn filter_report(document: &Document, diagnostics: &mut Vec<SemanticD
 }
 
 fn has_recorded_position_rule(code: &str) -> bool {
-    matches!(code, "H2219" | "W1009" | "W1010")
+    matches!(code, "H2219" | "W1000" | "W1009" | "W1010")
 }
 
 fn global_for(
@@ -376,7 +417,11 @@ fn parse_property_state(value: &PropertyValue, error_capable: bool) -> Option<Sw
     }
 }
 
-fn directive_action(table: &SwitchTable, body: &str) -> Option<DirectiveAction> {
+fn directive_action(
+    table: &SwitchTable,
+    body: &str,
+    warn_all_support: WarnAllSupport,
+) -> Option<DirectiveAction> {
     let mut tokens = body.split_ascii_whitespace();
     let keyword = tokens.next()?.trim_end_matches(':').to_ascii_uppercase();
     let arguments = tokens.collect::<Vec<_>>();
@@ -401,6 +446,34 @@ fn directive_action(table: &SwitchTable, body: &str) -> Option<DirectiveAction> 
             let Some(id) = arguments.first() else {
                 return Some(DirectiveAction::UnknownWarnings);
             };
+            if id.eq_ignore_ascii_case("ALL") {
+                return match warn_all_support {
+                    WarnAllSupport::Accepted => {
+                        let action = match arguments.as_slice() {
+                            [_, state] if state.eq_ignore_ascii_case("on") => {
+                                CodeAction::Set(SwitchState::On)
+                            }
+                            [_, state] if state.eq_ignore_ascii_case("off") => {
+                                CodeAction::Set(SwitchState::Off)
+                            }
+                            [_, state] if state.eq_ignore_ascii_case("error") => {
+                                CodeAction::Set(SwitchState::Error)
+                            }
+                            [_, state] if state.eq_ignore_ascii_case("default") => {
+                                CodeAction::Default
+                            }
+                            _ => CodeAction::Unknown,
+                        };
+                        Some(if action == CodeAction::Unknown {
+                            DirectiveAction::UnknownWarningIds
+                        } else {
+                            DirectiveAction::All(action)
+                        })
+                    }
+                    WarnAllSupport::Rejected => None,
+                    WarnAllSupport::Unknown => Some(DirectiveAction::UnknownWarningIds),
+                };
+            }
             let known_id = table
                 .entries()
                 .find(|entry| {

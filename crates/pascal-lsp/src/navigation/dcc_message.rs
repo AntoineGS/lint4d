@@ -13,6 +13,7 @@ pub(crate) enum DccMessage {
     E2254,
     E2291,
     E2301,
+    H2443,
     H2219,
     W1009,
     W1010,
@@ -40,6 +41,7 @@ impl DccMessage {
             Self::E2254 => "E2254",
             Self::E2291 => "E2291",
             Self::E2301 => "E2301",
+            Self::H2443 => "H2443",
             Self::H2219 => "H2219",
             Self::W1009 => "W1009",
             Self::W1010 => "W1010",
@@ -59,7 +61,7 @@ impl DccMessage {
             | Self::E2254
             | Self::E2291
             | Self::E2301 => DccSeverity::Error,
-            Self::H2219 => DccSeverity::Hint,
+            Self::H2219 | Self::H2443 => DccSeverity::Hint,
             Self::W1009 | Self::W1010 => DccSeverity::Warning,
         }
     }
@@ -77,6 +79,9 @@ impl DccMessage {
             Self::E2254 => "Overloaded procedure '%s' must be marked with the 'overload' directive",
             Self::E2291 => "Missing implementation of interface method %s.%s",
             Self::E2301 => "Method '%s' with identical parameters and result type already exists",
+            Self::H2443 => {
+                "Inline function '%s' has not been expanded because unit '%s' is not specified in USES list"
+            }
             Self::H2219 => "Private symbol '%s' declared but never used",
             Self::W1009 => "Redeclaration of '%s' hides a member in the base class",
             Self::W1010 => "Method '%s' hides virtual method of base type '%s'",
@@ -114,6 +119,7 @@ mod tests {
     #[test]
     fn severity_follows_the_code_prefix() {
         assert_eq!(DccMessage::H2219.severity(), DccSeverity::Hint);
+        assert_eq!(DccMessage::H2443.severity(), DccSeverity::Hint);
         assert_eq!(DccMessage::W1010.severity(), DccSeverity::Warning);
         assert_eq!(DccMessage::E2003.severity(), DccSeverity::Error);
         assert_eq!(DccMessage::E2037.severity(), DccSeverity::Error);
@@ -173,6 +179,11 @@ mod tests {
                 DccMessage::H2219,
                 "H2219",
                 "Private symbol '%s' declared but never used",
+            ),
+            (
+                DccMessage::H2443,
+                "H2443",
+                "Inline function '%s' has not been expanded because unit '%s' is not specified in USES list",
             ),
             (
                 DccMessage::W1009,

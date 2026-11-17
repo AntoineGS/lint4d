@@ -1,0 +1,4 @@
+unit = "RtlUse.pas"
+compilers = ["21.0", "24.0", "37.0"]
+requires_rtl = true
+reason = "Uses a real RTL inline routine; recall may be waived when the complete RTL source provider is unavailable."

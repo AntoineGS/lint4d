@@ -5,13 +5,13 @@
 use super::dcc_surface::{SurfaceKey, SurfacePlatform, table_for, verified_system_context};
 use super::*;
 use pascal_project::{CompilerVersion, ConditionalFact};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 /// dcc codes whose findings are compared. Grows as each rule lands.
 const ENABLED_CODES: &[&str] = &[
     "E2003", "E2004", "E2037", "E2065", "E2137", "E2170", "E2211", "E2252", "E2254", "E2291",
-    "E2301", "H2219", "W1009", "W1010",
+    "E2301", "H2219", "H2443", "W1009", "W1010",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -81,6 +81,67 @@ fn pascal_rtl_system(version: &str) -> Option<(Url, String)> {
         .unwrap_or_else(|error| panic!("PASCAL_RTL System source {path:?}: {error}"));
     let uri = Url::from_file_path(&path).expect("PASCAL_RTL System source URI");
     Some((uri, source))
+}
+
+fn pascal_rtl_unit(root: &Path, name: &str) -> Option<(Url, String)> {
+    let leaf = name.rsplit('.').next()?;
+    let file_name = format!("{leaf}.pas");
+    for directory in ["rtl/sys", "rtl/common", "rtl/win", "rtl/objpas"] {
+        let directory = root.join(directory);
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        let Some(path) = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|actual| actual.to_string_lossy().eq_ignore_ascii_case(&file_name))
+            })
+        else {
+            continue;
+        };
+        if path.is_file() {
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("PASCAL_RTL source {path:?}: {error}"));
+            let uri = Url::from_file_path(&path).expect("PASCAL_RTL source URI");
+            return Some((uri, source));
+        }
+    }
+    None
+}
+
+fn index_rtl_imports(
+    index: &mut NavigationIndex,
+    root: &Path,
+    context: &ConditionalContext,
+    source_uris: &[Url],
+    known_units: &mut HashSet<String>,
+    cancel: &AtomicBool,
+) -> Vec<Url> {
+    let imports = source_uris
+        .iter()
+        .flat_map(|uri| index.imports(uri))
+        .map(|import| import.name)
+        .collect::<BTreeSet<_>>();
+    let mut indexed = Vec::new();
+    for import in imports {
+        let leaf = import.rsplit('.').next().unwrap_or(&import);
+        if !known_units.insert(canonical_name(leaf)) {
+            continue;
+        }
+        let Some((uri, source)) = pascal_rtl_unit(root, &import) else {
+            continue;
+        };
+        index
+            .update_with_context_with_cancel(uri.clone(), source, context, cancel)
+            .unwrap_or_else(|error| panic!("PASCAL_RTL {import} parses: {error}"));
+        if let Some(name) = index.unit_name(&uri) {
+            known_units.insert(canonical_name(name.rsplit('.').next().unwrap_or(&name)));
+        }
+        indexed.push(uri);
+    }
+    indexed
 }
 
 fn load_case(dir: &Path) -> Case {
@@ -204,13 +265,37 @@ fn actual_findings(case: &Case, version: &str) -> Vec<Finding> {
         if path.file_name().unwrap().to_string_lossy() == case.unit {
             unit_uri = Some(uri.clone());
         }
-        if let Some((system_uri, _)) = &system {
-            index.bind_imports(
-                &uri,
-                std::iter::once(("System".to_owned(), system_uri.clone())),
-            );
-        }
         sources.insert(uri, source);
+    }
+    if let Some(root) = rtl_root(version).filter(|_| case.requires_rtl) {
+        let mut known_units = sources
+            .keys()
+            .chain(system.iter().map(|(uri, _)| uri))
+            .filter_map(|uri| index.unit_name(uri))
+            .map(|name| canonical_name(name.rsplit('.').next().unwrap_or(&name)))
+            .collect::<HashSet<_>>();
+        let fixture_uris = sources.keys().cloned().collect::<Vec<_>>();
+        let rtl_providers = index_rtl_imports(
+            &mut index,
+            &root,
+            &context,
+            &fixture_uris,
+            &mut known_units,
+            &cancel,
+        );
+        index_rtl_imports(
+            &mut index,
+            &root,
+            &context,
+            &rtl_providers,
+            &mut known_units,
+            &cancel,
+        );
+        for (uri, source) in &sources {
+            index
+                .update_with_context_with_cancel(uri.clone(), source.clone(), &context, &cancel)
+                .expect("fixture reparses with PASCAL_RTL providers indexed");
+        }
     }
     let uri = unit_uri.unwrap_or_else(|| panic!("{}: unit {} not found", case.name, case.unit));
     let source = &sources[&uri];

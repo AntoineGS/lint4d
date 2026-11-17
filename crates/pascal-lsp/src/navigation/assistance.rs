@@ -3280,6 +3280,7 @@ impl NavigationIndex {
             identifier,
             document.owner_type_for_scope(scope).as_deref(),
             &candidates,
+            false,
         ) {
             return Ok(None);
         }

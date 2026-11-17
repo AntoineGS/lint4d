@@ -426,6 +426,25 @@ pub(super) fn parameter_mode_for_argument(
         budget,
     )?;
     let Some(group) = selection.selected_group else {
+        // Argument type inference can be incomplete for compound lvalues such
+        // as record fields and indexed elements. The parameter mode is still
+        // proven when every remaining callable candidate has a parameter at
+        // this position and all candidates agree on its mode.
+        let modes = candidates
+            .iter()
+            .filter_map(|candidate| {
+                index
+                    .symbol(candidate)
+                    .and_then(|symbol| symbol.routine_parameters.get(argument_index))
+                    .map(|parameter| parameter.mode)
+            })
+            .collect::<Vec<_>>();
+        if modes.len() == candidates.len()
+            && let Some(mode) = modes.first().copied()
+            && modes.iter().all(|candidate_mode| *candidate_mode == mode)
+        {
+            return Ok(ParameterModeResolution::Resolved(Some(mode)));
+        }
         return Ok(ParameterModeResolution::Resolved(None));
     };
     let selected = candidates

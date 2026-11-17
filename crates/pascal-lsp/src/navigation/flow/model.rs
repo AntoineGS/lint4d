@@ -10,6 +10,8 @@ use std::ops::Range;
 use std::sync::atomic::AtomicBool;
 use tree_sitter::Node;
 
+type StatementLocations = Vec<(BlockId, Range<usize>)>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalVarParameterMode {
     Value,
@@ -257,7 +259,9 @@ fn build_routine_flow<'a>(
             && !locals.iter().enumerate().any(|(local_index, local)| {
                 local_index != result_local.unwrap() && canonical_name(&local.name) == key
             })
-            && key == "result";
+            && key == "result"
+            && !is_right_hand_member(identifier)
+            && !is_call_entity(identifier);
         let is_result_name = result_local.is_some()
             && routine_candidate.is_some()
             && routine_symbol_index
@@ -269,20 +273,22 @@ fn build_routine_flow<'a>(
                 start: identifier.start_byte(),
                 end: identifier.end_byte(),
             };
-            let Some((block, statement)) = statement_location(&cfg, span) else {
+            let Some(locations) = statement_locations(&cfg, span, cancel, budget)? else {
                 note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
                 continue;
             };
             let access =
                 classify_access(identifier, span, &document.source, &call_argument_accesses);
-            pending.push(PendingOccurrence {
-                var: result_local.unwrap(),
-                span,
-                access,
-                block,
-                statement_start: statement.start,
-                semantic_order: assignment_order(identifier),
-            });
+            for (block, statement) in locations {
+                pending.push(PendingOccurrence {
+                    var: result_local.unwrap(),
+                    span,
+                    access,
+                    block,
+                    statement_start: statement.start,
+                    semantic_order: assignment_order(identifier),
+                });
+            }
             continue;
         }
         if !local_names.contains(&key) && !is_result_name {
@@ -316,7 +322,7 @@ fn build_routine_flow<'a>(
                     start: identifier.start_byte(),
                     end: identifier.end_byte(),
                 };
-                let Some((block, statement)) = statement_location(&cfg, span) else {
+                let Some(locations) = statement_locations(&cfg, span, cancel, budget)? else {
                     note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
                     continue;
                 };
@@ -325,14 +331,16 @@ fn build_routine_flow<'a>(
                 if access == Access::AddressOf {
                     locals[binding.var].address_taken = true;
                 }
-                pending.push(PendingOccurrence {
-                    var: binding.var,
-                    span,
-                    access,
-                    block,
-                    statement_start: statement.start,
-                    semantic_order: assignment_order(identifier),
-                });
+                for (block, statement) in locations {
+                    pending.push(PendingOccurrence {
+                        var: binding.var,
+                        span,
+                        access,
+                        block,
+                        statement_start: statement.start,
+                        semantic_order: assignment_order(identifier),
+                    });
+                }
                 continue;
             }
             if is_result_name && routine_candidate.as_ref() == Some(candidate) {
@@ -341,20 +349,22 @@ fn build_routine_flow<'a>(
                     start: identifier.start_byte(),
                     end: identifier.end_byte(),
                 };
-                let Some((block, statement)) = statement_location(&cfg, span) else {
+                let Some(locations) = statement_locations(&cfg, span, cancel, budget)? else {
                     note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
                     continue;
                 };
                 let access =
                     classify_access(identifier, span, &document.source, &call_argument_accesses);
-                pending.push(PendingOccurrence {
-                    var,
-                    span,
-                    access,
-                    block,
-                    statement_start: statement.start,
-                    semantic_order: assignment_order(identifier),
-                });
+                for (block, statement) in locations {
+                    pending.push(PendingOccurrence {
+                        var,
+                        span,
+                        access,
+                        block,
+                        statement_start: statement.start,
+                        semantic_order: assignment_order(identifier),
+                    });
+                }
             }
         } else if (is_result_name
             || local_names.contains(&key)
@@ -930,12 +940,12 @@ fn call_argument_accesses(
     budget: &mut AssistanceBudget,
 ) -> Result<HashMap<(usize, usize), Access>, String> {
     let mut accesses = HashMap::new();
-    for call in body_nodes
-        .iter()
-        .copied()
-        .filter(|node| node.kind() == "exprCall")
-    {
+    for call in body_nodes.iter().copied() {
         check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if call.kind() != "exprCall" {
+            continue;
+        }
         let Some(arguments) = call.child_by_field_name("args") else {
             continue;
         };
@@ -944,6 +954,8 @@ fn call_argument_accesses(
         let mut cursor = arguments.walk();
         let mut argument_index = 0;
         for argument in arguments.named_children(&mut cursor) {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
             if argument.kind() == "legacyFormat" {
                 continue;
             }
@@ -952,49 +964,159 @@ fn call_argument_accesses(
             } else {
                 argument
             };
-            if expression.kind() == "identifier"
-                && local_names.contains(&canonical_name(&node_text(expression, &document.source)))
+            let lvalue_base =
+                call_argument_lvalue_base(expression, &document.source, cancel, budget)?;
+            let target_is_local = lvalue_base.is_some_and(|target| {
+                target.kind() == "identifier"
+                    && local_names.contains(&canonical_name(&node_text(target, &document.source)))
+            });
+            let fallback_targets = if lvalue_base.is_none() {
+                local_identifiers_in_expression(
+                    expression,
+                    &document.source,
+                    local_names,
+                    cancel,
+                    budget,
+                )?
+            } else {
+                Vec::new()
+            };
+            if !target_is_local && fallback_targets.is_empty() {
+                argument_index += 1;
+                continue;
+            }
+            let mode = super::super::overload::parameter_mode_for_argument(
+                index,
+                uri,
+                document,
+                call,
+                argument_index,
+                cancel,
+                budget,
+            )?;
+            let access = if matches!(callee_name.as_deref(), Some("inc" | "dec"))
+                && mode
+                    == super::super::overload::ParameterModeResolution::Intrinsic(Some(
+                        ParameterMode::Var,
+                    )) {
+                Access::ReadWrite
+            } else if callee_name.as_deref() == Some("addr")
+                && mode == super::super::overload::ParameterModeResolution::Unresolved
             {
-                let access = if matches!(callee_name.as_deref(), Some("inc" | "dec")) {
-                    Access::ReadWrite
-                } else if callee_name.as_deref() == Some("addr") {
-                    Access::AddressOf
+                Access::AddressOf
+            } else {
+                call_argument_access_for_mode(mode)
+            };
+
+            if access != Access::Read {
+                if target_is_local {
+                    let target = lvalue_base.expect("a local call target is an lvalue base");
+                    accesses.insert((target.start_byte(), target.end_byte()), access);
                 } else {
-                    match super::super::overload::parameter_mode_for_argument(
-                        index,
-                        uri,
-                        document,
-                        call,
-                        argument_index,
-                        cancel,
-                        budget,
-                    )? {
-                        super::super::overload::ParameterModeResolution::Resolved(Some(
-                            ParameterMode::Var,
-                        ))
-                        | super::super::overload::ParameterModeResolution::Intrinsic(Some(
-                            ParameterMode::Var,
-                        )) => Access::VarArg,
-                        super::super::overload::ParameterModeResolution::Resolved(Some(
-                            ParameterMode::Out,
-                        ))
-                        | super::super::overload::ParameterModeResolution::Intrinsic(Some(
-                            ParameterMode::Out,
-                        )) => Access::OutArg,
-                        super::super::overload::ParameterModeResolution::Unresolved
-                        | super::super::overload::ParameterModeResolution::Resolved(None)
-                        | super::super::overload::ParameterModeResolution::Intrinsic(None) => {
-                            Access::ReadWrite
-                        }
-                        _ => Access::Read,
+                    // The argument is not a recognized variable lvalue. Preserve
+                    // soundness by assigning a conservative variable-level effect
+                    // to every local it references rather than silently treating
+                    // the whole expression as a read.
+                    for identifier in fallback_targets {
+                        accesses.insert(
+                            (identifier.start_byte(), identifier.end_byte()),
+                            Access::ReadWrite,
+                        );
                     }
-                };
-                accesses.insert((expression.start_byte(), expression.end_byte()), access);
+                }
             }
             argument_index += 1;
         }
     }
     Ok(accesses)
+}
+
+fn call_argument_access_for_mode(mode: super::super::overload::ParameterModeResolution) -> Access {
+    match mode {
+        super::super::overload::ParameterModeResolution::Resolved(Some(ParameterMode::Var))
+        | super::super::overload::ParameterModeResolution::Intrinsic(Some(ParameterMode::Var)) => {
+            Access::VarArg
+        }
+        super::super::overload::ParameterModeResolution::Resolved(Some(ParameterMode::Out))
+        | super::super::overload::ParameterModeResolution::Intrinsic(Some(ParameterMode::Out)) => {
+            Access::OutArg
+        }
+        super::super::overload::ParameterModeResolution::Unresolved
+        | super::super::overload::ParameterModeResolution::Resolved(None)
+        | super::super::overload::ParameterModeResolution::Intrinsic(None) => Access::ReadWrite,
+        _ => Access::Read,
+    }
+}
+
+fn call_argument_lvalue_base<'tree>(
+    mut expression: Node<'tree>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<Node<'tree>>, String> {
+    loop {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        match expression.kind() {
+            "exprParens" if expression.named_child_count() == 1 => {
+                let Some(child) = expression.named_child(0) else {
+                    return Ok(None);
+                };
+                expression = child;
+            }
+            "exprDot" | "genericDot" => {
+                let Some(lhs) = expression.child_by_field_name("lhs") else {
+                    return Ok(None);
+                };
+                expression = lhs;
+            }
+            "exprSubscript" => {
+                let Some(entity) = expression.child_by_field_name("entity") else {
+                    return Ok(None);
+                };
+                expression = entity;
+            }
+            "exprUnary"
+                if expression
+                    .child_by_field_name("operator")
+                    .is_some_and(|operator| node_text(operator, source) == "^") =>
+            {
+                let Some(operand) = expression.child_by_field_name("operand") else {
+                    return Ok(None);
+                };
+                expression = operand;
+            }
+            "identifier" => return Ok(Some(expression)),
+            _ => return Ok(None),
+        }
+    }
+}
+
+fn local_identifiers_in_expression<'tree>(
+    expression: Node<'tree>,
+    source: &str,
+    local_names: &HashSet<String>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Vec<Node<'tree>>, String> {
+    let mut identifiers = Vec::new();
+    let mut pending = vec![expression];
+    while let Some(candidate) = pending.pop() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if candidate.kind() == "identifier"
+            && local_names.contains(&canonical_name(&node_text(candidate, source)))
+            && !is_declaration_name(candidate)
+            && !is_right_hand_member(candidate)
+            && !is_call_entity(candidate)
+        {
+            budget.require_owned_bytes(std::mem::size_of::<Node<'tree>>(), cancel)?;
+            identifiers.push(candidate);
+        }
+        let mut cursor = candidate.walk();
+        pending.extend(candidate.named_children(&mut cursor));
+    }
+    Ok(identifiers)
 }
 
 fn resolve_identifier(
@@ -1160,9 +1282,13 @@ fn is_right_hand_member(identifier: Node<'_>) -> bool {
     if !matches!(parent.kind(), "exprDot" | "genericDot") {
         return false;
     }
-    parent.child_by_field_name("right").is_some_and(|right| {
-        right.start_byte() <= identifier.start_byte() && identifier.end_byte() <= right.end_byte()
-    })
+    parent
+        .child_by_field_name("rhs")
+        .or_else(|| parent.child_by_field_name("right"))
+        .is_some_and(|right| {
+            right.start_byte() <= identifier.start_byte()
+                && identifier.end_byte() <= right.end_byte()
+        })
 }
 
 fn is_inside_with_body(identifier: Node<'_>, body_nodes: &[Node<'_>]) -> bool {
@@ -1175,20 +1301,41 @@ fn is_inside_with_body(identifier: Node<'_>, body_nodes: &[Node<'_>]) -> bool {
     })
 }
 
-fn statement_location(cfg: &Cfg, span: SourceSpan) -> Option<(BlockId, Range<usize>)> {
-    cfg.graph
-        .node_indices()
-        .flat_map(|node_index| {
-            let block = &cfg.graph[node_index];
-            block.stmts.iter().filter_map(move |statement| {
-                (statement.byte_range.start <= span.start && span.end <= statement.byte_range.end)
-                    .then_some((
-                        BlockId::from(node_index),
-                        statement.byte_range.clone(),
-                        statement.byte_range.end - statement.byte_range.start,
-                    ))
-            })
-        })
-        .min_by_key(|(block, _, length)| (*length, block.index().index()))
-        .map(|(block, range, _)| (block, range))
+pub(super) fn statement_locations(
+    cfg: &Cfg,
+    span: SourceSpan,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<StatementLocations>, String> {
+    let mut matches = Vec::new();
+    for node_index in cfg.graph.node_indices() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        let block = &cfg.graph[node_index];
+        for statement in &block.stmts {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            if statement.byte_range.start <= span.start && span.end <= statement.byte_range.end {
+                budget
+                    .require_owned_bytes(std::mem::size_of::<(BlockId, Range<usize>)>(), cancel)?;
+                matches.push((
+                    BlockId::from(node_index),
+                    statement.byte_range.clone(),
+                    statement.byte_range.end - statement.byte_range.start,
+                ));
+            }
+        }
+    }
+    let Some(shortest) = matches.iter().map(|(_, _, length)| *length).min() else {
+        return Ok(None);
+    };
+    matches.retain(|(_, _, length)| *length == shortest);
+    matches.sort_by_key(|(block, _, _)| block.index().index());
+    matches.dedup_by_key(|(block, _, _)| *block);
+    Ok(Some(
+        matches
+            .into_iter()
+            .map(|(block, range, _)| (block, range))
+            .collect(),
+    ))
 }

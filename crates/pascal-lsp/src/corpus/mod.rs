@@ -207,8 +207,19 @@ pub struct Report {
     pub include_located: Vec<DccMessage>,
     pub unanalysed_files: Vec<PathBuf>,
     pub index_timed_out: bool,
+    pub index_settle: Option<IndexSettleMetadata>,
     pub dcc_error_count: Option<usize>,
     pub friction: Vec<FrictionCategory>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexSettleMetadata {
+    pub context_count: Option<usize>,
+    pub pending: Option<u64>,
+    pub complete: Option<bool>,
+    pub membership_complete: Option<bool>,
+    pub consecutive_zero_pending_polls: usize,
+    pub required_zero_pending_polls: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -725,12 +736,31 @@ pub fn render_markdown(report: &Report) -> String {
 
     markdown.push_str("\n## Index settle\n\n");
     markdown.push_str(if report.index_timed_out {
-        "Timed out before the index became idle.\n"
+        "Timed out before zero-pending status stabilized.\n"
     } else if report.dcc_error_count.is_some() {
         "Not run: the project was excluded because DCC reported errors.\n"
     } else {
-        "Index reached idle.\n"
+        "Zero-pending status stabilized.\n"
     });
+    if let Some(metadata) = &report.index_settle {
+        let pending = metadata
+            .pending
+            .map_or_else(|| "unknown".to_string(), |count| count.to_string());
+        let contexts = metadata
+            .context_count
+            .map_or_else(|| "unknown".to_string(), |count| count.to_string());
+        let complete = metadata
+            .complete
+            .map_or("unknown", |value| if value { "true" } else { "false" });
+        let membership_complete = metadata
+            .membership_complete
+            .map_or("unknown", |value| if value { "true" } else { "false" });
+        markdown.push_str(&format!(
+            "Metadata: pending={pending} across {contexts} context(s); complete={complete}; membershipComplete={membership_complete}; zero-pending polls={}/{}.\n",
+            metadata.consecutive_zero_pending_polls,
+            metadata.required_zero_pending_polls
+        ));
+    }
 
     markdown.push_str("\n## Unanalysed files\n\n");
     if report.unanalysed_files.is_empty() {
@@ -937,10 +967,10 @@ fn strip_manifest_comment(line: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodeCounts, DccMessage, LspFinding, Manifest, ManifestProject, Report, Severity, compare,
-        compare_with_unanalysed, ensure_output_outside_roots, format_lsp_finding,
-        linux_path_to_wine, parse_dcc_output, parse_lsp_findings, parse_manifest, render_markdown,
-        wine_path_to_linux,
+        CodeCounts, DccMessage, IndexSettleMetadata, LspFinding, Manifest, ManifestProject, Report,
+        Severity, compare, compare_with_unanalysed, ensure_output_outside_roots,
+        format_lsp_finding, linux_path_to_wine, parse_dcc_output, parse_lsp_findings,
+        parse_manifest, render_markdown, wine_path_to_linux,
     };
     use std::collections::BTreeMap;
     use std::collections::HashSet;
@@ -1444,6 +1474,28 @@ initialization_options_json = '{"sourcePaths":["C:/DelphiSources/rtl"]}'
         assert!(markdown.contains("## Friction"));
         assert!(markdown.contains("Unit.pas:8"));
         assert!(markdown.contains("W1036"));
+    }
+
+    #[test]
+    fn renders_index_settle_completeness_fields_as_metadata() {
+        let report = Report {
+            index_settle: Some(IndexSettleMetadata {
+                context_count: Some(1),
+                pending: Some(0),
+                complete: Some(false),
+                membership_complete: Some(false),
+                consecutive_zero_pending_polls: 3,
+                required_zero_pending_polls: 3,
+            }),
+            ..Report::default()
+        };
+
+        let markdown = render_markdown(&report);
+
+        assert!(markdown.contains("pending=0 across 1 context"));
+        assert!(markdown.contains("complete=false"));
+        assert!(markdown.contains("membershipComplete=false"));
+        assert!(markdown.contains("zero-pending polls=3/3"));
     }
 
     #[test]

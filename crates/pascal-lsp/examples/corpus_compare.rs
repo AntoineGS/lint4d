@@ -1,6 +1,7 @@
 use pascal_lsp::corpus::{
-    DccMessage, Severity, compare_with_unanalysed, ensure_output_outside_roots, parse_dcc_output,
-    parse_lsp_findings, protected_output_roots, render_markdown, wine_path_to_linux,
+    DccMessage, IndexSettleMetadata, Severity, compare_with_unanalysed,
+    ensure_output_outside_roots, parse_dcc_output, parse_lsp_findings, protected_output_roots,
+    render_markdown, wine_path_to_linux,
 };
 use serde_json::Value;
 use std::collections::HashSet;
@@ -75,6 +76,7 @@ fn run() -> Result<(), String> {
             .get("index_timed_out")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        report.index_settle = parse_index_settle_metadata(Some(meta));
     }
     if report.index_timed_out {
         report.per_code.clear();
@@ -241,6 +243,29 @@ fn unanalysed_files(meta: Option<&Value>) -> HashSet<PathBuf> {
         .collect()
 }
 
+fn parse_index_settle_metadata(meta: Option<&Value>) -> Option<IndexSettleMetadata> {
+    let settle = meta?.get("index_settle")?;
+    Some(IndexSettleMetadata {
+        context_count: settle
+            .get("context_count")
+            .and_then(Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok()),
+        pending: settle.get("pending").and_then(Value::as_u64),
+        complete: settle.get("complete").and_then(Value::as_bool),
+        membership_complete: settle.get("membershipComplete").and_then(Value::as_bool),
+        consecutive_zero_pending_polls: settle
+            .get("consecutive_zero_pending_polls")
+            .and_then(Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or(0),
+        required_zero_pending_polls: settle
+            .get("required_zero_pending_polls")
+            .and_then(Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or(0),
+    })
+}
+
 fn failed_files(dcc: &[DccMessage]) -> HashSet<PathBuf> {
     dcc.iter()
         .filter(|message| matches!(message.severity, Severity::Error | Severity::Fatal))
@@ -271,9 +296,10 @@ fn resolve_dcc_path(path: &str, dcc_base: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{protected_roots, resolve_dcc_path, unanalysed_files};
+    use super::{parse_index_settle_metadata, protected_roots, resolve_dcc_path, unanalysed_files};
     use pascal_lsp::corpus::{
-        LspFinding, Severity, compare, ensure_output_outside_roots, parse_dcc_output,
+        IndexSettleMetadata, LspFinding, Severity, compare, ensure_output_outside_roots,
+        parse_dcc_output,
     };
     use serde_json::json;
     use std::collections::HashSet;
@@ -381,5 +407,31 @@ mod tests {
             HashSet::from([PathBuf::from("/project/Unit.pas")])
         );
         assert!(unanalysed_files(None).is_empty());
+    }
+
+    #[test]
+    fn reads_index_settle_metadata_without_requiring_complete_membership() {
+        let metadata = json!({
+            "index_settle": {
+                "context_count": 1,
+                "pending": 0,
+                "complete": false,
+                "membershipComplete": false,
+                "consecutive_zero_pending_polls": 3,
+                "required_zero_pending_polls": 3
+            }
+        });
+
+        assert_eq!(
+            parse_index_settle_metadata(Some(&metadata)),
+            Some(IndexSettleMetadata {
+                context_count: Some(1),
+                pending: Some(0),
+                complete: Some(false),
+                membership_complete: Some(false),
+                consecutive_zero_pending_polls: 3,
+                required_zero_pending_polls: 3,
+            })
+        );
     }
 }

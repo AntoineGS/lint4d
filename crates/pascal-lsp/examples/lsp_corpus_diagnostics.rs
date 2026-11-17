@@ -16,6 +16,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
 const PUSH_QUIET_PERIOD: Duration = Duration::from_millis(300);
 const PUSH_QUIET_LIMIT: Duration = Duration::from_secs(2);
+const INDEX_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const REQUIRED_ZERO_PENDING_POLLS: usize = 3;
 const MAX_LSP_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const NEOVIM_SOURCE_PATHS: &[&str] = &[
     "C:/DelphiSources/rtl/sys",
@@ -166,7 +168,7 @@ fn run() -> Result<(), String> {
         )?;
     }
 
-    let (index_status, index_timed_out) =
+    let (index_status, index_timed_out, zero_pending_polls) =
         client.wait_for_index(arguments.timeout, !documents.is_empty())?;
     let mut unanalysed_files = HashSet::new();
     if index_timed_out {
@@ -249,6 +251,7 @@ fn run() -> Result<(), String> {
     let meta = json!({
         "index_timed_out": index_timed_out,
         "index_status": index_status,
+        "index_settle": index_settle_metadata(&index_status, zero_pending_polls),
         "pull_diagnostics": pull_supported,
         "files_opened": documents.len(),
         "diagnostics": output.len(),
@@ -659,19 +662,34 @@ impl Client {
         &mut self,
         timeout: Duration,
         require_context: bool,
-    ) -> Result<(Value, bool), String> {
+    ) -> Result<(Value, bool, usize), String> {
         let deadline = Instant::now() + timeout;
+        let mut tracker = IndexSettleTracker::default();
+        let mut last_status = Value::Null;
         loop {
-            let status = self.request("pascal/indexStatus", json!({}), timeout)?;
-            if index_status_idle(&status, require_context) {
-                return Ok((status, false));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok((last_status, true, tracker.zero_pending_polls()));
             }
-            if Instant::now() >= deadline {
-                return Ok((status, true));
+            let status = match self.request("pascal/indexStatus", json!({}), remaining) {
+                Ok(status) => status,
+                Err(error) if error == "timed out waiting for pascal-lsp" => {
+                    return Ok((last_status, true, tracker.zero_pending_polls()));
+                }
+                Err(error) => return Err(error),
+            };
+            let observed_at = Instant::now();
+            let settled = tracker.observe(&status, observed_at, require_context);
+            last_status = status;
+            if settled && observed_at < deadline {
+                return Ok((last_status, false, tracker.zero_pending_polls()));
             }
             let pause = deadline
                 .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(500));
+                .min(INDEX_STATUS_POLL_INTERVAL);
+            if pause.is_zero() {
+                return Ok((last_status, true, tracker.zero_pending_polls()));
+            }
             thread::sleep(pause);
         }
     }
@@ -743,15 +761,74 @@ impl Drop for Client {
     }
 }
 
-fn index_status_idle(status: &Value, require_context: bool) -> bool {
+#[derive(Debug, Default)]
+struct IndexSettleTracker {
+    zero_pending_polls: usize,
+    last_zero_pending_poll: Option<Instant>,
+}
+
+impl IndexSettleTracker {
+    fn observe(&mut self, status: &Value, observed_at: Instant, require_context: bool) -> bool {
+        if !index_status_pending_zero(status, require_context) {
+            self.zero_pending_polls = 0;
+            self.last_zero_pending_poll = None;
+            return false;
+        }
+
+        self.zero_pending_polls = match self.last_zero_pending_poll {
+            Some(last_poll)
+                if observed_at.saturating_duration_since(last_poll)
+                    >= INDEX_STATUS_POLL_INTERVAL =>
+            {
+                self.zero_pending_polls.saturating_add(1)
+            }
+            _ => 1,
+        };
+        self.last_zero_pending_poll = Some(observed_at);
+        self.zero_pending_polls >= REQUIRED_ZERO_PENDING_POLLS
+    }
+
+    fn zero_pending_polls(&self) -> usize {
+        self.zero_pending_polls
+    }
+}
+
+fn index_status_pending_zero(status: &Value, require_context: bool) -> bool {
     let Some(contexts) = status.get("contexts").and_then(Value::as_array) else {
         return false;
     };
     (!require_context || !contexts.is_empty())
-        && contexts.iter().all(|context| {
-            context.get("complete").and_then(Value::as_bool) == Some(true)
-                && context.get("pending").and_then(Value::as_u64).unwrap_or(0) == 0
+        && contexts
+            .iter()
+            .all(|context| context.get("pending").and_then(Value::as_u64) == Some(0))
+}
+
+fn index_settle_metadata(status: &Value, zero_pending_polls: usize) -> Value {
+    let contexts = status.get("contexts").and_then(Value::as_array);
+    let context_count = contexts.map(Vec::len);
+    let pending = contexts.and_then(|contexts| {
+        contexts.iter().try_fold(0_u64, |total, context| {
+            total.checked_add(context.get("pending")?.as_u64()?)
         })
+    });
+    let all_contexts_bool = |key: &str| {
+        contexts.and_then(|contexts| {
+            (!contexts.is_empty()).then(|| {
+                contexts.iter().try_fold(true, |all, context| {
+                    context.get(key)?.as_bool().map(|value| all && value)
+                })
+            })?
+        })
+    };
+
+    json!({
+        "context_count": context_count,
+        "pending": pending,
+        "complete": all_contexts_bool("complete"),
+        "membershipComplete": all_contexts_bool("membershipComplete"),
+        "consecutive_zero_pending_polls": zero_pending_polls,
+        "required_zero_pending_polls": REQUIRED_ZERO_PENDING_POLLS
+    })
 }
 
 fn read_messages(stdout: impl Read, sender: Sender<Result<Value, String>>) {
@@ -819,26 +896,121 @@ fn read_message(reader: &mut impl BufRead) -> io::Result<Option<Value>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SourceDocument, compute_run_fingerprint, diagnostic_finding, index_status_idle,
-        initialize_capabilities, load_initialization_options,
+        IndexSettleTracker, SourceDocument, compute_run_fingerprint, diagnostic_finding,
+        index_settle_metadata, index_status_pending_zero, initialize_capabilities,
+        load_initialization_options,
     };
     use pascal_lsp::corpus::{ensure_output_outside_roots, protected_output_roots};
     use serde_json::json;
     use std::fs;
     use std::path::Path;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::{Duration, Instant, UNIX_EPOCH};
 
     #[test]
-    fn index_status_waits_for_context_completion() {
-        assert!(!index_status_idle(
-            &json!({"contexts": [{"complete": false, "pending": 0}]}),
+    fn zero_pending_is_settled_even_when_context_membership_is_incomplete() {
+        assert!(index_status_pending_zero(
+            &json!({
+                "contexts": [{
+                    "complete": false,
+                    "membershipComplete": false,
+                    "pending": 0
+                }]
+            }),
             true
         ));
-        assert!(!index_status_idle(&json!({"contexts": []}), true));
-        assert!(index_status_idle(
+        assert!(!index_status_pending_zero(
+            &json!({"contexts": [{"complete": true, "pending": 1}]}),
+            true
+        ));
+        assert!(!index_status_pending_zero(&json!({"contexts": []}), true));
+        assert!(index_status_pending_zero(
             &json!({"contexts": [{"complete": true, "pending": 0}]}),
             true
         ));
+    }
+
+    #[test]
+    fn index_settle_requires_three_spaced_zero_pending_samples_and_resets_on_work() {
+        let zero_pending_incomplete = json!({
+            "contexts": [{
+                "complete": false,
+                "membershipComplete": false,
+                "pending": 0
+            }]
+        });
+        let pending_work = json!({
+            "contexts": [{
+                "complete": false,
+                "membershipComplete": false,
+                "pending": 1
+            }]
+        });
+        let start = Instant::now();
+        let mut tracker = IndexSettleTracker::default();
+
+        assert!(!tracker.observe(&zero_pending_incomplete, start, true));
+        assert!(!tracker.observe(
+            &zero_pending_incomplete,
+            start + Duration::from_secs(2),
+            true
+        ));
+        assert!(tracker.observe(
+            &zero_pending_incomplete,
+            start + Duration::from_secs(4),
+            true
+        ));
+
+        let mut tracker = IndexSettleTracker::default();
+        assert!(!tracker.observe(&zero_pending_incomplete, start, true));
+        assert!(!tracker.observe(
+            &zero_pending_incomplete,
+            start + Duration::from_secs(2),
+            true
+        ));
+        assert!(!tracker.observe(&pending_work, start + Duration::from_secs(4), true));
+        assert!(!tracker.observe(
+            &zero_pending_incomplete,
+            start + Duration::from_secs(6),
+            true
+        ));
+        assert!(!tracker.observe(
+            &zero_pending_incomplete,
+            start + Duration::from_secs(8),
+            true
+        ));
+        assert!(tracker.observe(
+            &zero_pending_incomplete,
+            start + Duration::from_secs(10),
+            true
+        ));
+
+        let mut tracker = IndexSettleTracker::default();
+        for poll in 0..4 {
+            assert!(!tracker.observe(&pending_work, start + Duration::from_secs(poll * 2), true));
+        }
+    }
+
+    #[test]
+    fn index_settle_metadata_preserves_incomplete_server_status_fields() {
+        let status = json!({
+            "contexts": [{
+                "pending": 0,
+                "complete": false,
+                "membershipComplete": false
+            }]
+        });
+
+        assert_eq!(
+            index_settle_metadata(&status, 3),
+            json!({
+                "context_count": 1,
+                "pending": 0,
+                "complete": false,
+                "membershipComplete": false,
+                "consecutive_zero_pending_polls": 3,
+                "required_zero_pending_polls": 3
+            })
+        );
     }
 
     #[test]

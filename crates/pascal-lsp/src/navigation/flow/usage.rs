@@ -101,6 +101,25 @@ pub(super) fn flow_diagnostics(
             continue;
         }
 
+        let compiler_version = document.conditional_context.compiler_version;
+        if w1035_w1036_supported(compiler_version) {
+            for diagnostic in definite_assignment_diagnostics(
+                flow,
+                locals,
+                &loop_facts,
+                &active_occurrences,
+                compiler_version,
+                cancel,
+                budget,
+            )? {
+                if diagnostics.len() >= capacity {
+                    *diagnostic_cap_reached = true;
+                    return Ok(diagnostics);
+                }
+                diagnostics.push(diagnostic);
+            }
+        }
+
         append_loop_diagnostics(
             index,
             uri,
@@ -176,6 +195,437 @@ pub(super) fn flow_diagnostics(
     }
     diagnostics.sort_by_key(|diagnostic| (diagnostic.span.start, diagnostic.span.end));
     Ok(diagnostics)
+}
+
+#[derive(Debug)]
+struct MustFlowGraph {
+    state_blocks: Vec<usize>,
+    outgoing: Vec<Vec<(usize, EdgeKind)>>,
+    incoming: Vec<Vec<(usize, EdgeKind)>>,
+    reachable: Vec<bool>,
+    entry: usize,
+    exit: usize,
+    for_in_binders: HashSet<(usize, usize)>,
+    for_in_iterator_occurrences: HashSet<(usize, usize, SourceSpan)>,
+    for_in_vars: HashSet<usize>,
+}
+
+#[derive(Debug, Default)]
+struct DefiniteAssignmentFacts {
+    first_uninitialized_read: Option<SourceSpan>,
+    normal_exit_uninitialized: bool,
+}
+
+fn w1035_w1036_supported(compiler_version: Option<pascal_project::CompilerVersion>) -> bool {
+    matches!(
+        compiler_version.map(|version| (version.major, version.minor)),
+        Some((21, 0) | (24, 0) | (37, 0))
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn definite_assignment_diagnostics(
+    flow: &RoutineFlow<'_>,
+    locals: &[super::LocalVar],
+    loop_facts: &[LoopFact<'_>],
+    occurrences: &[&VarOccurrence],
+    compiler_version: Option<pascal_project::CompilerVersion>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Vec<SemanticDiagnostic>, String> {
+    let Some(cfg) = flow.cfg.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let graph = build_must_flow_graph(flow, loop_facts, occurrences, cancel, budget)?;
+    let compiler = compiler_version.map(|version| (version.major, version.minor));
+    let mut diagnostics = Vec::new();
+
+    if let Some(result) = locals
+        .iter()
+        .position(|local| local.kind == LocalKind::Result)
+        && local_is_definite_assignment_eligible(&locals[result], result, occurrences)
+    {
+        let facts = definite_assignment_facts(cfg, &graph, result, occurrences, cancel, budget)?;
+        if facts.normal_exit_uninitialized
+            && let Some(span) = final_end_span(flow, cancel, budget)?
+        {
+            budget.require_owned_bytes(std::mem::size_of::<SemanticDiagnostic>(), cancel)?;
+            let message = DccMessage::W1035.format(&[&flow.name]);
+            diagnostics.push(SemanticDiagnostic {
+                kind: super::super::SemanticDiagnosticKind::Dcc(DccMessage::W1035),
+                span,
+                message,
+            });
+        }
+    }
+
+    for (var, local) in locals.iter().enumerate() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        let eligible_kind = if graph.for_in_vars.contains(&var) {
+            compiler == Some((37, 0))
+        } else {
+            local.kind == LocalKind::Local
+        };
+        if !eligible_kind || !local_is_definite_assignment_eligible(local, var, occurrences) {
+            continue;
+        }
+        let facts = definite_assignment_facts(cfg, &graph, var, occurrences, cancel, budget)?;
+        let Some(span) = facts.first_uninitialized_read else {
+            continue;
+        };
+        budget.require_owned_bytes(std::mem::size_of::<SemanticDiagnostic>(), cancel)?;
+        diagnostics.push(SemanticDiagnostic {
+            kind: super::super::SemanticDiagnosticKind::Dcc(DccMessage::W1036),
+            span,
+            message: DccMessage::W1036.format(&[&local.name]),
+        });
+    }
+    Ok(diagnostics)
+}
+
+fn local_is_definite_assignment_eligible(
+    local: &super::LocalVar,
+    var: usize,
+    occurrences: &[&VarOccurrence],
+) -> bool {
+    (local.ty == VarType::Scalar || local.class_reference)
+        && local.type_resolved
+        && !local.unresolved_local_generic_argument
+        && !local.unknown_call_effect
+        && !local.address_taken
+        && !local.captured
+        && !local.absolute
+        && !local.possible_with_target
+        && !occurrences.iter().any(|occurrence| {
+            occurrence.var == var && matches!(occurrence.access, Access::OutArg | Access::VarArg)
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_must_flow_graph(
+    flow: &RoutineFlow<'_>,
+    loop_facts: &[LoopFact<'_>],
+    occurrences: &[&VarOccurrence],
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<MustFlowGraph, String> {
+    let cfg = flow.cfg.as_ref().expect("must-flow graph requires a CFG");
+    let block_count = cfg.graph.node_count();
+    let forced = definitely_nonempty_for_exits(flow, loop_facts, cancel, budget)?;
+    let mut forced_blocks = forced
+        .into_iter()
+        .filter(|block| *block < block_count)
+        .collect::<Vec<_>>();
+    forced_blocks.sort_unstable();
+    let state_count = block_count.saturating_add(forced_blocks.len());
+    let graph_bytes = state_count
+        .saturating_mul(
+            std::mem::size_of::<usize>()
+                + std::mem::size_of::<bool>()
+                + std::mem::size_of::<Vec<(usize, EdgeKind)>>() * 2,
+        )
+        .saturating_add(
+            cfg.graph
+                .edge_count()
+                .saturating_mul(4)
+                .saturating_mul(std::mem::size_of::<(usize, EdgeKind)>()),
+        )
+        .saturating_add(occurrences.len().saturating_mul(std::mem::size_of::<(
+            usize,
+            usize,
+            SourceSpan,
+        )>()));
+    budget.require_owned_bytes(graph_bytes, cancel)?;
+
+    let mut state_blocks = (0..block_count).collect::<Vec<_>>();
+    let mut recurrent_state = vec![None; block_count];
+    for block in forced_blocks {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        recurrent_state[block] = Some(state_blocks.len());
+        state_blocks.push(block);
+    }
+
+    let mut for_in_binders = HashSet::new();
+    let mut for_in_iterator_occurrences = HashSet::new();
+    let mut for_in_vars = HashSet::new();
+    for fact in loop_facts {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if fact.kind != LoopKind::ForIn {
+            continue;
+        }
+        let Some(span) = fact.iterator_span else {
+            continue;
+        };
+        for occurrence in occurrences {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            if occurrence.span != span {
+                continue;
+            }
+            let block = occurrence.block.index().index();
+            for_in_binders.insert((block, occurrence.var));
+            for_in_iterator_occurrences.insert((block, occurrence.var, occurrence.span));
+            for_in_vars.insert(occurrence.var);
+        }
+    }
+
+    let mut outgoing = vec![Vec::new(); state_count];
+    for edge in cfg.graph.edge_indices() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        let Some((from, to)) = cfg.graph.edge_endpoints(edge) else {
+            continue;
+        };
+        let Some(kind) = cfg.graph.edge_weight(edge) else {
+            continue;
+        };
+        let source = from.index();
+        let destination = to.index();
+        let target = if *kind == EdgeKind::LoopBack {
+            recurrent_state[destination].unwrap_or(destination)
+        } else {
+            destination
+        };
+        let first_entry_exit = recurrent_state[source].is_some() && *kind == EdgeKind::LoopExit;
+        if !first_entry_exit {
+            outgoing[source].push((target, kind.clone()));
+        }
+        if let Some(recurrent) = recurrent_state[source] {
+            outgoing[recurrent].push((target, kind.clone()));
+        }
+    }
+
+    let mut incoming = vec![Vec::new(); state_count];
+    for (source, edges) in outgoing.iter().enumerate() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        for (target, kind) in edges {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            incoming[*target].push((source, kind.clone()));
+        }
+    }
+
+    let entry = cfg.entry.index().index();
+    let exit = cfg.exit.index().index();
+    let mut reachable = vec![false; state_count];
+    if entry < state_count {
+        let mut pending = vec![entry];
+        reachable[entry] = true;
+        while let Some(state) = pending.pop() {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            for (target, _) in &outgoing[state] {
+                check_navigation_cancel(cancel)?;
+                budget.require_work(1, cancel)?;
+                if !reachable[*target] {
+                    reachable[*target] = true;
+                    pending.push(*target);
+                }
+            }
+        }
+    }
+
+    Ok(MustFlowGraph {
+        state_blocks,
+        outgoing,
+        incoming,
+        reachable,
+        entry,
+        exit,
+        for_in_binders,
+        for_in_iterator_occurrences,
+        for_in_vars,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn definite_assignment_facts(
+    cfg: &Cfg,
+    graph: &MustFlowGraph,
+    var: usize,
+    occurrences: &[&VarOccurrence],
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<DefiniteAssignmentFacts, String> {
+    let block_count = cfg.graph.node_count();
+    let state_count = graph.state_blocks.len();
+    budget.require_owned_bytes(
+        block_count
+            .saturating_mul(std::mem::size_of::<Vec<&VarOccurrence>>())
+            .saturating_add(state_count.saturating_mul(std::mem::size_of::<bool>() * 2))
+            .saturating_add(
+                occurrences
+                    .len()
+                    .saturating_mul(std::mem::size_of::<&VarOccurrence>()),
+            ),
+        cancel,
+    )?;
+    let mut by_block = vec![Vec::new(); block_count];
+    for &occurrence in occurrences {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if occurrence.var == var {
+            let block = occurrence.block.index().index();
+            if block < by_block.len() {
+                by_block[block].push(occurrence);
+            }
+        }
+    }
+    for events in &mut by_block {
+        events.sort_by_key(|occurrence| occurrence.order);
+    }
+
+    let mut input = vec![true; state_count];
+    let mut output = vec![true; state_count];
+    loop {
+        let mut changed = false;
+        for state in 0..state_count {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            if !graph.reachable[state] {
+                continue;
+            }
+            let next_input = if state == graph.entry {
+                false
+            } else {
+                let mut has_predecessor = false;
+                let mut defined = true;
+                for (source, kind) in &graph.incoming[state] {
+                    check_navigation_cancel(cancel)?;
+                    budget.require_work(1, cancel)?;
+                    if !graph.reachable[*source] {
+                        continue;
+                    }
+                    has_predecessor = true;
+                    defined &= must_edge_state(graph, *source, kind, var, &input, &output);
+                }
+                if !has_predecessor {
+                    continue;
+                }
+                defined
+            };
+            let block = graph.state_blocks[state];
+            let mut next_output = next_input;
+            for occurrence in &by_block[block] {
+                check_navigation_cancel(cancel)?;
+                budget.require_work(1, cancel)?;
+                if graph
+                    .for_in_iterator_occurrences
+                    .contains(&(block, var, occurrence.span))
+                {
+                    continue;
+                }
+                if access_writes(occurrence.access) {
+                    next_output = true;
+                }
+            }
+            if input[state] != next_input || output[state] != next_output {
+                input[state] = next_input;
+                output[state] = next_output;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut facts = DefiniteAssignmentFacts::default();
+    for state in 0..state_count {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if !graph.reachable[state] {
+            continue;
+        }
+        let block = graph.state_blocks[state];
+        let mut defined = input[state];
+        for occurrence in &by_block[block] {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            if graph
+                .for_in_iterator_occurrences
+                .contains(&(block, var, occurrence.span))
+            {
+                continue;
+            }
+            if access_reads(occurrence.access)
+                && !defined
+                && facts
+                    .first_uninitialized_read
+                    .is_none_or(|first| occurrence.span.start < first.start)
+            {
+                facts.first_uninitialized_read = Some(occurrence.span);
+            }
+            if access_writes(occurrence.access) {
+                defined = true;
+            }
+        }
+    }
+
+    for state in 0..state_count {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if !graph.reachable[state] {
+            continue;
+        }
+        for (target, kind) in &graph.outgoing[state] {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            if *target != graph.exit || *kind == EdgeKind::ExceptionThrow {
+                continue;
+            }
+            if !must_edge_state(graph, state, kind, var, &input, &output) {
+                facts.normal_exit_uninitialized = true;
+            }
+        }
+    }
+    Ok(facts)
+}
+
+fn must_edge_state(
+    graph: &MustFlowGraph,
+    source: usize,
+    kind: &EdgeKind,
+    var: usize,
+    input: &[bool],
+    output: &[bool],
+) -> bool {
+    let mut defined = if *kind == EdgeKind::ExceptionThrow {
+        input[source]
+    } else {
+        output[source]
+    };
+    if *kind == EdgeKind::ConditionalTrue
+        && graph
+            .for_in_binders
+            .contains(&(graph.state_blocks[source], var))
+    {
+        defined = true;
+    }
+    defined
+}
+
+fn final_end_span(
+    flow: &RoutineFlow<'_>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<SourceSpan>, String> {
+    let Some(body) = flow.node.child_by_field_name("body") else {
+        return Ok(None);
+    };
+    let nodes = collect_nodes(body, cancel, budget)?;
+    Ok(nodes
+        .into_iter()
+        .filter(|node| node.kind() == "kEnd")
+        .max_by_key(|node| node.start_byte())
+        .map(|node| SourceSpan {
+            start: node.start_byte(),
+            end: node.end_byte(),
+        }))
 }
 
 #[allow(clippy::too_many_arguments)]

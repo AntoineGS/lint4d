@@ -121,9 +121,9 @@ fn flow_scaffolding_extracts_routine_locals_and_cfg() {
 fn flow_model_classifies_local_types_and_parameter_modes_conservatively() {
     let source = concat!(
         "program FlowTypes;\n",
-        "type TRecord = record Value: Integer; end; TEnum = (One, Two); PInteger = ^Integer;\n",
+        "type TRecord = record Value: Integer; end; TEnum = (One, Two); PInteger = ^Integer; TClass = class(TObject) end;\n",
         "procedure Demo(Value: Integer; var Ref: Integer; out Output: Integer; const ReadOnly: Integer);\n",
-        "var Number: Integer; Text: string; R: TRecord; E: TEnum; P: PInteger;\n",
+        "var Number: Integer; Text: string; R: TRecord; E: TEnum; P: PInteger; C: TClass;\n",
         "begin Ref := Value; Output := Number; end;\n",
         "begin end.\n",
     );
@@ -156,6 +156,9 @@ fn flow_model_classifies_local_types_and_parameter_modes_conservatively() {
     assert_eq!(local("R").ty, VarType::Record);
     assert_eq!(local("E").ty, VarType::Unknown);
     assert_eq!(local("P").ty, VarType::Unknown);
+    assert_eq!(local("C").ty, VarType::Unknown);
+    assert!(local("C").class_reference);
+    assert!(local("C").type_resolved);
 }
 
 #[test]
@@ -669,6 +672,65 @@ fn flow_model_creates_result_local_and_binds_result_assignments() {
 }
 
 #[test]
+fn flow_model_treats_exit_value_as_a_result_write() {
+    let source = concat!(
+        "program FlowExitResult;\n",
+        "function Demo: Integer;\n",
+        "begin Exit(42); end;\n",
+        "begin end.\n",
+    );
+    let flow = routine(source, "Demo");
+    let result = flow
+        .locals
+        .iter()
+        .position(|local| local.kind == LocalKind::Result)
+        .expect("synthetic function result");
+
+    assert!(
+        flow.occurrences.iter().any(|occurrence| {
+            occurrence.var == result
+                && occurrence.access == Access::Write
+                && source[occurrence.span.start..occurrence.span.end].starts_with("Exit(")
+        }),
+        "Exit(value) must define the synthetic Result local"
+    );
+}
+
+#[test]
+fn flow_diagnostics_report_uninitialized_class_references() {
+    let source = include_str!("../../../tests/dcc_oracle/w1036_class_reference/ClassReference.pas");
+    let flow = routine(source, "Demo");
+    let worker = flow
+        .locals
+        .iter()
+        .find(|local| local.name == "Worker")
+        .expect("class reference local");
+
+    assert_eq!(worker.ty, VarType::Unknown);
+    assert!(worker.class_reference);
+    assert!(worker.type_resolved);
+    assert_eq!(flow.excluded, None);
+    assert!(
+        occurrences(&flow, "Worker").any(|occurrence| occurrence.access == Access::Read),
+        "the nil comparison must bind as a read of the local"
+    );
+    assert_eq!(
+        flow_finding_lines(
+            source,
+            &flow_diagnostics_with_version(
+                source,
+                Some(pascal_project::CompilerVersion::new(37, 0)),
+            ),
+        ),
+        vec![(
+            "W1036".to_owned(),
+            9,
+            "Variable 'Worker' might not have been initialized".to_owned(),
+        )]
+    );
+}
+
+#[test]
 fn flow_model_only_binds_bare_unqualified_result_as_the_synthetic_result() {
     let source = concat!(
         "program FlowQualifiedResult;\n",
@@ -818,6 +880,7 @@ fn flow_with_target_scan_reports_budget_exclusion() {
         decl_span: SourceSpan { start: 0, end: 0 },
         kind: LocalKind::Local,
         ty: VarType::Scalar,
+        class_reference: false,
         type_resolved: true,
         unresolved_local_generic_argument: false,
         unknown_call_effect: false,
@@ -1297,6 +1360,60 @@ fn flow_diagnostics_withhold_findings_when_a_routine_has_an_unresolved_identifie
 }
 
 #[test]
+fn flow_unresolved_callee_is_conservative() {
+    let source = concat!(
+        "program FlowUnresolvedCallee;\n",
+        "procedure Demo;\n",
+        "var Value: Integer;\n",
+        "begin\n",
+        "  Mystery(Value);\n",
+        "  WriteLn(Value);\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+
+    assert!(
+        flow_diagnostics_with_version(source, Some(pascal_project::CompilerVersion::new(37, 0)),)
+            .iter()
+            .all(|finding| finding.kind.code() != "W1036"),
+        "an unresolved call may initialize or modify its argument, so W1036 must stay silent"
+    );
+}
+
+#[test]
+fn flow_diagnostics_withhold_w1035_and_w1036_for_unrecorded_compiler_versions() {
+    let source = concat!(
+        "program FlowDefiniteAssignmentVersion;\n",
+        "function Answer: Integer;\n",
+        "begin\n",
+        "end;\n",
+        "procedure Demo;\n",
+        "var Value: Integer;\n",
+        "begin\n",
+        "  WriteLn(Value);\n",
+        "end;\n",
+        "begin\n",
+        "  WriteLn(Answer);\n",
+        "  Demo;\n",
+        "end.\n",
+    );
+    let unrecorded_versions = [
+        None,
+        Some(pascal_project::CompilerVersion::new(24, 1)),
+        Some(pascal_project::CompilerVersion::new(36, 0)),
+    ];
+
+    for compiler_version in unrecorded_versions {
+        assert!(
+            flow_diagnostics_with_version(source, compiler_version)
+                .iter()
+                .all(|finding| !matches!(finding.kind.code(), "W1035" | "W1036")),
+            "unrecorded compiler version {compiler_version:?} must not produce W1035 or W1036"
+        );
+    }
+}
+
+#[test]
 fn flow_diagnostics_withhold_findings_for_duplicate_local_identities() {
     let sources = [
         concat!(
@@ -1335,7 +1452,9 @@ fn flow_type_uncertainty_is_scoped_to_the_local_and_rules_that_need_its_type() {
         "var ExternalValue: ExternalTypes.TExternal;\n",
         "    NeverRead: Integer;\n",
         "begin\n",
+        "  WriteLn(ExternalValue);\n",
         "  ExternalValue := 1;\n",
+        "  WriteLn(ExternalValue);\n",
         "end;\n",
         "end.\n",
     );
@@ -1348,6 +1467,12 @@ fn flow_type_uncertainty_is_scoped_to_the_local_and_rules_that_need_its_type() {
             "Variable 'NeverRead' is declared but never used in 'Demo'".to_owned(),
         )],
         "the unresolved type must not hide independent H2164 or make its own write eligible for H2077"
+    );
+    assert!(
+        flow_diagnostics_with_version(source, Some(pascal_project::CompilerVersion::new(37, 0)),)
+            .iter()
+            .all(|finding| finding.kind.code() != "W1036"),
+        "an unresolved local type must not be treated as a proven scalar for W1036"
     );
 }
 

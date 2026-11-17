@@ -80,6 +80,7 @@ pub(crate) struct LocalVar {
     pub(crate) decl_span: SourceSpan,
     pub(crate) kind: LocalKind,
     pub(crate) ty: VarType,
+    pub(crate) class_reference: bool,
     pub(crate) type_resolved: bool,
     pub(crate) unresolved_local_generic_argument: bool,
     pub(crate) unknown_call_effect: bool,
@@ -423,9 +424,33 @@ fn build_routine_flow<'a>(
     for identifier in body_nodes.iter().copied() {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
-        if identifier.kind() != "identifier"
-            || is_control_transfer_identifier(identifier, &document.source)
-        {
+        if identifier.kind() != "identifier" {
+            continue;
+        }
+        if is_control_transfer_identifier(identifier, &document.source) {
+            if let (Some(result), Some(exit_call)) = (
+                result_local,
+                exit_call_with_argument(identifier, &document.source),
+            ) {
+                let span = SourceSpan {
+                    start: exit_call.start_byte(),
+                    end: exit_call.end_byte(),
+                };
+                let Some(locations) = statement_locations(&cfg, span, cancel, budget)? else {
+                    note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
+                    continue;
+                };
+                for (block, statement) in locations {
+                    pending.push(PendingOccurrence {
+                        var: result,
+                        span,
+                        access: Access::Write,
+                        block,
+                        statement_start: statement.start,
+                        semantic_order: 2,
+                    });
+                }
+            }
             continue;
         }
         let name = node_text(identifier, &document.source);
@@ -668,6 +693,7 @@ fn collect_locals(
         let mode = symbol.parameter_mode.map(local_parameter_mode);
         let kind = mode.map_or(LocalKind::Local, LocalKind::Parameter);
         let ty = classify_symbol_type(document, symbol);
+        let class_reference = symbol_is_class_reference(document, symbol);
         let type_resolved = symbol.type_shape.as_ref().is_some_and(|shape| {
             type_shape_is_resolved(document, symbol.scope, shape, &mut HashSet::new())
         });
@@ -688,6 +714,7 @@ fn collect_locals(
             },
             kind,
             ty,
+            class_reference,
             type_resolved,
             unresolved_local_generic_argument,
             unknown_call_effect: false,
@@ -746,6 +773,7 @@ fn collect_locals(
             },
             kind: LocalKind::Result,
             ty,
+            class_reference: false,
             type_resolved,
             unresolved_local_generic_argument,
             unknown_call_effect: false,
@@ -798,6 +826,67 @@ fn classify_symbol_type(document: &Document, symbol: &Symbol) -> VarType {
         .as_ref()
         .map(|shape| classify_type_shape(document, symbol.scope, shape, &mut HashSet::new()))
         .unwrap_or(VarType::Unknown)
+}
+
+fn symbol_is_class_reference(document: &Document, symbol: &Symbol) -> bool {
+    symbol.type_shape.as_ref().is_some_and(|shape| {
+        type_shape_is_class_reference(document, symbol.scope, shape, &mut HashSet::new())
+    })
+}
+
+fn type_shape_is_class_reference(
+    document: &Document,
+    scope: usize,
+    shape: &TypeShape,
+    visited: &mut HashSet<(usize, String)>,
+) -> bool {
+    match shape {
+        TypeShape::Named(type_ref) => {
+            type_ref_is_class_reference(document, scope, type_ref, visited)
+        }
+        TypeShape::Pointer(_)
+        | TypeShape::Array { .. }
+        | TypeShape::Callable
+        | TypeShape::Unknown => false,
+    }
+}
+
+fn type_ref_is_class_reference(
+    document: &Document,
+    scope: usize,
+    type_ref: &TypeRef,
+    visited: &mut HashSet<(usize, String)>,
+) -> bool {
+    let Some(name) = type_ref.path.last() else {
+        return false;
+    };
+    let key = canonical_name(name);
+    if key == "tobject" {
+        return true;
+    }
+    if !visited.insert((scope, key.clone())) {
+        return false;
+    }
+    let result = document
+        .symbols
+        .iter()
+        .filter(|candidate| {
+            candidate.kind == SymbolKind::Type
+                && candidate.key == key
+                && scope_is_within(document, scope, candidate.scope)
+        })
+        .max_by_key(|candidate| scope_depth(document, candidate.scope))
+        .is_some_and(|candidate| {
+            candidate.type_kind == TypeKind::Class
+                || candidate.type_shape.as_ref().is_some_and(|shape| {
+                    type_shape_is_class_reference(document, candidate.scope, shape, visited)
+                })
+                || candidate.type_ref.as_ref().is_some_and(|underlying| {
+                    type_ref_is_class_reference(document, candidate.scope, underlying, visited)
+                })
+        });
+    visited.remove(&(scope, key));
+    result
 }
 
 fn type_shape_is_resolved(
@@ -1747,6 +1836,18 @@ fn is_control_transfer_identifier(identifier: Node<'_>, source: &str) -> bool {
     ["exit", "break", "continue", "raise"]
         .iter()
         .any(|keyword| name.eq_ignore_ascii_case(keyword))
+}
+
+fn exit_call_with_argument<'tree>(identifier: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    if !node_text(identifier, source).eq_ignore_ascii_case("exit") {
+        return None;
+    }
+    let call = identifier
+        .parent()
+        .filter(|parent| parent.kind() == "exprCall")?;
+    let entity = call.child_by_field_name("entity")?;
+    let args = call.child_by_field_name("args")?;
+    (entity.id() == identifier.id() && args.named_child_count() > 0).then_some(call)
 }
 
 fn is_declaration_name(identifier: Node<'_>) -> bool {

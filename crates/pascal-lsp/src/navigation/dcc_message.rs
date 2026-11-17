@@ -19,6 +19,8 @@ pub(crate) enum DccMessage {
     H2219,
     W1009,
     W1010,
+    W1035,
+    W1036,
     W1037,
 }
 
@@ -50,6 +52,8 @@ impl DccMessage {
             Self::H2219 => "H2219",
             Self::W1009 => "W1009",
             Self::W1010 => "W1010",
+            Self::W1035 => "W1035",
+            Self::W1036 => "W1036",
             Self::W1037 => "W1037",
         }
     }
@@ -68,7 +72,9 @@ impl DccMessage {
             | Self::E2291
             | Self::E2301 => DccSeverity::Error,
             Self::H2077 | Self::H2135 | Self::H2164 | Self::H2219 => DccSeverity::Hint,
-            Self::W1009 | Self::W1010 | Self::W1037 => DccSeverity::Warning,
+            Self::W1009 | Self::W1010 | Self::W1035 | Self::W1036 | Self::W1037 => {
+                DccSeverity::Warning
+            }
         }
     }
 
@@ -91,6 +97,8 @@ impl DccMessage {
             Self::H2219 => "Private symbol '%s' declared but never used",
             Self::W1009 => "Redeclaration of '%s' hides a member in the base class",
             Self::W1010 => "Method '%s' hides virtual method of base type '%s'",
+            Self::W1035 => "Return value of function '%s' might be undefined",
+            Self::W1036 => "Variable '%s' might not have been initialized",
             Self::W1037 => "FOR-Loop variable '%s' may be undefined after loop",
         }
     }
@@ -130,6 +138,8 @@ mod tests {
         assert_eq!(DccMessage::H2164.severity(), DccSeverity::Hint);
         assert_eq!(DccMessage::H2219.severity(), DccSeverity::Hint);
         assert_eq!(DccMessage::W1010.severity(), DccSeverity::Warning);
+        assert_eq!(DccMessage::W1035.severity(), DccSeverity::Warning);
+        assert_eq!(DccMessage::W1036.severity(), DccSeverity::Warning);
         assert_eq!(DccMessage::W1037.severity(), DccSeverity::Warning);
         assert_eq!(DccMessage::E2003.severity(), DccSeverity::Error);
         assert_eq!(DccMessage::E2037.severity(), DccSeverity::Error);
@@ -214,6 +224,16 @@ mod tests {
                 DccMessage::W1010,
                 "W1010",
                 "Method '%s' hides virtual method of base type '%s'",
+            ),
+            (
+                DccMessage::W1035,
+                "W1035",
+                "Return value of function '%s' might be undefined",
+            ),
+            (
+                DccMessage::W1036,
+                "W1036",
+                "Variable '%s' might not have been initialized",
             ),
             (
                 DccMessage::W1037,

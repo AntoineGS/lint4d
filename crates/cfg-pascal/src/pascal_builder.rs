@@ -50,12 +50,45 @@ use crate::project::{ProjectBuildError, ProjectSnapshot, ProjectUnitId};
 /// disable resolution.
 ///
 pub fn build_file_cfgs(tree: &tree_sitter::Tree, source: &[u8]) -> Vec<Cfg> {
+    build_cfgs_with_routine_filter(tree, source, true, |_: &str, _: Node<'_>| true)
+}
+
+/// Build routine CFGs while allowing callers to skip selected executable routines.
+///
+/// The filter is called once per routine immediately before its CFG is built.
+/// Returning `false` omits only that routine; nested routines are still
+/// considered independently. Module initialization and main-section CFGs are
+/// not included.
+pub fn build_routine_cfgs_with_filter(
+    tree: &tree_sitter::Tree,
+    source: &[u8],
+    include_routine: impl FnMut(&str, Node<'_>) -> bool,
+) -> Vec<Cfg> {
+    build_cfgs_with_routine_filter(tree, source, false, include_routine)
+}
+
+fn build_cfgs_with_routine_filter(
+    tree: &tree_sitter::Tree,
+    source: &[u8],
+    include_module_cfgs: bool,
+    mut include_routine: impl FnMut(&str, Node<'_>) -> bool,
+) -> Vec<Cfg> {
     let root = tree.root_node();
     let exception_types = ExceptionTypeIndex::build(root, source);
     let unit_key = ExceptionTypeIndex::singleton_unit_key();
     let mut cfgs = Vec::new();
-    collect_def_proc_cfgs(root, source, None, &unit_key, &exception_types, &mut cfgs);
-    collect_module_cfgs(root, source, &unit_key, &exception_types, &mut cfgs);
+    collect_def_proc_cfgs(
+        root,
+        source,
+        None,
+        &unit_key,
+        &exception_types,
+        &mut include_routine,
+        &mut cfgs,
+    );
+    if include_module_cfgs {
+        collect_module_cfgs(root, source, &unit_key, &exception_types, &mut cfgs);
+    }
     cfgs.sort_by_key(|cfg| cfg.byte_range.start);
     cfgs
 }
@@ -100,12 +133,14 @@ pub fn build_file_cfgs_in_project(
     let unit_key = UnitKey::from_project(unit_id);
     let root = unit.tree().root_node();
     let mut cfgs = Vec::new();
+    let mut include_routine = |_: &str, _: Node<'_>| true;
     collect_def_proc_cfgs(
         root,
         unit.source(),
         None,
         &unit_key,
         &exception_types,
+        &mut include_routine,
         &mut cfgs,
     );
     collect_module_cfgs(root, unit.source(), &unit_key, &exception_types, &mut cfgs);
@@ -113,14 +148,17 @@ pub fn build_file_cfgs_in_project(
     Ok(cfgs)
 }
 
-fn collect_def_proc_cfgs(
-    node: Node,
+fn collect_def_proc_cfgs<'tree, F>(
+    node: Node<'tree>,
     source: &[u8],
     parent_qualified_name: Option<&str>,
     unit_key: &UnitKey,
     exception_types: &ExceptionTypeIndex,
+    include_routine: &mut F,
     out: &mut Vec<Cfg>,
-) {
+) where
+    F: FnMut(&str, Node<'tree>) -> bool,
+{
     if node.kind() == "defProc" {
         let Some(local_name) = extract_proc_name(node, source) else {
             return;
@@ -134,7 +172,10 @@ fn collect_def_proc_cfgs(
             .map(|_| qualified_name.clone())
             .unwrap_or(local_name);
 
-        if let Some(cfg) = build_proc_cfg(node, source, proc_name, unit_key, exception_types) {
+        if node.child_by_field_name("body").is_some()
+            && include_routine(&proc_name, node)
+            && let Some(cfg) = build_proc_cfg(node, source, proc_name, unit_key, exception_types)
+        {
             out.push(cfg);
         }
 
@@ -149,6 +190,7 @@ fn collect_def_proc_cfgs(
                 Some(&qualified_name),
                 unit_key,
                 exception_types,
+                include_routine,
                 out,
             );
         }
@@ -163,6 +205,7 @@ fn collect_def_proc_cfgs(
             parent_qualified_name,
             unit_key,
             exception_types,
+            include_routine,
             out,
         );
     }

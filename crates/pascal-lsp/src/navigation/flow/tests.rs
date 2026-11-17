@@ -1,5 +1,6 @@
 use super::*;
 use crate::navigation::{NavigationIndex, SourceSpan};
+use cfg_pascal::cfg_core::types::EdgeKind;
 use lsp_types::Url;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
@@ -50,7 +51,7 @@ fn flows(source: &str) -> Vec<FlowSnapshot> {
                 })
                 .collect(),
             locals: routine.locals,
-            cfg_blocks: routine.cfg.graph.node_count(),
+            cfg_blocks: routine.cfg.as_ref().map_or(0, |cfg| cfg.graph.node_count()),
             excluded: routine.excluded,
         })
         .collect()
@@ -276,6 +277,7 @@ fn flow_occurrences_keep_finally_statement_copies_in_each_cfg_block() {
         .into_iter()
         .find(|flow| flow.name == "Demo")
         .expect("Demo flow");
+    let cfg = flow.cfg.as_ref().expect("Demo CFG");
 
     let statement_start = source
         .rfind("Value := Value + 1;")
@@ -292,8 +294,7 @@ fn flow_occurrences_keep_finally_statement_copies_in_each_cfg_block() {
     assert_eq!(value_spans.len(), 2, "finally read and write occurrences");
 
     for span in value_spans {
-        let cfg_copies = flow
-            .cfg
+        let cfg_copies = cfg
             .graph
             .node_weights()
             .filter(|block| {
@@ -316,6 +317,158 @@ fn flow_occurrences_keep_finally_statement_copies_in_each_cfg_block() {
             "every CFG copy must retain the source occurrence at {span:?}"
         );
     }
+}
+
+fn assert_finally_copies_keep_occurrences_on_exception_paths(
+    source: &str,
+    routine_name: &str,
+    exception_source: &str,
+) {
+    let uri = Url::parse("file:///tmp/flow-finally-exception-copies.pas").expect("valid URI");
+    let mut index = NavigationIndex::new();
+    index
+        .update(uri.clone(), source.to_owned())
+        .expect("fixture parses");
+    let document = index.documents.get(&uri).expect("indexed document");
+    let cancel = AtomicBool::new(false);
+    let mut budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "flow test");
+    let flow = routine_flows(&index, &uri, document, &cancel, &mut budget)
+        .expect("flow model builds")
+        .into_iter()
+        .find(|flow| flow.name == routine_name)
+        .unwrap_or_else(|| panic!("{routine_name} flow"));
+    let cfg = flow.cfg.as_ref().expect("routine CFG");
+
+    let cleanup_start = source
+        .find("Value := Value + 1;")
+        .expect("finally statement");
+    let cleanup_blocks = cfg
+        .graph
+        .node_indices()
+        .filter(|&block| {
+            cfg.graph[block].stmts.iter().any(|statement| {
+                statement.byte_range.start <= cleanup_start
+                    && cleanup_start < statement.byte_range.end
+            })
+        })
+        .collect::<HashSet<_>>();
+    assert!(
+        cleanup_blocks.len() > 1,
+        "normal and exceptional continuations should have separate finally copies; \
+         cleanup blocks: {cleanup_blocks:?}; CFG blocks: {:?}; CFG edges: {:?}",
+        cfg.graph
+            .node_indices()
+            .map(|block| (
+                block.index(),
+                &cfg.graph[block].kind,
+                cfg.graph[block]
+                    .stmts
+                    .iter()
+                    .map(|statement| (
+                        statement.byte_range.clone(),
+                        source[statement.byte_range.clone()].to_owned()
+                    ))
+                    .collect::<Vec<_>>()
+            ))
+            .collect::<Vec<_>>(),
+        cfg.graph
+            .edge_indices()
+            .filter_map(|edge| {
+                let (from, to) = cfg.graph.edge_endpoints(edge)?;
+                Some((from.index(), to.index(), cfg.graph[edge].clone()))
+            })
+            .collect::<Vec<_>>()
+    );
+
+    let exception_cleanup_blocks = cfg
+        .graph
+        .edge_indices()
+        .filter_map(|edge| {
+            let (source_block, target_block) = cfg.graph.edge_endpoints(edge)?;
+            if cfg.graph[edge] != EdgeKind::ExceptionThrow
+                || !cleanup_blocks.contains(&target_block)
+            {
+                return None;
+            }
+            let enters_from_expected_source =
+                cfg.graph[source_block].stmts.iter().any(|statement| {
+                    source
+                        .get(statement.byte_range.clone())
+                        .is_some_and(|text| text.contains(exception_source))
+                });
+            enters_from_expected_source.then_some((source_block, target_block))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !exception_cleanup_blocks.is_empty(),
+        "an exception from {exception_source:?} must enter a finally copy"
+    );
+
+    for span in [
+        SourceSpan {
+            start: cleanup_start,
+            end: cleanup_start + "Value".len(),
+        },
+        SourceSpan {
+            start: cleanup_start + "Value := ".len(),
+            end: cleanup_start + "Value := ".len() + "Value".len(),
+        },
+    ] {
+        let occurrence_blocks = flow
+            .occurrences
+            .iter()
+            .filter(|occurrence| occurrence.span == span)
+            .map(|occurrence| occurrence.block.index())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            occurrence_blocks, cleanup_blocks,
+            "every finally CFG copy must retain the occurrence at {span:?}"
+        );
+    }
+}
+
+#[test]
+fn flow_occurrences_keep_finally_copies_for_raise_transfers() {
+    let source = concat!(
+        "program FlowFinallyRaise;\n",
+        "procedure Demo(A: Integer);\n",
+        "var Value: Integer;\n",
+        "begin\n",
+        "  try\n",
+        "    if A > 0 then raise Exception.Create('boom');\n",
+        "    Value := 0;\n",
+        "  finally\n",
+        "    Value := Value + 1;\n",
+        "  end;\n",
+        "end;\n",
+        "begin Demo(1); end.\n",
+    );
+
+    assert_finally_copies_keep_occurrences_on_exception_paths(
+        source,
+        "Demo",
+        "raise Exception.Create",
+    );
+}
+
+#[test]
+fn flow_occurrences_keep_finally_copies_for_call_exception_transfers() {
+    let source = concat!(
+        "program FlowFinallyCallException;\n",
+        "procedure Demo(A: Integer);\n",
+        "var Value: Integer;\n",
+        "begin\n",
+        "  try\n",
+        "    if A > 0 then MayThrow();\n",
+        "    Value := 0;\n",
+        "  finally\n",
+        "    Value := Value + 1;\n",
+        "  end;\n",
+        "end;\n",
+        "begin Demo(1); end.\n",
+    );
+
+    assert_finally_copies_keep_occurrences_on_exception_paths(source, "Demo", "MayThrow");
 }
 
 #[test]
@@ -585,6 +738,117 @@ fn flow_statement_mapping_observes_work_budget_and_cancellation() {
     assert_eq!(
         super::model::statement_locations(&cfg, span, &cancel, &mut budget)
             .expect_err("mapping must honor cancellation"),
+        "request cancelled"
+    );
+}
+
+#[test]
+fn flow_with_target_scan_reports_budget_exclusion() {
+    let source = concat!(
+        "program FlowWithBudget;\n",
+        "type TRecord = record Field: Integer; end;\n",
+        "procedure Demo;\n",
+        "var R: TRecord; Value: Integer;\n",
+        "begin with R do Value := 1; end;\n",
+        "begin Demo; end.\n",
+    );
+    let uri = Url::parse("file:///tmp/flow-with-budget.pas").expect("valid URI");
+    let mut index = NavigationIndex::new();
+    index
+        .update(uri.clone(), source.to_owned())
+        .expect("fixture parses");
+    let document = index.documents.get(&uri).expect("indexed document");
+    let cancel = AtomicBool::new(false);
+    let mut budget = AssistanceBudget::new(535, 8 * 1024 * 1024, "flow test");
+    let flows = routine_flows(&index, &uri, document, &cancel, &mut budget)
+        .expect("budget exhaustion in a with scan excludes the routine");
+    let flow = flows
+        .into_iter()
+        .find(|flow| flow.name == "Demo")
+        .expect("Demo flow");
+
+    assert_eq!(flow.excluded, Some(FlowExclusion::Budget));
+    assert!(flow.cfg.is_some(), "the CFG was built before the with scan");
+    assert!(
+        flow.locals
+            .iter()
+            .any(|local| local.name.eq_ignore_ascii_case("Value")),
+        "routine modeling reached its locals pass before the with scan exhausted"
+    );
+    assert!(budget.exhausted());
+}
+
+#[test]
+fn flow_cfg_build_precharge_excludes_a_routine_when_it_cannot_fit() {
+    let source = concat!(
+        "program FlowCfgBudget;\n",
+        "procedure Demo;\n",
+        "var Value: Integer;\n",
+        "begin Value := 1; end;\n",
+        "begin Demo; end.\n",
+    );
+    let uri = Url::parse("file:///tmp/flow-cfg-budget.pas").expect("valid URI");
+    let mut index = NavigationIndex::new();
+    index
+        .update(uri.clone(), source.to_owned())
+        .expect("fixture parses");
+    let document = index.documents.get(&uri).expect("indexed document");
+    let cancel = AtomicBool::new(false);
+    let mut budget = AssistanceBudget::new(150, 8 * 1024 * 1024, "flow test");
+    let flows = routine_flows(&index, &uri, document, &cancel, &mut budget)
+        .expect("an over-budget routine is excluded instead of built");
+    let flow = flows
+        .into_iter()
+        .find(|flow| flow.name == "Demo")
+        .expect("Demo flow");
+
+    assert_eq!(flow.excluded, Some(FlowExclusion::Budget));
+    assert!(flow.cfg.is_none(), "the CFG builder must skip the routine");
+    assert!(budget.exhausted());
+}
+
+#[test]
+fn flow_model_returns_cancellation_during_with_target_work() {
+    let source = concat!(
+        "program FlowWithCancel;\n",
+        "type TRecord = record Field: Integer; end;\n",
+        "procedure Demo;\n",
+        "var R: TRecord; Value: Integer;\n",
+        "begin with R do Value := 1; end;\n",
+        "begin Demo; end.\n",
+    );
+    let uri = Url::parse("file:///tmp/flow-with-cancel.pas").expect("valid URI");
+    let mut index = NavigationIndex::new();
+    index
+        .update(uri.clone(), source.to_owned())
+        .expect("fixture parses");
+    let document = index.documents.get(&uri).expect("indexed document");
+    let setup_cancel = AtomicBool::new(false);
+    let mut setup_budget = AssistanceBudget::new(1_000, 8 * 1024 * 1024, "flow test");
+    let with_node =
+        super::model::collect_nodes(document.tree.root_node(), &setup_cancel, &mut setup_budget)
+            .expect("collect fixture nodes")
+            .into_iter()
+            .find(|node| node.kind() == "with")
+            .expect("with statement");
+
+    let cancel = AtomicBool::new(false);
+    let mut budget = AssistanceBudget::new(100, 8 * 1024 * 1024, "flow test");
+    budget.cancel_after_work(2);
+    let mut locals = Vec::new();
+    let mut excluded = None;
+
+    assert_eq!(
+        super::model::mark_possible_with_targets(
+            document,
+            &[with_node],
+            &mut locals,
+            &HashSet::new(),
+            &mut excluded,
+            &cancel,
+            &mut budget,
+        )
+        .expect_err("cancellation during the with-body scan must stop flow modeling"),
         "request cancelled"
     );
 }

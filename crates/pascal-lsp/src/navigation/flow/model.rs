@@ -82,7 +82,7 @@ pub(crate) struct VarOccurrence {
 #[derive(Debug)]
 pub(crate) struct RoutineFlow<'a> {
     pub(crate) name: String,
-    pub(crate) cfg: Cfg,
+    pub(crate) cfg: Option<Cfg>,
     pub(crate) locals: Vec<LocalVar>,
     pub(crate) occurrences: Vec<VarOccurrence>,
     pub(crate) excluded: Option<FlowExclusion>,
@@ -101,8 +101,55 @@ pub(crate) fn routine_flows<'a>(
     budget.require_work(root.descendant_count().saturating_add(1), cancel)?;
     budget.require_owned_bytes(document.source.len(), cancel)?;
 
-    let mut cfgs = cfg_pascal::build_file_cfgs(&document.tree, document.source.as_bytes());
-    budget.require_work(cfgs.len(), cancel)?;
+    let all_nodes = collect_nodes(root, cancel, budget)?;
+    let mut routines = Vec::new();
+    for node in all_nodes {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if node.kind() == "defProc" && node.child_by_field_name("body").is_some() {
+            routines.push(node);
+        }
+    }
+    let mut budget_excluded = HashMap::new();
+    let mut build_error = None;
+    let mut cfgs = cfg_pascal::build_routine_cfgs_with_filter(
+        &document.tree,
+        document.source.as_bytes(),
+        |proc_name, node| {
+            if let Err(error) = check_navigation_cancel(cancel) {
+                build_error = Some(error);
+                return false;
+            }
+            let node_count = node.descendant_count().saturating_add(1);
+            match budget.take_work(node_count, cancel) {
+                Ok(true) => {
+                    if let Err(error) = check_navigation_cancel(cancel) {
+                        build_error = Some(error);
+                        false
+                    } else {
+                        true
+                    }
+                }
+                Ok(false) => {
+                    if let Err(error) = budget.require_owned_bytes(proc_name.len(), cancel) {
+                        build_error = Some(error);
+                        return false;
+                    }
+                    budget_excluded
+                        .insert((node.start_byte(), node.end_byte()), proc_name.to_owned());
+                    false
+                }
+                Err(error) => {
+                    build_error = Some(error);
+                    false
+                }
+            }
+        },
+    );
+    if let Some(error) = build_error {
+        return Err(error);
+    }
+    check_navigation_cancel(cancel)?;
     budget.require_owned_bytes(
         cfgs.len()
             .saturating_mul(std::mem::size_of::<Cfg>() + std::mem::size_of::<usize>() * 2),
@@ -110,20 +157,39 @@ pub(crate) fn routine_flows<'a>(
     )?;
     let mut cfgs_by_range = HashMap::with_capacity(cfgs.len());
     for cfg in cfgs.drain(..) {
+        check_navigation_cancel(cancel)?;
         cfgs_by_range.insert((cfg.byte_range.start, cfg.byte_range.end), cfg);
     }
 
-    let routines = collect_nodes(root, cancel, budget)?
-        .into_iter()
-        .filter(|node| node.kind() == "defProc" && node.child_by_field_name("body").is_some())
-        .collect::<Vec<_>>();
     let mut flows = Vec::with_capacity(routines.len());
     for node in routines {
         check_navigation_cancel(cancel)?;
+        let range = (node.start_byte(), node.end_byte());
+        if let Some(name) = budget_excluded.remove(&range) {
+            flows.push(RoutineFlow {
+                name,
+                cfg: None,
+                locals: Vec::new(),
+                occurrences: Vec::new(),
+                excluded: Some(FlowExclusion::Budget),
+                node,
+            });
+            continue;
+        }
         let Some(cfg) = cfgs_by_range.remove(&(node.start_byte(), node.end_byte())) else {
             continue;
         };
-        budget.require_work(1, cancel)?;
+        if !budget.take_work(1, cancel)? {
+            flows.push(RoutineFlow {
+                name: cfg.proc_name.clone(),
+                cfg: Some(cfg),
+                locals: Vec::new(),
+                occurrences: Vec::new(),
+                excluded: Some(FlowExclusion::Budget),
+                node,
+            });
+            continue;
+        }
         flows.push(build_routine_flow(
             index, uri, document, node, cfg, cancel, budget,
         )?);
@@ -169,20 +235,36 @@ fn build_routine_flow<'a>(
         .child_by_field_name("body")
         .expect("only executable routine nodes have a body");
     let all_nodes = collect_owned_nodes(node, node.id(), cancel, budget)?;
-    let body_nodes = all_nodes
-        .iter()
-        .copied()
-        .filter(|candidate| {
-            candidate.start_byte() >= body.start_byte() && candidate.end_byte() <= body.end_byte()
-        })
-        .collect::<Vec<_>>();
+    let mut body_nodes = Vec::new();
+    for candidate in all_nodes.iter().copied() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if candidate.start_byte() >= body.start_byte() && candidate.end_byte() <= body.end_byte() {
+            body_nodes.push(candidate);
+        }
+    }
     let nested_ranges = collect_nested_ranges(node, cancel, budget)?;
-    let routine_symbol_index = document.symbols.iter().position(|symbol| {
-        symbol.kind == SymbolKind::Routine
+    let mut routine_symbol_index = None;
+    for (symbol_index, symbol) in document.symbols.iter().enumerate() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if symbol.kind == SymbolKind::Routine
             && symbol.origin == Origin::Definition
             && symbol.declaration_span == Span::from_node(node)
-    });
-    let mut excluded = exclusion_for_routine(document, node, &body_nodes, &nested_ranges, &cfg);
+        {
+            routine_symbol_index = Some(symbol_index);
+            break;
+        }
+    }
+    let mut excluded = exclusion_for_routine(
+        document,
+        node,
+        &body_nodes,
+        &nested_ranges,
+        &cfg,
+        cancel,
+        budget,
+    )?;
     let CollectedLocals {
         mut locals,
         bindings,
@@ -216,7 +298,24 @@ fn build_routine_flow<'a>(
         cancel,
         budget,
     )?;
-    mark_possible_with_targets(document, &body_nodes, &mut locals, &local_names);
+    if !mark_possible_with_targets(
+        document,
+        &body_nodes,
+        &mut locals,
+        &local_names,
+        &mut excluded,
+        cancel,
+        budget,
+    )? {
+        return Ok(RoutineFlow {
+            name: cfg.proc_name.clone(),
+            cfg: Some(cfg),
+            locals,
+            occurrences: Vec::new(),
+            excluded,
+            node,
+        });
+    }
     mark_captured_locals(
         index,
         uri,
@@ -247,12 +346,12 @@ fn build_routine_flow<'a>(
         uri: uri.clone(),
         index,
     });
-    for identifier in body_nodes
-        .iter()
-        .copied()
-        .filter(|candidate| candidate.kind() == "identifier")
-    {
+    for identifier in body_nodes.iter().copied() {
         check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if identifier.kind() != "identifier" {
+            continue;
+        }
         let name = node_text(identifier, &document.source);
         let key = canonical_name(&name);
         let is_result_pseudo = result_local.is_some()
@@ -369,7 +468,7 @@ fn build_routine_flow<'a>(
         } else if (is_result_name
             || local_names.contains(&key)
                 && !is_right_hand_member(identifier)
-                && !is_inside_with_body(identifier, &body_nodes))
+                && !is_inside_with_body(identifier, &body_nodes, cancel, budget)?)
             && !state.receiver_resolution_uncertain()
             && !state.member_lookup_incomplete
         {
@@ -405,7 +504,7 @@ fn build_routine_flow<'a>(
 
     Ok(RoutineFlow {
         name: cfg.proc_name.clone(),
-        cfg,
+        cfg: Some(cfg),
         locals,
         occurrences,
         excluded,
@@ -655,43 +754,72 @@ fn exclusion_for_routine(
     body_nodes: &[Node<'_>],
     nested_ranges: &[Range<usize>],
     cfg: &Cfg,
-) -> Option<FlowExclusion> {
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<FlowExclusion>, String> {
     let mut excluded = None;
-    if !document.conditionals.complete
-        || document
-            .conditionals
-            .unknown_spans
-            .iter()
-            .any(|span| source_span_affects_routine(span.start, span.end, node, nested_ranges))
-    {
+    let mut unknown_conditional = !document.conditionals.complete;
+    for span in &document.conditionals.unknown_spans {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if source_span_affects_routine(span.start, span.end, node, nested_ranges, cancel, budget)? {
+            unknown_conditional = true;
+            break;
+        }
+    }
+    if unknown_conditional {
         note_exclusion(&mut excluded, FlowExclusion::UnknownConditional);
     }
-    if document
-        .parser_recovery_spans
-        .iter()
-        .any(|span| source_span_affects_routine(span.start, span.end, node, nested_ranges))
-    {
-        note_exclusion(&mut excluded, FlowExclusion::Recovery);
+    for span in &document.parser_recovery_spans {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if source_span_affects_routine(span.start, span.end, node, nested_ranges, cancel, budget)? {
+            note_exclusion(&mut excluded, FlowExclusion::Recovery);
+            break;
+        }
     }
-    if body_nodes.iter().any(|candidate| candidate.kind() == "asm") {
-        note_exclusion(&mut excluded, FlowExclusion::Asm);
+    for candidate in body_nodes {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if candidate.kind() == "asm" {
+            note_exclusion(&mut excluded, FlowExclusion::Asm);
+            break;
+        }
     }
-    if body_nodes.iter().any(|candidate| {
-        matches!(
+    let mut contains_goto = false;
+    for candidate in body_nodes {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if matches!(
             candidate.kind(),
             "goto" | "label" | "labeledStatement" | "labeledStatementTr"
-        )
-    }) || cfg.graph.edge_weights().any(|edge| *edge == EdgeKind::Goto)
-    {
+        ) {
+            contains_goto = true;
+            break;
+        }
+    }
+    if !contains_goto {
+        for edge in cfg.graph.edge_weights() {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            if *edge == EdgeKind::Goto {
+                contains_goto = true;
+                break;
+            }
+        }
+    }
+    if contains_goto {
         note_exclusion(&mut excluded, FlowExclusion::Goto);
     }
-    if body_nodes
-        .iter()
-        .any(|candidate| matches!(candidate.kind(), "varDef" | "varAssignDef"))
-    {
-        note_exclusion(&mut excluded, FlowExclusion::InlineVariable);
+    for candidate in body_nodes {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if matches!(candidate.kind(), "varDef" | "varAssignDef") {
+            note_exclusion(&mut excluded, FlowExclusion::InlineVariable);
+            break;
+        }
     }
-    excluded
+    Ok(excluded)
 }
 
 fn source_span_affects_routine(
@@ -699,16 +827,25 @@ fn source_span_affects_routine(
     end: usize,
     routine: Node<'_>,
     nested_ranges: &[Range<usize>],
-) -> bool {
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
     let intersects = if start == end {
         routine.start_byte() <= start && start <= routine.end_byte()
     } else {
         start < routine.end_byte() && routine.start_byte() < end
     };
-    intersects
-        && !nested_ranges
-            .iter()
-            .any(|range| range.start <= start && end <= range.end)
+    if !intersects {
+        return Ok(false);
+    }
+    for range in nested_ranges {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if range.start <= start && end <= range.end {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn note_exclusion(excluded: &mut Option<FlowExclusion>, reason: FlowExclusion) {
@@ -717,7 +854,7 @@ fn note_exclusion(excluded: &mut Option<FlowExclusion>, reason: FlowExclusion) {
     }
 }
 
-fn collect_nodes<'a>(
+pub(super) fn collect_nodes<'a>(
     root: Node<'a>,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
@@ -753,12 +890,13 @@ fn collect_nodes_with_boundary<'a>(
         }
         nodes.push(node);
         let mut cursor = node.walk();
-        pending.extend(
-            node.children(&mut cursor)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev(),
-        );
+        let mut children = Vec::new();
+        for child in node.children(&mut cursor) {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            children.push(child);
+        }
+        pending.extend(children.into_iter().rev());
     }
     Ok(nodes)
 }
@@ -775,7 +913,10 @@ fn collect_nested_ranges(
         budget.require_work(1, cancel)?;
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
             if child.id() != root.id() && matches!(child.kind(), "defProc" | "lambda") {
+                budget.require_owned_bytes(std::mem::size_of::<Range<usize>>(), cancel)?;
                 ranges.push(child.start_byte()..child.end_byte());
             }
             pending.push(child);
@@ -796,12 +937,12 @@ fn mark_loop_variables(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<(), String> {
-    for node in body_nodes
-        .iter()
-        .copied()
-        .filter(|node| node.kind() == "for")
-    {
+    for &node in body_nodes {
         check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if node.kind() != "for" {
+            continue;
+        }
         let Some(start) = node.child_by_field_name("start") else {
             continue;
         };
@@ -827,27 +968,42 @@ fn mark_loop_variables(
     Ok(())
 }
 
-fn mark_possible_with_targets(
+pub(super) fn mark_possible_with_targets(
     document: &Document,
     body_nodes: &[Node<'_>],
     locals: &mut [LocalVar],
     local_names: &HashSet<String>,
-) {
-    let with_nodes = body_nodes
-        .iter()
-        .copied()
-        .filter(|node| node.kind() == "with")
-        .collect::<Vec<_>>();
-    for with_node in with_nodes {
+    excluded: &mut Option<FlowExclusion>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    for &with_node in body_nodes {
+        check_navigation_cancel(cancel)?;
+        if !budget.take_work(1, cancel)? {
+            note_exclusion(excluded, FlowExclusion::Budget);
+            return Ok(false);
+        }
+        check_navigation_cancel(cancel)?;
+        if with_node.kind() != "with" {
+            continue;
+        }
         let Some(body) = with_node.child_by_field_name("body") else {
             continue;
         };
-        for identifier in body_nodes.iter().copied().filter(|node| {
-            node.kind() == "identifier"
-                && body.start_byte() <= node.start_byte()
-                && node.end_byte() <= body.end_byte()
-                && !is_right_hand_member(*node)
-        }) {
+        for &identifier in body_nodes {
+            check_navigation_cancel(cancel)?;
+            if !budget.take_work(1, cancel)? {
+                note_exclusion(excluded, FlowExclusion::Budget);
+                return Ok(false);
+            }
+            check_navigation_cancel(cancel)?;
+            if identifier.kind() != "identifier"
+                || body.start_byte() > identifier.start_byte()
+                || identifier.end_byte() > body.end_byte()
+                || is_right_hand_member(identifier)
+            {
+                continue;
+            }
             let key = canonical_name(&node_text(identifier, &document.source));
             if local_names.contains(&key) {
                 for local in locals
@@ -859,6 +1015,7 @@ fn mark_possible_with_targets(
             }
         }
     }
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -889,10 +1046,12 @@ fn mark_captured_locals(
             node.id() != routine_node.id() && matches!(node.kind(), "defProc" | "lambda");
         if is_nested {
             let nested_nodes = collect_nodes(node, cancel, budget)?;
-            for identifier in nested_nodes
-                .into_iter()
-                .filter(|candidate| candidate.kind() == "identifier")
-            {
+            for identifier in nested_nodes {
+                check_navigation_cancel(cancel)?;
+                budget.require_work(1, cancel)?;
+                if identifier.kind() != "identifier" {
+                    continue;
+                }
                 let key = canonical_name(&node_text(identifier, &document.source));
                 if !local_names.contains(&key) || is_declaration_name(identifier) {
                     continue;
@@ -1291,14 +1450,25 @@ fn is_right_hand_member(identifier: Node<'_>) -> bool {
         })
 }
 
-fn is_inside_with_body(identifier: Node<'_>, body_nodes: &[Node<'_>]) -> bool {
-    body_nodes.iter().copied().any(|node| {
-        node.kind() == "with"
+fn is_inside_with_body(
+    identifier: Node<'_>,
+    body_nodes: &[Node<'_>],
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    for &node in body_nodes {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if node.kind() == "with"
             && node.child_by_field_name("body").is_some_and(|body| {
                 body.start_byte() <= identifier.start_byte()
                     && identifier.end_byte() <= body.end_byte()
             })
-    })
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(super) fn statement_locations(

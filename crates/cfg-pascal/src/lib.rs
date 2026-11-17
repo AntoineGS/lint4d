@@ -10,7 +10,9 @@ pub mod prepared;
 pub mod project;
 pub mod source_map;
 
-pub use pascal_builder::{build_file_cfgs, build_file_cfgs_in_project};
+pub use pascal_builder::{
+    build_file_cfgs, build_file_cfgs_in_project, build_routine_cfgs_with_filter,
+};
 pub use prepared::{
     EnvironmentCompleteness, IncludeBinding, PreparationBudget, PreparationEnvironment,
     PreparationFidelity, PreparationLimits, PreparationOptions, PreparationProvenance,

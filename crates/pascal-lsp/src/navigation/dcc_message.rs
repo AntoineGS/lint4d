@@ -18,6 +18,10 @@ pub(crate) enum DccMessage {
     W1001,
     W1002,
     W1003,
+    W1004,
+    W1005,
+    W1006,
+    W1007,
     W1009,
     W1010,
 }
@@ -49,6 +53,10 @@ impl DccMessage {
             Self::W1001 => "W1001",
             Self::W1002 => "W1002",
             Self::W1003 => "W1003",
+            Self::W1004 => "W1004",
+            Self::W1005 => "W1005",
+            Self::W1006 => "W1006",
+            Self::W1007 => "W1007",
             Self::W1009 => "W1009",
             Self::W1010 => "W1010",
         }
@@ -60,6 +68,10 @@ impl DccMessage {
             Self::W1001 => Some("E1001"),
             Self::W1002 => Some("E1002"),
             Self::W1003 => Some("E1003"),
+            Self::W1004 => Some("E1004"),
+            Self::W1005 => Some("E1005"),
+            Self::W1006 => Some("E1006"),
+            Self::W1007 => Some("E1007"),
             Self::W1009 => Some("E1009"),
             Self::W1010 => Some("E1010"),
             _ => None,
@@ -80,9 +92,16 @@ impl DccMessage {
             | Self::E2291
             | Self::E2301 => DccSeverity::Error,
             Self::H2219 => DccSeverity::Hint,
-            Self::W1000 | Self::W1001 | Self::W1002 | Self::W1003 | Self::W1009 | Self::W1010 => {
-                DccSeverity::Warning
-            }
+            Self::W1000
+            | Self::W1001
+            | Self::W1002
+            | Self::W1003
+            | Self::W1004
+            | Self::W1005
+            | Self::W1006
+            | Self::W1007
+            | Self::W1009
+            | Self::W1010 => DccSeverity::Warning,
         }
     }
 
@@ -104,6 +123,10 @@ impl DccMessage {
             Self::W1001 => "Symbol '%s' is specific to a library",
             Self::W1002 => "Symbol '%s' is specific to a platform",
             Self::W1003 => "Symbol '%s' is experimental",
+            Self::W1004 => "Unit '%s' is specific to a library",
+            Self::W1005 => "Unit '%s' is specific to a platform",
+            Self::W1006 => "Unit '%s' is deprecated",
+            Self::W1007 => "Unit '%s' is experimental",
             Self::W1009 => "Redeclaration of '%s' hides a member in the base class",
             Self::W1010 => "Method '%s' hides virtual method of base type '%s'",
         }
@@ -141,6 +164,10 @@ mod tests {
     fn severity_follows_the_code_prefix() {
         assert_eq!(DccMessage::H2219.severity(), DccSeverity::Hint);
         assert_eq!(DccMessage::W1010.severity(), DccSeverity::Warning);
+        assert_eq!(DccMessage::W1004.severity(), DccSeverity::Warning);
+        assert_eq!(DccMessage::W1005.promoted_error_code(), Some("E1005"));
+        assert_eq!(DccMessage::W1006.promoted_error_code(), Some("E1006"));
+        assert_eq!(DccMessage::W1007.promoted_error_code(), Some("E1007"));
         assert_eq!(DccMessage::E2003.severity(), DccSeverity::Error);
         assert_eq!(DccMessage::E2037.severity(), DccSeverity::Error);
         assert_eq!(DccMessage::W1009.promoted_error_code(), Some("E1009"));
@@ -214,6 +241,18 @@ mod tests {
                 "Symbol '%s' is specific to a platform",
             ),
             (DccMessage::W1003, "W1003", "Symbol '%s' is experimental"),
+            (
+                DccMessage::W1004,
+                "W1004",
+                "Unit '%s' is specific to a library",
+            ),
+            (
+                DccMessage::W1005,
+                "W1005",
+                "Unit '%s' is specific to a platform",
+            ),
+            (DccMessage::W1006, "W1006", "Unit '%s' is deprecated"),
+            (DccMessage::W1007, "W1007", "Unit '%s' is experimental"),
             (
                 DccMessage::W1009,
                 "W1009",

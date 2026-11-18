@@ -1003,6 +1003,8 @@ impl SemanticDiagnosticReport {
 const MAX_SEMANTIC_DIAGNOSTIC_NODES: usize = 100_000;
 const MAX_SEMANTIC_DIAGNOSTIC_WORK: usize = 100_000;
 const MAX_SEMANTIC_DIAGNOSTIC_BYTES: usize = 8 * 1024 * 1024;
+const MAX_FLOW_DIAGNOSTIC_WORK: usize = 2_000_000;
+const MAX_FLOW_DIAGNOSTIC_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const MAX_MISSING_UNIT_REQUEST_WORK: usize = 300_000;
 pub(crate) const MAX_MISSING_UNIT_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SEMANTIC_DIAGNOSTICS: usize = 256;
@@ -3043,7 +3045,6 @@ impl NavigationIndex {
                     .rev(),
             );
         }
-
         'analysis: {
             let mut reported_undeclared_names = HashSet::new();
             for identifier in identifiers {
@@ -3283,25 +3284,32 @@ impl NavigationIndex {
                 }
                 result => result?,
             }
-            if report.has_capacity() {
-                let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
-                let mut flow_diagnostic_cap_reached = false;
-                let result = flow::flow_diagnostics_with_budget(
-                    self,
-                    uri,
-                    document,
-                    &report.diagnostics,
-                    capacity,
-                    &mut flow_diagnostic_cap_reached,
-                    cancel,
-                    &mut budget,
-                );
-                if let Some(flow_diagnostics) = report.checked_candidate(result, &budget)? {
-                    report.diagnostics.extend(flow_diagnostics);
-                }
-                if flow_diagnostic_cap_reached {
-                    report.note(SemanticCoverageGap::DiagnosticCap);
-                }
+        }
+        if report.has_capacity() {
+            let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
+            let mut flow_diagnostic_cap_reached = false;
+            // Keep flow bounded independently: name-proof work above may use
+            // the semantic budget before this more expensive pass runs.
+            let mut flow_budget = AssistanceBudget::new(
+                MAX_FLOW_DIAGNOSTIC_WORK,
+                MAX_FLOW_DIAGNOSTIC_BYTES,
+                "flow diagnostics",
+            );
+            let result = flow::flow_diagnostics_with_budget(
+                self,
+                uri,
+                document,
+                &report.diagnostics,
+                capacity,
+                &mut flow_diagnostic_cap_reached,
+                cancel,
+                &mut flow_budget,
+            );
+            if let Some(flow_diagnostics) = report.checked_candidate(result, &flow_budget)? {
+                report.diagnostics.extend(flow_diagnostics);
+            }
+            if flow_diagnostic_cap_reached {
+                report.note(SemanticCoverageGap::DiagnosticCap);
             }
         }
         report
@@ -29831,8 +29839,12 @@ mod tests {
         let visits = test_semantic_generic_symbol_visits();
 
         assert!(
-            diagnostics.is_empty() && visits > 0 && visits <= MAX_SEMANTIC_DIAGNOSTIC_WORK,
-            "upcast parent lookup must consume the shared budget and discard partial results after {visits} provider visits: {diagnostics:?}"
+            diagnostics.len() == 1
+                && diagnostics[0].kind.code() == "H2077"
+                && diagnostics[0].message == "Value assigned to 'B' never used"
+                && visits > 0
+                && visits <= MAX_SEMANTIC_DIAGNOSTIC_WORK,
+            "upcast parent lookup must consume the shared budget and discard partial results after {visits} provider visits, while independent flow diagnostics remain available: {diagnostics:?}"
         );
     }
 
@@ -30495,7 +30507,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_diagnostics_charge_generic_parameter_lookups_to_the_budget() {
+    fn semantic_flow_findings_survive_semantic_budget_exhaustion() {
         // Every reference to the local `Value` runs the generic parameter
         // lookup, which examines the 3,000 routines declaring a `Value`
         // parameter. Nothing else here is expensive: the local resolves in its
@@ -30506,7 +30518,9 @@ mod tests {
         for index in 1..=3_000 {
             writeln!(&mut source, "procedure G{index}<Value>;").expect("write routine");
         }
-        source.push_str("implementation\nprocedure Run;\nvar\n  Value: Integer;\nbegin\n");
+        source.push_str(
+            "implementation\nprocedure Run;\nvar\n  Value: Integer;\n  Unused: Integer;\nbegin\n",
+        );
         for _ in 0..40 {
             source.push_str("  Value := Value;\n");
         }
@@ -30519,6 +30533,12 @@ mod tests {
             .expect("bounded semantic diagnostics complete");
 
         assert_eq!(report.gaps, vec![SemanticCoverageGap::Budget], "{report:?}");
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind.code() == "H2164" && diagnostic.message.contains("'Unused'")
+            }),
+            "flow analysis should use its separate budget after semantic name lookup exhausts its budget: {report:?}"
+        );
     }
 
     #[test]

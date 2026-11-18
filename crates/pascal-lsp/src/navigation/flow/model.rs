@@ -1,7 +1,7 @@
 use super::super::{
     AssistanceBudget, Candidate, Document, NavigationIndex, Origin, ParameterMode, ResolutionState,
-    RoutineKind, SourceSpan, Span, Symbol, SymbolKind, TypeKind, TypeRef, TypeShape,
-    canonical_name, check_navigation_cancel, node_text,
+    RoutineKind, SourceSpan, Symbol, SymbolKind, TypeKind, TypeRef, TypeShape, canonical_name,
+    check_navigation_cancel, node_text,
 };
 use cfg_pascal::cfg_core::types::{BlockId, Cfg, EdgeKind};
 use lsp_types::Url;
@@ -10,7 +10,149 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tree_sitter::Node;
 
-type StatementLocations = Vec<(BlockId, Range<usize>)>;
+pub(super) type StatementLocations = Vec<(BlockId, Range<usize>)>;
+
+#[derive(Debug)]
+pub(super) struct StatementLocationIndex {
+    ranges: Vec<IndexedStatementRange>,
+}
+
+#[derive(Debug)]
+struct IndexedStatementRange {
+    range: Range<usize>,
+    blocks: Vec<BlockId>,
+    parent: Option<usize>,
+}
+
+impl StatementLocationIndex {
+    pub(super) fn new(
+        cfg: &Cfg,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<Self>, String> {
+        let mut by_range = HashMap::<(usize, usize), Vec<BlockId>>::new();
+        for node_index in cfg.graph.node_indices() {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            let block = BlockId::from(node_index);
+            for statement in &cfg.graph[node_index].stmts {
+                check_navigation_cancel(cancel)?;
+                budget.require_work(1, cancel)?;
+                if statement.byte_range.is_empty() {
+                    continue;
+                }
+                let range = (statement.byte_range.start, statement.byte_range.end);
+                if !by_range.contains_key(&range) {
+                    budget.require_owned_bytes(
+                        std::mem::size_of::<((usize, usize), Vec<BlockId>)>(),
+                        cancel,
+                    )?;
+                }
+                let blocks = by_range.entry(range).or_default();
+                if !blocks.contains(&block) {
+                    budget.require_work(1, cancel)?;
+                    budget.require_owned_bytes(std::mem::size_of::<BlockId>(), cancel)?;
+                    blocks.push(block);
+                }
+            }
+        }
+        let mut ranges = by_range
+            .into_iter()
+            .map(|((start, end), mut blocks)| {
+                blocks.sort_unstable();
+                IndexedStatementRange {
+                    range: start..end,
+                    blocks,
+                    parent: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        ranges.sort_by(|left, right| {
+            left.range
+                .start
+                .cmp(&right.range.start)
+                .then_with(|| right.range.end.cmp(&left.range.end))
+        });
+
+        let mut nesting = Vec::<usize>::new();
+        for index in 0..ranges.len() {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            while let Some(&parent_index) = nesting.last() {
+                let parent = &ranges[parent_index].range;
+                let current = &ranges[index].range;
+                if parent.end >= current.end {
+                    ranges[index].parent = Some(parent_index);
+                    break;
+                }
+                if parent.end > current.start {
+                    // Partially overlapping statement ranges are not a
+                    // containment forest, so retain the conservative scan.
+                    return Ok(None);
+                }
+                nesting.pop();
+            }
+            nesting.push(index);
+        }
+        Ok(Some(Self { ranges }))
+    }
+
+    pub(super) fn locations_for_node(
+        &self,
+        node: Node<'_>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<StatementLocations>, String> {
+        self.locations_for_span(
+            SourceSpan {
+                start: node.start_byte(),
+                end: node.end_byte(),
+            },
+            cancel,
+            budget,
+        )
+    }
+
+    fn locations_for_span(
+        &self,
+        span: SourceSpan,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<StatementLocations>, String> {
+        let prefix_len = self
+            .ranges
+            .partition_point(|entry| entry.range.start <= span.start);
+        let Some(mut index) = prefix_len.checked_sub(1) else {
+            return Ok(None);
+        };
+        loop {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            let entry = &self.ranges[index];
+            if span.end <= entry.range.end {
+                budget.require_owned_bytes(
+                    entry
+                        .blocks
+                        .len()
+                        .saturating_mul(std::mem::size_of::<(BlockId, Range<usize>)>()),
+                    cancel,
+                )?;
+                return Ok(Some(
+                    entry
+                        .blocks
+                        .iter()
+                        .copied()
+                        .map(|block| (block, entry.range.clone()))
+                        .collect(),
+                ));
+            }
+            let Some(parent) = entry.parent else {
+                return Ok(None);
+            };
+            index = parent;
+        }
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -42,6 +184,7 @@ pub(crate) enum LocalKind {
     Result,
     Parameter(LocalVarParameterMode),
     LoopVar,
+    ExceptionHandler,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +252,12 @@ pub(crate) struct RoutineFlow<'a> {
     pub(crate) node: Node<'a>,
 }
 
+struct CollectedRoutineNodes<'a> {
+    all_nodes: Vec<Node<'a>>,
+    body_nodes: Vec<Node<'a>>,
+    nested_ranges: Vec<Range<usize>>,
+}
+
 pub(crate) fn routine_flows<'a>(
     index: &NavigationIndex,
     uri: &Url,
@@ -122,6 +271,7 @@ pub(crate) fn routine_flows<'a>(
 
     let (document_node_count, routines) =
         collect_document_routines(root, &document.source, cancel, budget)?;
+    let flow_symbols = FlowSymbolIndex::new(document, &routines, cancel, budget)?;
     let flow_bytes = routines
         .len()
         .saturating_mul(std::mem::size_of::<RoutineFlow<'a>>());
@@ -224,7 +374,14 @@ pub(crate) fn routine_flows<'a>(
             continue;
         }
         flows.push(build_routine_flow(
-            index, uri, document, node, cfg, cancel, budget,
+            index,
+            uri,
+            document,
+            node,
+            cfg,
+            &flow_symbols,
+            cancel,
+            budget,
         )?);
     }
     Ok(flows)
@@ -289,40 +446,136 @@ struct CollectedLocals {
     routine_scope: Option<usize>,
 }
 
+#[derive(Debug, Default)]
+struct FlowSymbolIndex {
+    routine_by_range: HashMap<(usize, usize), usize>,
+    routine_scope_by_range: HashMap<(usize, usize), usize>,
+    function_ranges: HashSet<(usize, usize)>,
+    local_symbols_by_routine_scope: HashMap<usize, Vec<usize>>,
+}
+
+#[derive(Debug)]
+struct CachedLocalResolution {
+    candidates: Vec<Candidate>,
+    receiver_uncertain: bool,
+    member_lookup_incomplete: bool,
+    compiler_surface_resolved: bool,
+    ambiguous: bool,
+    inaccessible_candidate: bool,
+}
+
+impl FlowSymbolIndex {
+    fn new(
+        document: &Document,
+        routines: &[(Node<'_>, String)],
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Self, String> {
+        let mut result = Self::default();
+        for (symbol_index, symbol) in document.symbols.iter().enumerate() {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            if symbol.kind != SymbolKind::Routine || symbol.origin != Origin::Definition {
+                continue;
+            }
+            let range = (symbol.declaration_span.start, symbol.declaration_span.end);
+            budget.require_owned_bytes(std::mem::size_of::<((usize, usize), usize)>(), cancel)?;
+            result.routine_by_range.entry(range).or_insert(symbol_index);
+            if symbol.routine_kind == RoutineKind::Function {
+                budget.require_owned_bytes(std::mem::size_of::<(usize, usize)>(), cancel)?;
+                result.function_ranges.insert(range);
+            }
+        }
+
+        let mut scopes_by_range = HashMap::new();
+        for (scope_index, scope) in document.scopes.iter().enumerate() {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            budget.require_owned_bytes(std::mem::size_of::<((usize, usize), usize)>(), cancel)?;
+            scopes_by_range
+                .entry((scope.start, scope.end))
+                .or_insert(scope_index);
+        }
+
+        let mut routine_scopes = HashSet::new();
+        for (node, _) in routines {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            let range = (node.start_byte(), node.end_byte());
+            let routine_scope = result
+                .routine_by_range
+                .get(&range)
+                .and_then(|symbol_index| document.symbols.get(*symbol_index))
+                .and_then(|symbol| symbol.body_scope)
+                .or_else(|| scopes_by_range.get(&range).copied());
+            if let Some(routine_scope) = routine_scope {
+                budget.require_owned_bytes(
+                    std::mem::size_of::<((usize, usize), usize)>() + std::mem::size_of::<usize>(),
+                    cancel,
+                )?;
+                result.routine_scope_by_range.insert(range, routine_scope);
+                routine_scopes.insert(routine_scope);
+            }
+        }
+
+        for (symbol_index, symbol) in document.symbols.iter().enumerate() {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            if !matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Parameter) {
+                continue;
+            }
+            let mut current_scope = Some(symbol.scope);
+            let mut owner_routine_scope = None;
+            while let Some(scope) = current_scope {
+                check_navigation_cancel(cancel)?;
+                budget.require_work(1, cancel)?;
+                if routine_scopes.contains(&scope) {
+                    owner_routine_scope = Some(scope);
+                    break;
+                }
+                current_scope = document.scopes.get(scope).and_then(|scope| scope.parent);
+            }
+            if let Some(routine_scope) = owner_routine_scope {
+                budget.require_owned_bytes(std::mem::size_of::<usize>(), cancel)?;
+                result
+                    .local_symbols_by_routine_scope
+                    .entry(routine_scope)
+                    .or_default()
+                    .push(symbol_index);
+            }
+        }
+        Ok(result)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_routine_flow<'a>(
     index: &NavigationIndex,
     uri: &Url,
     document: &'a Document,
     node: Node<'a>,
     cfg: Cfg,
+    flow_symbols: &FlowSymbolIndex,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<RoutineFlow<'a>, String> {
     let body = node
         .child_by_field_name("body")
         .expect("only executable routine nodes have a body");
-    let all_nodes = collect_owned_nodes(node, node.id(), cancel, budget)?;
-    let mut body_nodes = Vec::new();
-    for candidate in all_nodes.iter().copied() {
-        check_navigation_cancel(cancel)?;
-        budget.require_work(1, cancel)?;
-        if candidate.start_byte() >= body.start_byte() && candidate.end_byte() <= body.end_byte() {
-            body_nodes.push(candidate);
-        }
-    }
-    let nested_ranges = collect_nested_ranges(node, cancel, budget)?;
-    let mut routine_symbol_index = None;
-    for (symbol_index, symbol) in document.symbols.iter().enumerate() {
-        check_navigation_cancel(cancel)?;
-        budget.require_work(1, cancel)?;
-        if symbol.kind == SymbolKind::Routine
-            && symbol.origin == Origin::Definition
-            && symbol.declaration_span == Span::from_node(node)
-        {
-            routine_symbol_index = Some(symbol_index);
-            break;
-        }
-    }
+    let CollectedRoutineNodes {
+        all_nodes,
+        body_nodes,
+        nested_ranges,
+    } = collect_routine_nodes(node, body, cancel, budget)?;
+    check_navigation_cancel(cancel)?;
+    budget.require_work(1, cancel)?;
+    let range = (node.start_byte(), node.end_byte());
+    let routine_symbol_index = flow_symbols.routine_by_range.get(&range).copied();
+    let routine_scope = flow_symbols.routine_scope_by_range.get(&range).copied();
+    let local_symbol_indices = routine_scope
+        .and_then(|scope| flow_symbols.local_symbols_by_routine_scope.get(&scope))
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     let mut excluded = exclusion_for_routine(
         document,
         node,
@@ -332,6 +585,7 @@ fn build_routine_flow<'a>(
         cancel,
         budget,
     )?;
+    let statement_index = StatementLocationIndex::new(&cfg, cancel, budget)?;
     let CollectedLocals {
         mut locals,
         bindings,
@@ -339,8 +593,9 @@ fn build_routine_flow<'a>(
     } = collect_locals(
         document,
         uri,
-        node,
         routine_symbol_index,
+        routine_scope,
+        local_symbol_indices,
         &nested_ranges,
         &all_nodes,
         cancel,
@@ -399,6 +654,7 @@ fn build_routine_flow<'a>(
         &nested_ranges,
         &mut locals,
         &bindings,
+        &flow_symbols.function_ranges,
         &mut excluded,
         cancel,
         budget,
@@ -417,10 +673,37 @@ fn build_routine_flow<'a>(
     let result_local = locals
         .iter()
         .position(|local| local.kind == LocalKind::Result);
+    let mut has_unindexed_bound_import = false;
+    if let Some(bindings) = document.import_bindings.as_ref() {
+        for unit_name in document
+            .interface_uses
+            .iter()
+            .chain(&document.implementation_uses)
+        {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            budget.require_bytes(unit_name.len(), cancel)?;
+            if bindings
+                .get(&canonical_name(unit_name))
+                .is_some_and(|unit_uri| !index.documents.contains_key(unit_uri))
+            {
+                has_unindexed_bound_import = true;
+                break;
+            }
+        }
+    }
+    let imports_are_incomplete = (!document.interface_uses.is_empty()
+        || !document.implementation_uses.is_empty())
+        && (document.import_bindings.is_none()
+            || document.unbound.is_some()
+            || document.lazy_imports.is_some()
+            || has_unindexed_bound_import);
     let routine_candidate = routine_symbol_index.map(|index| Candidate {
         uri: uri.clone(),
         index,
     });
+    let mut local_resolution_cache =
+        HashMap::<usize, HashMap<String, CachedLocalResolution>>::new();
     for identifier in body_nodes.iter().copied() {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
@@ -436,7 +719,14 @@ fn build_routine_flow<'a>(
                     start: exit_call.start_byte(),
                     end: exit_call.end_byte(),
                 };
-                let Some(locations) = statement_locations(&cfg, span, cancel, budget)? else {
+                let Some(locations) = statement_locations_for_node(
+                    &cfg,
+                    statement_index.as_ref(),
+                    exit_call,
+                    cancel,
+                    budget,
+                )?
+                else {
                     note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
                     continue;
                 };
@@ -473,7 +763,14 @@ fn build_routine_flow<'a>(
                 start: identifier.start_byte(),
                 end: identifier.end_byte(),
             };
-            let Some(locations) = statement_locations(&cfg, span, cancel, budget)? else {
+            let Some(locations) = statement_locations_for_node(
+                &cfg,
+                statement_index.as_ref(),
+                identifier,
+                cancel,
+                budget,
+            )?
+            else {
                 note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
                 continue;
             };
@@ -494,23 +791,83 @@ fn build_routine_flow<'a>(
         if is_declaration_name(identifier) {
             continue;
         }
+        if key == "self"
+            && routine_candidate
+                .as_ref()
+                .and_then(|candidate| index.symbol(candidate))
+                .is_some_and(|symbol| symbol.owner_type.is_some())
+        {
+            continue;
+        }
         let is_local_occurrence =
             (local_names.contains(&key) || is_result_name) && !is_right_hand_member(identifier);
-        if !is_local_occurrence && is_call_entity(identifier) {
+        if !is_local_occurrence && (is_call_entity(identifier) || imports_are_incomplete) {
             continue;
         }
 
-        let mut state = ResolutionState::new();
-        let candidates = index.resolve_candidates_at_with_state_and_budget(
-            uri,
-            document,
-            identifier.start_byte(),
-            identifier,
-            &mut state,
-            0,
-            cancel,
-            budget,
-        )?;
+        let offset = identifier.start_byte();
+        let (
+            candidates,
+            receiver_uncertain,
+            member_lookup_incomplete,
+            compiler_surface_resolved,
+            ambiguous,
+            inaccessible,
+        ) = if is_local_occurrence && !document.has_with_context_at(offset) {
+            let scope = document.scope_at(offset);
+            let cached = local_resolution_cache
+                .get(&scope)
+                .and_then(|by_name| by_name.get(&key));
+            if cached.is_none() {
+                let mut state = ResolutionState::new();
+                let candidates = index.resolve_candidates_at_with_state_and_budget(
+                    uri, document, offset, identifier, &mut state, 0, cancel, budget,
+                )?;
+                budget.require_work(1, cancel)?;
+                budget.require_owned_bytes(
+                    key.len() + std::mem::size_of::<(String, CachedLocalResolution)>(),
+                    cancel,
+                )?;
+                local_resolution_cache.entry(scope).or_default().insert(
+                    key.clone(),
+                    CachedLocalResolution {
+                        candidates,
+                        receiver_uncertain: state.receiver_resolution_uncertain(),
+                        member_lookup_incomplete: state.member_lookup_incomplete,
+                        compiler_surface_resolved: state.compiler_surface_resolved,
+                        ambiguous: state.ambiguous,
+                        inaccessible_candidate: state.inaccessible_candidate,
+                    },
+                );
+            } else {
+                budget.require_work(1, cancel)?;
+            }
+            let cached = local_resolution_cache
+                .get(&scope)
+                .and_then(|by_name| by_name.get(&key))
+                .expect("local resolution was cached");
+            (
+                std::borrow::Cow::Borrowed(cached.candidates.as_slice()),
+                cached.receiver_uncertain,
+                cached.member_lookup_incomplete,
+                cached.compiler_surface_resolved,
+                cached.ambiguous,
+                cached.inaccessible_candidate,
+            )
+        } else {
+            let mut state = ResolutionState::new();
+            let candidates = index.resolve_candidates_at_with_state_and_budget(
+                uri, document, offset, identifier, &mut state, 0, cancel, budget,
+            )?;
+            (
+                std::borrow::Cow::Owned(candidates),
+                state.receiver_resolution_uncertain(),
+                state.member_lookup_incomplete,
+                state.compiler_surface_resolved,
+                state.ambiguous,
+                state.inaccessible_candidate,
+            )
+        };
         let all_candidates_are_routines = !candidates.is_empty()
             && candidates.iter().all(|candidate| {
                 index
@@ -520,15 +877,21 @@ fn build_routine_flow<'a>(
                     .is_some_and(|symbol| symbol.kind == SymbolKind::Routine)
             });
         let local_resolution_uncertain = candidates.len() != 1
-            || state.receiver_resolution_uncertain()
-            || state.member_lookup_incomplete
-            || state.ambiguous
-            || state.inaccessible_candidate;
-        let external_resolution_uncertain = candidates.is_empty()
-            || state.receiver_resolution_uncertain()
-            || state.member_lookup_incomplete
-            || state.inaccessible_candidate
-            || state.ambiguous && !all_candidates_are_routines;
+            || receiver_uncertain
+            || member_lookup_incomplete
+            || ambiguous
+            || inaccessible;
+        let compiler_surface_only_resolution = candidates.is_empty()
+            && compiler_surface_resolved
+            && is_right_hand_member(identifier)
+            && !receiver_uncertain
+            && !inaccessible;
+        let external_resolution_uncertain = !compiler_surface_only_resolution
+            && (candidates.is_empty() && !compiler_surface_resolved
+                || receiver_uncertain
+                || member_lookup_incomplete
+                || inaccessible
+                || ambiguous && !all_candidates_are_routines);
         if is_local_occurrence && local_resolution_uncertain
             || !is_local_occurrence && external_resolution_uncertain
         {
@@ -551,7 +914,14 @@ fn build_routine_flow<'a>(
                     start: identifier.start_byte(),
                     end: identifier.end_byte(),
                 };
-                let Some(locations) = statement_locations(&cfg, span, cancel, budget)? else {
+                let Some(locations) = statement_locations_for_node(
+                    &cfg,
+                    statement_index.as_ref(),
+                    identifier,
+                    cancel,
+                    budget,
+                )?
+                else {
                     note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
                     continue;
                 };
@@ -578,7 +948,14 @@ fn build_routine_flow<'a>(
                     start: identifier.start_byte(),
                     end: identifier.end_byte(),
                 };
-                let Some(locations) = statement_locations(&cfg, span, cancel, budget)? else {
+                let Some(locations) = statement_locations_for_node(
+                    &cfg,
+                    statement_index.as_ref(),
+                    identifier,
+                    cancel,
+                    budget,
+                )?
+                else {
                     note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
                     continue;
                 };
@@ -597,7 +974,6 @@ fn build_routine_flow<'a>(
             }
         }
     }
-
     pending.sort_by_key(|occurrence| {
         (
             occurrence.block.index().index(),
@@ -643,21 +1019,15 @@ fn build_routine_flow<'a>(
 fn collect_locals(
     document: &Document,
     uri: &Url,
-    routine_node: Node<'_>,
     routine_symbol_index: Option<usize>,
+    routine_scope: Option<usize>,
+    local_symbol_indices: &[usize],
     nested_ranges: &[Range<usize>],
     routine_nodes: &[Node<'_>],
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<CollectedLocals, String> {
     let routine_symbol = routine_symbol_index.and_then(|index| document.symbols.get(index));
-    let routine_scope = routine_symbol
-        .and_then(|symbol| symbol.body_scope)
-        .or_else(|| {
-            document.scopes.iter().position(|scope| {
-                scope.start == routine_node.start_byte() && scope.end == routine_node.end_byte()
-            })
-        });
     let Some(routine_scope) = routine_scope else {
         return Ok(CollectedLocals {
             locals: Vec::new(),
@@ -667,9 +1037,12 @@ fn collect_locals(
     };
     let mut locals = Vec::new();
     let mut bindings = Vec::new();
-    for (symbol_index, symbol) in document.symbols.iter().enumerate() {
+    for &symbol_index in local_symbol_indices {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
+        let Some(symbol) = document.symbols.get(symbol_index) else {
+            continue;
+        };
         if !matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Parameter)
             || !scope_is_within(document, symbol.scope, routine_scope)
             || nested_ranges.iter().any(|range| {
@@ -691,7 +1064,13 @@ fn collect_locals(
             })
         });
         let mode = symbol.parameter_mode.map(local_parameter_mode);
-        let kind = mode.map_or(LocalKind::Local, LocalKind::Parameter);
+        let kind = if declaration_node
+            .is_some_and(|declaration| declaration.kind() == "exceptionHandler")
+        {
+            LocalKind::ExceptionHandler
+        } else {
+            mode.map_or(LocalKind::Local, LocalKind::Parameter)
+        };
         let ty = classify_symbol_type(document, symbol);
         let class_reference = symbol_is_class_reference(document, symbol);
         let type_resolved = symbol.type_shape.as_ref().is_some_and(|shape| {
@@ -1291,28 +1670,44 @@ fn collect_nodes_with_boundary<'a>(
     Ok(nodes)
 }
 
-fn collect_nested_ranges(
-    root: Node<'_>,
+fn collect_routine_nodes<'a>(
+    root: Node<'a>,
+    body: Node<'a>,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
-) -> Result<Vec<Range<usize>>, String> {
+) -> Result<CollectedRoutineNodes<'a>, String> {
+    let mut owned_nodes = Vec::new();
+    let mut body_nodes = Vec::new();
     let mut ranges = Vec::new();
-    let mut pending = vec![root];
-    while let Some(node) = pending.pop() {
+    let mut pending = vec![(root, true)];
+    while let Some((node, owned)) = pending.pop() {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
+        if owned {
+            budget.require_owned_bytes(std::mem::size_of::<Node<'a>>(), cancel)?;
+            owned_nodes.push(node);
+            if node.start_byte() >= body.start_byte() && node.end_byte() <= body.end_byte() {
+                budget.require_owned_bytes(std::mem::size_of::<Node<'a>>(), cancel)?;
+                body_nodes.push(node);
+            }
+        }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             check_navigation_cancel(cancel)?;
             budget.require_work(1, cancel)?;
-            if child.id() != root.id() && matches!(child.kind(), "defProc" | "lambda") {
+            let nested = matches!(child.kind(), "defProc" | "lambda");
+            if nested {
                 budget.require_owned_bytes(std::mem::size_of::<Range<usize>>(), cancel)?;
                 ranges.push(child.start_byte()..child.end_byte());
             }
-            pending.push(child);
+            pending.push((child, owned && !nested));
         }
     }
-    Ok(ranges)
+    Ok(CollectedRoutineNodes {
+        all_nodes: owned_nodes,
+        body_nodes,
+        nested_ranges: ranges,
+    })
 }
 
 fn collect_child_routines<'a>(
@@ -1439,6 +1834,7 @@ fn mark_captured_locals(
     nested_ranges: &[Range<usize>],
     locals: &mut [LocalVar],
     bindings: &[LocalBinding],
+    function_ranges: &HashSet<(usize, usize)>,
     excluded: &mut Option<FlowExclusion>,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
@@ -1479,7 +1875,7 @@ fn mark_captured_locals(
             node.id() != routine_node.id() && matches!(node.kind(), "defProc" | "lambda");
         if is_nested {
             let nested_has_own_result = node.kind() == "defProc"
-                && routine_has_function_result(document, node, cancel, budget)?;
+                && routine_has_function_result(function_ranges, node, cancel, budget)?;
             let child_routines = collect_child_routines(node, cancel, budget)?;
             pending.extend(child_routines);
             let nested_nodes = collect_owned_nodes(node, node.id(), cancel, budget)?;
@@ -1542,24 +1938,14 @@ fn mark_captured_locals(
 }
 
 fn routine_has_function_result(
-    document: &Document,
+    function_ranges: &HashSet<(usize, usize)>,
     node: Node<'_>,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<bool, String> {
-    let declaration_span = Span::from_node(node);
-    for symbol in &document.symbols {
-        check_navigation_cancel(cancel)?;
-        budget.require_work(1, cancel)?;
-        if symbol.kind == SymbolKind::Routine
-            && symbol.origin == Origin::Definition
-            && symbol.declaration_span == declaration_span
-            && symbol.routine_kind == RoutineKind::Function
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    check_navigation_cancel(cancel)?;
+    budget.require_work(1, cancel)?;
+    Ok(function_ranges.contains(&(node.start_byte(), node.end_byte())))
 }
 
 fn call_argument_accesses(
@@ -2027,4 +2413,26 @@ pub(super) fn statement_locations(
             .map(|(block, range, _)| (block, range))
             .collect(),
     ))
+}
+
+fn statement_locations_for_node(
+    cfg: &Cfg,
+    index: Option<&StatementLocationIndex>,
+    node: Node<'_>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<StatementLocations>, String> {
+    if let Some(index) = index {
+        index.locations_for_node(node, cancel, budget)
+    } else {
+        statement_locations(
+            cfg,
+            SourceSpan {
+                start: node.start_byte(),
+                end: node.end_byte(),
+            },
+            cancel,
+            budget,
+        )
+    }
 }

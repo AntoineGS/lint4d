@@ -107,7 +107,7 @@ fn run() -> Result<(), String> {
         documents.push(SourceDocument {
             path,
             uri,
-            text: String::from_utf8_lossy(&bytes).into_owned(),
+            text: decode_pascal_source(&bytes),
             bytes,
         });
     }
@@ -123,50 +123,35 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    let project_directory = fs::canonicalize(&project_file)
-        .map_err(|error| {
-            format!(
-                "could not resolve project file {}: {error}",
-                project_file.display()
-            )
-        })?
+    let canonical_project_file = fs::canonicalize(&project_file).map_err(|error| {
+        format!(
+            "could not resolve project file {}: {error}",
+            project_file.display()
+        )
+    })?;
+    let project_directory = canonical_project_file
         .parent()
         .ok_or_else(|| "project file has no parent directory".to_string())?
         .to_path_buf();
+    let project_uri = canonical_project_file
+        .extension()
+        .filter(|extension| extension.eq_ignore_ascii_case("dproj"))
+        .map(|_| file_uri(&canonical_project_file))
+        .transpose()?;
     let protected_roots = protected_output_roots(&project_directory, Some(&root))?;
     let output_path = ensure_output_outside_roots(&arguments.output, &protected_roots)?;
     let requested_meta_path = arguments.output.with_extension("meta.json");
     let meta_path = ensure_output_outside_roots(&requested_meta_path, &protected_roots)?;
 
     let mut client = Client::spawn(&arguments.binary)?;
-    let initialize_result = client.request(
-        "initialize",
-        json!({
-            "processId": null,
-            "rootUri": file_uri(&root)?,
-            "initializationOptions": initialization_options,
-            "capabilities": initialize_capabilities()
-        }),
+    let (pull_supported, project_selection) = initialize_and_open_documents(
+        &mut client,
+        &file_uri(&root)?,
+        &initialization_options,
+        project_uri.as_deref(),
+        &documents,
         arguments.timeout,
     )?;
-    let pull_supported = initialize_result
-        .pointer("/capabilities/diagnosticProvider")
-        .is_some_and(|provider| !provider.is_null() && provider != &Value::Bool(false));
-    client.notify("initialized", json!({}))?;
-
-    for document in &documents {
-        client.notify(
-            "textDocument/didOpen",
-            json!({
-                "textDocument": {
-                    "uri": document.uri,
-                    "languageId": "pascal",
-                    "version": 1,
-                    "text": document.text
-                }
-            }),
-        )?;
-    }
 
     let (index_status, index_timed_out, zero_pending_polls) =
         client.wait_for_index(arguments.timeout, !documents.is_empty())?;
@@ -252,6 +237,7 @@ fn run() -> Result<(), String> {
         "index_timed_out": index_timed_out,
         "index_status": index_status,
         "index_settle": index_settle_metadata(&index_status, zero_pending_polls),
+        "project_selection": project_selection,
         "pull_diagnostics": pull_supported,
         "files_opened": documents.len(),
         "diagnostics": output.len(),
@@ -298,6 +284,138 @@ fn initialize_capabilities() -> Value {
             "workspaceFolders": true
         }
     })
+}
+
+fn decode_pascal_source(bytes: &[u8]) -> String {
+    if let Some(bytes) = bytes.strip_prefix(&[0xff, 0xfe]) {
+        return decode_utf16_source(bytes, true);
+    }
+    if let Some(bytes) = bytes.strip_prefix(&[0xfe, 0xff]) {
+        return decode_utf16_source(bytes, false);
+    }
+    pascal_core::decode_bytes(bytes).into_owned()
+}
+
+fn decode_utf16_source(bytes: &[u8], little_endian: bool) -> String {
+    let units = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| {
+            if little_endian {
+                u16::from_le_bytes(*chunk)
+            } else {
+                u16::from_be_bytes(*chunk)
+            }
+        })
+        .collect::<Vec<_>>();
+    String::from_utf16_lossy(&units)
+}
+
+trait CorpusProtocol {
+    fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, String>;
+
+    fn notify(&mut self, method: &str, params: Value) -> Result<(), String>;
+}
+
+impl CorpusProtocol for Client {
+    fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+        Client::request(self, method, params, timeout)
+    }
+
+    fn notify(&mut self, method: &str, params: Value) -> Result<(), String> {
+        Client::notify(self, method, params)
+    }
+}
+
+fn initialize_and_open_documents(
+    client: &mut impl CorpusProtocol,
+    root_uri: &str,
+    initialization_options: &Value,
+    project_uri: Option<&str>,
+    documents: &[SourceDocument],
+    timeout: Duration,
+) -> Result<(bool, Value), String> {
+    let initialize_result = client.request(
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": root_uri,
+            "initializationOptions": initialization_options,
+            "capabilities": initialize_capabilities()
+        }),
+        timeout,
+    )?;
+    let pull_supported = initialize_result
+        .pointer("/capabilities/diagnosticProvider")
+        .is_some_and(|provider| !provider.is_null() && provider != &Value::Bool(false));
+
+    client.notify("initialized", json!({}))?;
+
+    let scope = documents.first().ok_or_else(|| {
+        "corpus command has no source documents for project selection".to_string()
+    })?;
+    let selection_result = client.request(
+        "pascal/selectProject",
+        json!({
+            "textDocument": { "uri": scope.uri },
+            "projectUri": project_uri
+        }),
+        timeout,
+    )?;
+    let project_selection = project_selection_metadata(selection_result, &scope.uri, project_uri)?;
+
+    for document in documents {
+        client.notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": document.uri,
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": document.text
+                }
+            }),
+        )?;
+    }
+    Ok((pull_supported, project_selection))
+}
+
+fn project_selection_metadata(
+    response: Value,
+    scope_uri: &str,
+    requested_project_uri: Option<&str>,
+) -> Result<Value, String> {
+    let mode = response
+        .get("selectionMode")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "pascal/selectProject returned no selectionMode".to_string())?;
+    let selected_project_uri = response.get("selectedProjectUri").unwrap_or(&Value::Null);
+    if mode == "invalid" {
+        return Err("pascal/selectProject returned an invalid project selection".to_string());
+    }
+    if let Some(requested_uri) = requested_project_uri {
+        let selected_uri = selected_project_uri.as_str().ok_or_else(|| {
+            format!("pascal/selectProject did not select the requested project {requested_uri}")
+        })?;
+        let requested = Url::parse(requested_uri)
+            .map_err(|error| format!("invalid requested project URI: {error}"))?;
+        let selected = Url::parse(selected_uri)
+            .map_err(|error| format!("invalid selected project URI: {error}"))?;
+        if selected != requested {
+            return Err(format!(
+                "pascal/selectProject did not select the requested project {requested_uri}; selected {selected_uri}"
+            ));
+        }
+    }
+
+    Ok(json!({
+        "scopeUri": scope_uri,
+        "requestedProjectUri": requested_project_uri,
+        "selectedProjectUri": selected_project_uri,
+        "selectionMode": mode,
+        "response": response
+    }))
 }
 
 fn load_initialization_options(path: Option<&Path>) -> Result<Value, String> {
@@ -896,15 +1014,153 @@ fn read_message(reader: &mut impl BufRead) -> io::Result<Option<Value>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        IndexSettleTracker, SourceDocument, compute_run_fingerprint, diagnostic_finding,
-        index_settle_metadata, index_status_pending_zero, initialize_capabilities,
-        load_initialization_options,
+        CorpusProtocol, IndexSettleTracker, SourceDocument, compute_run_fingerprint,
+        diagnostic_finding, index_settle_metadata, index_status_pending_zero,
+        initialize_and_open_documents, initialize_capabilities, load_initialization_options,
     };
     use pascal_lsp::corpus::{ensure_output_outside_roots, protected_output_roots};
     use serde_json::json;
+    use std::collections::HashMap;
     use std::fs;
     use std::path::Path;
     use std::time::{Duration, Instant, UNIX_EPOCH};
+
+    struct RecordingProtocol {
+        events: Vec<String>,
+        request_params: HashMap<String, serde_json::Value>,
+        selection_response: serde_json::Value,
+    }
+
+    impl CorpusProtocol for RecordingProtocol {
+        fn request(
+            &mut self,
+            method: &str,
+            params: serde_json::Value,
+            _timeout: Duration,
+        ) -> Result<serde_json::Value, String> {
+            self.events.push(format!("request:{method}"));
+            self.request_params.insert(method.to_owned(), params);
+            Ok(match method {
+                "initialize" => json!({
+                    "capabilities": { "diagnosticProvider": {} }
+                }),
+                "pascal/selectProject" => self.selection_response.clone(),
+                _ => serde_json::Value::Null,
+            })
+        }
+
+        fn notify(&mut self, method: &str, params: serde_json::Value) -> Result<(), String> {
+            self.events.push(format!("notify:{method}"));
+            self.request_params.insert(method.to_owned(), params);
+            Ok(())
+        }
+    }
+
+    fn source_document(path: &Path) -> SourceDocument {
+        SourceDocument {
+            path: path.to_path_buf(),
+            uri: super::file_uri(path).expect("document URI"),
+            text: "unit Unit;".to_string(),
+            bytes: b"unit Unit;".to_vec(),
+        }
+    }
+
+    #[test]
+    fn corpus_open_documents_decode_legacy_eight_bit_source_without_replacements() {
+        let source = b"unit Legacy; // caf\xe9\n";
+        assert_eq!(
+            super::decode_pascal_source(source),
+            "unit Legacy; // café\n"
+        );
+    }
+
+    #[test]
+    fn corpus_startup_selects_manifest_project_after_initialize_before_opening_documents() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let document_path = temp.path().join("Unit.pas");
+        let document = source_document(&document_path);
+        let project_uri = super::file_uri(&temp.path().join("App.dproj")).expect("project URI");
+        let mut protocol = RecordingProtocol {
+            events: Vec::new(),
+            request_params: HashMap::new(),
+            selection_response: json!({
+                "scopeUri": "file:///tmp",
+                "selectedProjectUri": project_uri,
+                "selectionMode": "directory",
+                "warnings": []
+            }),
+        };
+
+        let (pull_supported, selection) = initialize_and_open_documents(
+            &mut protocol,
+            "file:///tmp",
+            &json!({}),
+            Some(&project_uri),
+            std::slice::from_ref(&document),
+            Duration::from_secs(5),
+        )
+        .expect("initialize, select project, and open source");
+
+        assert!(pull_supported);
+        assert_eq!(
+            protocol.events,
+            [
+                "request:initialize",
+                "notify:initialized",
+                "request:pascal/selectProject",
+                "notify:textDocument/didOpen"
+            ]
+        );
+        assert_eq!(
+            protocol.request_params["pascal/selectProject"],
+            json!({
+                "textDocument": { "uri": document.uri },
+                "projectUri": project_uri
+            })
+        );
+        assert_eq!(selection["requestedProjectUri"], project_uri);
+        assert_eq!(selection["selectedProjectUri"], project_uri);
+        assert_eq!(selection["selectionMode"], "directory");
+    }
+
+    #[test]
+    fn corpus_startup_fails_closed_when_manifest_project_selection_is_rejected() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let document = source_document(&temp.path().join("Unit.pas"));
+        let project_uri = super::file_uri(&temp.path().join("App.dproj")).expect("project URI");
+        let mut protocol = RecordingProtocol {
+            events: Vec::new(),
+            request_params: HashMap::new(),
+            selection_response: json!({
+                "scopeUri": "file:///tmp",
+                "selectedProjectUri": "file:///tmp/Other.dproj",
+                "selectionMode": "ambiguous",
+                "warnings": ["requested project is not selected"]
+            }),
+        };
+
+        let error = initialize_and_open_documents(
+            &mut protocol,
+            "file:///tmp",
+            &json!({}),
+            Some(&project_uri),
+            std::slice::from_ref(&document),
+            Duration::from_secs(5),
+        )
+        .expect_err("rejected project selection must fail the corpus run");
+
+        assert!(
+            error.contains("did not select the requested project"),
+            "{error}"
+        );
+        assert!(
+            !protocol
+                .events
+                .iter()
+                .any(|event| event == "notify:textDocument/didOpen"),
+            "documents must not be opened after project selection is rejected"
+        );
+    }
 
     #[test]
     fn zero_pending_is_settled_even_when_context_membership_is_incomplete() {

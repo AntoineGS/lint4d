@@ -16,6 +16,135 @@ use tree_sitter::Node;
 const USE: u8 = 1;
 const DEF: u8 = 2;
 
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn test_flow_trace(
+    flow: &RoutineFlow<'_>,
+    active_occurrences: &[&VarOccurrence],
+    compiler_version: Option<pascal_project::CompilerVersion>,
+) -> serde_json::Value {
+    let routine_reasons = || {
+        let mut reasons = Vec::new();
+        if let Some(exclusion) = flow.excluded {
+            reasons.push(format!("routine_excluded:{exclusion:?}"));
+        }
+        if flow.cfg.is_none() {
+            reasons.push("missing_cfg".to_string());
+        }
+        reasons
+    };
+    let mut variables = serde_json::Map::new();
+    for (var, local) in flow.locals.iter().enumerate() {
+        let has_occurrence = active_occurrences
+            .iter()
+            .any(|occurrence| occurrence.var == var);
+        let has_write = active_occurrences
+            .iter()
+            .any(|occurrence| occurrence.var == var && occurrence.access == Access::Write);
+        let has_out_or_var_arg = active_occurrences.iter().any(|occurrence| {
+            occurrence.var == var && matches!(occurrence.access, Access::OutArg | Access::VarArg)
+        });
+        let mut h2164_reasons = routine_reasons();
+        if !matches!(local.kind, LocalKind::Local | LocalKind::LoopVar) {
+            h2164_reasons.push("kind_not_local_or_loop_variable".to_string());
+        }
+        if local.address_taken {
+            h2164_reasons.push("address_taken".to_string());
+        }
+        if local.captured {
+            h2164_reasons.push("captured".to_string());
+        }
+        if local.absolute {
+            h2164_reasons.push("absolute_storage".to_string());
+        }
+        if local.possible_with_target {
+            h2164_reasons.push("possible_with_target".to_string());
+        }
+        if has_occurrence {
+            h2164_reasons.push("has_active_occurrence".to_string());
+        }
+
+        let mut h2077_reasons = routine_reasons();
+        if local.kind != LocalKind::Local {
+            h2077_reasons.push("kind_not_local".to_string());
+        }
+        if local.ty != VarType::Scalar {
+            h2077_reasons.push("type_not_scalar".to_string());
+        }
+        if !local.type_resolved {
+            h2077_reasons.push("type_unresolved".to_string());
+        }
+        if local.unknown_call_effect {
+            h2077_reasons.push("unknown_call_effect".to_string());
+        }
+        if local.address_taken {
+            h2077_reasons.push("address_taken".to_string());
+        }
+        if local.captured {
+            h2077_reasons.push("captured".to_string());
+        }
+        if local.absolute {
+            h2077_reasons.push("absolute_storage".to_string());
+        }
+        if local.possible_with_target {
+            h2077_reasons.push("possible_with_target".to_string());
+        }
+        if !has_write {
+            h2077_reasons.push("no_active_write".to_string());
+        }
+
+        let mut w1036_reasons = routine_reasons();
+        if !w1035_w1036_supported(compiler_version) {
+            w1036_reasons.push("compiler_version_not_supported".to_string());
+        }
+        if local.kind != LocalKind::Local {
+            w1036_reasons.push("kind_not_local".to_string());
+        }
+        if local.ty != VarType::Scalar && !local.class_reference {
+            w1036_reasons.push("type_not_scalar_or_class_reference".to_string());
+        }
+        if !local.type_resolved {
+            w1036_reasons.push("type_unresolved".to_string());
+        }
+        if local.unresolved_local_generic_argument {
+            w1036_reasons.push("unresolved_local_generic_argument".to_string());
+        }
+        if local.unknown_call_effect {
+            w1036_reasons.push("unknown_call_effect".to_string());
+        }
+        if local.address_taken {
+            w1036_reasons.push("address_taken".to_string());
+        }
+        if local.captured {
+            w1036_reasons.push("captured".to_string());
+        }
+        if local.absolute {
+            w1036_reasons.push("absolute_storage".to_string());
+        }
+        if local.possible_with_target {
+            w1036_reasons.push("possible_with_target".to_string());
+        }
+        if has_out_or_var_arg {
+            w1036_reasons.push("out_or_var_argument".to_string());
+        }
+
+        variables.insert(
+            local.name.clone(),
+            serde_json::json!({
+                "kind": format!("{:?}", local.kind),
+                "H2164": { "reasons": h2164_reasons },
+                "H2077": { "reasons": h2077_reasons },
+                "W1036": { "reasons": w1036_reasons }
+            }),
+        );
+    }
+    serde_json::json!({
+        "routine": flow.name,
+        "exclusion": flow.excluded.map(|exclusion| format!("{exclusion:?}")),
+        "cfgAvailable": flow.cfg.is_some(),
+        "variables": variables
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoopKind {
     For,
@@ -59,6 +188,11 @@ pub(super) fn flow_diagnostics(
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
         if flow.excluded.is_some() || flow.cfg.is_none() {
+            #[cfg(feature = "test-support")]
+            eprintln!(
+                "LINT4D_FLOW_TRACE {}",
+                test_flow_trace(flow, &[], document.conditional_context.compiler_version)
+            );
             continue;
         }
         let loop_facts = collect_loop_facts(index, uri, document, flow, cancel, budget)?;
@@ -70,6 +204,15 @@ pub(super) fn flow_diagnostics(
                 active_occurrences.push(occurrence);
             }
         }
+        #[cfg(feature = "test-support")]
+        eprintln!(
+            "LINT4D_FLOW_TRACE {}",
+            test_flow_trace(
+                flow,
+                &active_occurrences,
+                document.conditional_context.compiler_version
+            )
+        );
         let locals = &flow.locals;
 
         for (local_index, local) in locals.iter().enumerate() {

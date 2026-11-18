@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem FlowIncompleteImports.pas
+FlowIncompleteImports.pas(10) H2077 Value assigned to 'WrittenOnly' never used
+FlowIncompleteImports.pas(7) H2164 Variable 'Unused' is declared but never used in 'Demo'

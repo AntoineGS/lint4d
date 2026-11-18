@@ -2,6 +2,7 @@ use super::*;
 use crate::navigation::{NavigationIndex, SourceSpan};
 use cfg_pascal::cfg_core::types::EdgeKind;
 use lsp_types::Url;
+use pascal_project::{CompilerVersion, ConditionalContext, LayoutContext, TargetPlatform};
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 
@@ -55,6 +56,105 @@ fn flows(source: &str) -> Vec<FlowSnapshot> {
             excluded: routine.excluded,
         })
         .collect()
+}
+
+#[test]
+fn routine_flows_use_bounded_work_for_many_routines() {
+    const ROUTINE_COUNT: usize = 384;
+    let mut source = String::from("program ManyRoutines;\n");
+    for index in 0..ROUTINE_COUNT {
+        source.push_str(&format!(
+            "procedure Work{index};\nvar Value: Integer;\nbegin Value := {index}; end;\n"
+        ));
+    }
+    source.push_str("begin end.\n");
+
+    let uri = Url::parse("file:///tmp/many-routines.pas").expect("source URI");
+    let mut index = NavigationIndex::new();
+    index
+        .update(uri.clone(), source)
+        .expect("generated source parses");
+    let document = index.documents.get(&uri).expect("indexed source");
+    let mut budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "flow test");
+    let flows = routine_flows(&index, &uri, document, &AtomicBool::new(false), &mut budget)
+        .expect("many small routines fit within the standard assistance budget");
+
+    assert_eq!(flows.len(), ROUTINE_COUNT);
+    assert!(
+        flows.iter().all(|flow| flow.cfg.is_some()),
+        "every small routine should be analyzed without exhausting the shared budget"
+    );
+}
+
+#[test]
+fn routine_flow_reuses_local_resolution_for_repeated_references() {
+    const ASSIGNMENT_COUNT: usize = 384;
+    let mut source = String::from(
+        "program RepeatedLocalReferences;\nprocedure Demo;\nvar Value: Integer;\nbegin\n",
+    );
+    for _ in 0..ASSIGNMENT_COUNT {
+        source.push_str("  Value := Value + 1;\n");
+    }
+    source.push_str("end;\nbegin Demo; end.\n");
+
+    let uri = Url::parse("file:///tmp/repeated-local-references.pas").expect("source URI");
+    let mut index = NavigationIndex::new();
+    index
+        .update(uri.clone(), source)
+        .expect("generated source parses");
+    let document = index.documents.get(&uri).expect("indexed source");
+    let mut budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "flow test");
+    let flows = routine_flows(&index, &uri, document, &AtomicBool::new(false), &mut budget)
+        .expect("repeated local references fit within the standard assistance budget");
+
+    assert_eq!(flows.len(), 1);
+    assert_eq!(flows[0].occurrences.len(), ASSIGNMENT_COUNT * 2);
+}
+
+#[test]
+fn flow_diagnostics_keep_findings_for_a_large_routine_within_the_work_budget() {
+    const BRANCH_COUNT: usize = 10_000;
+    let mut source = String::from(
+        "program LargeFlowBudget;\ntype TMarker = record Value: Integer; end;\nprocedure Demo;\nvar Unused: TMarker;\nbegin\n",
+    );
+    for _ in 0..BRANCH_COUNT {
+        source.push_str("  if 1 = 1 then begin end;\n");
+    }
+    source.push_str("end;\nbegin Demo; end.\n");
+
+    let uri = Url::parse("file:///tmp/large-flow-budget.pas").expect("source URI");
+    let mut index = NavigationIndex::new();
+    index
+        .update(uri.clone(), source.to_owned())
+        .expect("generated source parses");
+    let document = index.documents.get(&uri).expect("indexed source");
+    let mut budget = AssistanceBudget::new(
+        super::super::MAX_FLOW_DIAGNOSTIC_WORK,
+        super::super::MAX_FLOW_DIAGNOSTIC_BYTES,
+        "flow diagnostics",
+    );
+    let mut diagnostic_cap_reached = false;
+
+    let diagnostics = super::flow_diagnostics_with_budget(
+        &index,
+        &uri,
+        document,
+        &[],
+        100,
+        &mut diagnostic_cap_reached,
+        &AtomicBool::new(false),
+        &mut budget,
+    )
+    .expect("large but bounded flow analysis completes");
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind.code() == "H2164"
+                && diagnostic.message == "Variable 'Unused' is declared but never used in 'Demo'"
+        }),
+        "the large routine should retain its independently proven unused-local finding"
+    );
+    assert!(!diagnostic_cap_reached);
 }
 
 fn routine(source: &str, name: &str) -> FlowSnapshot {
@@ -345,6 +445,64 @@ fn flow_occurrences_keep_finally_statement_copies_in_each_cfg_block() {
     }
 }
 
+#[test]
+fn indexed_statement_mapping_matches_full_scan_for_finally_copies() {
+    let source = concat!(
+        "program FlowFinallyIndex;\n",
+        "procedure Demo(A: Integer);\n",
+        "var Value: Integer;\n",
+        "begin\n",
+        "  try\n",
+        "    if A > 0 then Exit;\n",
+        "    Value := 0;\n",
+        "  finally\n",
+        "    Value := Value + 1;\n",
+        "  end;\n",
+        "end;\n",
+        "begin Demo(1); end.\n",
+    );
+    let uri = Url::parse("file:///tmp/flow-finally-index.pas").expect("valid URI");
+    let mut navigation = NavigationIndex::new();
+    navigation
+        .update(uri.clone(), source.to_owned())
+        .expect("fixture parses");
+    let document = navigation.documents.get(&uri).expect("indexed document");
+    let routine_node = first_executable_routine(document.tree.root_node());
+    let cfg = cfg_pascal::build_file_cfgs(&document.tree, source.as_bytes())
+        .into_iter()
+        .find(|cfg| cfg.proc_name == "Demo")
+        .expect("Demo CFG");
+    let cancel = AtomicBool::new(false);
+    let mut node_budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "flow test");
+    let nodes = super::model::collect_nodes(routine_node, &cancel, &mut node_budget)
+        .expect("routine syntax nodes are collected");
+    let mut index_budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "flow test");
+    let statement_index =
+        super::model::StatementLocationIndex::new(&cfg, &cancel, &mut index_budget)
+            .expect("statement index builds")
+            .expect("all CFG statement ranges align with syntax nodes");
+
+    let identifiers = nodes
+        .into_iter()
+        .filter(|node| node.kind() == "identifier")
+        .collect::<Vec<_>>();
+    assert!(!identifiers.is_empty());
+    for identifier in identifiers {
+        let span = SourceSpan {
+            start: identifier.start_byte(),
+            end: identifier.end_byte(),
+        };
+        let mut slow_budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "flow test");
+        let expected = super::model::statement_locations(&cfg, span, &cancel, &mut slow_budget)
+            .expect("full-scan mapping succeeds");
+        let mut indexed_budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "flow test");
+        let actual = statement_index
+            .locations_for_node(identifier, &cancel, &mut indexed_budget)
+            .expect("indexed mapping succeeds");
+        assert_eq!(actual, expected, "mapping differs for {span:?}");
+    }
+}
+
 fn assert_finally_copies_keep_occurrences_on_exception_paths(
     source: &str,
     routine_name: &str,
@@ -590,6 +748,50 @@ fn unresolved_and_intrinsic_call_effects_are_classified_independently() {
             .access,
         Access::ReadWrite
     );
+}
+
+#[test]
+fn test_flow_trace_reports_per_variable_unknown_call_ineligibility() {
+    let source = concat!(
+        "program FlowTrace;\n",
+        "procedure Demo;\n",
+        "var Value, Other: Integer;\n",
+        "begin Mystery(Value); Other := 1; end;\n",
+        "begin Demo; end.\n",
+    );
+    let uri = Url::parse("file:///tmp/flow-trace.pas").expect("valid URI");
+    let mut index = NavigationIndex::new();
+    index
+        .update(uri.clone(), source.to_owned())
+        .expect("fixture parses");
+    let document = index.documents.get(&uri).expect("indexed document");
+    let cancel = AtomicBool::new(false);
+    let mut budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "flow trace test");
+    let flows =
+        routine_flows(&index, &uri, document, &cancel, &mut budget).expect("flow model builds");
+    let flow = flows
+        .iter()
+        .find(|flow| flow.name == "Demo")
+        .expect("demo flow");
+    let occurrences = flow.occurrences.iter().collect::<Vec<_>>();
+
+    let trace = super::usage::test_flow_trace(
+        flow,
+        &occurrences,
+        document.conditional_context.compiler_version,
+    );
+    let value_reasons = trace
+        .pointer("/variables/Value/H2077/reasons")
+        .and_then(serde_json::Value::as_array)
+        .expect("H2077 reasons");
+
+    assert!(
+        value_reasons
+            .iter()
+            .any(|reason| reason == "unknown_call_effect"),
+        "trace should preserve unknown call effects per variable: {trace}"
+    );
+    assert_eq!(trace["exclusion"], serde_json::Value::Null);
 }
 
 #[test]
@@ -1200,6 +1402,31 @@ fn flow_diagnostics_report_a_written_only_local_as_h2077() {
 }
 
 #[test]
+fn flow_diagnostics_do_not_report_exception_handler_variables_as_unused() {
+    let source = concat!(
+        "program FlowExceptionHandlerVariable;\n",
+        "type TTestException = class end;\n",
+        "procedure Demo;\n",
+        "begin\n",
+        "  try\n",
+        "  except\n",
+        "    on Error: TTestException do begin end;\n",
+        "  end;\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+
+    let diagnostics = flow_diagnostics(source);
+
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.kind.code() != "H2164"),
+        "the exception handler binds Error implicitly; it is not an unused local: {diagnostics:?}"
+    );
+}
+
+#[test]
 fn flow_diagnostics_withhold_h2077_for_a_local_with_an_unresolved_call_mode() {
     let source = concat!(
         "program FlowUnknownCallMode;\n",
@@ -1395,7 +1622,7 @@ fn flow_diagnostics_withhold_h2135_for_unrecorded_compiler_versions() {
 }
 
 #[test]
-fn flow_diagnostics_withhold_findings_when_a_routine_has_an_unresolved_identifier() {
+fn flow_diagnostics_withhold_findings_for_an_actual_unresolved_identifier_error() {
     let source = concat!(
         "program FlowUnresolved;\n",
         "procedure Demo;\n",
@@ -1406,10 +1633,174 @@ fn flow_diagnostics_withhold_findings_when_a_routine_has_an_unresolved_identifie
         "end;\n",
         "begin Demo; end.\n",
     );
+    let uri = Url::parse("file:///tmp/flow-unresolved.pas").expect("source URI");
+    let mut index = NavigationIndex::new();
+    index
+        .update(uri.clone(), source.to_owned())
+        .expect("fixture parses");
+    let report = index
+        .semantic_diagnostic_report_with_cancel(&uri, &AtomicBool::new(false))
+        .expect("semantic report");
 
     assert!(
-        flow_diagnostics(source).is_empty(),
-        "flow analysis must not publish findings for a routine with an unresolved identifier"
+        report
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.kind.code() != "H2077"),
+        "an unresolved nonlocal identifier without import context must not invent flow findings"
+    );
+}
+
+#[test]
+fn flow_diagnostics_bind_lexical_locals_despite_incomplete_imports() {
+    let source = concat!(
+        "program FlowIncompleteImports;\n",
+        "uses FlowExternal;\n",
+        "procedure Demo;\n",
+        "var\n",
+        "  Unused: Integer;\n",
+        "  WrittenOnly: Integer;\n",
+        "begin\n",
+        "  WrittenOnly := ExternalValue;\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+    let uri = Url::parse("file:///tmp/flow-incomplete-imports.pas").expect("source URI");
+    let mut index = NavigationIndex::new();
+    index
+        .update(uri.clone(), source.to_owned())
+        .expect("fixture parses");
+    // Deliberately leave FlowExternal out of the navigation index: the import
+    // and ExternalValue are unresolved to this partial workspace snapshot.
+    let report = index
+        .semantic_diagnostic_report_with_cancel(&uri, &AtomicBool::new(false))
+        .expect("semantic report");
+
+    assert_eq!(
+        flow_finding_lines(source, &report.diagnostics),
+        vec![
+            (
+                "H2077".to_owned(),
+                8,
+                "Value assigned to 'WrittenOnly' never used".to_owned(),
+            ),
+            (
+                "H2164".to_owned(),
+                5,
+                "Variable 'Unused' is declared but never used in 'Demo'".to_owned(),
+            ),
+        ],
+        "partial import resolution must not hide flow facts for lexically identified locals"
+    );
+}
+
+#[test]
+fn flow_diagnostics_bind_lexical_locals_when_bound_import_is_unindexed() {
+    let source = concat!(
+        "program FlowBoundUnindexedImport;\n",
+        "uses FlowExternal;\n",
+        "procedure Demo;\n",
+        "var\n",
+        "  Unused: Integer;\n",
+        "  WrittenOnly: Integer;\n",
+        "begin\n",
+        "  WrittenOnly := ExternalValue;\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+    let uri = Url::parse("file:///tmp/flow-bound-unindexed-import.pas").expect("source URI");
+    let unindexed_import =
+        Url::parse("file:///tmp/unindexed/FlowExternal.pas").expect("import URI");
+    let mut index = NavigationIndex::new();
+    index
+        .update(uri.clone(), source.to_owned())
+        .expect("fixture parses");
+    index.bind_imports(&uri, [("FlowExternal".to_owned(), unindexed_import)]);
+
+    let report = index
+        .semantic_diagnostic_report_with_cancel(&uri, &AtomicBool::new(false))
+        .expect("semantic report");
+
+    assert_eq!(
+        flow_finding_lines(source, &report.diagnostics),
+        vec![
+            (
+                "H2077".to_owned(),
+                8,
+                "Value assigned to 'WrittenOnly' never used".to_owned(),
+            ),
+            (
+                "H2164".to_owned(),
+                5,
+                "Variable 'Unused' is declared but never used in 'Demo'".to_owned(),
+            ),
+        ],
+        "a bound import without an indexed document is still incomplete lookup context"
+    );
+}
+
+#[test]
+fn flow_diagnostics_accept_a_compiler_surface_member_with_incomplete_provider_imports() {
+    let source = concat!(
+        "program FlowSurfaceIncompleteProvider;\n",
+        "uses FlowSurfaceProvider;\n",
+        "procedure Demo;\n",
+        "var\n",
+        "  Dead: Integer;\n",
+        "  Instance: TSurfaceObject;\n",
+        "begin\n",
+        "  Dead := 1;\n",
+        "  Instance.Free;\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+    let provider_source = concat!(
+        "unit FlowSurfaceProvider;\n",
+        "interface\n",
+        "uses SysUtils;\n",
+        "{$IFDEF UNKNOWN_PROVIDER_DEFINE}\n",
+        "type TOptionalProviderType = class end;\n",
+        "{$ENDIF}\n",
+        "type TSurfaceObject = class end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let uri = Url::parse("file:///tmp/flow-surface-incomplete-provider.pas").expect("source URI");
+    let provider_uri = Url::parse("file:///tmp/FlowSurfaceProvider.pas").expect("provider URI");
+    let version = CompilerVersion::new(37, 0);
+    let platform = TargetPlatform::Win32;
+    let context = ConditionalContext {
+        compiler_version: Some(version),
+        layout: LayoutContext::for_target(Some(version), Some(&platform)),
+        ..ConditionalContext::default()
+    };
+    let cancel = AtomicBool::new(false);
+    let mut index = NavigationIndex::new();
+    index
+        .update_with_context_with_cancel(
+            provider_uri.clone(),
+            provider_source.to_owned(),
+            &context,
+            &cancel,
+        )
+        .expect("provider parses");
+    index
+        .update_with_context_with_cancel(uri.clone(), source.to_owned(), &context, &cancel)
+        .expect("fixture parses");
+    index.bind_imports(&uri, [("FlowSurfaceProvider".to_owned(), provider_uri)]);
+
+    let report = index
+        .semantic_diagnostic_report_with_cancel(&uri, &cancel)
+        .expect("semantic report");
+
+    assert_eq!(
+        flow_finding_lines(source, &report.diagnostics),
+        vec![(
+            "H2077".to_owned(),
+            8,
+            "Value assigned to 'Dead' never used".to_owned(),
+        )],
+        "the verified TObject.Free surface member should not suppress unrelated local flow facts"
     );
 }
 

@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Find unused-unit LSP findings and compare normalized DCC output."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+
+LSP_LINE = re.compile(
+    r"^(?P<path>.+)\((?P<line>[0-9]+)\) (?P<severity>\S+) "
+    r"(?P<code>\S+) (?P<source>\S+)(?: (?P<text>.*))?$"
+)
+UNUSED_UNIT_TEXT = re.compile(r"^Unit '([^']+)' is not used$")
+DCC_LINE = re.compile(
+    r"^(?P<path>.*)\([0-9]+\) "
+    r"(?:Error|Warning|Hint|Fatal): (?P<code>[EWHF][0-9]{4}) (?P<text>.*)$"
+)
+
+
+def canonical_path(value: str | Path) -> Path:
+    return Path(os.path.realpath(value))
+
+
+def unused_unit_findings(lsp_path: Path, command_path: Path) -> list[tuple[Path, int, str]]:
+    with command_path.open(encoding="utf-8") as command_file:
+        command = json.load(command_file)
+    files = command.get("files")
+    if not isinstance(files, list) or not all(isinstance(path, str) for path in files):
+        raise ValueError("command JSON files must be an array of paths")
+    project_files = {canonical_path(path) for path in files}
+
+    findings: list[tuple[Path, int, str]] = []
+    with lsp_path.open(encoding="utf-8") as lsp_file:
+        for line_number, line in enumerate(lsp_file, start=1):
+            match = LSP_LINE.match(line.rstrip("\r\n"))
+            if not match or match["code"] != "lint4d-unused-unit":
+                continue
+            if match["severity"] != "Hint":
+                raise ValueError(
+                    f"{lsp_path}:{line_number}: unused-unit finding is not a Hint"
+                )
+            unit_match = UNUSED_UNIT_TEXT.fullmatch(match["text"] or "")
+            if not unit_match:
+                raise ValueError(
+                    f"{lsp_path}:{line_number}: unrecognized unused-unit message"
+                )
+            path = canonical_path(match["path"])
+            if path in project_files:
+                findings.append((path, int(match["line"]), unit_match[1]))
+    return findings
+
+
+def dcc_path(value: str) -> str:
+    value = value.replace("\\", "/")
+    if re.match(r"^Z:/", value, flags=re.IGNORECASE):
+        return os.path.realpath(value[2:])
+    return os.path.normpath(value)
+
+
+def dcc_messages(
+    raw_path: Path,
+    project_root: Path,
+    edited_source: Path | None,
+    original_source: Path,
+) -> Counter[tuple[str, str, str]]:
+    project_root = canonical_path(project_root)
+    if edited_source is not None:
+        edited_source = canonical_path(edited_source)
+    original_source = canonical_path(original_source)
+    messages: Counter[tuple[str, str, str]] = Counter()
+    with raw_path.open(encoding="utf-8", errors="replace") as raw_file:
+        for line in raw_file:
+            match = DCC_LINE.match(line.rstrip("\r\n"))
+            if not match:
+                continue
+            path = dcc_path(match["path"])
+            if edited_source is not None and path == str(edited_source):
+                path = str(original_source)
+            candidate = Path(path)
+            if candidate.is_absolute():
+                candidate = canonical_path(candidate)
+                try:
+                    path = candidate.relative_to(project_root).as_posix()
+                except ValueError:
+                    path = str(candidate)
+            else:
+                path = candidate.as_posix()
+            messages[(path, match["code"], match["text"])] += 1
+    return messages
+
+
+def display_path(path: str, project_root: Path) -> str:
+    candidate = Path(path)
+    if candidate.is_absolute():
+        try:
+            return candidate.relative_to(canonical_path(project_root)).as_posix()
+        except ValueError:
+            return candidate.name
+    return path
+
+
+def first_difference(
+    original: Counter[tuple[str, str, str]],
+    edited: Counter[tuple[str, str, str]],
+    project_root: Path,
+) -> str:
+    for message in sorted(original.keys() | edited.keys()):
+        count = original[message] - edited[message]
+        if count == 0:
+            continue
+        path, code, text = message
+        side = "original only" if count > 0 else "edited only"
+        return f"{side}: {display_path(path, project_root)} {code} {text}"
+    return ""
+
+
+def compare_outputs(
+    original_path: Path,
+    edited_path: Path,
+    project_root: Path,
+    edited_source: Path,
+    original_source: Path,
+) -> str:
+    original = dcc_messages(
+        original_path, project_root, None, original_source
+    )
+    edited = dcc_messages(
+        edited_path, project_root, edited_source, original_source
+    )
+    difference = first_difference(original, edited, project_root)
+    return f"differs: {difference}" if difference else "identical"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    findings_parser = subparsers.add_parser("findings")
+    findings_parser.add_argument("lsp_output", type=Path)
+    findings_parser.add_argument("command_json", type=Path)
+    compare_parser = subparsers.add_parser("compare")
+    compare_parser.add_argument("original_dcc", type=Path)
+    compare_parser.add_argument("edited_dcc", type=Path)
+    compare_parser.add_argument("project_root", type=Path)
+    compare_parser.add_argument("edited_source", type=Path)
+    compare_parser.add_argument("original_source", type=Path)
+    args = parser.parse_args()
+
+    try:
+        if args.command == "findings":
+            for path, line, unit in unused_unit_findings(
+                args.lsp_output, args.command_json
+            ):
+                sys.stdout.buffer.write(
+                    os.fsencode(path) + b"\0" + str(line).encode() + b"\0"
+                    + os.fsencode(unit) + b"\0"
+                )
+            return 0
+        print(
+            compare_outputs(
+                args.original_dcc,
+                args.edited_dcc,
+                args.project_root,
+                args.edited_source,
+                args.original_source,
+            )
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print(f"dcc-corpus-unused-unit: {error}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

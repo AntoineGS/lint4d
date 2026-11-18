@@ -216,6 +216,16 @@ initialization options, or server binary path/mtime:
 scripts/dcc-corpus.sh --compare <manifest-entry>
 ```
 
+For a fresh LSP run, `--verify-unused-units` recompiles each
+`lint4d-unused-unit` finding after removing its `uses` entry from a temporary
+source copy. The edited copy is first on DCC's unit search path, compiler outputs
+stay in temporary directories, and the report compares the original and edited
+diagnostic multisets while ignoring line shifts. Findings are marked `verified`
+when the diagnostics are identical and `false-positive` with the first
+difference otherwise; a false positive makes the command exit nonzero.
+`--verify-unused-units` requires `--lsp <binary>` and can be combined with
+`--compare`.
+
 For one project, add its manifest `name` after the options. Set
 `LINT4D_LSP_TIMEOUT` to adjust the default 600-second index-settle limit. The
 script exits nonzero if indexing times out; the comparison report marks parity

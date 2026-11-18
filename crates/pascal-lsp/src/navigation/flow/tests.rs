@@ -1652,7 +1652,7 @@ fn flow_diagnostics_withhold_findings_for_an_actual_unresolved_identifier_error(
 }
 
 #[test]
-fn flow_diagnostics_bind_lexical_locals_despite_incomplete_imports() {
+fn flow_diagnostics_withhold_findings_for_an_unresolved_nonlocal_with_incomplete_imports() {
     let source = concat!(
         "program FlowIncompleteImports;\n",
         "uses FlowExternal;\n",
@@ -1676,26 +1676,14 @@ fn flow_diagnostics_bind_lexical_locals_despite_incomplete_imports() {
         .semantic_diagnostic_report_with_cancel(&uri, &AtomicBool::new(false))
         .expect("semantic report");
 
-    assert_eq!(
-        flow_finding_lines(source, &report.diagnostics),
-        vec![
-            (
-                "H2077".to_owned(),
-                8,
-                "Value assigned to 'WrittenOnly' never used".to_owned(),
-            ),
-            (
-                "H2164".to_owned(),
-                5,
-                "Variable 'Unused' is declared but never used in 'Demo'".to_owned(),
-            ),
-        ],
-        "partial import resolution must not hide flow facts for lexically identified locals"
+    assert!(
+        flow_finding_lines(source, &report.diagnostics).is_empty(),
+        "an unresolved imported identifier must suppress all flow findings in its routine"
     );
 }
 
 #[test]
-fn flow_diagnostics_bind_lexical_locals_when_bound_import_is_unindexed() {
+fn flow_diagnostics_withhold_findings_for_an_unresolved_nonlocal_with_bound_unindexed_import() {
     let source = concat!(
         "program FlowBoundUnindexedImport;\n",
         "uses FlowExternal;\n",
@@ -1721,21 +1709,9 @@ fn flow_diagnostics_bind_lexical_locals_when_bound_import_is_unindexed() {
         .semantic_diagnostic_report_with_cancel(&uri, &AtomicBool::new(false))
         .expect("semantic report");
 
-    assert_eq!(
-        flow_finding_lines(source, &report.diagnostics),
-        vec![
-            (
-                "H2077".to_owned(),
-                8,
-                "Value assigned to 'WrittenOnly' never used".to_owned(),
-            ),
-            (
-                "H2164".to_owned(),
-                5,
-                "Variable 'Unused' is declared but never used in 'Demo'".to_owned(),
-            ),
-        ],
-        "a bound import without an indexed document is still incomplete lookup context"
+    assert!(
+        flow_finding_lines(source, &report.diagnostics).is_empty(),
+        "a bound but unindexed provider cannot prove the unresolved identifier's declaration"
     );
 }
 

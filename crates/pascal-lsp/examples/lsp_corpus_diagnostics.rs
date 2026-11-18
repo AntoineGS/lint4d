@@ -50,7 +50,7 @@ struct Arguments {
 struct SourceDocument {
     path: PathBuf,
     uri: String,
-    text: String,
+    text: Option<String>,
     bytes: Vec<u8>,
 }
 
@@ -92,6 +92,7 @@ fn run() -> Result<(), String> {
         .unwrap_or_else(|| workspace_root(&project_file));
     let initialization_options = load_initialization_options(arguments.init_options.as_deref())?;
     let mut documents = Vec::with_capacity(files.len());
+    let mut undecodable_files = HashSet::new();
     for file in files {
         let path = PathBuf::from(file);
         let uri = Url::from_file_path(&path)
@@ -104,10 +105,21 @@ fn run() -> Result<(), String> {
             .to_string();
         let bytes = fs::read(&path)
             .map_err(|error| format!("could not read source {}: {error}", path.display()))?;
+        let text = match decode_pascal_source(&bytes) {
+            Ok(text) => Some(text),
+            Err(error) => {
+                eprintln!(
+                    "source {} is undecodable and will not be analysed: {error}",
+                    path.display()
+                );
+                undecodable_files.insert(path.clone());
+                None
+            }
+        };
         documents.push(SourceDocument {
             path,
             uri,
-            text: decode_pascal_source(&bytes),
+            text,
             bytes,
         });
     }
@@ -143,6 +155,41 @@ fn run() -> Result<(), String> {
     let requested_meta_path = arguments.output.with_extension("meta.json");
     let meta_path = ensure_output_outside_roots(&requested_meta_path, &protected_roots)?;
 
+    let analysable_count = documents
+        .iter()
+        .filter(|document| document.text.is_some())
+        .count();
+    if analysable_count == 0 {
+        let undecodable_count = undecodable_files.len();
+        fs::write(&output_path, b"")
+            .map_err(|error| format!("could not create output file: {error}"))?;
+        let meta = json!({
+            "index_timed_out": false,
+            "index_status": null,
+            "index_settle": null,
+            "project_selection": null,
+            "pull_diagnostics": false,
+            "files_opened": 0,
+            "diagnostics": 0,
+            "run_fingerprint": run_fingerprint,
+            "server_binary": server_binary,
+            "server_mtime_ns": server_mtime_ns,
+            "undecodable_files": sorted_paths(undecodable_files.clone()),
+            "unanalysed_files": sorted_paths(undecodable_files)
+        });
+        fs::write(
+            &meta_path,
+            serde_json::to_vec_pretty(&meta)
+                .map_err(|error| format!("could not encode metadata: {error}"))?,
+        )
+        .map_err(|error| format!("could not write metadata {}: {error}", meta_path.display()))?;
+        eprintln!(
+            "opened 0 file(s), recorded 0 diagnostic(s), {} unanalysed file(s)",
+            undecodable_count
+        );
+        return Ok(());
+    }
+
     let mut client = Client::spawn(&arguments.binary)?;
     let (pull_supported, project_selection) = initialize_and_open_documents(
         &mut client,
@@ -154,13 +201,13 @@ fn run() -> Result<(), String> {
     )?;
 
     let (index_status, index_timed_out, zero_pending_polls) =
-        client.wait_for_index(arguments.timeout, !documents.is_empty())?;
-    let mut unanalysed_files = HashSet::new();
+        client.wait_for_index(arguments.timeout, analysable_count > 0)?;
+    let mut unanalysed_files = undecodable_files;
     if index_timed_out {
         unanalysed_files.extend(documents.iter().map(|document| document.path.clone()));
     } else {
         if pull_supported {
-            for document in &documents {
+            for document in documents.iter().filter(|document| document.text.is_some()) {
                 let result = client.request(
                     "textDocument/diagnostic",
                     json!({
@@ -192,6 +239,7 @@ fn run() -> Result<(), String> {
             let deadline = Instant::now() + arguments.timeout;
             let expected = documents
                 .iter()
+                .filter(|document| document.text.is_some())
                 .map(|document| document.uri.clone())
                 .collect::<HashSet<_>>();
             while !expected.is_subset(&client.pushed_uris) && Instant::now() < deadline {
@@ -199,7 +247,7 @@ fn run() -> Result<(), String> {
                     break;
                 }
             }
-            for document in &documents {
+            for document in documents.iter().filter(|document| document.text.is_some()) {
                 if !client.pushed_uris.contains(&document.uri) {
                     unanalysed_files.insert(document.path.clone());
                 }
@@ -209,7 +257,7 @@ fn run() -> Result<(), String> {
     }
 
     let mut output = Vec::new();
-    for document in &documents {
+    for document in documents.iter().filter(|document| document.text.is_some()) {
         if index_timed_out {
             continue;
         }
@@ -239,11 +287,12 @@ fn run() -> Result<(), String> {
         "index_settle": index_settle_metadata(&index_status, zero_pending_polls),
         "project_selection": project_selection,
         "pull_diagnostics": pull_supported,
-        "files_opened": documents.len(),
+        "files_opened": analysable_count,
         "diagnostics": output.len(),
         "run_fingerprint": run_fingerprint,
         "server_binary": server_binary,
         "server_mtime_ns": server_mtime_ns,
+        "undecodable_files": sorted_paths(undecodable_paths(&documents)),
         "unanalysed_files": sorted_paths(unanalysed_files)
     });
     fs::write(
@@ -263,7 +312,7 @@ fn run() -> Result<(), String> {
     }
     eprintln!(
         "opened {} file(s), recorded {} diagnostic(s), {} unanalysed file(s)",
-        documents.len(),
+        analysable_count,
         output.len(),
         unanalysed_count
     );
@@ -286,17 +335,20 @@ fn initialize_capabilities() -> Value {
     })
 }
 
-fn decode_pascal_source(bytes: &[u8]) -> String {
+fn decode_pascal_source(bytes: &[u8]) -> Result<String, String> {
     if let Some(bytes) = bytes.strip_prefix(&[0xff, 0xfe]) {
         return decode_utf16_source(bytes, true);
     }
     if let Some(bytes) = bytes.strip_prefix(&[0xfe, 0xff]) {
         return decode_utf16_source(bytes, false);
     }
-    pascal_core::decode_bytes(bytes).into_owned()
+    Ok(pascal_core::decode_bytes(bytes).into_owned())
 }
 
-fn decode_utf16_source(bytes: &[u8], little_endian: bool) -> String {
+fn decode_utf16_source(bytes: &[u8], little_endian: bool) -> Result<String, String> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err("UTF-16 byte sequence has an odd length".to_string());
+    }
     let units = bytes
         .as_chunks::<2>()
         .0
@@ -309,7 +361,7 @@ fn decode_utf16_source(bytes: &[u8], little_endian: bool) -> String {
             }
         })
         .collect::<Vec<_>>();
-    String::from_utf16_lossy(&units)
+    String::from_utf16(&units).map_err(|_| "UTF-16 contains an unpaired surrogate".to_string())
 }
 
 trait CorpusProtocol {
@@ -352,9 +404,10 @@ fn initialize_and_open_documents(
 
     client.notify("initialized", json!({}))?;
 
-    let scope = documents.first().ok_or_else(|| {
-        "corpus command has no source documents for project selection".to_string()
-    })?;
+    let scope = documents
+        .iter()
+        .find(|document| document.text.is_some())
+        .ok_or_else(|| "corpus command has no decodable source documents".to_string())?;
     let selection_result = client.request(
         "pascal/selectProject",
         json!({
@@ -365,7 +418,7 @@ fn initialize_and_open_documents(
     )?;
     let project_selection = project_selection_metadata(selection_result, &scope.uri, project_uri)?;
 
-    for document in documents {
+    for document in documents.iter().filter(|document| document.text.is_some()) {
         client.notify(
             "textDocument/didOpen",
             json!({
@@ -373,7 +426,10 @@ fn initialize_and_open_documents(
                     "uri": document.uri,
                     "languageId": "pascal",
                     "version": 1,
-                    "text": document.text
+                    "text": document
+                        .text
+                        .as_deref()
+                        .expect("only decodable source documents are opened")
                 }
             }),
         )?;
@@ -650,6 +706,14 @@ fn sorted_paths(paths: HashSet<PathBuf>) -> Vec<String> {
         .collect::<Vec<_>>();
     paths.sort();
     paths
+}
+
+fn undecodable_paths(documents: &[SourceDocument]) -> HashSet<PathBuf> {
+    documents
+        .iter()
+        .filter(|document| document.text.is_none())
+        .map(|document| document.path.clone())
+        .collect()
 }
 
 struct Client {
@@ -1060,7 +1124,7 @@ mod tests {
         SourceDocument {
             path: path.to_path_buf(),
             uri: super::file_uri(path).expect("document URI"),
-            text: "unit Unit;".to_string(),
+            text: Some("unit Unit;".to_string()),
             bytes: b"unit Unit;".to_vec(),
         }
     }
@@ -1069,8 +1133,89 @@ mod tests {
     fn corpus_open_documents_decode_legacy_eight_bit_source_without_replacements() {
         let source = b"unit Legacy; // caf\xe9\n";
         assert_eq!(
-            super::decode_pascal_source(source),
+            super::decode_pascal_source(source).expect("legacy source decodes"),
             "unit Legacy; // café\n"
+        );
+    }
+
+    #[test]
+    fn corpus_decoder_does_not_silently_drop_an_odd_utf16_byte() {
+        assert!(
+            super::decode_pascal_source(&[0xff, 0xfe, b'A', 0, b'B']).is_err(),
+            "odd UTF-16 input must be rejected instead of dropping its trailing byte"
+        );
+    }
+
+    #[test]
+    fn corpus_decoder_rejects_unpaired_utf16_surrogates() {
+        for source in [
+            &[0xff, 0xfe, 0x00, 0xd8][..],
+            &[0xfe, 0xff, 0xd8, 0x00][..],
+            &[0xff, 0xfe, 0x00, 0xdc][..],
+        ] {
+            assert!(
+                super::decode_pascal_source(source).is_err(),
+                "malformed UTF-16 must be rejected rather than analysed"
+            );
+        }
+    }
+
+    #[test]
+    fn undecodable_utf16_is_recorded_and_not_opened_for_analysis() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let invalid_path = temp.path().join("Invalid.pas");
+        let invalid_bytes = vec![0xff, 0xfe, 0x00, 0xd8];
+        let invalid_document = SourceDocument {
+            path: invalid_path.clone(),
+            uri: super::file_uri(&invalid_path).expect("invalid document URI"),
+            text: super::decode_pascal_source(&invalid_bytes).ok(),
+            bytes: invalid_bytes,
+        };
+        let valid_path = temp.path().join("Valid.pas");
+        let valid_document = source_document(&valid_path);
+        let documents = [invalid_document, valid_document.clone()];
+
+        assert_eq!(
+            super::undecodable_paths(&documents),
+            std::collections::HashSet::from([invalid_path])
+        );
+
+        let mut protocol = RecordingProtocol {
+            events: Vec::new(),
+            request_params: HashMap::new(),
+            selection_response: json!({
+                "scopeUri": "file:///tmp",
+                "selectedProjectUri": null,
+                "selectionMode": "directory",
+                "warnings": []
+            }),
+        };
+        super::initialize_and_open_documents(
+            &mut protocol,
+            "file:///tmp",
+            &json!({}),
+            None,
+            &documents,
+            Duration::from_secs(5),
+        )
+        .expect("open only decodable source");
+
+        assert_eq!(
+            protocol.events,
+            [
+                "request:initialize",
+                "notify:initialized",
+                "request:pascal/selectProject",
+                "notify:textDocument/didOpen"
+            ]
+        );
+        assert_eq!(
+            protocol.request_params["textDocument/didOpen"]["textDocument"]["uri"],
+            valid_document.uri
+        );
+        assert_eq!(
+            protocol.request_params["textDocument/didOpen"]["textDocument"]["text"],
+            "unit Unit;"
         );
     }
 
@@ -1321,7 +1466,7 @@ mod tests {
         let document = SourceDocument {
             path: source.clone(),
             uri: "file:///Unit.pas".to_string(),
-            text: "unit Unit;".to_string(),
+            text: Some("unit Unit;".to_string()),
             bytes: b"unit Unit;".to_vec(),
         };
         let options = json!({"sourcePaths": ["C:/rtl"]});
@@ -1362,7 +1507,7 @@ mod tests {
             &[SourceDocument {
                 path: source,
                 uri: "file:///Unit.pas".to_string(),
-                text: "unit Unit;".to_string(),
+                text: Some("unit Unit;".to_string()),
                 bytes: b"unit Unit;".to_vec(),
             }],
             &changed_options,

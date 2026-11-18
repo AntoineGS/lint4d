@@ -255,7 +255,8 @@ crates/pascal-lsp/tests/dcc_oracle/flow_incomplete_imports/FlowIncompleteImports
 crates/pascal-lsp/tests/dcc_oracle/flow_self_receiver/FlowSelfReceiver.pas 026813df97cc7cf0 5
 crates/pascal-lsp/tests/dcc_oracle/flow_surface_member_incomplete_provider/FlowSurfaceIncompleteProvider.pas 59ecdffb722a0ab6 4
 crates/pascal-lsp/tests/dcc_oracle/flow_surface_member_incomplete_provider/FlowSurfaceProvider.pas 4961c90684e42a07 3
-crates/pascal-lsp/tests/dcc_oracle/flow_unresolved_nonlocal/FlowUnresolvedNonlocal.pas 75b6550b617ddf58 3
+crates/pascal-lsp/tests/dcc_oracle/flow_unresolved_nonlocal/FlowExternal.pas aca1910eec50f8d3 2
+crates/pascal-lsp/tests/dcc_oracle/flow_unresolved_nonlocal/FlowUnresolvedNonlocal.pas b627a159d5862cce 3
 crates/pascal-lsp/tests/dcc_oracle/h2077_except_handler_read/ExceptHandlerRead.pas f4e3b5ced64f9800 3
 crates/pascal-lsp/tests/dcc_oracle/h2077_field_assignment/FieldAssignment.pas 6b4be688dd536e02 5
 crates/pascal-lsp/tests/dcc_oracle/h2077_finally_handler_read/FinallyHandlerRead.pas b0f69b2052ff56c4 3

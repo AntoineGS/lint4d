@@ -41,6 +41,7 @@ struct Case {
     recall: bool,
     recall_exempt: Vec<String>,
     silent_codes: Vec<String>,
+    unindexed_units: Vec<String>,
 }
 
 impl Case {
@@ -144,6 +145,9 @@ fn load_case_from_toml(name: &str, dir: &Path, toml: &str) -> Case {
     let silent_codes = value("silent")
         .map(|raw| parse_string_array(&raw, name, "silent"))
         .unwrap_or_default();
+    let unindexed_units = value("unindexed_units")
+        .map(|raw| parse_string_array(&raw, name, "unindexed_units"))
+        .unwrap_or_default();
     Case {
         unit: value("unit").unwrap_or_else(|| panic!("{name}: case.toml has no unit")),
         compilers,
@@ -153,6 +157,7 @@ fn load_case_from_toml(name: &str, dir: &Path, toml: &str) -> Case {
         recall,
         recall_exempt,
         silent_codes,
+        unindexed_units,
         name: name.to_owned(),
         dir: dir.to_path_buf(),
     }
@@ -394,6 +399,12 @@ fn actual_findings(case: &Case, version: &str) -> Vec<Finding> {
         .collect::<Vec<_>>();
     entries.sort();
     for path in entries {
+        if case.unindexed_units.iter().any(|unit| {
+            path.file_name()
+                .is_some_and(|file_name| file_name.eq_ignore_ascii_case(unit))
+        }) {
+            continue;
+        }
         let source = std::fs::read_to_string(&path).unwrap();
         let uri = Url::from_file_path(&path).unwrap();
         let warning_properties = project
@@ -560,6 +571,7 @@ fn silent_case_codes_override_matching_dcc_and_linter_findings() {
         recall: true,
         recall_exempt: Vec::new(),
         silent_codes: vec!["E2065".to_owned()],
+        unindexed_units: Vec::new(),
     };
     let finding = Finding {
         file: case.unit.clone(),
@@ -977,6 +989,7 @@ fn dproj_oracle_context_uses_selected_warning_properties_and_oracle_defines() {
         recall: true,
         recall_exempt: Vec::new(),
         silent_codes: Vec::new(),
+        unindexed_units: Vec::new(),
     };
 
     let project =
@@ -1064,6 +1077,7 @@ fn dproj_oracle_cases_require_explicit_config_and_platform() {
             recall: true,
             recall_exempt: Vec::new(),
             silent_codes: Vec::new(),
+            unindexed_units: Vec::new(),
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             project_context_for_case(&case, "37.0", case.config.clone(), case.platform.clone())

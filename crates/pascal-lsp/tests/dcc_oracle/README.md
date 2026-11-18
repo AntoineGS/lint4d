@@ -24,6 +24,10 @@ semantic model makes even a matching dcc diagnostic unsafe. The recording has
 `#` header lines followed by normalized messages in the form
 `<File>.pas(<line>) <code> <message>`.
 
+A case may set `unindexed_units = ["Provider.pas"]` to keep a sibling Pascal
+source available to the dcc recorder while deliberately omitting it from the
+navigation index. This models an import whose provider is not indexed.
+
 A case may contain one sibling `.dproj`. Optional `config = "Debug"` and
 `platform = "Win32"` entries in `case.toml` select its build configuration and
 platform; when omitted, the project's evaluated defaults are used. The oracle

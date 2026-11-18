@@ -1,5 +1,7 @@
 program FlowUnresolvedNonlocal;
 
+uses FlowExternal;
+
 procedure Demo;
 var
   Value: Integer;

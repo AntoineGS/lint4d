@@ -673,31 +673,6 @@ fn build_routine_flow<'a>(
     let result_local = locals
         .iter()
         .position(|local| local.kind == LocalKind::Result);
-    let mut has_unindexed_bound_import = false;
-    if let Some(bindings) = document.import_bindings.as_ref() {
-        for unit_name in document
-            .interface_uses
-            .iter()
-            .chain(&document.implementation_uses)
-        {
-            check_navigation_cancel(cancel)?;
-            budget.require_work(1, cancel)?;
-            budget.require_bytes(unit_name.len(), cancel)?;
-            if bindings
-                .get(&canonical_name(unit_name))
-                .is_some_and(|unit_uri| !index.documents.contains_key(unit_uri))
-            {
-                has_unindexed_bound_import = true;
-                break;
-            }
-        }
-    }
-    let imports_are_incomplete = (!document.interface_uses.is_empty()
-        || !document.implementation_uses.is_empty())
-        && (document.import_bindings.is_none()
-            || document.unbound.is_some()
-            || document.lazy_imports.is_some()
-            || has_unindexed_bound_import);
     let routine_candidate = routine_symbol_index.map(|index| Candidate {
         uri: uri.clone(),
         index,
@@ -801,10 +776,13 @@ fn build_routine_flow<'a>(
         }
         let is_local_occurrence =
             (local_names.contains(&key) || is_result_name) && !is_right_hand_member(identifier);
-        if !is_local_occurrence && (is_call_entity(identifier) || imports_are_incomplete) {
+        if !is_local_occurrence && is_call_entity(identifier) {
             continue;
         }
 
+        // Incomplete imports do not excuse an unresolved bare identifier: a
+        // resolver candidate is the evidence that the name is declared and
+        // visible; otherwise the routine is excluded below.
         let offset = identifier.start_byte();
         let (
             candidates,

@@ -1,2 +1,6 @@
 unit = "FlowUnresolvedNonlocal.pas"
 compilers = ["21.0", "24.0", "37.0"]
+recall_exempt = ["E2003"]
+silent = ["H2077", "H2164", "W1036"]
+unindexed_units = ["FlowExternal.pas"]
+reason = "The fixture intentionally leaves FlowExternal unindexed, so the import is incomplete and lint4d cannot report the compiler's E2003; flow hints must still be withheld."

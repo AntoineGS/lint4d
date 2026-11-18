@@ -14,10 +14,10 @@ use super::{
 };
 use crate::configuration::{config_directories, resolve_lint};
 use crate::navigation::{
-    AssistanceBudget, DccMessage, MAX_MISSING_UNIT_REQUEST_BYTES, MAX_MISSING_UNIT_REQUEST_WORK,
-    MissingInterfaceMethodImplementationCandidate, MissingMethodImplementationCandidate,
-    MissingUnitCandidate, MissingUnitUseKind, NavigationTarget, SemanticDiagnosticKind, SourceSpan,
-    UnitOrderSafety,
+    AssistanceBudget, DccMessage, FormFileRequirement, MAX_MISSING_UNIT_REQUEST_BYTES,
+    MAX_MISSING_UNIT_REQUEST_WORK, MissingInterfaceMethodImplementationCandidate,
+    MissingMethodImplementationCandidate, MissingUnitCandidate, MissingUnitUseKind,
+    NavigationTarget, SemanticDiagnosticKind, SourceSpan, UnitOrderSafety,
 };
 use crate::text;
 use lint4d::config::{Config, RuleSeverityOverride};
@@ -698,6 +698,36 @@ pub(crate) fn code_actions_from_input(
         Vec::new()
     };
     let mut supplementary_actions = extraction_actions;
+    let mut unused_unit_records = Vec::new();
+    let current_unused_unit_findings = if requests_quickfix
+        && !rule_is_off(&config, "unused-unit")
+        && input_source_is_writable(&input, &uri)
+        && params
+            .context
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic_code(diagnostic) == Some("lint4d-unused-unit"))
+    {
+        match current_unused_unit_findings_from_input(
+            &input,
+            &uri,
+            &source,
+            &target_record,
+            &configuration_records,
+            cancel,
+        ) {
+            Ok((findings, records)) => {
+                unused_unit_records = records;
+                findings
+            }
+            Err(error) if error == CANCELLATION_MESSAGE => {
+                return failed(source_generation, configuration_generation, error);
+            }
+            Err(_) => HashSet::new(),
+        }
+    } else {
+        HashSet::new()
+    };
     if requests_quickfix
         && !rule_is_off(&config, "unused-unit")
         && input_source_is_writable(&input, &uri)
@@ -708,6 +738,7 @@ pub(crate) fn code_actions_from_input(
             &target_record,
             &params.context,
             features.document_changes,
+            &current_unused_unit_findings,
         ) {
             match push_bounded_code_action(&mut supplementary_actions, action) {
                 Ok(true) => {}
@@ -1067,6 +1098,7 @@ pub(crate) fn code_actions_from_input(
                 append_records(&mut records, interface_method_records);
                 append_records(&mut records, organize_imports_records);
                 append_records(&mut records, fix_all_records);
+                append_records(&mut records, unused_unit_records);
                 append_records(&mut records, configuration_records);
                 records
             },
@@ -1328,6 +1360,7 @@ pub(crate) fn code_actions_from_input(
                             value: Ok(actions),
                             records: {
                                 let mut records = organize_imports_records.clone();
+                                append_records(&mut records, unused_unit_records.clone());
                                 append_records(&mut records, configuration_records);
                                 records
                             },
@@ -1374,6 +1407,7 @@ pub(crate) fn code_actions_from_input(
                             value: Ok(actions),
                             records: {
                                 let mut records = fix_all_records.clone();
+                                append_records(&mut records, unused_unit_records.clone());
                                 append_records(&mut records, configuration_records);
                                 records
                             },
@@ -1412,6 +1446,7 @@ pub(crate) fn code_actions_from_input(
     append_records(&mut records, interface_method_records);
     append_records(&mut records, organize_imports_records);
     append_records(&mut records, fix_all_records);
+    append_records(&mut records, unused_unit_records);
     append_records(&mut records, configuration_records);
     Computed {
         source_generation,
@@ -3181,17 +3216,108 @@ fn organize_imports_plan_from_input(
     Ok((Some(plan), snapshot_records(&snapshot)))
 }
 
+type CurrentUnusedUnitFindings = HashSet<(Range, String)>;
+
+fn current_unused_unit_findings_from_input(
+    input: &WorkspaceInput,
+    uri: &Url,
+    source: &str,
+    target_record: &SourceRecord,
+    configuration_records: &[SourceRecord],
+    cancel: &AtomicBool,
+) -> Result<(CurrentUnusedUnitFindings, Vec<SourceRecord>), String> {
+    let snapshot = build_snapshot(
+        input,
+        std::slice::from_ref(uri),
+        &[],
+        SnapshotMode::LocalWithImports,
+        Some(
+            SnapshotSeed::new(target_record.clone())
+                .with_consumed_configuration(configuration_records),
+        ),
+        &[],
+        cancel,
+    )?;
+    if !snapshot.editable.contains(uri)
+        || snapshot
+            .sources
+            .get(uri)
+            .is_none_or(|current| current != source)
+    {
+        return Ok((HashSet::new(), Vec::new()));
+    }
+    let report = snapshot
+        .index
+        .semantic_diagnostic_report_with_cancel(uri, cancel)?;
+    if !report.is_complete() {
+        return Ok((HashSet::new(), Vec::new()));
+    }
+    let form_file_requirement = snapshot.index.form_file_requirement(uri);
+    let form_file_bytes = match form_file_requirement {
+        Some(FormFileRequirement::None) => None,
+        Some(FormFileRequirement::Unknown) | None => return Ok((HashSet::new(), Vec::new())),
+        Some(FormFileRequirement::Read(extension)) => {
+            let Some(cached_document) = input.cached_documents.get(uri) else {
+                return Ok((HashSet::new(), Vec::new()));
+            };
+            match super::read_unused_unit_form_resource(
+                cached_document.context.read_policy(),
+                uri,
+                extension,
+                cancel,
+            ) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+                Err(_) => return Ok((HashSet::new(), Vec::new())),
+            }
+        }
+    };
+    let diagnostics = snapshot.index.unused_unit_diagnostics_with_report(
+        uri,
+        &report,
+        form_file_bytes.as_deref(),
+        cancel,
+    )?;
+    let mut findings = HashSet::new();
+    for diagnostic in diagnostics {
+        let Some(unit_name) = source.get(diagnostic.span.start..diagnostic.span.end) else {
+            continue;
+        };
+        let (Some(start), Some(end)) = (
+            text::offset_to_position(source, diagnostic.span.start),
+            text::offset_to_position(source, diagnostic.span.end),
+        ) else {
+            continue;
+        };
+        findings.insert((Range::new(start, end), unit_name.to_owned()));
+    }
+    Ok((findings, snapshot_records(&snapshot)))
+}
+
 fn unused_unit_removal_actions(
     uri: &Url,
     source: &str,
     target_record: &SourceRecord,
     context: &CodeActionContext,
     document_changes: bool,
+    current_findings: &HashSet<(Range, String)>,
 ) -> Vec<CodeActionOrCommand> {
     let mut actions = Vec::new();
     let mut seen_ranges = HashSet::new();
     for diagnostic in &context.diagnostics {
-        if diagnostic_code(diagnostic) != Some("lint4d-unused-unit")
+        if diagnostic_code(diagnostic) != Some("lint4d-unused-unit") {
+            continue;
+        }
+        let Some(unit_name) = diagnostic
+            .data
+            .as_ref()
+            .and_then(|data| data.get("unitName"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let unit_name = unit_name.to_owned();
+        if !current_findings.contains(&(diagnostic.range, unit_name.clone()))
             || !seen_ranges.insert(diagnostic.range)
         {
             continue;
@@ -3205,9 +3331,12 @@ fn unused_unit_removal_actions(
         let Some(end) = text::position_to_offset(source, diagnostic.range.end) else {
             continue;
         };
-        let Some(unit_name) = source.get(start..end) else {
+        let Some(current_name) = source.get(start..end) else {
             continue;
         };
+        if current_name != unit_name {
+            continue;
+        }
         let raw_edits = HashMap::from([(uri.clone(), vec![edit])]);
         let records = HashMap::from([(uri.clone(), target_record.clone())]);
         let Ok(edit) = workspace_edit(raw_edits, &records, document_changes) else {
@@ -7518,6 +7647,7 @@ mod tests {
         NumberOrString, Position, Range,
     };
     use pascal_project::delphi_overrides::OverrideSession;
+    use pascal_project::{CompilerVersion, ConditionalContext, LayoutContext, TargetPlatform};
     use serde_json::json;
     use std::fs::{self, File, FileTimes};
     #[cfg(unix)]
@@ -7530,6 +7660,34 @@ mod tests {
         let root = temp.path().to_path_buf();
         let source_path = root.join("Main.pas");
         fs::write(&source_path, source).expect("source");
+        for name in ["System", "SysInit"] {
+            fs::write(
+                root.join(format!("{name}.pas")),
+                format!("unit {name}; interface implementation end."),
+            )
+            .expect("compiler unit provider");
+        }
+        let uses_clause = source
+            .split_once("uses")
+            .and_then(|(_, rest)| rest.split_once(';').map(|(uses, _)| uses))
+            .unwrap_or_default();
+        let imports = uses_clause
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<String>();
+        for import in imports.split(',') {
+            let Some(provider_name) = import.split_whitespace().next() else {
+                continue;
+            };
+            if provider_name.eq_ignore_ascii_case("in") {
+                continue;
+            }
+            fs::write(
+                root.join(format!("{provider_name}.pas")),
+                format!("unit {provider_name}; interface implementation end."),
+            )
+            .expect("unused-unit provider");
+        }
         let uri = Url::from_file_path(&source_path).expect("source URI");
         let start = source.find(unit_name)?;
         let end = start.checked_add(unit_name.len())?;
@@ -7537,7 +7695,7 @@ mod tests {
             crate::text::offset_to_position(source, start)?,
             crate::text::offset_to_position(source, end)?,
         );
-        let diagnostic = Diagnostic::new(
+        let mut diagnostic = Diagnostic::new(
             range,
             Some(DiagnosticSeverity::HINT),
             Some(NumberOrString::String("lint4d-unused-unit".to_string())),
@@ -7546,6 +7704,7 @@ mod tests {
             None,
             Some(vec![DiagnosticTag::UNNECESSARY]),
         );
+        diagnostic.data = Some(json!({"unitName": unit_name}));
         let params: lsp_types::CodeActionParams = serde_json::from_value(json!({
             "textDocument": {"uri": uri},
             "range": range,
@@ -7555,8 +7714,25 @@ mod tests {
             }
         }))
         .expect("code action parameters");
-        let input = test_workspace(vec![root], Default::default()).analysis_input();
-        let actions = code_actions_from_input(
+        let version = CompilerVersion::new(24, 0);
+        let conditional_context = ConditionalContext {
+            compiler_version: Some(version),
+            ..ConditionalContext::default()
+        }
+        .with_layout(LayoutContext::for_target(
+            Some(version),
+            Some(&TargetPlatform::Win32),
+        ));
+        let options = WorkspaceOptions {
+            conditional_context,
+            ..WorkspaceOptions::default()
+        };
+        let mut workspace = test_workspace(vec![root], options);
+        workspace
+            .context_for_uri(&uri)
+            .expect("code-action project context");
+        let input = workspace.analysis_input();
+        let computed = code_actions_from_input(
             input,
             params,
             ClientActionFeatures {
@@ -7565,9 +7741,8 @@ mod tests {
                 disabled: false,
             },
             &AtomicBool::new(false),
-        )
-        .value
-        .ok()?;
+        );
+        let actions = computed.value.ok()?;
         let edit = actions.into_iter().find_map(|action| {
             let CodeActionOrCommand::CodeAction(action) = action else {
                 return None;

@@ -16529,17 +16529,13 @@ impl Workspace {
                 None
             }
             Some(crate::navigation::FormFileRequirement::Read(extension)) => {
-                let Some(mut path) = uri.to_file_path().ok() else {
-                    return Ok(diagnostics);
-                };
-                path.set_extension(extension);
                 let context_key = match self.context_for_uri_with_cancel(uri, Some(cancel)) {
                     Ok(context_key) => context_key,
                     Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
                     Err(_) => return Ok(diagnostics),
                 };
-                match rename::read_context_source(self, &context_key, &path, cancel) {
-                    Ok(text) => Some(text.into_bytes()),
+                match self.read_form_file_for_unused_units(uri, &context_key, extension, cancel) {
+                    Ok(bytes) => Some(bytes),
                     Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
                     Err(_) => None,
                 }
@@ -16557,6 +16553,20 @@ impl Workspace {
         };
         diagnostics.extend(unused);
         Ok(diagnostics)
+    }
+
+    fn read_form_file_for_unused_units(
+        &self,
+        uri: &Url,
+        context_key: &ContextKey,
+        extension: &str,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<u8>, String> {
+        let context = self
+            .contexts
+            .get(context_key)
+            .ok_or_else(|| "project context was not retained for form resource".to_string())?;
+        read_unused_unit_form_resource(context.context.read_policy(), uri, extension, cancel)
     }
 
     fn ensure_open_root_expansions_for_semantic_context(
@@ -17493,6 +17503,43 @@ fn withheld_lint_message(
     format!("include expansion was incomplete; {WITHHELD}")
 }
 
+pub(super) fn read_unused_unit_form_resource(
+    read_policy: &ReadPolicy,
+    uri: &Url,
+    extension: &str,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, String> {
+    const MAX_FORM_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+    let extension = if extension.eq_ignore_ascii_case("dfm") {
+        "dfm"
+    } else if extension.eq_ignore_ascii_case("fmx") {
+        "fmx"
+    } else {
+        return Err("unsupported form resource extension".to_string());
+    };
+    check_workspace_cancel(Some(cancel))?;
+    let source_path = uri
+        .to_file_path()
+        .map_err(|()| "form source URI is not a file".to_string())?;
+    let source_directory = source_path
+        .parent()
+        .ok_or_else(|| "form source has no parent directory".to_string())?;
+    let resource_path = source_path.with_extension(extension);
+    if resource_path.parent() != Some(source_directory) {
+        return Err("form resource is not a sibling of its unit".to_string());
+    }
+    let entry = read_policy
+        .entry_for_path(&resource_path)
+        .ok_or_else(|| "form resource is outside the effective project read roots".to_string())?;
+    if !read_policy.allows_location(&entry) {
+        return Err("form resource is outside the effective project read roots".to_string());
+    }
+    let bytes = read_policy.read_payload_bytes(&entry, MAX_FORM_FILE_BYTES)?;
+    check_workspace_cancel(Some(cancel))?;
+    Ok(bytes)
+}
+
 fn semantic_lsp_diagnostic(diagnostic: SemanticDiagnostic, range: Range) -> LspDiagnostic {
     let severity = match diagnostic.kind.severity() {
         DccSeverity::Error => DiagnosticSeverity::ERROR,
@@ -17501,7 +17548,16 @@ fn semantic_lsp_diagnostic(diagnostic: SemanticDiagnostic, range: Range) -> LspD
     };
     let tags = (diagnostic.kind == crate::navigation::SemanticDiagnosticKind::UnusedUnit)
         .then_some(vec![lsp_types::DiagnosticTag::UNNECESSARY]);
-    LspDiagnostic::new(
+    let data = (diagnostic.kind == crate::navigation::SemanticDiagnosticKind::UnusedUnit)
+        .then(|| {
+            diagnostic
+                .message
+                .strip_prefix("Unit '")
+                .and_then(|message| message.strip_suffix("' is not used"))
+                .map(|unit_name| serde_json::json!({"unitName": unit_name}))
+        })
+        .flatten();
+    let mut lsp_diagnostic = LspDiagnostic::new(
         range,
         Some(severity),
         Some(NumberOrString::String(diagnostic.kind.code().to_string())),
@@ -17509,7 +17565,9 @@ fn semantic_lsp_diagnostic(diagnostic: SemanticDiagnostic, range: Range) -> LspD
         diagnostic.message,
         None,
         tags,
-    )
+    );
+    lsp_diagnostic.data = data;
+    lsp_diagnostic
 }
 
 pub(crate) fn server_diagnostic(message: &str, severity: DiagnosticSeverity) -> LspDiagnostic {

@@ -24114,9 +24114,10 @@ pub(super) fn is_non_value_identifier_with_budget_and_declaration(
     budget: &mut AssistanceBudget,
     declaration: bool,
 ) -> Result<bool, String> {
-    let name = canonical_name(node_text_with_budget(identifier, source, cancel, budget)?);
+    let raw_name = node_text_with_budget(identifier, source, cancel, budget)?;
+    let name = canonical_name(raw_name);
     if declaration
-        || is_implicit_or_intrinsic_name(&name)
+        || (!raw_name.starts_with('&') && is_implicit_or_intrinsic_name(&name))
         || is_type_valued_intrinsic_argument_with_budget(identifier, source, cancel, budget)?
     {
         return Ok(true);

@@ -107,7 +107,7 @@ impl NavigationIndex {
                 continue;
             }
             let name = node_text_with_budget(identifier, &document.source, cancel, budget)?;
-            if is_implicit_or_intrinsic_name(&canonical_name(name)) {
+            if !name.starts_with('&') && is_implicit_or_intrinsic_name(&canonical_name(name)) {
                 continue;
             }
             let non_value = is_non_value_identifier_with_budget_and_declaration(
@@ -850,6 +850,32 @@ mod tests {
     }
 
     #[test]
+    fn escaped_intrinsic_spelling_resolves_to_an_imported_declaration() {
+        let (index, uri) = index_with_sources(
+            &[
+                (
+                    "U",
+                    "unit U; interface procedure &Exit; implementation procedure &Exit; begin end; end.",
+                ),
+                ("V", "unit V; interface implementation end."),
+            ],
+            "D",
+            "unit D; interface uses U, V; implementation procedure Work; begin &Exit; end; end.",
+        );
+
+        let diagnostics = unused_diagnostics(&index, &uri, None);
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["Unit 'V' is not used"],
+            "escaping an intrinsic spelling makes it an ordinary identifier"
+        );
+    }
+
+    #[test]
     fn does_not_report_when_the_document_compiler_tables_are_unknown() {
         let mut index = NavigationIndex::new();
         for (name, source) in [
@@ -1113,6 +1139,66 @@ mod tests {
                 .iter()
                 .all(|diagnostic| diagnostic.message != "Unit 'U' is not used"),
             "indexing can invoke U's default property without naming it: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn transitive_resourcestring_side_effect_blocks_unused_import_hint() {
+        let (index, uri) = index_with_sources(
+            &[
+                (
+                    "U",
+                    "unit U; interface uses SideEffects; implementation end.",
+                ),
+                (
+                    "SideEffects",
+                    "unit SideEffects; interface resourcestring DisplayName = 'side effect'; implementation end.",
+                ),
+                ("V", "unit V; interface implementation end."),
+            ],
+            "D",
+            "unit D; interface uses U, V; implementation end.",
+        );
+
+        let diagnostics = unused_diagnostics(&index, &uri, None);
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["Unit 'V' is not used"],
+            "removing U would remove a transitive resourcestring initializer"
+        );
+    }
+
+    #[test]
+    fn transitive_message_side_effect_blocks_unused_import_hint() {
+        let (index, uri) = index_with_sources(
+            &[
+                (
+                    "U",
+                    "unit U; interface uses SideEffects; implementation end.",
+                ),
+                (
+                    "SideEffects",
+                    "unit SideEffects; interface implementation {$MESSAGE WARN 'side effect'} end.",
+                ),
+                ("V", "unit V; interface implementation end."),
+            ],
+            "D",
+            "unit D; interface uses U, V; implementation end.",
+        );
+
+        let diagnostics = unused_diagnostics(&index, &uri, None);
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["Unit 'V' is not used"],
+            "removing U would remove a transitive MESSAGE directive"
         );
     }
 

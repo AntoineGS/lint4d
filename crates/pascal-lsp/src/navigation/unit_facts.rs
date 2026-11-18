@@ -22,6 +22,8 @@ pub(crate) enum SideEffectKind {
     ClassConstructor,
     ClassDestructor,
     Resource,
+    ResourceStrings,
+    Message,
     Exports,
 }
 
@@ -50,6 +52,9 @@ pub(crate) fn unit_side_effects(
         budget.require_work(1, cancel)?;
         let node = cursor.node();
         let effect = match node.kind() {
+            "declConsts" if node_has_child(node, "kResourcestring") => {
+                Some(SideEffectKind::ResourceStrings)
+            }
             "initialization" => Some(if node_has_child(node, "kBegin") {
                 SideEffectKind::UnitBlock
             } else {
@@ -83,6 +88,9 @@ pub(crate) fn unit_side_effects(
         budget.require_bytes(directive.body.len(), cancel)?;
         if directive.activity == Truth::False {
             continue;
+        }
+        if message_directive(&directive.body) {
+            record_effect(&mut effects, SideEffectKind::Message);
         }
         match resource_directive(&directive.body) {
             ResourceDirective::None => {}
@@ -328,6 +336,17 @@ fn resource_directive(body: &str) -> ResourceDirective {
     }
 }
 
+fn message_directive(body: &str) -> bool {
+    let body = body.trim_start();
+    let keyword_end = body
+        .char_indices()
+        .find_map(|(index, character)| {
+            (!character.is_ascii_alphanumeric() && character != '_').then_some(index)
+        })
+        .unwrap_or(body.len());
+    body[..keyword_end].eq_ignore_ascii_case("message")
+}
+
 fn closure_budget(
     budget: &mut AssistanceBudget,
     cancel: &AtomicBool,
@@ -462,6 +481,30 @@ mod tests {
         assert_eq!(
             side_effects("unit U; interface implementation {$R+} {$R -} end."),
             SideEffects::None
+        );
+    }
+
+    #[test]
+    fn resourcestring_sections_are_side_effects() {
+        assert!(
+            matches!(
+                side_effects(
+                    "unit U; interface implementation resourcestring DisplayName = 'U'; end."
+                ),
+                SideEffects::Some(_)
+            ),
+            "resourcestring initialization must keep a unit in the uses closure"
+        );
+    }
+
+    #[test]
+    fn active_message_directives_are_side_effects() {
+        assert!(
+            matches!(
+                side_effects("unit U; interface implementation {$MESSAGE WARN 'building U'} end."),
+                SideEffects::Some(_)
+            ),
+            "an active MESSAGE directive is an observable compiler side effect"
         );
     }
 

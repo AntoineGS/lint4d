@@ -144,7 +144,9 @@ const MAX_COMPLETION_RESOLUTION_ITEM_BYTES: usize = 64 * 1024;
 const COMPLETION_RESOLUTION_DATA_VERSION: u8 = 1;
 const MAX_DIAGNOSTIC_RESULT_ENTRIES: usize = 2_048;
 const MAX_DIAGNOSTIC_RESULT_BYTES: usize = 32 * 1024 * 1024;
-const MAX_DIAGNOSTIC_DEPENDENCY_RECORDS: usize = 32_768;
+// Recursive provider searches retain one freshness witness per observed
+// directory. The 64 MiB preflight below remains the hard byte bound.
+pub(crate) const MAX_DIAGNOSTIC_DEPENDENCY_RECORDS: usize = 65_536;
 // This is the mandatory worker-side freshness-evidence bound.  Optional
 // result-cache admission remains smaller below, so cache pressure can only
 // disable reuse; it can never discard the evidence used for validation.
@@ -19804,7 +19806,10 @@ mod tests {
         assert_eq!(
             super::compact_diagnostic_records(&over_count)
                 .expect_err("diagnostic count is checked before projecting records"),
-            "diagnostic validation evidence exceeds the 32768-record limit"
+            format!(
+                "diagnostic validation evidence exceeds the {}-record limit",
+                super::MAX_DIAGNOSTIC_DEPENDENCY_RECORDS
+            )
         );
     }
 
@@ -19857,7 +19862,10 @@ mod tests {
         assert_eq!(
             super::compact_diagnostic_records(&too_many_diagnostic)
                 .expect_err("diagnostic count above the exact boundary is rejected"),
-            "diagnostic validation evidence exceeds the 32768-record limit"
+            format!(
+                "diagnostic validation evidence exceeds the {}-record limit",
+                super::MAX_DIAGNOSTIC_DEPENDENCY_RECORDS
+            )
         );
 
         let completion_at_bytes = source_record_with_path_estimate(
@@ -19957,6 +19965,48 @@ mod tests {
             .expect("diagnostic preflight subtracts both source-payload capacities");
         assert!(compacted[0].text.is_empty());
         assert!(compacted[0].content_bytes.is_none());
+    }
+
+    #[test]
+    fn diagnostic_dependency_preparation_accepts_many_directory_observations() {
+        // QuickPO's dependency set measured 34,800-34,801 records.
+        let count = super::MAX_DIAGNOSTIC_DEPENDENCY_RECORDS / 2 + 2_033;
+        let records = (0..count)
+            .map(|index| {
+                let path = PathBuf::from(format!(
+                    "/project/search-paths/recursive-provider-scan/dir-{index}"
+                ));
+                let uri = Url::from_file_path(&path).expect("directory observation URI");
+                let mut record = test_completion_record(uri);
+                record.open = false;
+                record.path = Some(path);
+                record.path_stamp = Some(pascal_project::ProjectReadStamp {
+                    bytes: 0,
+                    modified: None,
+                    is_dir: true,
+                    is_symlink: false,
+                    change: None,
+                    settled: true,
+                });
+                record.directory_observation = true;
+                record.directory_listing =
+                    crate::workspace::rename::DirectoryListingWitness::Resolvable(index as u64);
+                record
+            })
+            .collect::<Vec<_>>();
+
+        let dependency = super::prepare_diagnostic_dependency(&records, 1, 1)
+            .expect("bounded recursive-search evidence should fit its byte limit")
+            .expect("non-empty diagnostic evidence produces a dependency");
+
+        assert_eq!(dependency.records.len(), count);
+        for (source, compacted) in records.iter().zip(dependency.records.iter()) {
+            assert_eq!(compacted.uri, source.uri);
+            assert_eq!(compacted.path, source.path);
+            assert_eq!(compacted.path_stamp, source.path_stamp);
+            assert!(compacted.directory_observation);
+            assert_eq!(compacted.directory_listing, source.directory_listing);
+        }
     }
 
     fn receive_analysis_result(jobs: &mut AnalysisJobs, id: &RequestId) -> AnalysisResult {

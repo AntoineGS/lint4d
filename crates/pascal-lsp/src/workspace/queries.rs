@@ -15,6 +15,7 @@ use crate::navigation::{
     CompletionMetadata, CompletionOptions, CompletionResult, FoldingRangeOptions, InlayHintOptions,
     PhysicalProjection, SemanticTokenResolutionMode, completion_prefix_at_position,
 };
+use crate::server::MAX_DIAGNOSTIC_DEPENDENCY_RECORDS;
 use crate::workspace_index::CandidateQuery;
 use crate::{NavigationIndex, NavigationTarget};
 #[cfg(test)]
@@ -3149,7 +3150,7 @@ pub(crate) fn workspace_diagnostics_from_input(
             .cmp(right.uri.as_str())
             .then_with(|| left.text.len().cmp(&right.text.len()))
     });
-    if records.len() > 32_768 {
+    if records.len() > MAX_DIAGNOSTIC_DEPENDENCY_RECORDS {
         return failed(
             source_generation,
             configuration_generation,

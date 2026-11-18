@@ -22,6 +22,7 @@ dcc_runs=0
 unused_unit_findings=0
 unused_unit_verified=0
 unused_unit_false_positives=0
+unused_unit_unverified=0
 skipped_projects=()
 temporary_directories=()
 
@@ -294,11 +295,11 @@ verify_unused_unit_findings() {
   local project_root verification_report verification_tmp findings_file
   local finding_file finding_line unit overlay_dir edited_source output_dir
   local edited_raw edited_status edited_banner edited_error_count
+  local sentinel comparison_raw
   local overlay_wine output_wine argument verify_source verify_source_wine
   local comparison file_name
-  local verified_count=0 false_positive_count=0 finding_count=0
+  local verified_count=0 false_positive_count=0 unverified_count=0 finding_count=0
   local unit_path_added
-  local compiled_unit_dcu
   local -a unused_findings=()
   local -a verify_dcc_args=()
   local index
@@ -366,6 +367,14 @@ verify_unused_unit_findings() {
       printf -- '- `%s:%s` (`%s`): verification failed: quick-fix edit was unsafe.\n' \
         "$file_name" "$finding_line" "$unit" >>"$verification_report"
       echo "$project_name: could not safely remove $unit from $file_name" >&2
+      status=1
+      continue
+    fi
+    if ! sentinel=$("$python_bin" "$root/scripts/dcc-corpus-unused-unit.py" \
+      instrument-overlay "$edited_source"); then
+      printf -- '- `%s:%s` (`%s`): verification failed: could not instrument overlay source.\n' \
+        "$file_name" "$finding_line" "$unit" >>"$verification_report"
+      echo "$project_name: could not instrument overlay source for $file_name" >&2
       status=1
       continue
     fi
@@ -448,21 +457,23 @@ verify_unused_unit_findings() {
       continue
     fi
 
-    if [[ $(canonical_path "$finding_file") != "$(canonical_path "$main_source")" ]]; then
-      if ! compiled_unit_dcu=$("$python_bin" \
-        "$root/scripts/dcc-corpus-unused-unit.py" unit-dcu-name "$finding_file") || \
-        [[ ! -s "$output_dir/$compiled_unit_dcu" ]]; then
-        printf -- '- `%s:%s` (`%s`): unverified: overlay not proven used.\n' \
-          "$file_name" "$finding_line" "$unit" >>"$verification_report"
-        echo "$project_name: overlay not proven used for $file_name" >&2
-        status=1
-        continue
-      fi
+    comparison_raw="$verification_tmp/compared-$finding_count.raw"
+    if ! "$python_bin" "$root/scripts/dcc-corpus-unused-unit.py" strip-sentinel \
+      "$verification_tmp/edited-$finding_count.raw" "$comparison_raw" \
+      "$edited_source" "$sentinel"; then
+      printf -- '- `%s:%s` (`%s`): unverified: overlay not proven compiled.\n' \
+        "$file_name" "$finding_line" "$unit" >>"$verification_report"
+      echo "$project_name: overlay not proven compiled for $file_name" >&2
+      unverified_count=$((unverified_count + 1))
+      unused_unit_unverified=$((unused_unit_unverified + 1))
+      status=1
+      continue
     fi
 
     if ! comparison=$("$python_bin" "$root/scripts/dcc-corpus-unused-unit.py" compare \
-      "$project_out/dcc.raw" "$verification_tmp/edited-$finding_count.raw" \
-      "$project_root" "$edited_source" "$finding_file"); then
+      "$project_out/dcc.raw" "$comparison_raw" \
+      "$project_root" "$edited_source" "$finding_file" \
+      "$verify_source" "$main_source"); then
       printf -- '- `%s:%s` (`%s`): verification failed: could not compare DCC output.\n' \
         "$file_name" "$finding_line" "$unit" >>"$verification_report"
       echo "$project_name: DCC comparison failed for $file_name" >&2
@@ -490,10 +501,12 @@ verify_unused_unit_findings() {
     fi
   done
 
-  printf '\nTotals: %s finding(s), %s verified, %s false positive(s).\n' \
-    "$finding_count" "$verified_count" "$false_positive_count" >>"$verification_report"
-  printf '%s: unused-unit verification: %s finding(s), %s verified, %s false positive(s)\n' \
-    "$project_name" "$finding_count" "$verified_count" "$false_positive_count"
+  printf '\nTotals: %s finding(s), %s verified, %s false positive(s), %s unverified.\n' \
+    "$finding_count" "$verified_count" "$false_positive_count" "$unverified_count" \
+    >>"$verification_report"
+  printf '%s: unused-unit verification: %s finding(s), %s verified, %s false positive(s), %s unverified\n' \
+    "$project_name" "$finding_count" "$verified_count" "$false_positive_count" \
+    "$unverified_count"
 }
 
 while IFS= read -r record; do
@@ -851,8 +864,9 @@ if [[ $selected_count -eq 0 ]]; then
 fi
 printf 'summary: %s selected project(s), %s dcc run(s)\n' "$selected_count" "$dcc_runs"
 if ((run_unused_unit_verification)); then
-  printf 'unused-unit verification: %s finding(s), %s verified, %s false positive(s)\n' \
-    "$unused_unit_findings" "$unused_unit_verified" "$unused_unit_false_positives"
+  printf 'unused-unit verification: %s finding(s), %s verified, %s false positive(s), %s unverified\n' \
+    "$unused_unit_findings" "$unused_unit_verified" "$unused_unit_false_positives" \
+    "$unused_unit_unverified"
 fi
 if ((${#skipped_projects[@]})); then
   printf 'skipped projects: %s\n' "${skipped_projects[*]}"

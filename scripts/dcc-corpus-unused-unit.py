@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import posixpath
 import re
+import secrets
 import sys
 from collections import Counter
 from pathlib import Path
@@ -25,9 +27,9 @@ IN_REFERENCE = re.compile(
     r"(?P<prefix>\bin[ \t]*)(?P<quote>['\"])(?P<path>[^'\"]+)(?P=quote)",
     re.IGNORECASE,
 )
-UNIT_DECLARATION = re.compile(
-    r"^[ \t]*unit[ \t]+"
-    r"(?P<name>[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)[ \t]*;",
+MODULE_HEADER = re.compile(
+    r"^(?:\ufeff)?[ \t]*(?:unit|program|library)[ \t]+"
+    r"[^;\r\n]*;[^\r\n]*(?P<newline>\r?\n|$)",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -73,12 +75,79 @@ def write_overlay_main(
     overlay_main.write_text(rewritten, encoding="utf-8", errors="surrogateescape")
 
 
-def unit_dcu_name(source: Path) -> str:
-    text = source.read_text(encoding="utf-8", errors="replace")
-    match = UNIT_DECLARATION.search(text)
+def instrument_overlay_source(source: Path) -> str:
+    text = source.read_text(encoding="utf-8", errors="surrogateescape")
+    match = MODULE_HEADER.search(text)
     if not match:
-        raise ValueError(f"{source}: Pascal unit declaration was not found")
-    return f"{match['name']}.dcu"
+        raise ValueError(f"{source}: Pascal module declaration was not found")
+
+    nonce = f"lint4d-overlay-{secrets.token_hex(16)}"
+    newline = match["newline"] or "\n"
+    message = newline.join(
+        (
+            "{$IFOPT W+}",
+            f"{{$MESSAGE WARN '{nonce}'}}",
+            "{$ELSE}",
+            "{$WARNINGS ON}",
+            f"{{$MESSAGE WARN '{nonce}'}}",
+            "{$WARNINGS OFF}",
+            "{$ENDIF}",
+            "",
+        )
+    )
+    prefix = text[: match.end()]
+    if not match["newline"]:
+        prefix += newline
+    source.write_text(
+        prefix + message + text[match.end() :],
+        encoding="utf-8",
+        errors="surrogateescape",
+    )
+    return nonce
+
+
+def normalized_path_key(value: str | Path) -> str:
+    value = str(value).replace("\\", "/")
+    if re.match(r"^Z:/", value, flags=re.IGNORECASE):
+        value = value[2:]
+    return posixpath.normpath(value).casefold()
+
+
+def diagnostic_source_matches(value: str, source: Path) -> bool:
+    path = dcc_path(value)
+    if normalized_path_key(path) == normalized_path_key(canonical_path(source)):
+        return True
+    candidate = Path(value.replace("\\", "/"))
+    return not candidate.is_absolute() and candidate.name.casefold() == source.name.casefold()
+
+
+def strip_overlay_sentinel(
+    raw_path: Path,
+    output_path: Path,
+    edited_source: Path,
+    nonce: str,
+) -> None:
+    with raw_path.open(encoding="utf-8", errors="replace") as raw_file:
+        lines = raw_file.readlines()
+    sentinel_lines: list[int] = []
+    for index, line in enumerate(lines):
+        if nonce not in line:
+            continue
+        match = DCC_LINE.match(line.rstrip("\r\n"))
+        if not match or match["code"] != "W1054":
+            raise ValueError("overlay sentinel was not emitted as a message warning")
+        if not diagnostic_source_matches(match["path"], edited_source):
+            raise ValueError("overlay sentinel was attributed to a different source")
+        sentinel_lines.append(index)
+    if len(sentinel_lines) != 1:
+        raise ValueError(
+            f"expected one overlay sentinel, found {len(sentinel_lines)}"
+        )
+    sentinel_index = sentinel_lines[0]
+    output_path.write_text(
+        "".join(line for index, line in enumerate(lines) if index != sentinel_index),
+        encoding="utf-8",
+    )
 
 
 def unused_unit_findings(lsp_path: Path, command_path: Path) -> list[tuple[Path, int, str]]:
@@ -120,13 +189,13 @@ def dcc_path(value: str) -> str:
 def dcc_messages(
     raw_path: Path,
     project_root: Path,
-    edited_source: Path | None,
-    original_source: Path,
+    source_mappings: list[tuple[Path, Path]],
 ) -> Counter[tuple[str, str, str]]:
     project_root = canonical_path(project_root)
-    if edited_source is not None:
-        edited_source = canonical_path(edited_source)
-    original_source = canonical_path(original_source)
+    canonical_mappings = [
+        (canonical_path(overlay), canonical_path(original))
+        for overlay, original in source_mappings
+    ]
     messages: Counter[tuple[str, str, str]] = Counter()
     with raw_path.open(encoding="utf-8", errors="replace") as raw_file:
         for line in raw_file:
@@ -134,8 +203,11 @@ def dcc_messages(
             if not match:
                 continue
             path = dcc_path(match["path"])
-            if edited_source is not None and path == str(edited_source):
-                path = str(original_source)
+            path_key = normalized_path_key(path)
+            for overlay, original in canonical_mappings:
+                if path_key == normalized_path_key(overlay):
+                    path = str(original)
+                    break
             candidate = Path(path)
             if candidate.is_absolute():
                 candidate = canonical_path(candidate)
@@ -180,12 +252,17 @@ def compare_outputs(
     project_root: Path,
     edited_source: Path,
     original_source: Path,
+    overlay_main: Path,
+    original_main: Path,
 ) -> str:
-    original = dcc_messages(
-        original_path, project_root, None, original_source
-    )
+    original = dcc_messages(original_path, project_root, [])
     edited = dcc_messages(
-        edited_path, project_root, edited_source, original_source
+        edited_path,
+        project_root,
+        [
+            (edited_source, original_source),
+            (overlay_main, original_main),
+        ],
     )
     difference = first_difference(original, edited, project_root)
     return f"differs: {difference}" if difference else "identical"
@@ -202,14 +279,21 @@ def main() -> int:
     overlay_parser.add_argument("original_source", type=Path)
     overlay_parser.add_argument("overlay_source_wine")
     overlay_parser.add_argument("overlay_main", type=Path)
-    unit_dcu_parser = subparsers.add_parser("unit-dcu-name")
-    unit_dcu_parser.add_argument("source", type=Path)
+    instrument_parser = subparsers.add_parser("instrument-overlay")
+    instrument_parser.add_argument("source", type=Path)
+    strip_sentinel_parser = subparsers.add_parser("strip-sentinel")
+    strip_sentinel_parser.add_argument("raw_output", type=Path)
+    strip_sentinel_parser.add_argument("stripped_output", type=Path)
+    strip_sentinel_parser.add_argument("edited_source", type=Path)
+    strip_sentinel_parser.add_argument("nonce")
     compare_parser = subparsers.add_parser("compare")
     compare_parser.add_argument("original_dcc", type=Path)
     compare_parser.add_argument("edited_dcc", type=Path)
     compare_parser.add_argument("project_root", type=Path)
     compare_parser.add_argument("edited_source", type=Path)
     compare_parser.add_argument("original_source", type=Path)
+    compare_parser.add_argument("overlay_main", type=Path)
+    compare_parser.add_argument("original_main", type=Path)
     args = parser.parse_args()
 
     try:
@@ -230,8 +314,16 @@ def main() -> int:
                 args.overlay_main,
             )
             return 0
-        if args.command == "unit-dcu-name":
-            print(unit_dcu_name(args.source))
+        if args.command == "instrument-overlay":
+            print(instrument_overlay_source(args.source))
+            return 0
+        if args.command == "strip-sentinel":
+            strip_overlay_sentinel(
+                args.raw_output,
+                args.stripped_output,
+                args.edited_source,
+                args.nonce,
+            )
             return 0
         print(
             compare_outputs(
@@ -240,6 +332,8 @@ def main() -> int:
                 args.project_root,
                 args.edited_source,
                 args.original_source,
+                args.overlay_main,
+                args.original_main,
             )
         )
     except (OSError, ValueError, json.JSONDecodeError) as error:

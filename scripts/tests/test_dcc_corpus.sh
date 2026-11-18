@@ -42,7 +42,7 @@ case "$example" in
       incomplete)
         printf '{"incomplete":true}\n'
         ;;
-      failed-lsp|timeout-lsp|valid|valid-lsp|valid-unused-unit|unused-unit-difference|unused-unit-duplicate-difference|unused-unit-external|unused-unit-fatal|unused-unit-no-evidence|dcc-errors|dcc-error-output|dcc-fatal|dcc-nonzero-no-error)
+      failed-lsp|timeout-lsp|valid|valid-lsp|valid-unused-unit|valid-unused-unit-main-diagnostic|unused-unit-difference|unused-unit-duplicate-difference|unused-unit-external|unused-unit-fatal|dcc-errors|dcc-error-output|dcc-fatal|dcc-nonzero-no-error)
         python3 - "$DCC_FAKE_ROOT" "$DCC_FAKE_DCC" "$DCC_FAKE_SOURCE" \
           "$DCC_FAKE_MAIN_SOURCE" "$DCC_FAKE_UNUSED_SOURCE" <<'PY'
 import json
@@ -51,9 +51,10 @@ import sys
 
 root, dcc, source, main_source, unused_source = sys.argv[1:]
 unused_mode = os.environ["DCC_FAKE_MODE"] in {
-    "valid-unused-unit", "unused-unit-difference",
+    "valid-unused-unit", "valid-unused-unit-main-diagnostic",
+    "unused-unit-difference",
     "unused-unit-duplicate-difference", "unused-unit-external",
-    "unused-unit-fatal", "unused-unit-no-evidence"
+    "unused-unit-fatal"
 }
 print(json.dumps({
     "compiler": "37.0",
@@ -85,7 +86,7 @@ PY
     output_index=$((separator + 3))
     output_file="${args[output_index]}"
     case "$DCC_FAKE_MODE" in
-      valid-unused-unit|unused-unit-difference|unused-unit-duplicate-difference|unused-unit-fatal|unused-unit-no-evidence)
+      valid-unused-unit|valid-unused-unit-main-diagnostic|unused-unit-difference|unused-unit-duplicate-difference|unused-unit-fatal)
         printf '%s(1) Hint lint4d-unused-unit pascal-lsp Unit '\''Unused'\'' is not used\n' \
           "$DCC_FAKE_UNUSED_SOURCE" >"$output_file"
         ;;
@@ -165,8 +166,11 @@ source_wine="${DCC_FAKE_SOURCE//\//\\}"
 printf 'Embarcadero Delphi for Win32 compiler version 37.0\n'
 if [[ $DCC_FAKE_MODE == valid-unused-unit || $DCC_FAKE_MODE == unused-unit-difference || \
   $DCC_FAKE_MODE == unused-unit-duplicate-difference || \
-  $DCC_FAKE_MODE == unused-unit-fatal || $DCC_FAKE_MODE == unused-unit-no-evidence ]]; then
+  $DCC_FAKE_MODE == valid-unused-unit-main-diagnostic || \
+  $DCC_FAKE_MODE == unused-unit-fatal ]]; then
   main_wine="${!#}"
+  main_source_linux=${main_wine#Z:}
+  main_source_linux=${main_source_linux//\\//}
   unit_source="$(python3 - "$main_wine" <<'PY'
 import os
 import re
@@ -227,23 +231,47 @@ PY
   printf '%s\n' "$@" >"$DCC_FAKE_VERIFY_ARGS_RECORD"
   printf '%s\n' "$unit_source" >"$DCC_FAKE_SELECTED_UNIT_PATH_RECORD"
   cat "$unit_source" >"$DCC_FAKE_EDITED_UNIT_RECORD"
-  if [[ $DCC_FAKE_MODE != unused-unit-no-evidence ]]; then
-    for argument in "$@"; do
-      if [[ $argument == -N0* ]]; then
-        dcu_output_dir=${argument#-N0}
-        dcu_output_dir=${dcu_output_dir#Z:}
-        dcu_output_dir=${dcu_output_dir//\\//}
-        mkdir -p -- "$dcu_output_dir"
-        printf 'compiled %s\n' "$unit_source" >"$dcu_output_dir/UnitA.dcu"
-        break
-      fi
-    done
+  for argument in "$@"; do
+    if [[ $argument == -N0* ]]; then
+      dcu_output_dir=${argument#-N0}
+      dcu_output_dir=${dcu_output_dir#Z:}
+      dcu_output_dir=${dcu_output_dir//\\//}
+      mkdir -p -- "$dcu_output_dir"
+      printf 'compiled %s\n' "$unit_source" >"$dcu_output_dir/UnitA.dcu"
+      break
+    fi
+  done
+  for candidate in "$unit_source" "$main_source_linux"; do
+    [[ -f $candidate ]] || continue
+    sentinel="$(python3 - "$candidate" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+match = re.search(r"lint4d-overlay-[0-9a-f]{32}", text)
+if match:
+    print(match[0])
+PY
+)"
+    [[ -n $sentinel ]] || continue
+    sentinel_source_wine="${candidate//\//\\}"
+    printf 'Z:%s(3) Warning: W1054 %s\n' "$sentinel_source_wine" "$sentinel"
+    break
+  done
+  if [[ $DCC_FAKE_MODE == valid-unused-unit-main-diagnostic ]]; then
+    main_diagnostic_path=$main_wine
+    if [[ $main_source_linux == *"/dcc-corpus-unused-unit."* ]]; then
+      main_diagnostic_path="z:${main_source_linux^^}"
+    fi
+    printf '%s(4) Warning: W1036 synthetic main diagnostic\n' \
+      "$main_diagnostic_path"
   fi
   if [[ $DCC_FAKE_MODE == unused-unit-fatal && $line_number -eq 99 ]]; then
     printf 'Fatal: synthetic compiler failure\n'
     exit 0
   fi
-  if [[ $DCC_FAKE_MODE == valid-unused-unit && $line_number -eq 10 ]]; then
+  if [[ ( $DCC_FAKE_MODE == valid-unused-unit || \
+    $DCC_FAKE_MODE == valid-unused-unit-main-diagnostic ) && $line_number -eq 10 ]]; then
     printf 'Unit.pas(%s) Warning: W1036 synthetic warning\n' "$line_number"
   else
     printf 'Z:%s(%s) Warning: W1036 synthetic warning\n' "$source_wine" "$line_number"
@@ -333,9 +361,9 @@ if "$script" --verify-unused-units synthetic >"$tmp/verify-requires-lsp.log" 2>&
 fi
 grep -q -- '--verify-unused-units requires --lsp' "$tmp/verify-requires-lsp.log"
 
-cat >"$DCC_FAKE_MAIN_SOURCE" <<'PAS'
+cat >"$DCC_FAKE_MAIN_SOURCE" <<PAS
 program Main;
-uses UnitA in 'Unit.pas';
+uses UnitA in '$DCC_FAKE_UNUSED_SOURCE';
 begin
 end.
 PAS
@@ -421,19 +449,56 @@ grep -q 'false-positive: edited only: Unit.pas E2003 synthetic missing identifie
   exit 1
 }
 
-export DCC_FAKE_MODE=unused-unit-no-evidence
-export LINT4D_CORPUS_OUT="$tmp/out-unused-no-evidence"
+cat >"$tmp/bin/python-no-overlay-rewrite" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if [[ ${1##*/} == dcc-corpus-unused-unit.py && ${2:-} == overlay-main ]]; then
+  cp -- "$3" "$6"
+  exit 0
+fi
+exec python3 "$@"
+SH
+chmod +x "$tmp/bin/python-no-overlay-rewrite"
+export DCC_FAKE_MODE=valid-unused-unit
+export LINT4D_CORPUS_OUT="$tmp/out-unused-unrewritten-in"
+export PYTHON="$tmp/bin/python-no-overlay-rewrite"
 rm -f -- "$DCC_FAKE_VERIFY_UNIT_PATH_RECORD" "$DCC_FAKE_VERIFY_ARGS_RECORD" \
-  "$DCC_FAKE_EDITED_UNIT_RECORD"
+  "$DCC_FAKE_SELECTED_UNIT_PATH_RECORD" "$DCC_FAKE_EDITED_UNIT_RECORD"
 if "$script" --lsp "$tmp/bin/pascal-lsp" --verify-unused-units synthetic \
-  >"$tmp/unused-no-evidence.log" 2>&1; then
-  echo "verification without evidence that the edited source was compiled succeeded" >&2
+  >"$tmp/unused-unrewritten-in.log" 2>&1; then
+  echo "verification succeeded when the explicit in path compiled the original unit" >&2
   exit 1
 fi
-grep -q 'Unit.pas:1.*unverified: overlay not proven used' \
+export PYTHON=python3
+grep -q 'Unit.pas:1.*unverified: overlay not proven compiled' \
   "$LINT4D_CORPUS_OUT/synthetic/report.md" || {
   cat "$LINT4D_CORPUS_OUT/synthetic/report.md" >&2
-  echo "verification without overlay-use evidence was not reported as unverified" >&2
+  echo "an original-source compile was not reported as unverified" >&2
+  exit 1
+}
+grep -q 'Totals: 1 finding(s), 0 verified, 0 false positive(s), 1 unverified' \
+  "$LINT4D_CORPUS_OUT/synthetic/unused-unit-verification.md" || {
+  cat "$LINT4D_CORPUS_OUT/synthetic/unused-unit-verification.md" >&2
+  echo "unverified finding was not included in totals" >&2
+  exit 1
+}
+[[ $(<"$DCC_FAKE_SELECTED_UNIT_PATH_RECORD") == "$DCC_FAKE_UNUSED_SOURCE" ]] || {
+  cat "$DCC_FAKE_SELECTED_UNIT_PATH_RECORD" >&2
+  echo "unrewritten in clause did not make the fake compiler use the original unit" >&2
+  exit 1
+}
+
+export DCC_FAKE_MODE=valid-unused-unit-main-diagnostic
+export LINT4D_CORPUS_OUT="$tmp/out-unused-main-diagnostic"
+if ! "$script" --lsp "$tmp/bin/pascal-lsp" --verify-unused-units synthetic \
+  >"$tmp/unused-main-diagnostic.log" 2>&1; then
+  cat "$LINT4D_CORPUS_OUT/synthetic/report.md" >&2
+  echo "an unchanged main-source diagnostic became a false positive" >&2
+  exit 1
+fi
+grep -q 'Unit.pas:1.*verified' "$LINT4D_CORPUS_OUT/synthetic/report.md" || {
+  cat "$LINT4D_CORPUS_OUT/synthetic/report.md" >&2
+  echo "main-source path mapping did not preserve the unchanged diagnostic" >&2
   exit 1
 }
 

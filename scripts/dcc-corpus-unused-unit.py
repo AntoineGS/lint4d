@@ -21,10 +21,64 @@ DCC_LINE = re.compile(
     r"^(?P<path>.*)\([0-9]+\) "
     r"(?:Error|Warning|Hint|Fatal): (?P<code>[EWHF][0-9]{4}) (?P<text>.*)$"
 )
+IN_REFERENCE = re.compile(
+    r"(?P<prefix>\bin[ \t]*)(?P<quote>['\"])(?P<path>[^'\"]+)(?P=quote)",
+    re.IGNORECASE,
+)
+UNIT_DECLARATION = re.compile(
+    r"^[ \t]*unit[ \t]+"
+    r"(?P<name>[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)[ \t]*;",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def canonical_path(value: str | Path) -> Path:
     return Path(os.path.realpath(value))
+
+
+def resolve_in_path(value: str, main_source: Path) -> Path | None:
+    value = value.replace("\\", os.sep)
+    if re.match(r"^[A-Za-z]:" + re.escape(os.sep), value):
+        if value[:2].upper() != "Z:":
+            return None
+        value = value[2:]
+    path = Path(value)
+    if not path.is_absolute():
+        path = main_source.parent / path
+    return canonical_path(path)
+
+
+def write_overlay_main(
+    main_source: Path,
+    original_source: Path,
+    overlay_source_wine: str,
+    overlay_main: Path,
+) -> None:
+    main_source = canonical_path(main_source)
+    original_source = canonical_path(original_source)
+    text = main_source.read_text(encoding="utf-8", errors="surrogateescape")
+
+    def rewrite_reference(match: re.Match[str]) -> str:
+        referenced_source = resolve_in_path(match["path"], main_source)
+        if referenced_source != original_source:
+            return match[0]
+        return (
+            match["prefix"]
+            + match["quote"]
+            + overlay_source_wine
+            + match["quote"]
+        )
+
+    rewritten = IN_REFERENCE.sub(rewrite_reference, text)
+    overlay_main.write_text(rewritten, encoding="utf-8", errors="surrogateescape")
+
+
+def unit_dcu_name(source: Path) -> str:
+    text = source.read_text(encoding="utf-8", errors="replace")
+    match = UNIT_DECLARATION.search(text)
+    if not match:
+        raise ValueError(f"{source}: Pascal unit declaration was not found")
+    return f"{match['name']}.dcu"
 
 
 def unused_unit_findings(lsp_path: Path, command_path: Path) -> list[tuple[Path, int, str]]:
@@ -143,6 +197,13 @@ def main() -> int:
     findings_parser = subparsers.add_parser("findings")
     findings_parser.add_argument("lsp_output", type=Path)
     findings_parser.add_argument("command_json", type=Path)
+    overlay_parser = subparsers.add_parser("overlay-main")
+    overlay_parser.add_argument("main_source", type=Path)
+    overlay_parser.add_argument("original_source", type=Path)
+    overlay_parser.add_argument("overlay_source_wine")
+    overlay_parser.add_argument("overlay_main", type=Path)
+    unit_dcu_parser = subparsers.add_parser("unit-dcu-name")
+    unit_dcu_parser.add_argument("source", type=Path)
     compare_parser = subparsers.add_parser("compare")
     compare_parser.add_argument("original_dcc", type=Path)
     compare_parser.add_argument("edited_dcc", type=Path)
@@ -160,6 +221,17 @@ def main() -> int:
                     os.fsencode(path) + b"\0" + str(line).encode() + b"\0"
                     + os.fsencode(unit) + b"\0"
                 )
+            return 0
+        if args.command == "overlay-main":
+            write_overlay_main(
+                args.main_source,
+                args.original_source,
+                args.overlay_source_wine,
+                args.overlay_main,
+            )
+            return 0
+        if args.command == "unit-dcu-name":
+            print(unit_dcu_name(args.source))
             return 0
         print(
             compare_outputs(

@@ -298,6 +298,7 @@ verify_unused_unit_findings() {
   local comparison file_name
   local verified_count=0 false_positive_count=0 finding_count=0
   local unit_path_added
+  local compiled_unit_dcu
   local -a unused_findings=()
   local -a verify_dcc_args=()
   local index
@@ -409,6 +410,17 @@ verify_unused_unit_findings() {
     verify_source=$main_source
     if [[ $(canonical_path "$finding_file") == "$(canonical_path "$main_source")" ]]; then
       verify_source=$edited_source
+    else
+      verify_source="$overlay_dir/$(basename -- "$main_source")"
+      if ! "$python_bin" "$root/scripts/dcc-corpus-unused-unit.py" overlay-main \
+        "$main_source" "$finding_file" "$(linux_to_wine "$edited_source")" \
+        "$verify_source"; then
+        printf -- '- `%s:%s` (`%s`): verification failed: could not prepare overlay main source.\n' \
+          "$file_name" "$finding_line" "$unit" >>"$verification_report"
+        echo "$project_name: could not prepare overlay main source for $file_name" >&2
+        status=1
+        continue
+      fi
     fi
     verify_source_wine="$(linux_to_wine "$verify_source")"
     if edited_raw=$(
@@ -434,6 +446,18 @@ verify_unused_unit_findings() {
       echo "$project_name: edited DCC run failed for $file_name (exit $edited_status)" >&2
       status=1
       continue
+    fi
+
+    if [[ $(canonical_path "$finding_file") != "$(canonical_path "$main_source")" ]]; then
+      if ! compiled_unit_dcu=$("$python_bin" \
+        "$root/scripts/dcc-corpus-unused-unit.py" unit-dcu-name "$finding_file") || \
+        [[ ! -s "$output_dir/$compiled_unit_dcu" ]]; then
+        printf -- '- `%s:%s` (`%s`): unverified: overlay not proven used.\n' \
+          "$file_name" "$finding_line" "$unit" >>"$verification_report"
+        echo "$project_name: overlay not proven used for $file_name" >&2
+        status=1
+        continue
+      fi
     fi
 
     if ! comparison=$("$python_bin" "$root/scripts/dcc-corpus-unused-unit.py" compare \
@@ -502,6 +526,10 @@ while IFS= read -r record; do
     lsp-driver.log report.md compare.log unused-unit-verification.md; do
     assert_outside_corpus_roots "$project_out/$output_file" || exit 2
   done
+  if ((run_unused_unit_verification)); then
+    printf '## Unused-unit DCC verification\n\nskipped: verification did not run\n' \
+      >"$project_out/unused-unit-verification.md"
+  fi
   command_json="$project_out/command.json"
   command_args=("$dproj")
   [[ -n $config ]] && command_args+=(--config "$config")
@@ -655,6 +683,10 @@ PY
     "$project_out/dcc.raw" || true)"
   if [[ $dcc_error_count -gt 0 || $dcc_exit -ne 0 ]]; then
     printf 'excluded: dcc errors (%s)\n' "$dcc_error_count" >"$project_out/dcc.validation"
+    if ((run_unused_unit_verification)); then
+      printf '## Unused-unit DCC verification\n\nskipped: original dcc run failed\n' \
+        >"$project_out/unused-unit-verification.md"
+    fi
     echo "$name: excluded: dcc errors ($dcc_error_count), exit $dcc_exit"
     rm -f -- "$project_out/lsp.txt" "$project_out/lsp.meta.json" \
       "$project_out/lsp.status" "$project_out/lsp.validation" \

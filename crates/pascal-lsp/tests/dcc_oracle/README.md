@@ -21,6 +21,19 @@ semantic model makes even a matching dcc diagnostic unsafe. The recording has
 `#` header lines followed by normalized messages in the form
 `<File>.pas(<line>) <code> <message>`.
 
+A case may contain one sibling `.dproj`. Optional `config = "Debug"` and
+`platform = "Win32"` entries in `case.toml` select its build configuration and
+platform; when omitted, the project's evaluated defaults are used. The oracle
+loads that project through `pascal-project`, retaining the selected compiler's
+closed conditional context and taking project warning properties from the
+selected `.dproj` configuration. The recorder applies those same configured
+warning properties to its dcc invocation. It evaluates root-level
+`PropertyGroup`s and property `Condition` comparisons with `Config` and
+`Platform` plus `and`/`or`; unsupported conditions, nested property groups, and
+unevaluable warning properties fail recording instead of silently guessing.
+Imported MSBuild files are not evaluated by the recorder and therefore fail
+recording. Cases without a `.dproj` keep the original projectless behavior.
+
 The recorder compiles the unit with sibling resources such as `.dfm`; the
 semantic oracle indexes only `.pas` files. A DFM event binding is therefore not
 counted as a Pascal identifier use by the H2219 scan, and its behavior must be
@@ -45,6 +58,50 @@ Headless-Delphi Wine prefix and accepts `DCC_ORACLE_WINEPREFIX` and
 missing because Wine would otherwise create an empty one. Never hand-edit an
 `expected*.dcc` file: it is the compiler's recording, not a hand-authored
 expectation.
+
+Usage output from dcc32 21.0, 24.0, and 37.0 (run with no arguments) reports
+`-W[+|-|^][warn_id]`; all three versions accept `-W-<ID>`, `-W+<ID>`, and
+`-W^<ID>` for a warning property. The same usage output lists `-H` as the hint
+output switch; `-H+` and `-H-` are accepted to enable/disable hints. The
+recorder keeps the defaults `-H+ -W+`, then appends configured `.dproj`
+switches so project values take precedence.
+
+## Warning and hint switch fixtures
+
+Tier 1B adds 11 switch cases recorded with Delphi 21.0, 24.0, and 37.0. The
+recordings agree across all three versions: global warning regions and
+per-ID `OFF` suppress only the governed findings, `DEFAULT` restores the
+initial state, and `ERROR` reports warning IDs as `E1009`/`E1010` with Error
+severity. The `.dproj` cases cover a configuration/platform-specific warning
+property and `DCC_Hints=false`.
+
+The paired H2219 case settles its governing position: dcc uses the hint state
+at the end of the unit, so turning hints off before `end.` suppresses H2219
+even when the private field precedes the directive. The dcc recording confirms
+that a switch inside an expanded include affects following declarations. The
+unexpanded-include case
+records dcc's W1009 but sets `recall = false`: the navigation-only oracle
+cannot see the include's switch, so lint4d must stay silent after that include
+while precision remains enforced. Likewise, a switch in an unknown conditional
+leaves the affected state unknown from that point; a direct switch-state test
+covers this independently of whether semantic analysis produced a candidate
+diagnostic.
+
+Four umbrella-warning cases record `{$WARN ALL OFF}`, `ON` after `OFF`, `ERROR`,
+and `DEFAULT` on Delphi 21.0, 24.0, and 37.0. The older compilers reject `ALL`
+with E1030 and leave warning/hint states unchanged. Delphi 37.0 applies the
+umbrella states to rows with `$WARN` identifiers: OFF suppresses W1000, W1009,
+and W1010; ON after OFF restores them; ERROR promotes them to E1000, E1009, and
+E1010; DEFAULT restores their initial state. H2219 is recorded in every mode,
+so `ALL` does not affect hint rows without a `$WARN` identifier. The switch
+derivation script recognizes no other umbrella form. For an unknown compiler
+version, an `ALL` directive leaves those warning-ID states unknown and silent.
+
+If the document has no compiler version or its version has no recognized
+switch table, warning and hint analysis uses only the per-code defaults,
+governing globals, and warning IDs shared by all checked-in tables. Findings
+whose switch rows disagree across versions remain withheld. Error diagnostics
+are not filtered by warning or hint switches.
 
 The unit test in `src/navigation/dcc_oracle_tests.rs` compares only codes in
 `ENABLED_CODES`; add a code there as the corresponding lint rule is implemented.

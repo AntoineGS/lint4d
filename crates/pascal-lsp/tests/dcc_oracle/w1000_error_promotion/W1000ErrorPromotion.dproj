@@ -1,0 +1,13 @@
+<Project>
+  <PropertyGroup>
+    <MainSource>W1000ErrorPromotion.pas</MainSource>
+    <Config Condition="'$(Config)'==''">Release</Config>
+    <Platform Condition="'$(Platform)'==''">Win32</Platform>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Debug'">
+    <DCC_SYMBOL_DEPRECATED>error</DCC_SYMBOL_DEPRECATED>
+    <DCC_SYMBOL_LIBRARY>error</DCC_SYMBOL_LIBRARY>
+    <DCC_SYMBOL_PLATFORM>error</DCC_SYMBOL_PLATFORM>
+    <DCC_SYMBOL_EXPERIMENTAL>error</DCC_SYMBOL_EXPERIMENTAL>
+  </PropertyGroup>
+</Project>

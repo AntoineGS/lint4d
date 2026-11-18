@@ -1,0 +1,4 @@
+unit = "SwitchInUnexpandedInclude.pas"
+compilers = ["21.0", "24.0", "37.0"]
+recall = false
+reason = "The NavigationIndex-only oracle deliberately does not expand the sibling include; its switch state is unknown and must remain silent."

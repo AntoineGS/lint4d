@@ -1,0 +1,4 @@
+unit = "W1000Qualified.pas"
+compilers = ["21.0", "24.0", "37.0"]
+recall = false
+reason = "Delphi 21.0 emits two identical W1000 diagnostics for one qualified routine identifier; the semantic pass proves one finding per occurrence and cannot establish the compiler's duplicate multiplicity."

@@ -130,6 +130,11 @@ pub struct ProjectContext {
     pub(crate) include_path_entries: Vec<ProjectPathEntry>,
     pub(crate) unit_namespaces: Vec<String>,
     pub(crate) unit_aliases: HashMap<String, String>,
+    /// Evaluated Delphi compiler warning and hint switches for the selected
+    /// project configuration and platform. Missing entries are not explicitly
+    /// configured; values that could not be evaluated are retained as
+    /// [`PropertyValue::Unknown`].
+    pub(crate) warning_properties: BTreeMap<String, PropertyValue>,
     /// Effective compiler/version/options/constants used by source analysis.
     pub(crate) conditional_context: ConditionalContext,
     /// Whether project sources can close their define set and resolved RTL constants.
@@ -169,6 +174,16 @@ pub struct ProjectContext {
     /// `main_source_entry` and `explicit_unit_entries` by file name, built
     /// on first use (no field is changed after construction).
     pub(crate) exact_entries: ExactEntryIndex,
+}
+
+/// An evaluated MSBuild property value relevant to Delphi warning switches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PropertyValue {
+    /// The property expanded to a known string.
+    Known(String),
+    /// The property was assigned, but its value or assignment could not be
+    /// evaluated with the available project metadata.
+    Unknown,
 }
 
 /// The exact entries `path_entry_for` checks, in its order, bucketed by
@@ -349,6 +364,17 @@ impl ProjectContext {
 
     pub fn unit_aliases(&self) -> &HashMap<String, String> {
         &self.unit_aliases
+    }
+
+    /// Evaluated `DCC_<ID>`, `DCC_Hints`, and `DCC_Warnings` properties for
+    /// the selected project configuration and platform.
+    ///
+    /// Property names use the canonical Delphi spelling: warning identifiers
+    /// are uppercase, while the global properties are `DCC_Hints` and
+    /// `DCC_Warnings`. Properties absent from the selected configuration are
+    /// omitted; configured values that could not be evaluated are `Unknown`.
+    pub fn warning_properties(&self) -> &BTreeMap<String, PropertyValue> {
+        &self.warning_properties
     }
 
     pub fn conditional_context(&self) -> &ConditionalContext {
@@ -868,6 +894,7 @@ pub struct ProjectContextParts {
     pub include_path_entries: Vec<ProjectPathEntry>,
     pub unit_namespaces: Vec<String>,
     pub unit_aliases: HashMap<String, String>,
+    pub warning_properties: BTreeMap<String, PropertyValue>,
     pub conditional_context: ConditionalContext,
     pub conditional_closure: ConditionalClosure,
     pub library_conditional_context: ConditionalContext,
@@ -903,6 +930,7 @@ impl ProjectContext {
             include_path_entries,
             unit_namespaces,
             unit_aliases,
+            warning_properties,
             conditional_context,
             conditional_closure,
             library_conditional_context,
@@ -934,6 +962,7 @@ impl ProjectContext {
             include_path_entries,
             unit_namespaces,
             unit_aliases,
+            warning_properties,
             conditional_context,
             conditional_closure,
             library_conditional_context,
@@ -969,6 +998,7 @@ impl ProjectContext {
             include_path_entries,
             unit_namespaces,
             unit_aliases,
+            warning_properties,
             conditional_context,
             conditional_closure,
             library_conditional_context,
@@ -1001,6 +1031,7 @@ impl ProjectContext {
             include_path_entries,
             unit_namespaces,
             unit_aliases,
+            warning_properties,
             conditional_context,
             conditional_closure,
             library_conditional_context,

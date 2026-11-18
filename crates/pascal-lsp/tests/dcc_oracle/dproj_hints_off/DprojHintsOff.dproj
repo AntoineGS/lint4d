@@ -1,0 +1,11 @@
+<Project>
+  <PropertyGroup>
+    <MainSource>DprojHintsOff.pas</MainSource>
+    <Config Condition="'$(Config)'==''">Release</Config>
+    <Platform Condition="'$(Platform)'==''">Win32</Platform>
+    <DCC_Hints>true</DCC_Hints>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Debug' and '$(Platform)'=='Win32'">
+    <DCC_Hints>false</DCC_Hints>
+  </PropertyGroup>
+</Project>

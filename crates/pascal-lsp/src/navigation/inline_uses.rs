@@ -702,6 +702,113 @@ mod tests {
     }
 
     #[test]
+    fn inline_use_and_hint_passes_share_the_semantic_diagnostic_cap() {
+        let provider = concat!(
+            "unit InlineProvider;\n",
+            "interface\n",
+            "function UsesHelper: Integer; inline; deprecated 'use a replacement';\n",
+            "implementation\n",
+            "uses InlineHelper;\n",
+            "function UsesHelper: Integer;\n",
+            "begin Result := HelperValue; end;\n",
+            "end.\n",
+        );
+        let caller = concat!(
+            "unit InlineCaller;\n",
+            "interface\n",
+            "implementation\n",
+            "uses InlineProvider;\n",
+            "procedure P;\n",
+            "var I: Integer;\n",
+            "begin\n",
+            "  I := UsesHelper;\n",
+            "  I := UsesHelper;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let units = [
+            ("InlineHelper", HELPER),
+            ("InlineProvider", provider),
+            ("InlineCaller", caller),
+        ];
+        let small_diagnostics = indexed_diagnostics(&units, "InlineCaller");
+        assert!(
+            small_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind.code() == "W1000"),
+            "the hint-directive pass must produce a warning for the inline call"
+        );
+        assert_eq!(h2443(&small_diagnostics).len(), 2);
+
+        let mut index = NavigationIndex::new();
+        let mut caller_uri = None;
+        for (name, source) in units {
+            let uri = Url::parse(&format!("file:///tmp/{name}.pas")).expect("test URI");
+            index
+                .update(uri.clone(), source.to_owned())
+                .expect("test unit parses");
+            if name == "InlineCaller" {
+                caller_uri = Some(uri);
+            }
+        }
+        let caller_uri = caller_uri.expect("caller indexed");
+        let document = index.documents.get(&caller_uri).expect("caller indexed");
+        let mut pending = vec![document.tree.root_node()];
+        let mut identifiers = Vec::new();
+        let mut calls = Vec::new();
+        while let Some(node) = pending.pop() {
+            if node.kind() == "identifier" {
+                identifiers.push(node);
+                continue;
+            }
+            if node.kind() == "exprCall" {
+                calls.push(node);
+            }
+            let mut cursor = node.walk();
+            pending.extend(
+                node.children(&mut cursor)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev(),
+            );
+        }
+
+        let mut report = SemanticDiagnosticReport::default();
+        for _ in 0..MAX_SEMANTIC_DIAGNOSTICS - 1 {
+            report.diagnostics.push(SemanticDiagnostic {
+                kind: SemanticDiagnosticKind::TypeMismatch,
+                span: SourceSpan { start: 0, end: 0 },
+                message: String::new(),
+            });
+        }
+        let cancel = AtomicBool::new(false);
+        let mut budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "cap regression test");
+        let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
+        index
+            .append_inline_and_hint_directive_diagnostics_with_budget(
+                &caller_uri,
+                document,
+                &calls,
+                &identifiers,
+                capacity,
+                &mut report,
+                &cancel,
+                &mut budget,
+            )
+            .expect("final semantic diagnostics complete");
+
+        assert_eq!(report.diagnostics.len(), MAX_SEMANTIC_DIAGNOSTICS);
+        assert_eq!(h2443(&report.diagnostics).len(), 1);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.kind.code() != "W1000"),
+            "once the inline-use pass fills the cap, the later pass must not append findings"
+        );
+    }
+
+    #[test]
     fn reports_h2443_at_a_call_to_an_inline_routine_using_an_implementation_unit() {
         let diagnostics = indexed_diagnostics(
             &[

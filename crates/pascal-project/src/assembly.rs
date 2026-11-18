@@ -1060,6 +1060,7 @@ pub(super) fn build_project_context(
                 .chain(ide_paths.namespaces)
                 .collect(),
             unit_aliases: parse_aliases(builder.property("dcc_unitalias").as_deref()),
+            warning_properties: collect_warning_properties(&builder),
             conditional_context,
             conditional_closure,
             library_conditional_context,
@@ -1215,6 +1216,7 @@ fn build_standalone_context(
             include_path_entries: Vec::new(),
             unit_namespaces: Vec::new(),
             unit_aliases: HashMap::new(),
+            warning_properties: BTreeMap::new(),
             conditional_context,
             conditional_closure,
             library_conditional_context,
@@ -1883,6 +1885,36 @@ fn property_list(builder: &ProjectBuilder, name: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn collect_warning_properties(builder: &ProjectBuilder) -> BTreeMap<String, PropertyValue> {
+    builder
+        .properties
+        .iter()
+        .filter_map(|(name, value)| {
+            let suffix = name.strip_prefix("dcc_")?;
+            let public_name = match suffix {
+                "hints" => "DCC_Hints".to_owned(),
+                "warnings" => "DCC_Warnings".to_owned(),
+                _ => format!("DCC_{}", suffix.to_ascii_uppercase()),
+            };
+            let unknown = builder.unknown_properties.contains(name)
+                || builder.unevaluated_assignments.contains(name)
+                || value.contains(UNRESOLVED_MARKER)
+                || builder
+                    .property_empty_expansions
+                    .get(name)
+                    .is_some_and(|points| !points.is_empty());
+            Some((
+                public_name,
+                if unknown {
+                    PropertyValue::Unknown
+                } else {
+                    PropertyValue::Known(value.clone())
+                },
+            ))
+        })
+        .collect()
 }
 
 pub(super) fn full_range(value: &str) -> Vec<Range<usize>> {

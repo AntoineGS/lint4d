@@ -995,12 +995,9 @@ module.exports = grammar({
 				choice($.kMul, $.kDiv, $.kMod, $.kShl, $.kShr), $._subRangeBound),
 		),
 
-		// A hint right after a type reference stays in it (`fA: Integer
-		// deprecated;`) rather than becoming a declaration hint.
 		typeref:         $ => prec.right(seq(
 			...enable_if(fpc, field('_dummy', optional($.kSpecialize))),
 			$._typeref,
-			...enable_if(delphi, optional(prec.right(seq($.kDeprecated, optional($._expr))))),
 		)),
 
 		_typeref:        $ => choice(

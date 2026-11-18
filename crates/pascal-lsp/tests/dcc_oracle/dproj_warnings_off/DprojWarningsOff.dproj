@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup>
+    <MainSource>DprojWarningsOff.pas</MainSource>
+    <Config Condition="'$(Config)'==''">Release</Config>
+    <Platform Condition="'$(Platform)'==''">Win32</Platform>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Debug'">
+    <DCC_Warnings>false</DCC_Warnings>
+  </PropertyGroup>
+</Project>

@@ -132,11 +132,12 @@ mapfile -t candidate_ids < "$candidate_file"
 candidate_ids_all=("${candidate_ids[@]}")
 candidate_ids=()
 
-codes=(H2219 W1000 W1001 W1002 W1003 W1004 W1005 W1006 W1007 W1009 W1010)
+codes=(H2219 H2443 W1000 W1001 W1002 W1003 W1004 W1005 W1006 W1007 W1009 W1010)
 source_root="$root/crates/pascal-lsp/tests/dcc_oracle"
 [[ -f "$source_root/w1009_property/W1009Property.pas" ]] || fail "W1009 trigger fixture is missing"
 [[ -f "$source_root/w1010_hides_virtual/W1010HidesVirtual.pas" ]] || fail "W1010 trigger fixture is missing"
 [[ -f "$source_root/h2219_unused_field/UnusedField.pas" ]] || fail "H2219 trigger fixture is missing"
+[[ -f "$source_root/h2443_impl_uses_unit/InlUse.pas" ]] || fail "H2443 trigger fixture is missing"
 
 compiler_output=''
 compiler_status=0
@@ -295,6 +296,14 @@ write_single_unit_trigger() {
       source_file="$source_root/h2219_unused_field/UnusedField.pas"
       source_name='UnusedField.pas'
       ;;
+    H2443)
+      source_file="$source_root/h2443_impl_uses_unit/InlUse.pas"
+      source_name='InlUse.pas'
+      cp -- \
+        "$source_root/h2443_impl_uses_unit/InlProv.pas" \
+        "$source_root/h2443_impl_uses_unit/InlHelper.pas" \
+        "$work_dir/"
+      ;;
     W1009)
       source_file="$source_root/w1009_property/W1009Property.pas"
       source_name='W1009Property.pas'
@@ -325,7 +334,7 @@ write_trigger() {
     W1000|W1001|W1002|W1003|W1004|W1005|W1006|W1007)
       write_program_trigger "$code" "$directives"
       ;;
-    H2219|W1009|W1010)
+    H2219|H2443|W1009|W1010)
       write_single_unit_trigger "$code" "$directives"
       ;;
     *)

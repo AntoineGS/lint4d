@@ -247,8 +247,8 @@ impl SwitchTable {
 }
 
 const SUPPORTED_CODES: &[&str] = &[
-    "H2219", "W1000", "W1001", "W1002", "W1003", "W1004", "W1005", "W1006", "W1007", "W1009",
-    "W1010",
+    "H2219", "H2443", "W1000", "W1001", "W1002", "W1003", "W1004", "W1005", "W1006", "W1007",
+    "W1009", "W1010",
 ];
 
 fn known_code(code: &str) -> Option<&'static str> {

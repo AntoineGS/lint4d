@@ -91,6 +91,7 @@ mod dcc_oracle_tests;
 mod dcc_surface;
 mod dcc_switches;
 mod declarations;
+mod inline_uses;
 #[cfg(test)]
 mod surface_tests;
 #[cfg(test)]
@@ -2958,6 +2959,51 @@ impl NavigationIndex {
             || identifier_at(document.tree.root_node(), offset).is_none())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn append_inline_and_hint_directive_diagnostics_with_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        calls: &[Node<'_>],
+        identifiers: &[Node<'_>],
+        capacity: usize,
+        report: &mut SemanticDiagnosticReport,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<(), String> {
+        let mut inline_uses_cap_reached = false;
+        let result = self.inline_uses_diagnostics_with_budget(
+            uri,
+            document,
+            calls,
+            identifiers,
+            capacity,
+            &mut inline_uses_cap_reached,
+            cancel,
+            budget,
+        );
+        if let Some(inline_uses) = report.checked_candidate(result, budget)? {
+            report.diagnostics.extend(inline_uses);
+            if inline_uses_cap_reached {
+                report.note(SemanticCoverageGap::DiagnosticCap);
+            }
+        }
+        if !report.has_capacity() {
+            return Ok(());
+        }
+
+        let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
+        match self.append_hint_directive_diagnostics_with_budget(
+            uri, document, capacity, report, cancel, budget,
+        ) {
+            Err(error) if error == SEMANTIC_DIAGNOSTICS_LIMIT => {
+                report.note(SemanticCoverageGap::DiagnosticCap);
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
     /// Return only source-semantic diagnostics whose absence was proven by the
     /// bounded navigation model.
     ///
@@ -3045,7 +3091,7 @@ impl NavigationIndex {
 
         'analysis: {
             let mut reported_undeclared_names = HashSet::new();
-            for identifier in identifiers {
+            for &identifier in &identifiers {
                 if cancel.load(Ordering::Relaxed) {
                     return Err("request cancelled".to_string());
                 }
@@ -3161,7 +3207,7 @@ impl NavigationIndex {
                     message: format!("type mismatch: cannot assign '{actual}' to '{expected}'"),
                 });
             }
-            for call in calls {
+            for &call in &calls {
                 if document.conditionals.is_unknown_at(call.start_byte())
                     || document
                         .opaque_ranges
@@ -3269,19 +3315,16 @@ impl NavigationIndex {
                 break 'analysis;
             }
             let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
-            match self.append_hint_directive_diagnostics_with_budget(
+            self.append_inline_and_hint_directive_diagnostics_with_budget(
                 uri,
                 document,
+                &calls,
+                &identifiers,
                 capacity,
                 &mut report,
                 cancel,
                 &mut budget,
-            ) {
-                Err(error) if error == SEMANTIC_DIAGNOSTICS_LIMIT => {
-                    report.note(SemanticCoverageGap::DiagnosticCap);
-                }
-                result => result?,
-            }
+            )?;
         }
         report
             .diagnostics
@@ -8175,6 +8218,7 @@ impl NavigationIndex {
                 identifier,
                 owner_type.as_deref(),
                 &current,
+                state.allow_class_global_fallback,
             ) {
                 state.mark_receiver_uncertain();
                 return Ok(Vec::new());
@@ -8226,9 +8270,13 @@ impl NavigationIndex {
             }
         }
         if !imported.is_empty() {
-            if self
-                .is_unknown_global_fallback_for_owner(document, identifier, owner_type, &imported)
-            {
+            if self.is_unknown_global_fallback_for_owner(
+                document,
+                identifier,
+                owner_type,
+                &imported,
+                state.allow_class_global_fallback,
+            ) {
                 state.mark_receiver_uncertain();
                 return Ok(Vec::new());
             }
@@ -16478,6 +16526,7 @@ struct RoutineDirectives {
     forward: bool,
     external: bool,
     abstract_: bool,
+    inline: bool,
     calling_convention: Option<CallingConvention>,
     calling_convention_unknown: bool,
 }
@@ -17347,6 +17396,12 @@ struct ResolutionState {
     with_context_resolutions: HashMap<(Url, Span), Option<Vec<WithReceiverSlot>>>,
     with_member_substitutions: HashMap<(Url, usize, Candidate), Vec<GenericSubstitution>>,
     suppress_with_lookup: bool,
+    /// H2443 resolves the identifier after the ordinary member lookup has
+    /// established whether a class member shadows an imported global. The
+    /// diagnostic still rejects an incomplete member lookup via
+    /// `member_lookup_incomplete`; this bypasses only the broader D16
+    /// rename-safety guard for otherwise complete read-only lookups.
+    allow_class_global_fallback: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -17380,6 +17435,7 @@ impl ResolutionState {
             with_context_resolutions: HashMap::new(),
             with_member_substitutions: HashMap::new(),
             suppress_with_lookup: false,
+            allow_class_global_fallback: false,
         }
     }
 
@@ -20581,6 +20637,7 @@ fn routine_directives(node: Node<'_>) -> RoutineDirectives {
         "kForward" => directives.forward = true,
         "kExternal" => directives.external = true,
         "kAbstract" => directives.abstract_ = true,
+        "kInline" => directives.inline = true,
         "kCdecl" => directives.calling_convention = Some(CallingConvention::Cdecl),
         "kStdcall" => directives.calling_convention = Some(CallingConvention::Stdcall),
         "kPascal" => directives.calling_convention = Some(CallingConvention::Pascal),

@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 24.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem MethodUse.pas
+MethodUse.pas(9) H2443 Inline function 'TInlineClass.GetValue' has not been expanded because unit 'MethodHelper' is not specified in USES list
+MethodUse.pas(9) H2077 Value assigned to 'I' never used

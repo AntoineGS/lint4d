@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem H2443SwitchPositions.pas
+H2443SwitchPositions.pas(12) H2443 Inline function 'UsesImplUnit' has not been expanded because unit 'InlHelper' is not specified in USES list
+H2443SwitchPositions.pas(27) H2443 Inline function 'UsesImplUnit' has not been expanded because unit 'InlHelper' is not specified in USES list

@@ -960,9 +960,11 @@ mod tests {
         let provider = concat!(
             "unit InlineProvider;\n",
             "interface\n",
-            "function UsesHelper<T>(Value: T): T; inline;\n",
+            "function UsesHelper<T>(Value: T): Integer; inline;\n",
             "implementation\n",
-            "function UsesHelper<T>(Value: T): T; begin Result := Value; end;\n",
+            "uses InlineHelper;\n",
+            "function UsesHelper<T>(Value: T): Integer;\n",
+            "begin Result := HelperValue; end;\n",
             "end.\n",
         );
         let caller = concat!(

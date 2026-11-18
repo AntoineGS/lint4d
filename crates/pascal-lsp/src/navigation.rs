@@ -121,6 +121,8 @@ pub(crate) use symbols::{
     WorkspaceSymbolList, lsp_kind_for_shape, too_many_workspace_symbols, workspace_symbol_cap,
 };
 mod type_hierarchy;
+mod unused_units;
+pub(crate) use unused_units::FormFileRequirement;
 mod unit_facts;
 mod warning_switches;
 #[cfg(test)]
@@ -864,6 +866,7 @@ pub(crate) enum SemanticProofStatus {
 pub(crate) enum SemanticDiagnosticKind {
     TypeMismatch,
     IncompatibleArgument,
+    UnusedUnit,
     #[allow(dead_code)]
     Dcc(DccMessage),
     PromotedDcc(DccMessage),
@@ -874,6 +877,7 @@ impl SemanticDiagnosticKind {
         match self {
             Self::TypeMismatch => "pascal-type-mismatch",
             Self::IncompatibleArgument => "pascal-incompatible-argument",
+            Self::UnusedUnit => "lint4d-unused-unit",
             Self::Dcc(message) => message.code(),
             Self::PromotedDcc(message) => message
                 .promoted_error_code()
@@ -886,6 +890,7 @@ impl SemanticDiagnosticKind {
             Self::Dcc(message) => message.severity(),
             Self::PromotedDcc(_) => DccSeverity::Error,
             Self::TypeMismatch | Self::IncompatibleArgument => DccSeverity::Error,
+            Self::UnusedUnit => DccSeverity::Hint,
         }
     }
 }
@@ -924,6 +929,7 @@ fn semantic_diagnostic_kind_rank(kind: SemanticDiagnosticKind) -> u8 {
         SemanticDiagnosticKind::Dcc(DccMessage::E2003) => 0,
         SemanticDiagnosticKind::TypeMismatch => 2,
         SemanticDiagnosticKind::IncompatibleArgument => 3,
+        SemanticDiagnosticKind::UnusedUnit => 7,
         SemanticDiagnosticKind::Dcc(_) | SemanticDiagnosticKind::PromotedDcc(_) => 6,
     }
 }

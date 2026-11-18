@@ -698,6 +698,24 @@ pub(crate) fn code_actions_from_input(
         Vec::new()
     };
     let mut supplementary_actions = extraction_actions;
+    if requests_quickfix
+        && !rule_is_off(&config, "unused-unit")
+        && input_source_is_writable(&input, &uri)
+    {
+        for action in unused_unit_removal_actions(
+            &uri,
+            &source,
+            &target_record,
+            &params.context,
+            features.document_changes,
+        ) {
+            match push_bounded_code_action(&mut supplementary_actions, action) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => return failed(source_generation, configuration_generation, error),
+            }
+        }
+    }
     if requests_signature && input_source_is_writable(&input, &uri) {
         let signature_edits = match signature::plan(&source, params.range, cancel) {
             Ok(edits) => edits,
@@ -3161,6 +3179,344 @@ fn organize_imports_plan_from_input(
         edits,
     };
     Ok((Some(plan), snapshot_records(&snapshot)))
+}
+
+fn unused_unit_removal_actions(
+    uri: &Url,
+    source: &str,
+    target_record: &SourceRecord,
+    context: &CodeActionContext,
+    document_changes: bool,
+) -> Vec<CodeActionOrCommand> {
+    let mut actions = Vec::new();
+    let mut seen_ranges = HashSet::new();
+    for diagnostic in &context.diagnostics {
+        if diagnostic_code(diagnostic) != Some("lint4d-unused-unit")
+            || !seen_ranges.insert(diagnostic.range)
+        {
+            continue;
+        }
+        let Some(edit) = unused_unit_removal_edit(uri, source, diagnostic.range) else {
+            continue;
+        };
+        let Some(start) = text::position_to_offset(source, diagnostic.range.start) else {
+            continue;
+        };
+        let Some(end) = text::position_to_offset(source, diagnostic.range.end) else {
+            continue;
+        };
+        let Some(unit_name) = source.get(start..end) else {
+            continue;
+        };
+        let raw_edits = HashMap::from([(uri.clone(), vec![edit])]);
+        let records = HashMap::from([(uri.clone(), target_record.clone())]);
+        let Ok(edit) = workspace_edit(raw_edits, &records, document_changes) else {
+            continue;
+        };
+        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+            title: format!("Remove unused unit '{unit_name}'"),
+            kind: Some(CodeActionKind::QUICKFIX),
+            diagnostics: Some(vec![diagnostic.clone()]),
+            edit: Some(edit),
+            command: None,
+            is_preferred: Some(true),
+            disabled: None,
+            data: None,
+        }));
+    }
+    actions
+}
+
+/// Build one removal edit only for an exact unit-name range inside a parsed
+/// `uses` clause. Comments in the removed text are retained, and the edited
+/// source must still parse before the action is exposed.
+fn unused_unit_removal_edit(uri: &Url, source: &str, anchor: Range) -> Option<TextEdit> {
+    let start = text::position_to_offset(source, anchor.start)?;
+    let end = text::position_to_offset(source, anchor.end)?;
+    if start >= end {
+        return None;
+    }
+    let path = uri.to_file_path().ok().map(absolute_path)?;
+    let (tree, _) = parser::parse_file(&FileInfo::new(path.clone()), source.as_bytes()).ok()?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+
+    let mut clause_span = None;
+    let mut import_spans = Vec::new();
+    walk(root, &mut |node| {
+        if node.kind() != "moduleName" {
+            return;
+        }
+        let mut parent = node.parent();
+        while let Some(ancestor) = parent {
+            if ancestor.kind() == "declUses" {
+                let span = (ancestor.start_byte(), ancestor.end_byte());
+                if span.0 <= start && end <= span.1 {
+                    clause_span = Some(span);
+                    import_spans.push((node.start_byte(), node.end_byte()));
+                }
+                break;
+            }
+            parent = ancestor.parent();
+        }
+    });
+    let (clause_start, clause_end) = clause_span?;
+    let (semicolon, commas) = uses_clause_separators(source, clause_start, clause_end)?;
+    import_spans.sort_unstable();
+    let target_index = import_spans.iter().position(|span| *span == (start, end))?;
+    if commas.len().saturating_add(1) != import_spans.len() {
+        return None;
+    }
+
+    let (edit_start, edit_end, fallback, preserve_separator) = if import_spans.len() == 1 {
+        (clause_start, semicolon + 1, "", false)
+    } else if let Some((next_start, _)) = import_spans.get(target_index + 1).copied() {
+        let start = if target_index == 0 {
+            clause_start.checked_add("uses".len())?
+        } else {
+            *commas.get(target_index - 1)? + 1
+        };
+        let fallback = source.get(start..import_spans[target_index].0)?;
+        (start, next_start, fallback, true)
+    } else {
+        let previous_comma = commas
+            .iter()
+            .copied()
+            .take_while(|comma| *comma < import_spans[target_index].0)
+            .last()?;
+        (previous_comma, semicolon, "", false)
+    };
+    if edit_start >= edit_end
+        || !source.is_char_boundary(edit_start)
+        || !source.is_char_boundary(edit_end)
+    {
+        return None;
+    }
+    let replacement =
+        preserve_comments(source, edit_start, edit_end, fallback, preserve_separator)?;
+    let mut updated_source = source.to_owned();
+    updated_source.replace_range(edit_start..edit_end, &replacement);
+    let (updated_tree, _) =
+        parser::parse_file(&FileInfo::new(path), updated_source.as_bytes()).ok()?;
+    if updated_tree.root_node().has_error() {
+        return None;
+    }
+
+    Some(TextEdit::new(
+        Range::new(
+            text::offset_to_position(source, edit_start)?,
+            text::offset_to_position(source, edit_end)?,
+        ),
+        replacement,
+    ))
+}
+
+fn uses_clause_separators(source: &str, start: usize, end: usize) -> Option<(usize, Vec<usize>)> {
+    if start >= end || end > source.len() || !source_keyword_at(source, start, end, "uses") {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    let mut cursor = start + "uses".len();
+    let mut semicolon = None;
+    let mut commas = Vec::new();
+    while cursor < end {
+        match bytes[cursor] {
+            b'\'' | b'"' => {
+                let quote = bytes[cursor];
+                cursor = quoted_string_end(bytes, cursor, end, quote)?;
+            }
+            b'{' => {
+                let (comment_end, directive) = braced_comment_end(bytes, cursor, end)?;
+                if directive {
+                    return None;
+                }
+                cursor = comment_end;
+            }
+            b'(' if bytes.get(cursor + 1) == Some(&b'*') => {
+                let (comment_end, directive) = paren_comment_end(bytes, cursor, end)?;
+                if directive {
+                    return None;
+                }
+                cursor = comment_end;
+            }
+            b'/' if bytes.get(cursor + 1) == Some(&b'/') => {
+                cursor = line_comment_end(bytes, cursor, end);
+            }
+            b',' => {
+                if semicolon.is_some() {
+                    return None;
+                }
+                commas.push(cursor);
+                cursor += 1;
+            }
+            b';' => {
+                if semicolon.replace(cursor).is_some() {
+                    return None;
+                }
+                cursor += 1;
+            }
+            _ => cursor += 1,
+        }
+    }
+    let semicolon = semicolon?;
+    if commas.iter().any(|comma| *comma >= semicolon) {
+        return None;
+    }
+    Some((semicolon, commas))
+}
+
+fn preserve_comments(
+    source: &str,
+    start: usize,
+    end: usize,
+    fallback: &str,
+    preserve_separator: bool,
+) -> Option<String> {
+    let bytes = source.as_bytes();
+    let mut cursor = start;
+    let mut comments = Vec::new();
+    while cursor < end {
+        let comment = match bytes[cursor] {
+            b'{' => {
+                let (comment_end, directive) = braced_comment_end(bytes, cursor, end)?;
+                if directive {
+                    return None;
+                }
+                Some((comment_end, false))
+            }
+            b'(' if bytes.get(cursor + 1) == Some(&b'*') => {
+                let (comment_end, directive) = paren_comment_end(bytes, cursor, end)?;
+                if directive {
+                    return None;
+                }
+                Some((comment_end, false))
+            }
+            b'/' if bytes.get(cursor + 1) == Some(&b'/') => {
+                Some((line_comment_end(bytes, cursor, end), true))
+            }
+            b'\'' | b'"' => {
+                cursor = quoted_string_end(bytes, cursor, end, bytes[cursor])?;
+                None
+            }
+            _ => None,
+        };
+        if let Some((comment_end, line_comment)) = comment {
+            comments.push((cursor, comment_end, line_comment));
+            cursor = comment_end;
+        } else if cursor < end {
+            cursor += 1;
+        }
+    }
+    if comments.is_empty() {
+        return Some(if preserve_separator {
+            fallback.to_string()
+        } else {
+            String::new()
+        });
+    }
+
+    let (first_start, _, _) = comments[0];
+    let prefix = trailing_whitespace(source.get(start..first_start)?).unwrap_or(fallback);
+    let mut result = prefix.to_string();
+    for (index, (comment_start, comment_end, line_comment)) in comments.iter().copied().enumerate()
+    {
+        if index > 0 && !matches!(result.chars().last(), Some('\n' | '\r' | ' ')) && !line_comment {
+            result.push(' ');
+        }
+        result.push_str(source.get(comment_start..comment_end)?);
+    }
+
+    let (_, last_end, last_is_line) = comments.last().copied()?;
+    let mut suffix = leading_whitespace(source.get(last_end..end)?);
+    if last_is_line && suffix.starts_with("\r\n") {
+        suffix = &suffix[2..];
+    } else if last_is_line && suffix.starts_with(['\n', '\r']) {
+        suffix = &suffix[1..];
+    }
+    result.push_str(suffix);
+    if preserve_separator
+        && !result.is_empty()
+        && !result.chars().last().is_some_and(char::is_whitespace)
+    {
+        result.push(' ');
+    }
+    Some(result)
+}
+
+fn trailing_whitespace(text: &str) -> Option<&str> {
+    let index = text
+        .char_indices()
+        .rev()
+        .find_map(|(index, character)| {
+            (!character.is_whitespace()).then_some(index + character.len_utf8())
+        })
+        .unwrap_or(0);
+    text.get(index..)
+}
+
+fn leading_whitespace(text: &str) -> &str {
+    let end = text
+        .char_indices()
+        .find_map(|(index, character)| (!character.is_whitespace()).then_some(index))
+        .unwrap_or(text.len());
+    &text[..end]
+}
+
+fn braced_comment_end(bytes: &[u8], start: usize, limit: usize) -> Option<(usize, bool)> {
+    let directive = bytes.get(start + 1) == Some(&b'$');
+    let mut depth = 1usize;
+    let mut cursor = start + 1;
+    while cursor < limit {
+        match bytes[cursor] {
+            b'{' => depth = depth.checked_add(1)?,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((cursor + 1, directive));
+                }
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn paren_comment_end(bytes: &[u8], start: usize, limit: usize) -> Option<(usize, bool)> {
+    let directive = bytes.get(start + 2) == Some(&b'$');
+    let mut depth = 1usize;
+    let mut cursor = start + 2;
+    while cursor + 1 < limit {
+        if bytes[cursor] == b'(' && bytes[cursor + 1] == b'*' {
+            depth = depth.checked_add(1)?;
+            cursor += 2;
+        } else if bytes[cursor] == b'*' && bytes[cursor + 1] == b')' {
+            depth -= 1;
+            cursor += 2;
+            if depth == 0 {
+                return Some((cursor, directive));
+            }
+        } else {
+            cursor += 1;
+        }
+    }
+    None
+}
+
+fn line_comment_end(bytes: &[u8], start: usize, limit: usize) -> usize {
+    let mut end = start + 2;
+    while end < limit && !matches!(bytes[end], b'\n' | b'\r') {
+        end += 1;
+    }
+    if bytes.get(end) == Some(&b'\r') && bytes.get(end + 1) == Some(&b'\n') {
+        end + 2
+    } else if end < limit {
+        end + 1
+    } else {
+        end
+    }
 }
 
 fn parse_organize_imports_clause(
@@ -7158,8 +7514,8 @@ mod tests {
     use crate::workspace::rename::revalidate_input;
     use lsp_types::Url;
     use lsp_types::{
-        CodeActionContext, CodeActionOrCommand, Diagnostic, DiagnosticSeverity, NumberOrString,
-        Position, Range,
+        CodeActionContext, CodeActionOrCommand, Diagnostic, DiagnosticSeverity, DiagnosticTag,
+        NumberOrString, Position, Range,
     };
     use pascal_project::delphi_overrides::OverrideSession;
     use serde_json::json;
@@ -7169,8 +7525,151 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
+    fn removed_unused_unit(source: &str, unit_name: &str) -> Option<String> {
+        let temp = tempfile::tempdir().expect("unused-unit workspace");
+        let root = temp.path().to_path_buf();
+        let source_path = root.join("Main.pas");
+        fs::write(&source_path, source).expect("source");
+        let uri = Url::from_file_path(&source_path).expect("source URI");
+        let start = source.find(unit_name)?;
+        let end = start.checked_add(unit_name.len())?;
+        let range = Range::new(
+            crate::text::offset_to_position(source, start)?,
+            crate::text::offset_to_position(source, end)?,
+        );
+        let diagnostic = Diagnostic::new(
+            range,
+            Some(DiagnosticSeverity::HINT),
+            Some(NumberOrString::String("lint4d-unused-unit".to_string())),
+            Some("pascal-lsp".to_string()),
+            format!("Unit '{unit_name}' is not used"),
+            None,
+            Some(vec![DiagnosticTag::UNNECESSARY]),
+        );
+        let params: lsp_types::CodeActionParams = serde_json::from_value(json!({
+            "textDocument": {"uri": uri},
+            "range": range,
+            "context": {
+                "diagnostics": [diagnostic],
+                "only": ["quickfix"]
+            }
+        }))
+        .expect("code action parameters");
+        let input = test_workspace(vec![root], Default::default()).analysis_input();
+        let actions = code_actions_from_input(
+            input,
+            params,
+            ClientActionFeatures {
+                resolve: false,
+                document_changes: false,
+                disabled: false,
+            },
+            &AtomicBool::new(false),
+        )
+        .value
+        .ok()?;
+        let edit = actions.into_iter().find_map(|action| {
+            let CodeActionOrCommand::CodeAction(action) = action else {
+                return None;
+            };
+            (action.title == format!("Remove unused unit '{unit_name}'"))
+                .then_some(action.edit)
+                .flatten()
+        })?;
+        let edits = edit.changes?.get(&uri)?.clone();
+        let mut updated = source.to_owned();
+        let mut offsets = edits
+            .iter()
+            .map(|edit| {
+                Some((
+                    crate::text::position_to_offset(&updated, edit.range.start)?,
+                    crate::text::position_to_offset(&updated, edit.range.end)?,
+                    edit.new_text.as_str(),
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        offsets.sort_by_key(|(start, _, _)| *start);
+        for (start, end, new_text) in offsets.into_iter().rev() {
+            updated.replace_range(start..end, new_text);
+        }
+        Some(updated)
+    }
+
     fn test_workspace(roots: Vec<std::path::PathBuf>, options: WorkspaceOptions) -> Workspace {
         Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
+
+    #[test]
+    fn unused_unit_removal_handles_each_uses_list_position() {
+        let cases = [
+            (
+                "unit Main;\ninterface\nuses UnusedFirst, Keep;\nimplementation\nend.\n",
+                "UnusedFirst",
+                "unit Main;\ninterface\nuses Keep;\nimplementation\nend.\n",
+            ),
+            (
+                "unit Main;\ninterface\nuses KeepA, UnusedMiddle, KeepB;\nimplementation\nend.\n",
+                "UnusedMiddle",
+                "unit Main;\ninterface\nuses KeepA, KeepB;\nimplementation\nend.\n",
+            ),
+            (
+                "unit Main;\ninterface\nuses Keep, UnusedLast;\nimplementation\nend.\n",
+                "UnusedLast",
+                "unit Main;\ninterface\nuses Keep;\nimplementation\nend.\n",
+            ),
+            (
+                "unit Main;\ninterface\nuses UnusedOnly;\nimplementation\nend.\n",
+                "UnusedOnly",
+                "unit Main;\ninterface\n\nimplementation\nend.\n",
+            ),
+        ];
+
+        for (source, unit_name, expected) in cases {
+            assert_eq!(
+                removed_unused_unit(source, unit_name).as_deref(),
+                Some(expected),
+                "unit: {unit_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn unused_unit_removal_preserves_neighbor_comments_and_multiline_layout() {
+        let source = concat!(
+            "unit Main;\n",
+            "interface\n",
+            "uses KeepA,\n",
+            "  // Keep this explanation with the following entry.\n",
+            "  UnusedMiddle,\n",
+            "  KeepB;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let expected = concat!(
+            "unit Main;\n",
+            "interface\n",
+            "uses KeepA,\n",
+            "  // Keep this explanation with the following entry.\n",
+            "  KeepB;\n",
+            "implementation\n",
+            "end.\n",
+        );
+
+        assert_eq!(
+            removed_unused_unit(source, "UnusedMiddle").as_deref(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn unused_unit_removal_covers_explicit_path_qualifiers() {
+        let source = "unit Main;\ninterface\nuses UnusedPath in 'UnusedPath.pas', Keep;\nimplementation\nend.\n";
+        let expected = "unit Main;\ninterface\nuses Keep;\nimplementation\nend.\n";
+
+        assert_eq!(
+            removed_unused_unit(source, "UnusedPath").as_deref(),
+            Some(expected)
+        );
     }
 
     #[test]

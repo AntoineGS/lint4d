@@ -16321,7 +16321,8 @@ impl Workspace {
         } = request;
         check_workspace_cancel(Some(cancel))?;
         let input = self.analysis_input();
-        let semantic_diagnostics = self.semantic_diagnostics_for_input(&input, uri, cancel)?;
+        let semantic_diagnostics =
+            self.semantic_diagnostics_for_input(&input, uri, config, cancel)?;
         let run_file_local = |lint_source: &[u8], run_cfg_rules| {
             let diagnostics = if run_cfg_rules {
                 lint4d::engine::run_lint_with_cfg_project(
@@ -16482,6 +16483,7 @@ impl Workspace {
         &mut self,
         input: &rename::WorkspaceInput,
         uri: &Url,
+        config: &lint4d::config::Config,
         cancel: &AtomicBool,
     ) -> Result<Vec<SemanticDiagnostic>, String> {
         let snapshot = match rename::build_snapshot(
@@ -16504,14 +16506,57 @@ impl Workspace {
         }
         // Every reported finding is proven even when coverage has gaps; the
         // client has no channel for coverage yet (LSP-1).
-        match snapshot
+        let report = match snapshot
             .index
             .semantic_diagnostic_report_with_cancel(uri, cancel)
         {
-            Ok(report) => Ok(report.diagnostics),
-            Err(error) if error == CANCELLATION_MESSAGE => Err(error),
-            Err(_) => Ok(Vec::new()),
+            Ok(report) => report,
+            Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut diagnostics = report.diagnostics.clone();
+        if matches!(
+            config.rule_severity("unused-unit"),
+            Some(lint4d::config::RuleSeverityOverride::Off)
+        ) {
+            return Ok(diagnostics);
         }
+        let form_file_bytes = match snapshot.index.form_file_requirement(uri) {
+            Some(crate::navigation::FormFileRequirement::None) => None,
+            Some(crate::navigation::FormFileRequirement::Unknown) | None => {
+                // No form bytes can prove that streamed classes do not depend
+                // on an imported unit.
+                None
+            }
+            Some(crate::navigation::FormFileRequirement::Read(extension)) => {
+                let Some(mut path) = uri.to_file_path().ok() else {
+                    return Ok(diagnostics);
+                };
+                path.set_extension(extension);
+                let context_key = match self.context_for_uri_with_cancel(uri, Some(cancel)) {
+                    Ok(context_key) => context_key,
+                    Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+                    Err(_) => return Ok(diagnostics),
+                };
+                match rename::read_context_source(self, &context_key, &path, cancel) {
+                    Ok(text) => Some(text.into_bytes()),
+                    Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+                    Err(_) => None,
+                }
+            }
+        };
+        let unused = match snapshot.index.unused_unit_diagnostics_with_report(
+            uri,
+            &report,
+            form_file_bytes.as_deref(),
+            cancel,
+        ) {
+            Ok(diagnostics) => diagnostics,
+            Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+            Err(_) => Vec::new(),
+        };
+        diagnostics.extend(unused);
+        Ok(diagnostics)
     }
 
     fn ensure_open_root_expansions_for_semantic_context(
@@ -17454,6 +17499,8 @@ fn semantic_lsp_diagnostic(diagnostic: SemanticDiagnostic, range: Range) -> LspD
         DccSeverity::Warning => DiagnosticSeverity::WARNING,
         DccSeverity::Hint => DiagnosticSeverity::HINT,
     };
+    let tags = (diagnostic.kind == crate::navigation::SemanticDiagnosticKind::UnusedUnit)
+        .then_some(vec![lsp_types::DiagnosticTag::UNNECESSARY]);
     LspDiagnostic::new(
         range,
         Some(severity),
@@ -17461,7 +17508,7 @@ fn semantic_lsp_diagnostic(diagnostic: SemanticDiagnostic, range: Range) -> LspD
         Some("pascal-lsp".to_string()),
         diagnostic.message,
         None,
-        None,
+        tags,
     )
 }
 
@@ -18451,6 +18498,128 @@ fn is_immutable_override_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn lint_configuration_can_disable_unused_unit_hints() {
+        use pascal_project::{CompilerVersion, LayoutContext, TargetPlatform};
+        use std::fs;
+        use std::sync::atomic::AtomicBool;
+
+        let temp = tempfile::tempdir().expect("unused-unit workspace");
+        let root = temp.path().to_path_buf();
+        fs::write(
+            root.join("System.pas"),
+            "unit System; interface implementation end.\n",
+        )
+        .expect("System unit");
+        fs::write(
+            root.join("SysInit.pas"),
+            "unit SysInit; interface implementation end.\n",
+        )
+        .expect("SysInit unit");
+        fs::write(
+            root.join("U.pas"),
+            "unit U; interface implementation end.\n",
+        )
+        .expect("provider unit");
+        fs::write(
+            root.join("Main.pas"),
+            "unit Main; interface uses U; implementation end.\n",
+        )
+        .expect("consumer unit");
+
+        let version = CompilerVersion::new(24, 0);
+        let conditional_context = pascal_project::ConditionalContext {
+            compiler_version: Some(version),
+            ..Default::default()
+        }
+        .with_layout(LayoutContext::for_target(
+            Some(version),
+            Some(&TargetPlatform::Win32),
+        ));
+        let mut workspace = super::Workspace::with_override_session(
+            vec![root],
+            super::WorkspaceOptions {
+                conditional_context,
+                ..Default::default()
+            },
+            pascal_project::delphi_overrides::OverrideSession::new(None),
+        );
+        let uri = super::Url::from_file_path(temp.path().join("Main.pas")).expect("source URI");
+        let context_key = workspace.context_for_uri(&uri).expect("project context");
+        assert_eq!(
+            workspace
+                .contexts
+                .get(&context_key)
+                .expect("context state")
+                .context
+                .effective_conditional_context()
+                .compiler_version,
+            Some(version)
+        );
+        assert_eq!(
+            workspace
+                .contexts
+                .get(&context_key)
+                .expect("context state")
+                .context
+                .effective_conditional_context()
+                .layout
+                .platform,
+            Some(pascal_project::LayoutPlatform::Win32)
+        );
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        let snapshot = super::rename::build_snapshot(
+            &input,
+            std::slice::from_ref(&uri),
+            &[],
+            super::rename::SnapshotMode::LocalWithImports,
+            None,
+            &[],
+            &cancel,
+        )
+        .expect("semantic snapshot");
+        assert!(
+            snapshot.complete,
+            "semantic snapshot is incomplete: {:?}; include errors: {:?}",
+            snapshot.incomplete_reason, snapshot.include_errors
+        );
+        let report = snapshot
+            .index
+            .semantic_diagnostic_report_with_cancel(&uri, &cancel)
+            .expect("semantic report");
+        assert!(report.is_complete(), "semantic coverage: {report:?}");
+        let unused = snapshot
+            .index
+            .unused_unit_diagnostics_with_report(&uri, &report, None, &cancel)
+            .expect("unused-unit analysis");
+        assert_eq!(unused.len(), 1, "direct analyzer output: {unused:?}");
+
+        let enabled = "version = 1\n"
+            .parse::<lint4d::config::Config>()
+            .expect("default lint configuration");
+        let enabled_diagnostics = workspace
+            .semantic_diagnostics_for_input(&input, &uri, &enabled, &AtomicBool::new(false))
+            .expect("enabled semantic diagnostics");
+        assert!(
+            enabled_diagnostics.iter().any(|diagnostic| diagnostic.kind
+                == crate::navigation::SemanticDiagnosticKind::UnusedUnit),
+            "unused-unit hints are enabled by default: {enabled_diagnostics:?}"
+        );
+
+        let disabled = "version = 1\n[rules]\nunused-unit = \"off\"\n"
+            .parse::<lint4d::config::Config>()
+            .expect("disabled lint configuration");
+        let disabled_diagnostics = workspace
+            .semantic_diagnostics_for_input(&input, &uri, &disabled, &AtomicBool::new(false))
+            .expect("disabled semantic diagnostics");
+        assert!(
+            disabled_diagnostics.iter().all(|diagnostic| diagnostic.kind
+                != crate::navigation::SemanticDiagnosticKind::UnusedUnit),
+            "the off override suppresses unused-unit hints"
+        );
+    }
+
+    #[test]
     fn semantic_lsp_diagnostic_mapping_sets_dcc_code_source_and_severity() {
         let diagnostic = super::semantic_lsp_diagnostic(
             crate::navigation::SemanticDiagnostic {
@@ -18491,6 +18660,31 @@ mod tests {
         assert_eq!(diagnostic.source.as_deref(), Some("pascal-lsp"));
         assert_eq!(diagnostic.severity, Some(super::DiagnosticSeverity::ERROR));
         assert_eq!(diagnostic.message, "Undeclared identifier: 'Baz'");
+    }
+
+    #[test]
+    fn semantic_lsp_diagnostic_publishes_unused_unit_as_an_unnecessary_hint() {
+        let diagnostic = super::semantic_lsp_diagnostic(
+            crate::navigation::SemanticDiagnostic {
+                kind: crate::navigation::SemanticDiagnosticKind::UnusedUnit,
+                span: crate::navigation::SourceSpan { start: 0, end: 1 },
+                message: "Unit 'U' is not used".to_string(),
+            },
+            super::Range::default(),
+        );
+
+        assert_eq!(
+            diagnostic.code,
+            Some(super::NumberOrString::String(
+                "lint4d-unused-unit".to_string()
+            ))
+        );
+        assert_eq!(diagnostic.source.as_deref(), Some("pascal-lsp"));
+        assert_eq!(diagnostic.severity, Some(super::DiagnosticSeverity::HINT));
+        assert_eq!(
+            diagnostic.tags,
+            Some(vec![lsp_types::DiagnosticTag::UNNECESSARY])
+        );
     }
 
     /// Review M1/M2 (l4d-zgyw): a stopped analysis is named by its own

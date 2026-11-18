@@ -30,6 +30,171 @@ fn test_inline_body_proof_walks() -> usize {
 }
 
 impl NavigationIndex {
+    pub(super) fn inline_body_dependencies_with_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        identifiers: &[Node<'_>],
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<HashSet<Url>>, String> {
+        if !document.conditionals.complete
+            || document
+                .conditionals
+                .unknown_activity_requires_fail_closed()
+            || !Self::document_is_complete_for_proof(document, cancel, budget)?
+            || !declarations::include_expansion_complete(document)
+            || self
+                .complete_imported_units(document, cancel, budget)?
+                .is_none()
+        {
+            return Ok(None);
+        }
+
+        let mut calls = Vec::new();
+        let mut pending = vec![document.tree.root_node()];
+        while let Some(node) = pending.pop() {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            if node.kind() == "exprCall" {
+                budget.require_owned_bytes(std::mem::size_of::<Node<'_>>(), cancel)?;
+                calls.push(node);
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.children(&mut cursor));
+        }
+
+        let mut dependencies = HashSet::new();
+        for call in calls.into_iter().chain(
+            identifiers
+                .iter()
+                .copied()
+                .filter_map(bare_callable_expression)
+                .map(|(call, _)| call),
+        ) {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            if document.conditionals.is_unknown_at(call.start_byte())
+                || document
+                    .opaque_ranges
+                    .iter()
+                    .any(|range| range.contains(Span::from_node(call)))
+                || !self.imports_are_complete_for_proof(
+                    document,
+                    call.start_byte(),
+                    cancel,
+                    budget,
+                )?
+            {
+                return Ok(None);
+            }
+            let selected =
+                self.selected_call_candidates(uri, document, call, true, false, cancel, budget)?;
+            if selected.is_none() {
+                let Some(entity) = call
+                    .child_by_field_name("entity")
+                    .or_else(|| (call.kind() != "exprCall").then_some(call))
+                else {
+                    return Ok(None);
+                };
+                let identifier = callable_lookup_identifier(entity);
+                let mut state = ResolutionState::new();
+                state.allow_class_global_fallback = true;
+                let candidates = self.resolve_candidates_at_with_state_and_budget(
+                    uri,
+                    document,
+                    identifier.start_byte(),
+                    identifier,
+                    &mut state,
+                    0,
+                    cancel,
+                    budget,
+                )?;
+                if state.ambiguous
+                    || state.member_lookup_incomplete
+                    || state.receiver_resolution_uncertain()
+                    || state.inaccessible_candidate
+                    || state.implicit_system_namespace_incomplete
+                    || candidates
+                        .iter()
+                        .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+                {
+                    return Ok(None);
+                }
+                if candidates.is_empty() {
+                    if state.compiler_surface_resolved {
+                        continue;
+                    }
+                    return Ok(None);
+                }
+                if candidates
+                    .iter()
+                    .any(|candidate| self.candidate_may_be_inline(candidate))
+                {
+                    return Ok(None);
+                }
+                continue;
+            }
+            let selected = selected.expect("checked selected candidates");
+            for candidate in selected {
+                check_navigation_cancel(cancel)?;
+                if !self.candidate_may_be_inline(&candidate) {
+                    continue;
+                }
+                let Some(target) = self.documents.get(&candidate.uri) else {
+                    return Ok(None);
+                };
+                let Some((_, definition)) =
+                    self.inline_routine_pair(target, &candidate, cancel, budget)?
+                else {
+                    return Ok(None);
+                };
+                let Some(definition_node) =
+                    routine_definition_node(target, definition, cancel, budget)?
+                else {
+                    return Ok(None);
+                };
+                let Some(body) = definition_node.child_by_field_name("body") else {
+                    return Ok(None);
+                };
+                if contains_descendant_kind_with_budget(body, "asm", cancel, budget)?
+                    || target
+                        .opaque_ranges
+                        .iter()
+                        .any(|range| range.contains(Span::from_node(body)))
+                    || target.conditionals.unknown_spans.iter().any(|span| {
+                        span.start < definition_node.end_byte()
+                            && definition_node.start_byte() < span.end
+                    })
+                {
+                    return Ok(None);
+                }
+                let Some(references) = self.inline_body_references(
+                    &candidate.uri,
+                    target,
+                    definition_node,
+                    cancel,
+                    budget,
+                )?
+                else {
+                    return Ok(None);
+                };
+                for reference in references {
+                    budget.require_owned_bytes(
+                        reference
+                            .uri
+                            .as_str()
+                            .len()
+                            .saturating_add(std::mem::size_of::<Url>()),
+                        cancel,
+                    )?;
+                    dependencies.insert(reference.uri);
+                }
+            }
+        }
+        Ok(Some(dependencies))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn inline_uses_diagnostics_with_budget(
         &self,
@@ -465,6 +630,29 @@ impl NavigationIndex {
             return Ok(None);
         }
         Ok(Some((declaration, definition)))
+    }
+
+    fn candidate_may_be_inline(&self, candidate: &Candidate) -> bool {
+        let Some(symbol) = self.symbol(candidate) else {
+            return true;
+        };
+        if symbol.routine_directives.inline {
+            return true;
+        }
+        let Some(routine_key) = symbol.routine_key.as_ref() else {
+            return false;
+        };
+        self.documents
+            .get(&candidate.uri)
+            .and_then(|document| document.routine_symbol_indices.get(routine_key))
+            .is_some_and(|indices| {
+                indices.iter().any(|index| {
+                    self.documents
+                        .get(&candidate.uri)
+                        .and_then(|document| document.symbols.get(*index))
+                        .is_some_and(|symbol| symbol.routine_directives.inline)
+                })
+            })
     }
 
     fn inline_body_references(

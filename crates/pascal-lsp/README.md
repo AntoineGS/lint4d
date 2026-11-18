@@ -111,6 +111,7 @@ name, and all ranges map back to physical include files. The codes are:
 | Warning | Hides base member | `W1009` | A redeclaration hides a base-class member. |
 | Hint | Private symbol unused | `H2219` | A private class member is declared but never used. |
 | Hint | Inline expansion unavailable | `H2443` | A proven inline call uses a source-backed unit absent from the caller's `USES` list. |
+| Hint | Unused unit | `lint4d-unused-unit` | A `uses` entry is provably removable without changing diagnostics or program side effects. |
 
 Override and interface diagnostics use the same complete source-backed ancestry,
 visibility, conditional-state, generic-substitution, cancellation, and traversal
@@ -135,6 +136,19 @@ locals and the body; dependencies appearing only in parameter or result types
 are intentionally unsupported and remain silent. Generic routines, unresolved
 or ambiguous imports, incomplete providers/bodies, and unproven body
 identifiers also remain silent.
+
+Unused-unit hints are enabled by default and use the LSP `Unnecessary` tag so
+editors can de-emphasize the removable `uses` entry. The analysis fails closed
+when bindings, compiler tables, side effects, inline dependencies, or form
+resources cannot be proven. It is controlled by `.lint4d.toml`, independently
+of dcc warning switches:
+
+```toml
+[rules]
+unused-unit = "off"
+```
+
+Set the value to `"hint"` to explicitly enable the rule.
 
 Missing-interface diagnostics are emitted for source-declared classes,
 including abstract classes, with complete source-declared interface ancestry,

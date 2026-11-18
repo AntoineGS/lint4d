@@ -1,0 +1,1 @@
+TypeProvider differs: edited only: TypeConsumer.pas E2003 Undeclared identifier: 'TThing'

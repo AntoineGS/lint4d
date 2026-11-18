@@ -1,0 +1,7 @@
+unit = "FormConsumer.pas"
+compilers = ["21.0", "24.0", "37.0"]
+unused_unit_check = ["StdCtrls"]
+unit_scopes = ["Vcl"]
+recall = false
+reason = "VCL source units are unavailable to lint4d in the fixture harness"
+expect_silent_reason = { "StdCtrls" = "DFM-only class with VCL source unavailable to lint4d" }

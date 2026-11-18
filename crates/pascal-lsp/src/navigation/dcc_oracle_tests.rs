@@ -102,8 +102,23 @@ struct Case {
     platform: Option<String>,
     requires_rtl: bool,
     recall: bool,
+    reason: Option<String>,
     recall_exempt: Vec<String>,
     silent_codes: Vec<String>,
+    unused_unit_check: Vec<String>,
+    expect_silent_reason: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UnusedUnitOutcome {
+    Identical,
+    Differs(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnusedUnitCheck {
+    unit: String,
+    outcome: UnusedUnitOutcome,
 }
 
 struct CaseInitialState {
@@ -414,6 +429,33 @@ fn load_case_from_toml(name: &str, dir: &Path, toml: &str) -> Case {
         (recall && recall_exempt.is_empty()) || reason.is_some(),
         "{name}: recall waivers require a reason"
     );
+    let unused_unit_check = value("unused_unit_check")
+        .map(|raw| parse_string_array(&raw, name, "unused_unit_check"))
+        .unwrap_or_default();
+    let mut checked_units = HashSet::new();
+    for unit in &unused_unit_check {
+        assert!(
+            checked_units.insert(canonical_name(unit)),
+            "{name}: duplicate unused_unit_check entry {unit:?}"
+        );
+    }
+    let expect_silent_reason = value("expect_silent_reason")
+        .map(|raw| parse_string_map(&raw, name, "expect_silent_reason"))
+        .unwrap_or_default();
+    assert!(
+        expect_silent_reason.is_empty() || (!recall && reason.is_some()),
+        "{name}: expect_silent_reason requires recall = false and a case reason"
+    );
+    for (unit, why) in &expect_silent_reason {
+        assert!(
+            checked_units.contains(unit),
+            "{name}: expect_silent_reason names unchecked unit {unit:?}"
+        );
+        assert!(
+            !why.trim().is_empty(),
+            "{name}: empty silence reason for {unit}"
+        );
+    }
     let compilers = value("compilers")
         .map(|raw| parse_string_array(&raw, name, "compilers"))
         .unwrap_or_else(|| vec!["37.0".to_owned()]);
@@ -428,8 +470,11 @@ fn load_case_from_toml(name: &str, dir: &Path, toml: &str) -> Case {
         platform: value("platform"),
         requires_rtl: value("requires_rtl").as_deref() == Some("true"),
         recall,
+        reason,
         recall_exempt,
         silent_codes,
+        unused_unit_check,
+        expect_silent_reason,
         name: name.to_owned(),
         dir: dir.to_path_buf(),
     }
@@ -445,6 +490,76 @@ fn parse_string_array(raw: &str, case_name: &str, key: &str) -> Vec<String> {
         .collect()
 }
 
+fn parse_string_map(raw: &str, case_name: &str, key: &str) -> BTreeMap<String, String> {
+    let inner = raw
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+        .unwrap_or_else(|| panic!("{case_name}: {key} must be an inline string map"));
+    let mut entries = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in inner.char_indices() {
+        if quoted && escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                entries.push(inner[start..index].trim());
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    assert!(!quoted, "{case_name}: unterminated string in {key}");
+    if !inner[start..].trim().is_empty() {
+        entries.push(inner[start..].trim());
+    }
+
+    let mut values = BTreeMap::new();
+    for entry in entries {
+        let (raw_unit, raw_reason) = entry
+            .split_once('=')
+            .unwrap_or_else(|| panic!("{case_name}: malformed {key} entry {entry:?}"));
+        let unit = parse_toml_string(raw_unit.trim(), case_name, key);
+        let reason = parse_toml_string(raw_reason.trim(), case_name, key);
+        assert!(
+            values.insert(canonical_name(&unit), reason).is_none(),
+            "{case_name}: duplicate {key} entry {unit:?}"
+        );
+    }
+    values
+}
+
+fn parse_toml_string(raw: &str, case_name: &str, key: &str) -> String {
+    let inner = raw
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("{case_name}: {key} keys and values must be quoted strings"));
+    let mut value = String::new();
+    let mut escaped = false;
+    for character in inner.chars() {
+        if escaped {
+            value.push(match character {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                other => other,
+            });
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else {
+            value.push(character);
+        }
+    }
+    assert!(!escaped, "{case_name}: unfinished escape in {key}");
+    value
+}
+
 fn expected_path(case_dir: &Path, version: &str) -> PathBuf {
     let name = match version {
         "37.0" => "expected.dcc".to_owned(),
@@ -452,6 +567,54 @@ fn expected_path(case_dir: &Path, version: &str) -> PathBuf {
         _ => panic!("unsupported Delphi compiler version {version:?}"),
     };
     case_dir.join(name)
+}
+
+fn parse_unused_unit_check(case: &Case, version: &str) -> Vec<UnusedUnitCheck> {
+    if case.unused_unit_check.is_empty() {
+        return Vec::new();
+    }
+    let path = case.dir.join(format!("unused_unit_check.{version}.txt"));
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "{}: no {}; run scripts/dcc-oracle-record.sh --compiler {} {}: {error}",
+            case.name,
+            path.display(),
+            version,
+            case.name,
+        )
+    });
+    let lines = text.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines.len(),
+        case.unused_unit_check.len(),
+        "{} under {version}: expected one unused-unit result per configured unit",
+        case.name
+    );
+    lines
+        .into_iter()
+        .zip(&case.unused_unit_check)
+        .map(|(line, unit)| {
+            if line == format!("{unit} identical") {
+                return UnusedUnitCheck {
+                    unit: unit.clone(),
+                    outcome: UnusedUnitOutcome::Identical,
+                };
+            }
+            let difference = line
+                .strip_prefix(&format!("{unit} differs: "))
+                .filter(|difference| !difference.trim().is_empty())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} under {version}: malformed or out-of-order unused-unit result {line:?}",
+                        case.name
+                    )
+                });
+            UnusedUnitCheck {
+                unit: unit.clone(),
+                outcome: UnusedUnitOutcome::Differs(difference.to_owned()),
+            }
+        })
+        .collect()
 }
 
 /// `File.pas(23) E2037 message` lines; `#` lines are headers.
@@ -722,9 +885,17 @@ fn actual_findings(case: &Case, version: &str) -> Vec<Finding> {
     }
     let uri = unit_uri.unwrap_or_else(|| panic!("{}: unit {} not found", case.name, case.unit));
     let source = &sources[&uri];
-    index
-        .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
-        .expect("semantic diagnostics complete")
+    let cancel = AtomicBool::new(false);
+    let report = index
+        .semantic_diagnostic_report_with_cancel(&uri, &cancel)
+        .expect("semantic diagnostics complete");
+    let form_file_bytes = std::fs::read(case.dir.join(&case.unit).with_extension("dfm")).ok();
+    let unused_unit_diagnostics = index
+        .unused_unit_diagnostics_with_report(&uri, &report, form_file_bytes.as_deref(), &cancel)
+        .expect("unused-unit diagnostics complete");
+    let mut diagnostics = report.diagnostics;
+    diagnostics.extend(unused_unit_diagnostics);
+    diagnostics
         .into_iter()
         .map(|diagnostic| Finding {
             file: case.unit.clone(),
@@ -738,6 +909,101 @@ fn actual_findings(case: &Case, version: &str) -> Vec<Finding> {
             },
         })
         .collect()
+}
+
+fn unused_unit_name(finding: &Finding) -> Option<&str> {
+    finding
+        .message
+        .strip_prefix("Unit '")?
+        .strip_suffix("' is not used")
+}
+
+fn unused_unit_parity_failures(case: &Case, version: &str, actual: &[Finding]) -> Vec<String> {
+    let checks = parse_unused_unit_check(case, version);
+    let checks_by_unit = checks
+        .iter()
+        .map(|check| (canonical_name(&check.unit), check))
+        .collect::<HashMap<_, _>>();
+    let mut findings_by_unit = HashMap::new();
+    let mut failures = Vec::new();
+
+    for finding in actual
+        .iter()
+        .filter(|finding| finding.code == "lint4d-unused-unit")
+    {
+        let Some(unit) = unused_unit_name(finding) else {
+            failures.push(format!(
+                "{} under {version}: malformed unused-unit finding: {finding:?}",
+                case.name
+            ));
+            continue;
+        };
+        let canonical = canonical_name(unit);
+        if findings_by_unit
+            .insert(canonical.clone(), finding)
+            .is_some()
+        {
+            failures.push(format!(
+                "{} under {version}: duplicate lint4d-unused-unit finding for {unit}",
+                case.name
+            ));
+        }
+        let Some(check) = checks_by_unit.get(&canonical) else {
+            failures.push(format!(
+                "{} under {version}: lint4d reported unverified unused unit {unit}; add it to unused_unit_check",
+                case.name
+            ));
+            continue;
+        };
+        if let UnusedUnitOutcome::Differs(difference) = &check.outcome {
+            failures.push(format!(
+                "{} under {version}: lint4d reported {unit}, but removing it changes dcc output ({difference})",
+                case.name
+            ));
+        }
+        if let Some(reason) = case.expect_silent_reason.get(&canonical) {
+            failures.push(format!(
+                "{} under {version}: lint4d reported {unit}, which must remain silent ({reason})",
+                case.name
+            ));
+        }
+    }
+
+    for check in &checks {
+        let canonical = canonical_name(&check.unit);
+        let reported = findings_by_unit.contains_key(&canonical);
+        match &check.outcome {
+            UnusedUnitOutcome::Identical if case.recall && !reported => failures.push(format!(
+                "{} under {version}: lint4d missed {unit}, whose removal leaves dcc output identical",
+                case.name,
+                unit = check.unit
+            )),
+            UnusedUnitOutcome::Identical if case.expect_silent_reason.contains_key(&canonical) => {
+                eprintln!(
+                    "unused-unit {} {version} {} identical; lint4d silent ({})",
+                    case.name,
+                    check.unit,
+                    case.expect_silent_reason[&canonical]
+                );
+            }
+            UnusedUnitOutcome::Identical if !case.recall => eprintln!(
+                "unused-unit {} {version} {} identical; lint4d {} (recall waived: {})",
+                case.name,
+                check.unit,
+                if reported { "reported" } else { "silent" },
+                case.reason.as_deref().unwrap_or("no reason recorded")
+            ),
+            UnusedUnitOutcome::Identical => eprintln!(
+                "unused-unit {} {version} {} identical; lint4d reported",
+                case.name, check.unit
+            ),
+            UnusedUnitOutcome::Differs(difference) => eprintln!(
+                "unused-unit {} {version} {} differs; lint4d silent ({difference})",
+                case.name, check.unit
+            ),
+        }
+    }
+    failures
 }
 
 fn summarize_code(
@@ -978,8 +1244,11 @@ fn silent_case_codes_override_matching_dcc_and_linter_findings() {
         platform: None,
         requires_rtl: false,
         recall: true,
+        reason: None,
         recall_exempt: Vec::new(),
         silent_codes: vec!["E2065".to_owned()],
+        unused_unit_check: Vec::new(),
+        expect_silent_reason: BTreeMap::new(),
     };
     let finding = Finding {
         file: case.unit.clone(),
@@ -1359,8 +1628,11 @@ fn dproj_oracle_context_uses_selected_warning_properties_and_oracle_defines() {
         platform: Some("Win32".to_owned()),
         requires_rtl: false,
         recall: true,
+        reason: None,
         recall_exempt: Vec::new(),
         silent_codes: Vec::new(),
+        unused_unit_check: Vec::new(),
+        expect_silent_reason: BTreeMap::new(),
     };
 
     let project =
@@ -1446,8 +1718,11 @@ fn dproj_oracle_cases_require_explicit_config_and_platform() {
             platform: platform.map(str::to_owned),
             requires_rtl: false,
             recall: true,
+            reason: None,
             recall_exempt: Vec::new(),
             silent_codes: Vec::new(),
+            unused_unit_check: Vec::new(),
+            expect_silent_reason: BTreeMap::new(),
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             project_context_for_case(&case, "37.0", case.config.clone(), case.platform.clone())
@@ -1573,6 +1848,129 @@ fn expected_file_names_follow_the_compiler() {
     );
 }
 
+fn normalized_dcc_messages(text: &str) -> Vec<(String, String, String)> {
+    let mut messages = text
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let (location, rest) = line.split_once(") ").expect("File(line) prefix");
+            let (file, line_no) = location.split_once('(').expect("File(line)");
+            line_no.parse::<usize>().expect("line number");
+            let (code, message) = rest.split_once(' ').expect("code and message");
+            (file.to_owned(), code.to_owned(), message.to_owned())
+        })
+        .collect::<Vec<_>>();
+    messages.sort();
+    messages
+}
+
+#[test]
+fn unused_unit_recorder_results_cover_every_configured_unit_and_compiler() {
+    let mut dirs = std::fs::read_dir(cases_root())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    dirs.sort();
+    let mut checked_cases = 0;
+
+    for dir in dirs {
+        let case = load_case(&dir);
+        if case.unused_unit_check.is_empty() {
+            continue;
+        }
+        checked_cases += 1;
+        let name = &case.name;
+
+        for version in &case.compilers {
+            let path = dir.join(format!("unused_unit_check.{version}.txt"));
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+                panic!(
+                    "{name}: no {}; run scripts/dcc-oracle-record.sh --compiler {version} {name}: {error}",
+                    path.display()
+                )
+            });
+            let lines = text.lines().collect::<Vec<_>>();
+            assert_eq!(
+                lines.len(),
+                case.unused_unit_check.len(),
+                "{name} under {version}: expected one record per configured unit"
+            );
+            for (unit, line) in case.unused_unit_check.iter().zip(lines) {
+                assert!(
+                    line == format!("{unit} identical")
+                        || line.starts_with(&format!("{unit} differs: ")),
+                    "{name} under {version}: malformed or out-of-order record {line:?}"
+                );
+            }
+
+            let expected_path = expected_path(&dir, version);
+            let expected = std::fs::read_to_string(&expected_path)
+                .unwrap_or_else(|error| panic!("{name}: {}: {error}", expected_path.display()));
+            for check in parse_unused_unit_check(&case, version) {
+                let edited_path =
+                    dir.join(format!("unused_unit_check.{version}.{}.dcc", check.unit));
+                let edited = std::fs::read_to_string(&edited_path).unwrap_or_else(|error| {
+                    panic!(
+                        "{name} under {version}: missing edited DCC output {}: {error}",
+                        edited_path.display()
+                    )
+                });
+                let removed_header = format!("# unused-unit check: removed {}", check.unit);
+                let expected_headers = expected
+                    .lines()
+                    .filter(|line| line.starts_with('#'))
+                    .collect::<Vec<_>>();
+                let edited_headers = edited
+                    .lines()
+                    .filter(|line| line.starts_with('#'))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    expected_headers.len(),
+                    2,
+                    "{} under {version}: malformed expected DCC headers",
+                    expected_path.display()
+                );
+                assert_eq!(
+                    edited_headers,
+                    [
+                        expected_headers[0],
+                        expected_headers[1],
+                        removed_header.as_str()
+                    ],
+                    "{} under {version}: {} headers differ from expected DCC output or omit the removed unit",
+                    name,
+                    edited_path.display()
+                );
+                let identical =
+                    normalized_dcc_messages(&expected) == normalized_dcc_messages(&edited);
+                assert_eq!(
+                    matches!(check.outcome, UnusedUnitOutcome::Identical),
+                    identical,
+                    "{} under {version}: {} verdict disagrees with {}",
+                    name,
+                    path.display(),
+                    edited_path.display()
+                );
+            }
+        }
+    }
+    assert!(checked_cases > 0, "no unused-unit DCC oracle cases");
+}
+
+#[test]
+fn dcc_verified_unused_unit_fixture_reports_the_proven_unused_entry() {
+    let case = load_case(&cases_root().join("unused_unit_truly_unused"));
+    let actual = actual_findings(&case, "37.0");
+    let unused = actual
+        .iter()
+        .filter(|finding| finding.code == "lint4d-unused-unit")
+        .map(|finding| finding.message.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(unused, ["Unit 'TrulyUnused' is not used"]);
+}
+
 #[test]
 fn summary_formats_synthetic_findings_and_waivers_per_code() {
     let expected = vec![
@@ -1675,10 +2073,9 @@ fn dcc_oracle_cases_match_recorded_dcc_output() {
                 .into_iter()
                 .filter(|finding| enabled(finding) && finding.file.eq_ignore_ascii_case(&case.unit))
                 .collect::<Vec<_>>();
-            let actual = actual_findings(&case, version)
-                .into_iter()
-                .filter(enabled)
-                .collect::<Vec<_>>();
+            let actual_all = actual_findings(&case, version);
+            failures.extend(unused_unit_parity_failures(&case, version, &actual_all));
+            let actual = actual_all.into_iter().filter(enabled).collect::<Vec<_>>();
             let recall_enforced =
                 case.recall && (!case.requires_rtl || rtl_root(version).is_some());
             for code in ENABLED_CODES {

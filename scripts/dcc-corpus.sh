@@ -15,13 +15,29 @@ python_bin="${PYTHON:-python3}"
 requested_names=()
 lsp_binary=""
 run_compare=0
+run_unused_unit_verification=0
 status=0
 selected_count=0
 dcc_runs=0
+unused_unit_findings=0
+unused_unit_verified=0
+unused_unit_false_positives=0
+unused_unit_unverified=0
 skipped_projects=()
+temporary_directories=()
+
+# Invoked through EXIT trap.
+# shellcheck disable=SC2329
+cleanup_temporary_directories() {
+  local temporary_directory
+  for temporary_directory in "${temporary_directories[@]}"; do
+    [[ -n $temporary_directory ]] && rm -rf -- "$temporary_directory"
+  done
+}
+trap cleanup_temporary_directories EXIT
 
 usage() {
-  printf 'Usage: %s [--lsp <pascal-lsp-binary>] [--lsp-timeout-secs N] [--compare] [name ...]\n' \
+  printf 'Usage: %s [--lsp <pascal-lsp-binary>] [--lsp-timeout-secs N] [--compare] [--verify-unused-units] [name ...]\n' \
     "${BASH_SOURCE[0]}"
 }
 
@@ -39,6 +55,10 @@ while (($#)); do
       ;;
     --compare)
       run_compare=1
+      shift
+      ;;
+    --verify-unused-units)
+      run_unused_unit_verification=1
       shift
       ;;
     --lsp-timeout-secs)
@@ -74,6 +94,10 @@ if [[ -n $lsp_binary ]]; then
     lsp_binary="$PWD/$lsp_binary"
   fi
   [[ -x $lsp_binary ]] || { echo "pascal-lsp binary is not executable: $lsp_binary" >&2; exit 2; }
+fi
+if ((run_unused_unit_verification)) && [[ -z $lsp_binary ]]; then
+  echo "--verify-unused-units requires --lsp <pascal-lsp-binary>" >&2
+  exit 2
 fi
 
 canonical_path() {
@@ -263,6 +287,228 @@ if isinstance(value, str):
 PY
 }
 
+# The single-quoted format strings intentionally render Markdown code spans.
+# shellcheck disable=SC2016
+verify_unused_unit_findings() {
+  local project_out=$1
+  local project_name=$2
+  local project_root verification_report verification_tmp findings_file
+  local finding_file finding_line unit overlay_dir edited_source output_dir
+  local edited_raw edited_status edited_banner edited_error_count
+  local sentinel comparison_raw
+  local overlay_wine output_wine argument verify_source verify_source_wine
+  local comparison file_name
+  local verified_count=0 false_positive_count=0 unverified_count=0 finding_count=0
+  local unit_path_added
+  local -a unused_findings=()
+  local -a verify_dcc_args=()
+  local index
+
+  verification_report="$project_out/unused-unit-verification.md"
+  verification_tmp="$(mktemp -d "$tmp_parent/dcc-corpus-unused-unit.XXXXXXXX")"
+  verification_tmp="$(canonical_path "$verification_tmp")"
+  temporary_directories+=("$verification_tmp")
+  if ! assert_outside_corpus_roots "$verification_tmp"; then
+    echo "$project_name: unsafe temporary path for unused-unit verification" >&2
+    return 1
+  fi
+  findings_file="$verification_tmp/findings.bin"
+  if ! "$python_bin" "$root/scripts/dcc-corpus-unused-unit.py" findings \
+    "$project_out/lsp.txt" "$command_json" >"$findings_file"; then
+    printf '## Unused-unit DCC verification\n\nVerification failed while reading LSP findings.\n' \
+      >"$verification_report"
+    echo "$project_name: could not read unused-unit findings" >&2
+    return 1
+  fi
+  mapfile -d '' -t unused_findings <"$findings_file"
+  if ((${#unused_findings[@]} % 3 != 0)); then
+    printf '## Unused-unit DCC verification\n\nVerification failed: malformed finding records.\n' \
+      >"$verification_report"
+    echo "$project_name: malformed unused-unit finding records" >&2
+    return 1
+  fi
+  project_root="$(read_meta_field "$command_json" project_root)"
+  if [[ -z $project_root ]]; then
+    printf '## Unused-unit DCC verification\n\nVerification failed: project root is missing.\n' \
+      >"$verification_report"
+    echo "$project_name: project root missing from command JSON" >&2
+    return 1
+  fi
+
+  {
+    printf '## Unused-unit DCC verification\n\n'
+    if ((${#unused_findings[@]} == 0)); then
+      printf 'No lint4d-unused-unit findings on project files.\n'
+    fi
+  } >"$verification_report"
+
+  for ((index = 0; index < ${#unused_findings[@]}; index += 3)); do
+    finding_file=${unused_findings[index]}
+    finding_line=${unused_findings[index + 1]}
+    unit=${unused_findings[index + 2]}
+    finding_count=$((finding_count + 1))
+    unused_unit_findings=$((unused_unit_findings + 1))
+    file_name="$(basename -- "$finding_file")"
+
+    if [[ ! -f $finding_file ]]; then
+      printf -- '- `%s:%s` (`%s`): verification failed: source file is unavailable.\n' \
+        "$file_name" "$finding_line" "$unit" >>"$verification_report"
+      echo "$project_name: unused-unit source is unavailable: $file_name" >&2
+      status=1
+      continue
+    fi
+
+    overlay_dir="$verification_tmp/overlay-$finding_count"
+    output_dir="$verification_tmp/output-$finding_count"
+    edited_source="$overlay_dir/$(basename -- "$finding_file")"
+    mkdir -p -- "$overlay_dir" "$output_dir"
+    if ! "$python_bin" "$root/scripts/dcc-oracle-remove-unit.py" --unit "$unit" \
+      <"$finding_file" >"$edited_source"; then
+      printf -- '- `%s:%s` (`%s`): verification failed: quick-fix edit was unsafe.\n' \
+        "$file_name" "$finding_line" "$unit" >>"$verification_report"
+      echo "$project_name: could not safely remove $unit from $file_name" >&2
+      status=1
+      continue
+    fi
+    if ! sentinel=$("$python_bin" "$root/scripts/dcc-corpus-unused-unit.py" \
+      instrument-overlay "$edited_source"); then
+      printf -- '- `%s:%s` (`%s`): verification failed: could not instrument overlay source.\n' \
+        "$file_name" "$finding_line" "$unit" >>"$verification_report"
+      echo "$project_name: could not instrument overlay source for $file_name" >&2
+      status=1
+      continue
+    fi
+
+    overlay_wine="$(linux_to_wine "$overlay_dir")"
+    output_wine="$(linux_to_wine "$output_dir")"
+    verify_dcc_args=()
+    unit_path_added=0
+    for argument in "${dcc_args[@]}"; do
+      case $argument in
+        -U*)
+          verify_dcc_args+=("-U$overlay_wine;${argument#-U}")
+          unit_path_added=1
+          ;;
+        -N0*)
+          verify_dcc_args+=("-N0$output_wine")
+          ;;
+        -E*)
+          verify_dcc_args+=("-E$output_wine")
+          ;;
+        -LE*)
+          verify_dcc_args+=("-LE$output_wine")
+          ;;
+        -LN*)
+          verify_dcc_args+=("-LN$output_wine")
+          ;;
+        -NU*)
+          verify_dcc_args+=("-NU$output_wine")
+          ;;
+        -NO*)
+          verify_dcc_args+=("-NO$output_wine")
+          ;;
+        *)
+          verify_dcc_args+=("$argument")
+          ;;
+      esac
+    done
+    if ((unit_path_added == 0)); then
+      verify_dcc_args+=("-U$overlay_wine")
+    fi
+
+    verify_source=$main_source
+    if [[ $(canonical_path "$finding_file") == "$(canonical_path "$main_source")" ]]; then
+      verify_source=$edited_source
+    else
+      verify_source="$overlay_dir/$(basename -- "$main_source")"
+      if ! "$python_bin" "$root/scripts/dcc-corpus-unused-unit.py" overlay-main \
+        "$main_source" "$finding_file" "$(linux_to_wine "$edited_source")" \
+        "$verify_source"; then
+        printf -- '- `%s:%s` (`%s`): verification failed: could not prepare overlay main source.\n' \
+          "$file_name" "$finding_line" "$unit" >>"$verification_report"
+        echo "$project_name: could not prepare overlay main source for $file_name" >&2
+        status=1
+        continue
+      fi
+    fi
+    verify_source_wine="$(linux_to_wine "$verify_source")"
+    if edited_raw=$(
+      cd "$source_dir"
+      WINEPREFIX="$prefix" WINEDEBUG=-all timeout "$timeout_seconds" \
+        wine "$dcc" "${verify_dcc_args[@]}" "$verify_source_wine" 2>&1 | tr -d '\r'
+    ); then
+      edited_status=0
+    else
+      edited_status=$?
+    fi
+    printf '%s\n' "$edited_raw" >"$verification_tmp/edited-$finding_count.raw"
+    edited_banner="$(grep -m1 '^Embarcadero Delphi' <<<"$edited_raw" || true)"
+    edited_error_count="$(grep -Eic 'Error: [EF][0-9]{4}([[:space:]]|$)|Fatal:' \
+      <<<"$edited_raw" || true)"
+    if [[ $edited_status -eq 124 || $edited_status -eq 137 || $edited_status -gt 1 || \
+      -z $edited_banner || $edited_banner != *"compiler version $compiler"* ]] || \
+      grep -q '^Fatal:' <<<"$edited_raw" || \
+      grep -qE '(Fatal|Error): F[0-9]{4}' <<<"$edited_raw" || \
+      [[ $edited_status -eq 1 && $edited_error_count -eq 0 ]]; then
+      printf -- '- `%s:%s` (`%s`): verification failed: edited DCC run was invalid.\n' \
+        "$file_name" "$finding_line" "$unit" >>"$verification_report"
+      echo "$project_name: edited DCC run failed for $file_name (exit $edited_status)" >&2
+      status=1
+      continue
+    fi
+
+    comparison_raw="$verification_tmp/compared-$finding_count.raw"
+    if ! "$python_bin" "$root/scripts/dcc-corpus-unused-unit.py" strip-sentinel \
+      "$verification_tmp/edited-$finding_count.raw" "$comparison_raw" \
+      "$edited_source" "$sentinel"; then
+      printf -- '- `%s:%s` (`%s`): unverified: overlay not proven compiled.\n' \
+        "$file_name" "$finding_line" "$unit" >>"$verification_report"
+      echo "$project_name: overlay not proven compiled for $file_name" >&2
+      unverified_count=$((unverified_count + 1))
+      unused_unit_unverified=$((unused_unit_unverified + 1))
+      status=1
+      continue
+    fi
+
+    if ! comparison=$("$python_bin" "$root/scripts/dcc-corpus-unused-unit.py" compare \
+      "$project_out/dcc.raw" "$comparison_raw" \
+      "$project_root" "$edited_source" "$finding_file" \
+      "$verify_source" "$main_source"); then
+      printf -- '- `%s:%s` (`%s`): verification failed: could not compare DCC output.\n' \
+        "$file_name" "$finding_line" "$unit" >>"$verification_report"
+      echo "$project_name: DCC comparison failed for $file_name" >&2
+      status=1
+      continue
+    fi
+
+    if [[ $comparison == identical ]]; then
+      printf -- '- `%s:%s` (`%s`): verified\n' \
+        "$file_name" "$finding_line" "$unit" >>"$verification_report"
+      verified_count=$((verified_count + 1))
+      unused_unit_verified=$((unused_unit_verified + 1))
+    elif [[ $comparison == differs:* ]]; then
+      printf -- '- `%s:%s` (`%s`): false-positive: %s\n' \
+        "$file_name" "$finding_line" "$unit" "${comparison#differs: }" \
+        >>"$verification_report"
+      false_positive_count=$((false_positive_count + 1))
+      unused_unit_false_positives=$((unused_unit_false_positives + 1))
+      status=1
+    else
+      printf -- '- `%s:%s` (`%s`): verification failed: invalid comparison result.\n' \
+        "$file_name" "$finding_line" "$unit" >>"$verification_report"
+      echo "$project_name: invalid DCC comparison result for $file_name" >&2
+      status=1
+    fi
+  done
+
+  printf '\nTotals: %s finding(s), %s verified, %s false positive(s), %s unverified.\n' \
+    "$finding_count" "$verified_count" "$false_positive_count" "$unverified_count" \
+    >>"$verification_report"
+  printf '%s: unused-unit verification: %s finding(s), %s verified, %s false positive(s), %s unverified\n' \
+    "$project_name" "$finding_count" "$verified_count" "$false_positive_count" \
+    "$unverified_count"
+}
+
 while IFS= read -r record; do
   [[ -n $record ]] || continue
   name="$(cut -f1 <<<"$record")"
@@ -290,9 +536,13 @@ while IFS= read -r record; do
   mkdir -p "$project_out"
   for output_file in command.json dcc.raw dcc.status dcc.validation lsp.txt \
     lsp.meta.json lsp.status lsp.validation lsp-init-options.json \
-    lsp-driver.log report.md compare.log; do
+    lsp-driver.log report.md compare.log unused-unit-verification.md; do
     assert_outside_corpus_roots "$project_out/$output_file" || exit 2
   done
+  if ((run_unused_unit_verification)); then
+    printf '## Unused-unit DCC verification\n\nskipped: verification did not run\n' \
+      >"$project_out/unused-unit-verification.md"
+  fi
   command_json="$project_out/command.json"
   command_args=("$dproj")
   [[ -n $config ]] && command_args+=(--config "$config")
@@ -446,6 +696,10 @@ PY
     "$project_out/dcc.raw" || true)"
   if [[ $dcc_error_count -gt 0 || $dcc_exit -ne 0 ]]; then
     printf 'excluded: dcc errors (%s)\n' "$dcc_error_count" >"$project_out/dcc.validation"
+    if ((run_unused_unit_verification)); then
+      printf '## Unused-unit DCC verification\n\nskipped: original dcc run failed\n' \
+        >"$project_out/unused-unit-verification.md"
+    fi
     echo "$name: excluded: dcc errors ($dcc_error_count), exit $dcc_exit"
     rm -f -- "$project_out/lsp.txt" "$project_out/lsp.meta.json" \
       "$project_out/lsp.status" "$project_out/lsp.validation" \
@@ -483,7 +737,8 @@ PY
   if [[ -n $lsp_binary ]]; then
     echo "$name: collecting pascal-lsp diagnostics"
     rm -f -- "$project_out/lsp.txt" "$project_out/lsp.meta.json" \
-      "$project_out/lsp.status" "$project_out/lsp.validation" "$project_out/report.md"
+      "$project_out/lsp.status" "$project_out/lsp.validation" \
+      "$project_out/report.md" "$project_out/unused-unit-verification.md"
     if (
       cd "$root"
       "$cargo_bin" run -q -p pascal-lsp --example lsp_corpus_diagnostics -- \
@@ -516,6 +771,23 @@ PY
       printf 'failed: diagnostics driver exited %s\n' "$lsp_exit" >"$project_out/lsp.validation"
       rm -f -- "$project_out/lsp.txt" "$project_out/lsp.meta.json" "$project_out/report.md"
       echo "$name: LSP diagnostics driver failed (exit $lsp_exit)" >&2
+      status=1
+    fi
+  fi
+
+  if ((run_unused_unit_verification)); then
+    lsp_validation=""
+    if [[ -f $project_out/lsp.validation ]]; then
+      lsp_validation=$(<"$project_out/lsp.validation")
+    fi
+    if [[ $lsp_validation == valid && -f $project_out/lsp.txt ]]; then
+      if ! verify_unused_unit_findings "$project_out" "$name"; then
+        status=1
+      fi
+    else
+      printf '## Unused-unit DCC verification\n\nVerification unavailable: LSP diagnostics are not valid.\n' \
+        >"$project_out/unused-unit-verification.md"
+      echo "$name: unused-unit verification unavailable (LSP diagnostics are not valid)" >&2
       status=1
     fi
   fi
@@ -576,6 +848,14 @@ PY
       status=1
     fi
   fi
+
+  if ((run_unused_unit_verification)); then
+    if [[ ! -f $project_out/report.md ]]; then
+      printf '# Unused-unit verification\n\n' >"$project_out/report.md"
+    fi
+    printf '\n' >>"$project_out/report.md"
+    cat "$project_out/unused-unit-verification.md" >>"$project_out/report.md"
+  fi
 done <<<"$records"
 
 if [[ $selected_count -eq 0 ]]; then
@@ -583,6 +863,11 @@ if [[ $selected_count -eq 0 ]]; then
   exit 2
 fi
 printf 'summary: %s selected project(s), %s dcc run(s)\n' "$selected_count" "$dcc_runs"
+if ((run_unused_unit_verification)); then
+  printf 'unused-unit verification: %s finding(s), %s verified, %s false positive(s), %s unverified\n' \
+    "$unused_unit_findings" "$unused_unit_verified" "$unused_unit_false_positives" \
+    "$unused_unit_unverified"
+fi
 if ((${#skipped_projects[@]})); then
   printf 'skipped projects: %s\n' "${skipped_projects[*]}"
 fi

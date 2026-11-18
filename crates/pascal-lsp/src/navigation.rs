@@ -100,6 +100,7 @@ pub(crate) use dcc_message::{DccMessage, DccSeverity};
 mod documentation;
 mod facts;
 mod folding;
+mod form_file;
 mod hint_directives;
 #[cfg(test)]
 mod index_characterization;
@@ -120,6 +121,7 @@ pub(crate) use symbols::{
     WorkspaceSymbolList, lsp_kind_for_shape, too_many_workspace_symbols, workspace_symbol_cap,
 };
 mod type_hierarchy;
+mod unit_facts;
 mod warning_switches;
 #[cfg(test)]
 pub(crate) use assistance::CompletionResolutionSeed;

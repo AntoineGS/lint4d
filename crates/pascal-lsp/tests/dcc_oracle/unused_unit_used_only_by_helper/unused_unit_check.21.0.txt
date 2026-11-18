@@ -1,0 +1,1 @@
+HelperUnit differs: edited only: HelperConsumer.pas E2003 Undeclared identifier: 'Touch'

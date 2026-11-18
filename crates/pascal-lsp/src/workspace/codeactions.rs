@@ -7673,6 +7673,66 @@ mod tests {
     }
 
     #[test]
+    fn dcc_oracle_editor_matches_the_unused_unit_quick_fix() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/dcc-oracle-remove-unit.py");
+        let cases = [
+            (
+                "unit Main;\ninterface\nuses UnusedFirst, Keep;\nimplementation\nend.\n",
+                "UnusedFirst",
+            ),
+            (
+                "unit Main;\ninterface\nuses KeepA,\n  // Keep this explanation with the following entry.\n  UnusedMiddle,\n  KeepB;\nimplementation\nend.\n",
+                "UnusedMiddle",
+            ),
+            (
+                "unit Main;\ninterface\nuses UnusedPath in 'UnusedPath.pas', Keep;\nimplementation\nend.\n",
+                "UnusedPath",
+            ),
+            (
+                "unit Main;\ninterface\nuses UnusedOnly;\nimplementation\nend.\n",
+                "UnusedOnly",
+            ),
+        ];
+
+        for (source, unit_name) in cases {
+            let quick_fix = removed_unused_unit(source, unit_name)
+                .unwrap_or_else(|| panic!("quick fix could not remove {unit_name}"));
+            let mut child = Command::new("python3")
+                .arg(&helper)
+                .arg("--unit")
+                .arg(unit_name)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("start dcc-oracle editor");
+            child
+                .stdin
+                .take()
+                .expect("editor stdin")
+                .write_all(source.as_bytes())
+                .expect("write source to editor");
+            let output = child
+                .wait_with_output()
+                .expect("wait for dcc-oracle editor");
+            assert!(
+                output.status.success(),
+                "editor failed for {unit_name}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8(output.stdout).expect("editor output is UTF-8"),
+                quick_fix,
+                "dcc-oracle edit differs from quick fix for {unit_name}"
+            );
+        }
+    }
+
+    #[test]
     fn add_missing_unit_matches_an_e2003_diagnostic() {
         let anchor = Range::new(Position::new(3, 2), Position::new(3, 13));
         let diagnostic = Diagnostic::new(

@@ -59,6 +59,23 @@ missing because Wine would otherwise create an empty one. Never hand-edit an
 `expected*.dcc` file: it is the compiler's recording, not a hand-authored
 expectation.
 
+Cases may set `unit_scopes = ["Vcl"]` to add compiler unit scopes alongside
+`System` on 24.0 and 37.0; 21.0 keeps its unscoped VCL unit names.
+
+Unused-unit fixtures set `unused_unit_check = ["UnitName", ...]`. For each
+listed unit, the recorder compiles the original case and a temporary full copy
+with that entry removed using the same conservative edit policy as the quick
+fix. It compares the sorted multiset of `<file> <code> <message>` diagnostics,
+ignoring shifted line numbers, and writes one result per unit to
+`unused_unit_check.<version>.txt`: `<UnitName> identical` or
+`<UnitName> differs: <first difference>`. Do not hand-edit these files. The
+oracle harness requires a result for every configured unit and compiler,
+rejects any lint4d finding when removal changes compiler output, and requires
+an unused-unit finding for identical output unless recall is waived with a
+reason. An `expect_silent_reason` inline table names units that must remain
+silent despite identical compiler output, such as units with initialization
+side effects; these still require `recall = false` and a case-level `reason`.
+
 Usage output from dcc32 21.0, 24.0, and 37.0 (run with no arguments) reports
 `-W[+|-|^][warn_id]`; all three versions accept `-W-<ID>`, `-W+<ID>`, and
 `-W^<ID>` for a warning property. The same usage output lists `-H` as the hint

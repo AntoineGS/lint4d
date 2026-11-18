@@ -221,6 +221,10 @@ impl NavigationIndex {
             let unit_name = canonical_name(&import.name);
             if unit_name.is_empty()
                 || used_units.contains(&unit_name)
+                || report.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.span.start < import.span.end
+                        && import.span.start < diagnostic.span.end
+                })
                 || import_is_project_path(uri, document, import)
                 || import_is_duplicated(document, &unit_name)
                 || import_is_in_conditional_uses_clause(document, import.span, cancel, budget)?
@@ -943,6 +947,43 @@ mod tests {
             assert!(
                 unused_diagnostics(&index, &uri, None).is_empty(),
                 "side-effect source: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn dcc_unit_warning_at_a_uses_entry_blocks_an_unused_unit_hint() {
+        for (directive, code) in [
+            ("library", "W1004"),
+            ("platform", "W1005"),
+            ("deprecated 'use another unit instead'", "W1006"),
+            ("experimental", "W1007"),
+        ] {
+            let provider = format!("unit U {directive}; interface implementation end.");
+            let (index, uri) = index_with_sources(
+                &[("U", provider.as_str())],
+                "D",
+                "unit D; interface uses U; implementation end.",
+            );
+            let cancel = AtomicBool::new(false);
+            let report = index
+                .semantic_diagnostic_report_with_cancel(&uri, &cancel)
+                .unwrap();
+            assert!(
+                report
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.kind.code() == code),
+                "unit declaration should produce {code}: {:?}",
+                report.diagnostics
+            );
+
+            let unused = index
+                .unused_unit_diagnostics_with_report(&uri, &report, None, &cancel)
+                .unwrap();
+            assert!(
+                unused.is_empty(),
+                "removing the entry would remove {code}: {unused:?}"
             );
         }
     }

@@ -88,11 +88,214 @@ case_includes_compiler() {
   [[ ",$compilers," == *",$compiler,"* ]]
 }
 
+unused_units=()
+unit_scopes=()
+read_unused_unit_check() {
+  local case_file=$1
+  local -a lines=()
+  local -a entries=()
+  mapfile -t lines < <(grep -E '^[[:space:]]*unused_unit_check[[:space:]]*=' "$case_file" || true)
+  unused_units=()
+  if ((${#lines[@]} == 0)); then
+    return 0
+  fi
+  if ((${#lines[@]} != 1)) || \
+    [[ ! ${lines[0]} =~ ^[[:space:]]*unused_unit_check[[:space:]]*=[[:space:]]*\[(.*)\][[:space:]]*$ ]]; then
+    echo "$case_file: malformed unused_unit_check array" >&2
+    return 1
+  fi
+  local values=${BASH_REMATCH[1]}
+  [[ -n ${values//[[:space:]]/} ]] || {
+    echo "$case_file: unused_unit_check must not be empty" >&2
+    return 1
+  }
+  local value unit existing
+  IFS=',' read -r -a entries <<< "$values"
+  for value in "${entries[@]}"; do
+    value=${value//[[:space:]]/}
+    if [[ ! $value =~ ^\"([A-Za-z_][A-Za-z0-9_.]*)\"$ ]]; then
+      echo "$case_file: invalid unused_unit_check entry: $value" >&2
+      return 1
+    fi
+    unit=${BASH_REMATCH[1]}
+    for existing in "${unused_units[@]}"; do
+      if [[ ${existing,,} == "${unit,,}" ]]; then
+        echo "$case_file: duplicate unused_unit_check entry: $unit" >&2
+        return 1
+      fi
+    done
+    unused_units+=("$unit")
+  done
+}
+
+read_unit_scopes() {
+  local case_file=$1
+  local -a lines=()
+  local -a entries=()
+  unit_scopes=()
+  mapfile -t lines < <(grep -E '^[[:space:]]*unit_scopes[[:space:]]*=' "$case_file" || true)
+  if ((${#lines[@]} == 0)); then
+    return 0
+  fi
+  if ((${#lines[@]} != 1)) || \
+    [[ ! ${lines[0]} =~ ^[[:space:]]*unit_scopes[[:space:]]*=[[:space:]]*\[(.*)\][[:space:]]*$ ]]; then
+    echo "$case_file: malformed unit_scopes array" >&2
+    return 1
+  fi
+  local values=${BASH_REMATCH[1]}
+  [[ -n ${values//[[:space:]]/} ]] || {
+    echo "$case_file: unit_scopes must not be empty" >&2
+    return 1
+  }
+  local value scope existing
+  IFS=',' read -r -a entries <<< "$values"
+  for value in "${entries[@]}"; do
+    value=${value//[[:space:]]/}
+    if [[ ! $value =~ ^\"([A-Za-z_][A-Za-z0-9_]*)\"$ ]]; then
+      echo "$case_file: invalid unit_scopes entry: $value" >&2
+      return 1
+    fi
+    scope=${BASH_REMATCH[1]}
+    for existing in "${unit_scopes[@]}"; do
+      if [[ ${existing,,} == "${scope,,}" ]]; then
+        echo "$case_file: duplicate unit_scopes entry: $scope" >&2
+        return 1
+      fi
+    done
+    unit_scopes+=("$scope")
+  done
+}
+
+compile_dcc() {
+  local work_dir=$1
+  local source_unit=$2
+  local out_dir=$3
+  local -a args=(-B -H+ -W+ -Q "-U$lib")
+  args+=("${project_switch_flags[@]}")
+  if [[ $use_unit_scopes == true ]]; then
+    args+=(-NSSystem)
+    for scope in "${unit_scopes[@]}"; do args+=("-NS$scope"); done
+  fi
+  args+=(-N0"$(winpath "$out_dir")" -E"$(winpath "$out_dir")" "$source_unit")
+  (
+    cd "$work_dir"
+    WINEPREFIX="$prefix" WINEDEBUG=-all timeout 300 wine "$dcc" "${args[@]}" 2>&1
+  ) | tr -d '\r'
+}
+
+validate_dcc_output() {
+  local name=$1 raw=$2 compiler_status=$3
+  local version
+  case "$compiler_status" in
+    0|1) ;;
+    124|137)
+      echo "$name: dcc timed out (exit $compiler_status), nothing recorded:" >&2
+      printf '%s\n' "$raw" >&2
+      return 1
+      ;;
+    *)
+      echo "$name: dcc invocation failed (exit $compiler_status), nothing recorded:" >&2
+      printf '%s\n' "$raw" >&2
+      return 1
+      ;;
+  esac
+  version=$(grep -m1 '^Embarcadero Delphi' <<<"$raw" || true)
+  if [[ -z $version || $version != *"compiler version $compiler"* ]] || \
+    grep -qE '(Fatal|Error): F[0-9]{4}' <<<"$raw"; then
+    echo "$name: dcc did not run cleanly as Delphi $compiler, nothing recorded:" >&2
+    printf '%s\n' "$raw" >&2
+    return 1
+  fi
+  if [[ $compiler_status -eq 1 ]] && ! grep -qE 'Error: E[0-9]{4} ' <<<"$raw"; then
+    echo "$name: dcc exited 1 without a compiler error, nothing recorded:" >&2
+    printf '%s\n' "$raw" >&2
+    return 1
+  fi
+}
+
+normalize_dcc_messages() {
+  local raw=$1
+  local messages
+  messages=$(grep -E '^[^ ].*\([0-9]+\) (Error|Warning|Hint): [EWH][0-9]{4} ' <<<"$raw" || true)
+  [[ -n $messages ]] || return 0
+  sed -E 's/^(.*[\\/])?([^\\/(]+)\([0-9]+\) (Error|Warning|Hint): /\2 /' <<<"$messages"
+}
+
+first_message_difference() {
+  local original=$1 edited=$2 difference
+  difference=$(diff -u "$original" "$edited" \
+    | awk '
+      /^-[^-]/ { print "original only: " substr($0, 2); exit }
+      /^\+[^+]/ { print "edited only: " substr($0, 2); exit }
+    ' || true)
+  printf '%s' "${difference:-diagnostic multiset changed}"
+}
+
+record_unused_unit_checks() {
+  local name=$1 dir=$2 unit=$3 original_raw=$4 record tmp tmp_base check_unit
+  local record_tmp
+  ((${#unused_units[@]})) || return 0
+  record="$dir/unused_unit_check.$compiler.txt"
+  tmp_base="${TMPDIR:-/tmp/opencode}"
+  mkdir -p "$tmp_base"
+  tmp=$(mktemp -d "$tmp_base/dcc-oracle-unused.XXXXXX")
+  mkdir -p "$tmp/original" "$tmp/edited"
+  normalize_dcc_messages "$original_raw" | LC_ALL=C sort > "$tmp/original.txt"
+  record_tmp="$tmp/record.txt"
+  : > "$record_tmp"
+  for check_unit in "${unused_units[@]}"; do
+    local case_copy="$tmp/edited/$check_unit"
+    local output_dir="$tmp/output-$check_unit"
+    mkdir -p "$case_copy" "$output_dir"
+    if ! cp -a "$dir/." "$case_copy/"; then
+      echo "$name: could not copy fixture for unused-unit check $check_unit" >&2
+      rm -rf "$tmp"
+      return 1
+    fi
+    local source="$case_copy/$unit"
+    if [[ ! -f $source ]]; then
+      echo "$name: checked unit source not found for unused-unit check $check_unit: $source" >&2
+      rm -rf "$tmp"
+      return 1
+    fi
+    if ! python3 "$root/scripts/dcc-oracle-remove-unit.py" --unit "$check_unit" \
+      < "$source" > "$source.edited"; then
+      echo "$name: could not remove $check_unit from $unit" >&2
+      rm -rf "$tmp"
+      return 1
+    fi
+    mv "$source.edited" "$source"
+
+    local edited_raw edited_status
+    if edited_raw=$(compile_dcc "$case_copy" "$unit" "$output_dir"); then
+      edited_status=0
+    else
+      edited_status=$?
+    fi
+    if ! validate_dcc_output "$name without $check_unit" "$edited_raw" "$edited_status"; then
+      rm -rf "$tmp"
+      return 1
+    fi
+    normalize_dcc_messages "$edited_raw" | LC_ALL=C sort > "$tmp/edited.txt"
+    if cmp -s "$tmp/original.txt" "$tmp/edited.txt"; then
+      printf '%s identical\n' "$check_unit" >> "$record_tmp"
+    else
+      local difference
+      difference=$(first_message_difference "$tmp/original.txt" "$tmp/edited.txt")
+      printf '%s differs: %s\n' "$check_unit" "$difference" >> "$record_tmp"
+    fi
+  done
+  mv "$record_tmp" "$record"
+  rm -rf "$tmp"
+  echo "$name: recorded unused-unit checks for Delphi $compiler"
+}
+
 status=0
 for name in "${cases[@]}"; do
   dir="$cases_dir/$name"
   unit=$(sed -nE 's/^unit *= *"([^"]+)".*/\1/p' "$dir/case.toml")
   if [[ -z $unit ]]; then echo "$name: case.toml has no unit" >&2; status=1; continue; fi
+  if ! read_unused_unit_check "$dir/case.toml"; then status=1; continue; fi
   if case_includes_compiler "$dir/case.toml"; then
     :
   else
@@ -101,6 +304,7 @@ for name in "${cases[@]}"; do
     echo "$name: skipped (not configured for $compiler)"
     continue
   fi
+  if ! read_unit_scopes "$dir/case.toml"; then status=1; continue; fi
   mapfile -d '' -t dproj_files < <(find "$dir" -mindepth 1 -maxdepth 1 -type f -iname '*.dproj' -print0)
   if ((${#dproj_files[@]} > 1)); then
     echo "$name: expected at most one .dproj, found ${#dproj_files[@]}" >&2
@@ -135,52 +339,25 @@ for name in "${cases[@]}"; do
   output="$dir/expected.dcc"
   if [[ $compiler != 37.0 ]]; then output="$dir/expected.$compiler.dcc"; fi
   out=$(mktemp -d)
-  dcc_args=(-B -H+ -W+ -Q "-U$lib")
-  dcc_args+=("${project_switch_flags[@]}")
-  if [[ $use_unit_scopes == true ]]; then dcc_args+=(-NSSystem); fi
-  dcc_args+=(-N0"$(winpath "$out")" -E"$(winpath "$out")" "$unit")
-  if raw=$(cd "$dir" && WINEPREFIX="$prefix" WINEDEBUG=-all timeout 300 \
-    wine "$dcc" "${dcc_args[@]}" 2>&1 | tr -d '\r'); then
+  if raw=$(compile_dcc "$dir" "$unit" "$out"); then
     compiler_status=0
   else
-    # With pipefail, command substitution preserves dcc's 0/1 exit status.
     compiler_status=$?
   fi
   rm -rf "$out"
-  case "$compiler_status" in
-    0|1) ;;
-    124|137)
-      echo "$name: dcc timed out (exit $compiler_status), nothing recorded:" >&2
-      printf '%s\n' "$raw" >&2
-      status=1
-      continue
-      ;;
-    *)
-      echo "$name: dcc invocation failed (exit $compiler_status), nothing recorded:" >&2
-      printf '%s\n' "$raw" >&2
-      status=1
-      continue
-      ;;
-  esac
-  version=$(grep -m1 '^Embarcadero Delphi' <<<"$raw" || true)
-  if [[ -z $version || $version != *"compiler version $compiler"* ]] || \
-    grep -qE '(Fatal|Error): F[0-9]{4}' <<<"$raw"; then
-    echo "$name: dcc did not run cleanly as Delphi $compiler, nothing recorded:" >&2
-    printf '%s\n' "$raw" >&2
+  if ! validate_dcc_output "$name" "$raw" "$compiler_status"; then
     status=1
     continue
   fi
-  if [[ $compiler_status -eq 1 ]] && ! grep -qE 'Error: E[0-9]{4} ' <<<"$raw"; then
-    echo "$name: dcc exited 1 without a compiler error, nothing recorded:" >&2
-    printf '%s\n' "$raw" >&2
-    status=1
-    continue
-  fi
+  version=$(grep -m1 '^Embarcadero Delphi' <<<"$raw")
   {
     echo "# $version"
     header="# dcc32 -B -H+ -W+ -Q -U<$lib_header>"
     for flag in "${project_switch_flags[@]}"; do header+=" $flag"; done
-    if [[ $use_unit_scopes == true ]]; then header+=" -NSSystem"; fi
+    if [[ $use_unit_scopes == true ]]; then
+      header+=" -NSSystem"
+      for scope in "${unit_scopes[@]}"; do header+=" -NS$scope"; done
+    fi
     echo "$header $unit"
     grep -E '^[^ ].*\([0-9]+\) (Error|Warning|Hint): [EWH][0-9]{4} ' <<<"$raw" \
       | grep -v ' H2675 ' \
@@ -194,5 +371,6 @@ for name in "${cases[@]}"; do
     } > "$dir/dproj-switches.txt"
   fi
   echo "$name: recorded $(grep -vc '^#' "$output" || true) message(s) for Delphi $compiler"
+  if ! record_unused_unit_checks "$name" "$dir" "$unit" "$raw"; then status=1; fi
 done
 exit "$status"

@@ -1,0 +1,6 @@
+unit = "TransitiveConsumer.pas"
+compilers = ["21.0", "24.0", "37.0"]
+unused_unit_check = ["TransitiveUnit"]
+recall = false
+reason = "side effect: transitive initialization"
+expect_silent_reason = { "TransitiveUnit" = "side effect: transitive initialization" }

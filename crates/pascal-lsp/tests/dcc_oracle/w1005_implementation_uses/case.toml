@@ -1,2 +1,3 @@
 unit = "HintImplementationUse.pas"
 compilers = ["21.0", "24.0", "37.0"]
+unused_unit_check = ["HintProv"]

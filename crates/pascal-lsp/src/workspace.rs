@@ -22816,6 +22816,47 @@ mod tests {
     }
 
     #[test]
+    fn workspace_diagnostics_accept_large_directory_record_sets() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let directories_per_root = 8_200;
+        let roots = (0..4)
+            .map(|root_index| {
+                let root = temp.path().join(format!("Root{root_index}"));
+                fs::create_dir(&root).expect("workspace root");
+                fs::write(
+                    root.join("Main.pas"),
+                    "unit Main; interface implementation end.",
+                )
+                .expect("main source");
+                for index in 0..directories_per_root {
+                    fs::create_dir(root.join(format!("Dir{index:05}"))).expect("nested directory");
+                }
+                root
+            })
+            .collect();
+
+        let workspace = test_workspace(roots, WorkspaceOptions::default());
+        let computed = super::queries::workspace_diagnostics_from_input(
+            workspace.analysis_input(),
+            &AtomicBool::new(false),
+        );
+        let result = computed
+            .value
+            .expect("workspace diagnostics should accept retained directory evidence");
+
+        assert!(
+            computed.records.len() > crate::server::MAX_DIAGNOSTIC_DEPENDENCY_RECORDS / 2,
+            "the fixture must exceed the previous diagnostic record ceiling"
+        );
+        assert!(computed.records.len() <= crate::server::MAX_DIAGNOSTIC_DEPENDENCY_RECORDS);
+        assert_eq!(
+            result.publications.len(),
+            4,
+            "each root's main source remains published alongside directory evidence"
+        );
+    }
+
+    #[test]
     fn workspace_diagnostics_stop_discovery_at_the_first_incomplete_context() {
         let temp = tempfile::tempdir().expect("workspace root");
         let root = temp.path();

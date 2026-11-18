@@ -146,7 +146,7 @@ const MAX_DIAGNOSTIC_RESULT_ENTRIES: usize = 2_048;
 const MAX_DIAGNOSTIC_RESULT_BYTES: usize = 32 * 1024 * 1024;
 // Recursive provider searches retain one freshness witness per observed
 // directory. The 64 MiB preflight below remains the hard byte bound.
-const MAX_DIAGNOSTIC_DEPENDENCY_RECORDS: usize = 65_536;
+pub(crate) const MAX_DIAGNOSTIC_DEPENDENCY_RECORDS: usize = 65_536;
 // This is the mandatory worker-side freshness-evidence bound.  Optional
 // result-cache admission remains smaller below, so cache pressure can only
 // disable reuse; it can never discard the evidence used for validation.
@@ -19970,7 +19970,7 @@ mod tests {
     #[test]
     fn diagnostic_dependency_preparation_accepts_many_directory_observations() {
         // QuickPO's dependency set measured 34,800-34,801 records.
-        let count = 32_768 + 2_033;
+        let count = super::MAX_DIAGNOSTIC_DEPENDENCY_RECORDS / 2 + 2_033;
         let records = (0..count)
             .map(|index| {
                 let path = PathBuf::from(format!(

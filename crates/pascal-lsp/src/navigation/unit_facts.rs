@@ -191,7 +191,10 @@ pub(crate) fn uses_closure(
         let Some(provider) = index.documents.get(&provider_uri) else {
             return Ok(None);
         };
-        if canonical_name(&provider.unit_name) != unit {
+        let Some(declared_unit) = parsed_unit_name(provider) else {
+            return Ok(None);
+        };
+        if declared_unit != unit || canonical_name(&provider.unit_name) != unit {
             return Ok(None);
         }
         let Some(complete) = budget_result(
@@ -245,6 +248,20 @@ fn node_has_child(node: tree_sitter::Node<'_>, kind: &str) -> bool {
     (0..node.child_count())
         .filter_map(|index| node.child(index))
         .any(|child| child.kind() == kind)
+}
+
+fn parsed_unit_name(document: &Document) -> Option<String> {
+    let root = document.tree.root_node();
+    let mut root_cursor = root.walk();
+    let unit = root
+        .named_children(&mut root_cursor)
+        .find(|child| child.kind() == "unit")?;
+    let mut unit_cursor = unit.walk();
+    let module_name = unit
+        .named_children(&mut unit_cursor)
+        .find(|child| child.kind() == "moduleName")?;
+    let name = super::canonical_path(&super::identifier_texts(module_name, &document.source));
+    (!name.is_empty()).then_some(name)
 }
 
 fn class_lifecycle_effect(node: tree_sitter::Node<'_>) -> Option<SideEffectKind> {
@@ -549,6 +566,43 @@ mod tests {
                 &index,
                 document,
                 &["Missing".to_owned()],
+                &AtomicBool::new(false),
+                &mut budget,
+            )
+            .expect("closure analysis succeeds"),
+            None
+        );
+    }
+
+    #[test]
+    fn uses_closure_fails_closed_for_same_named_fragment() {
+        let mut index = NavigationIndex::new();
+        let document_uri = indexed_unit(
+            &mut index,
+            "file:///tmp/closure/Consumer.pas",
+            "unit Consumer; interface uses A; implementation end.",
+        );
+        let fragment_uri = indexed_unit(
+            &mut index,
+            "file:///tmp/closure/A.pas",
+            "type TWidget = class end;",
+        );
+        let document = index
+            .documents
+            .get(&document_uri)
+            .expect("indexed document");
+        let fragment = index
+            .documents
+            .get(&fragment_uri)
+            .expect("indexed fragment");
+        assert_eq!(fragment.unit_name, "a", "filename fallback matches import");
+        let mut budget = AssistanceBudget::new(10_000, 1024 * 1024, "unit closure test");
+
+        assert_eq!(
+            uses_closure(
+                &index,
+                document,
+                &["A".to_owned()],
                 &AtomicBool::new(false),
                 &mut budget,
             )

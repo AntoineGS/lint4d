@@ -4,9 +4,8 @@ pub(crate) fn form_object_classes(bytes: &[u8]) -> Option<Vec<String>> {
     if bytes.starts_with(b"TPF0") {
         return None;
     }
-    let text = std::str::from_utf8(bytes)
-        .ok()?
-        .trim_start_matches('\u{feff}');
+    let text = pascal_core::text::decode_bytes(bytes);
+    let text = text.trim_start_matches('\u{feff}');
     let mut lexical = LexicalState::default();
     let mut frames = Vec::new();
     let mut collections = Vec::new();
@@ -61,6 +60,13 @@ pub(crate) fn form_object_classes(bytes: &[u8]) -> Option<Vec<String>> {
             continue;
         }
         if keyword.eq_ignore_ascii_case("end") {
+            if rest == ">" {
+                frames.pop()?;
+                if collections.pop()? != frames.len() {
+                    return None;
+                }
+                continue;
+            }
             if !rest.is_empty() {
                 return None;
             }
@@ -145,7 +151,9 @@ fn visible_line(line: &str, state: &mut LexicalState) -> Option<String> {
 fn first_word(line: &str) -> (&str, &str) {
     let end = line
         .char_indices()
-        .find_map(|(index, character)| character.is_ascii_whitespace().then_some(index))
+        .find_map(|(index, character)| {
+            (character.is_ascii_whitespace() || character == '>').then_some(index)
+        })
         .unwrap_or(line.len());
     (&line[..end], line[end..].trim_start())
 }
@@ -242,6 +250,29 @@ end
     #[test]
     fn binary_dfm_signature_is_not_text() {
         assert_eq!(form_object_classes(b"TPF0\x01\x02\x03"), None);
+    }
+
+    #[test]
+    fn decodes_legacy_text_with_latin1_bytes() {
+        let form = b"object MainForm: TMainForm\n  Caption = 'caf\xe9'\nend\n";
+        assert_eq!(
+            form_object_classes(form),
+            Some(vec!["TMainForm".to_owned()])
+        );
+    }
+
+    #[test]
+    fn collection_item_can_close_with_end_then_collection_delimiter() {
+        for closing in ["end>", "end   >"] {
+            let form = format!(
+                "object Root: TRoot\n  Items = <\n    item\n      Caption = 'A'\n  {closing}\nend\n"
+            );
+            assert_eq!(
+                form_object_classes(form.as_bytes()),
+                Some(vec!["TRoot".to_owned()]),
+                "closing line: {closing}"
+            );
+        }
     }
 
     #[test]

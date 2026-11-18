@@ -294,12 +294,14 @@ impl WarningSwitches {
         if !has_recorded_position_rule(&code) && state.switched {
             return None;
         }
-        let governing_offset = if code == "H2219" {
-            // dcc reports H2219 at the end-of-unit position, not at the field
-            // declaration. The paired fixture records this behavior.
-            document.source.len()
-        } else {
-            offset
+        let governing_offset = match code.as_str() {
+            "H2219" => {
+                // dcc reports H2219 at the end-of-unit position, not at the
+                // field declaration. The paired fixture records this behavior.
+                document.source.len()
+            }
+            "H2443" => routine_end_offset(document, offset)?,
+            _ => offset,
         };
         let index = state
             .changes
@@ -343,7 +345,41 @@ pub(crate) fn filter_report(document: &Document, diagnostics: &mut Vec<SemanticD
 }
 
 fn has_recorded_position_rule(code: &str) -> bool {
-    matches!(code, "H2219" | "W1000" | "W1009" | "W1010")
+    matches!(
+        code,
+        "H2077"
+            | "H2135"
+            | "H2164"
+            | "H2219"
+            | "H2443"
+            | "W1000"
+            | "W1001"
+            | "W1002"
+            | "W1003"
+            | "W1004"
+            | "W1005"
+            | "W1006"
+            | "W1007"
+            | "W1009"
+            | "W1010"
+            | "W1035"
+            | "W1036"
+            | "W1037"
+    )
+}
+
+fn routine_end_offset(document: &Document, offset: usize) -> Option<usize> {
+    let mut scope = Some(document.scope_at(offset));
+    while let Some(index) = scope {
+        if document
+            .routine_symbol_indices_by_body_scope
+            .contains_key(&index)
+        {
+            return document.scopes.get(index).map(|scope| scope.end);
+        }
+        scope = document.scopes.get(index)?.parent;
+    }
+    None
 }
 
 fn global_for(

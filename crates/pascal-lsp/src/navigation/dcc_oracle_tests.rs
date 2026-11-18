@@ -44,6 +44,46 @@ fn enabled_warning_and_hint_codes_have_rows_in_every_switch_table() {
     }
 }
 
+#[test]
+fn warning_switches_require_position_rules_for_every_enabled_code() {
+    let source = "\
+unit WarningSwitchPositionRules;
+interface
+implementation
+procedure P;
+begin
+{$WARNINGS OFF}
+{$HINTS OFF}
+end;
+end.
+";
+    let uri = Url::parse("file:///tmp/warning-switch-position-rules.pas").unwrap();
+    let mut index = NavigationIndex::new();
+    index
+        .update_with_context_with_cancel(
+            uri.clone(),
+            source.to_owned(),
+            &oracle_context("37.0"),
+            &AtomicBool::new(false),
+        )
+        .expect("probe parses");
+
+    let document = index.documents.get(&uri).expect("probe document indexed");
+    let switches = super::warning_switches::WarningSwitches::new(document);
+    let routine_end = source.find("end;").expect("probe routine end");
+    for code in ENABLED_CODES
+        .iter()
+        .copied()
+        .filter(|code| matches!(code.as_bytes().first(), Some(b'W' | b'H')))
+    {
+        assert_eq!(
+            switches.effective_switch(document, code, routine_end),
+            Some(super::dcc_switches::SwitchState::Off),
+            "{code} has no recorded switch-position rule"
+        );
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Finding {
     file: String,

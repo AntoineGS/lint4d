@@ -269,6 +269,9 @@ crates/pascal-lsp/tests/dcc_oracle/h2219_used_with/UsedWith.pas 29e0b221f3692030
 crates/pascal-lsp/tests/dcc_oracle/h2443_asm_body/AsmHelper.pas d85d7234e99514a9 3
 crates/pascal-lsp/tests/dcc_oracle/h2443_asm_body/AsmProv.pas 2e4cbe408b01a256 3
 crates/pascal-lsp/tests/dcc_oracle/h2443_asm_body/AsmUse.pas def44c89742cfed1 3
+crates/pascal-lsp/tests/dcc_oracle/h2443_bare_callable_values/CallableValues.pas a86187156563ccb3 5
+crates/pascal-lsp/tests/dcc_oracle/h2443_bare_callable_values/InlineHelper.pas c83e15f77a98d83e 3
+crates/pascal-lsp/tests/dcc_oracle/h2443_bare_callable_values/ValueProvider.pas bc41264a714c1f83 3
 crates/pascal-lsp/tests/dcc_oracle/h2443_body_params_only/BodyProv.pas ab7f94f439cfbd32 5
 crates/pascal-lsp/tests/dcc_oracle/h2443_body_params_only/BodyUse.pas 7a03697a66ba1e70 3
 crates/pascal-lsp/tests/dcc_oracle/h2443_caller_uses_needed_unit/CallHelper.pas 59a99f0fafffa08b 3
@@ -301,6 +304,9 @@ crates/pascal-lsp/tests/dcc_oracle/h2443_repeated_calls/RepeatedUse.pas 867efbcb
 crates/pascal-lsp/tests/dcc_oracle/h2443_rtl_inline/RtlUse.pas 74133e3d7b533fe8 3
 crates/pascal-lsp/tests/dcc_oracle/h2443_same_unit/SameHelper.pas 8793123fd15e0ac7 3
 crates/pascal-lsp/tests/dcc_oracle/h2443_same_unit/SameUnit.pas 7ef29589f9de99ae 5
+crates/pascal-lsp/tests/dcc_oracle/h2443_switch_positions/H2443SwitchPositions.pas 145e59f0dded7a60 4
+crates/pascal-lsp/tests/dcc_oracle/h2443_switch_positions/InlHelper.pas 6cc993fa72fb0cda 3
+crates/pascal-lsp/tests/dcc_oracle/h2443_switch_positions/InlProv.pas 4e8c9d0072206a69 3
 crates/pascal-lsp/tests/dcc_oracle/h2443_two_missing_units/FirstHelper.pas 16127251531bc433 3
 crates/pascal-lsp/tests/dcc_oracle/h2443_two_missing_units/SecondHelper.pas cbee61586181d4c0 3
 crates/pascal-lsp/tests/dcc_oracle/h2443_two_missing_units/TwoProv.pas 198152cfb189b3a4 3

@@ -6,6 +6,29 @@ struct ReferencedUnit {
     name: String,
 }
 
+#[derive(Clone, Copy)]
+enum BareCallableContext<'tree> {
+    Statement,
+    AssignmentTarget(Node<'tree>),
+    BinaryPeer(Node<'tree>),
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_INLINE_BODY_PROOF_WALKS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn test_reset_inline_body_proof_walks() {
+    TEST_INLINE_BODY_PROOF_WALKS.with(|value| value.set(0));
+}
+
+#[cfg(test)]
+fn test_inline_body_proof_walks() -> usize {
+    TEST_INLINE_BODY_PROOF_WALKS.with(std::cell::Cell::get)
+}
+
 impl NavigationIndex {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn inline_uses_diagnostics_with_budget(
@@ -34,11 +57,13 @@ impl NavigationIndex {
         };
 
         let mut diagnostics = Vec::new();
-        for call in calls.iter().copied().chain(
+        let mut reference_cache: HashMap<(Url, String), Arc<[ReferencedUnit]>> = HashMap::new();
+        for (call, bare_context) in calls.iter().copied().map(|call| (call, None)).chain(
             identifiers
                 .iter()
                 .copied()
-                .filter_map(bare_callable_expression),
+                .filter_map(bare_callable_expression)
+                .map(|(call, context)| (call, Some(context))),
         ) {
             check_navigation_cancel(cancel)?;
             budget.require_work(1, cancel)?;
@@ -61,6 +86,13 @@ impl NavigationIndex {
             else {
                 continue;
             };
+            if let Some(context) = bare_context
+                && !self.bare_callable_context_is_proven(
+                    uri, document, context, &selected, cancel, budget,
+                )?
+            {
+                continue;
+            }
             let Some(candidate) = selected.first() else {
                 continue;
             };
@@ -80,38 +112,52 @@ impl NavigationIndex {
             else {
                 continue;
             };
-            let Some(definition_node) =
-                routine_definition_node(target, definition, cancel, budget)?
+            let Some(routine_key) = self
+                .symbol(candidate)
+                .and_then(|symbol| symbol.routine_key.clone())
             else {
                 continue;
             };
-            let Some(body) = definition_node.child_by_field_name("body") else {
-                continue;
-            };
-            if body.kind() == "asm"
-                || target
-                    .opaque_ranges
-                    .iter()
-                    .any(|range| range.contains(Span::from_node(body)))
-                || target.conditionals.unknown_spans.iter().any(|span| {
-                    span.start < definition_node.end_byte()
-                        && definition_node.start_byte() < span.end
-                })
-            {
-                continue;
-            }
-            let Some(references) = self.inline_body_references(
-                &candidate.uri,
-                target,
-                definition_node,
-                cancel,
-                budget,
-            )?
-            else {
-                continue;
+            let cache_key = (candidate.uri.clone(), routine_key);
+            let references = if let Some(references) = reference_cache.get(&cache_key) {
+                Arc::clone(references)
+            } else {
+                let Some(definition_node) =
+                    routine_definition_node(target, definition, cancel, budget)?
+                else {
+                    continue;
+                };
+                let Some(body) = definition_node.child_by_field_name("body") else {
+                    continue;
+                };
+                if contains_descendant_kind_with_budget(body, "asm", cancel, budget)?
+                    || target
+                        .opaque_ranges
+                        .iter()
+                        .any(|range| range.contains(Span::from_node(body)))
+                    || target.conditionals.unknown_spans.iter().any(|span| {
+                        span.start < definition_node.end_byte()
+                            && definition_node.start_byte() < span.end
+                    })
+                {
+                    continue;
+                }
+                let Some(references) = self.inline_body_references(
+                    &candidate.uri,
+                    target,
+                    definition_node,
+                    cancel,
+                    budget,
+                )?
+                else {
+                    continue;
+                };
+                let references: Arc<[ReferencedUnit]> = references.into();
+                reference_cache.insert(cache_key, Arc::clone(&references));
+                references
             };
             let caller_imports = &imported_units;
-            let Some(missing) = references.into_iter().find(|referenced| {
+            let Some(missing) = references.iter().find(|referenced| {
                 referenced.uri != candidate.uri
                     && referenced.uri != *uri
                     && !matches!(
@@ -152,6 +198,71 @@ impl NavigationIndex {
             });
         }
         Ok(diagnostics)
+    }
+
+    fn bare_callable_context_is_proven(
+        &self,
+        uri: &Url,
+        document: &Document,
+        context: BareCallableContext<'_>,
+        candidates: &[Candidate],
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        if candidates.is_empty()
+            || candidates.iter().any(|candidate| {
+                self.symbol(candidate).is_none_or(|symbol| {
+                    symbol.kind != SymbolKind::Routine || !symbol.routine_parameters.is_empty()
+                })
+            })
+        {
+            return Ok(false);
+        }
+
+        match context {
+            BareCallableContext::Statement => Ok(true),
+            BareCallableContext::AssignmentTarget(expected)
+            | BareCallableContext::BinaryPeer(expected) => {
+                self.expression_is_proven_nonprocedural(uri, document, expected, cancel, budget)
+            }
+        }
+    }
+
+    fn expression_is_proven_nonprocedural(
+        &self,
+        uri: &Url,
+        document: &Document,
+        expression: Node<'_>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        if matches!(
+            expression.kind(),
+            "literalNumber" | "literalString" | "literalChar" | "kTrue" | "kFalse"
+        ) {
+            return Ok(true);
+        }
+        let lookup_identifier = callable_lookup_identifier(expression);
+        let mut state = ResolutionState::new();
+        let expected_types = self.resolve_receivers_with_state_and_budget(
+            uri,
+            document,
+            expression.start_byte(),
+            expression,
+            lookup_identifier,
+            &mut state,
+            cancel,
+            budget,
+            0,
+        )?;
+        if overload::state_has_uncertainty(&state) || expected_types.is_empty() {
+            return Ok(false);
+        }
+        Ok(expected_types.iter().all(|receiver| match receiver {
+            Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => true,
+            Receiver::Type(instance) => instance.kind != TypeKind::Callable,
+            Receiver::Unit(_) => false,
+        }))
     }
 
     fn complete_imported_units(
@@ -195,6 +306,9 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Option<Vec<Candidate>>, String> {
+        if overload::has_explicit_generic_arguments(call) {
+            return Ok(None);
+        }
         let Some(entity) = call
             .child_by_field_name("entity")
             .or_else(|| (call.kind() != "exprCall").then_some(call))
@@ -223,9 +337,7 @@ impl NavigationIndex {
         }
         candidates.retain(|candidate| {
             self.symbol(candidate).is_some_and(|symbol| {
-                symbol.kind == SymbolKind::Routine
-                    && !symbol.unresolved_abbreviated
-                    && symbol.generic_parameters.is_empty()
+                symbol.kind == SymbolKind::Routine && !symbol.unresolved_abbreviated
             })
         });
         if candidates.is_empty() {
@@ -289,7 +401,12 @@ impl NavigationIndex {
             return Ok(None);
         };
         candidates.retain(|candidate| overload::candidate_in_group(self, candidate, &group));
-        if candidates.is_empty() {
+        if candidates.is_empty()
+            || candidates.iter().any(|candidate| {
+                self.symbol(candidate)
+                    .is_none_or(|symbol| !symbol.generic_parameters.is_empty())
+            })
+        {
             return Ok(None);
         }
         Ok(Some(candidates))
@@ -549,7 +666,7 @@ fn unique_callable_identifier_call(identifier: Node<'_>) -> Option<Node<'_>> {
         .then_some(call)
 }
 
-fn bare_callable_expression(identifier: Node<'_>) -> Option<Node<'_>> {
+fn bare_callable_expression(identifier: Node<'_>) -> Option<(Node<'_>, BareCallableContext<'_>)> {
     if overload::call_for_identifier(identifier).is_some() {
         return None;
     }
@@ -570,7 +687,75 @@ fn bare_callable_expression(identifier: Node<'_>) -> Option<Node<'_>> {
         }
         entity = parent;
     }
-    (Span::from_node(callable_lookup_identifier(entity)) == identifier_span).then_some(entity)
+    if Span::from_node(callable_lookup_identifier(entity)) != identifier_span {
+        return None;
+    }
+
+    let mut expression = entity;
+    loop {
+        let parent = expression.tree_parent()?;
+        match parent.kind() {
+            "exprParens" => expression = parent,
+            "exprUnary"
+                if parent
+                    .child_by_field_name("operator")
+                    .is_some_and(|operator| operator.kind() == "kAt") =>
+            {
+                return None;
+            }
+            "assignment" => {
+                let rhs = parent.child_by_field_name("rhs")?;
+                if !Span::from_node(rhs).contains(Span::from_node(expression)) {
+                    return None;
+                }
+                let target = parent.child_by_field_name("lhs")?;
+                return Some((entity, BareCallableContext::AssignmentTarget(target)));
+            }
+            "exprBinary" => {
+                let lhs = parent.child_by_field_name("lhs")?;
+                let rhs = parent.child_by_field_name("rhs")?;
+                let peer = if Span::from_node(lhs).contains(Span::from_node(expression)) {
+                    rhs
+                } else if Span::from_node(rhs).contains(Span::from_node(expression)) {
+                    lhs
+                } else {
+                    return None;
+                };
+                return Some((entity, BareCallableContext::BinaryPeer(peer)));
+            }
+            "statement" => {
+                let statement_expression = first_named_child(parent)?;
+                if Span::from_node(statement_expression) != Span::from_node(expression) {
+                    return None;
+                }
+                return Some((entity, BareCallableContext::Statement));
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn contains_descendant_kind_with_budget(
+    root: Node<'_>,
+    kind: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    #[cfg(test)]
+    TEST_INLINE_BODY_PROOF_WALKS.with(|value| {
+        value.set(value.get().saturating_add(1));
+    });
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if node.kind() == kind {
+            return Ok(true);
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.children(&mut cursor));
+    }
+    Ok(false)
 }
 
 fn inline_display_name(symbol: &Symbol) -> Option<String> {
@@ -835,6 +1020,105 @@ mod tests {
     }
 
     #[test]
+    fn routine_values_are_not_calls_but_bare_parameterless_functions_are() {
+        let provider = concat!(
+            "unit ValueProvider;\n",
+            "interface\n",
+            "function InlineFn: Integer; inline;\n",
+            "implementation\n",
+            "uses InlineHelper;\n",
+            "function InlineFn: Integer;\n",
+            "begin Result := HelperValue; end;\n",
+            "end.\n",
+        );
+        let caller = concat!(
+            "unit ValueCaller;\n",
+            "interface\n",
+            "implementation\n",
+            "uses ValueProvider;\n",
+            "type TIntegerFunction = function: Integer;\n",
+            "procedure P;\n",
+            "var F: TIntegerFunction; X: Integer;\n",
+            "begin\n",
+            "  F := @InlineFn;\n",
+            "  F := InlineFn;\n",
+            "  X := InlineFn;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let diagnostics = indexed_diagnostics(
+            &[
+                ("InlineHelper", HELPER),
+                ("ValueProvider", provider),
+                ("ValueCaller", caller),
+            ],
+            "ValueCaller",
+        );
+        let findings = h2443(&diagnostics);
+        let expected_call = caller.find("X := InlineFn").unwrap() + "X := ".len();
+
+        assert_eq!(findings.len(), 1, "only the function invocation warns");
+        assert_eq!(findings[0].span.start, expected_call);
+    }
+
+    #[test]
+    fn bare_parameterless_routine_statement_is_a_call() {
+        let provider = concat!(
+            "unit InlineProvider;\n",
+            "interface\n",
+            "procedure UsesHelper; inline;\n",
+            "implementation\n",
+            "uses InlineHelper;\n",
+            "procedure UsesHelper;\n",
+            "begin HelperValue; end;\n",
+            "end.\n",
+        );
+        let caller = concat!(
+            "unit InlineCaller;\n",
+            "interface\n",
+            "implementation\n",
+            "uses InlineProvider;\n",
+            "procedure P;\n",
+            "begin UsesHelper; end;\n",
+            "end.\n",
+        );
+        let diagnostics = indexed_diagnostics(
+            &[
+                ("InlineHelper", HELPER),
+                ("InlineProvider", provider),
+                ("InlineCaller", caller),
+            ],
+            "InlineCaller",
+        );
+
+        assert_eq!(h2443(&diagnostics).len(), 1);
+    }
+
+    #[test]
+    fn repeated_calls_walk_an_inline_body_once_per_diagnostics_pass() {
+        let caller = CALLER.replace(
+            "begin I := UsesHelper; end;",
+            "begin I := UsesHelper; I := UsesHelper; end;",
+        );
+        super::test_reset_inline_body_proof_walks();
+        let diagnostics = indexed_diagnostics(
+            &[
+                ("InlineHelper", HELPER),
+                ("InlineProvider", PROVIDER),
+                ("InlineCaller", &caller),
+            ],
+            "InlineCaller",
+        );
+
+        assert_eq!(h2443(&diagnostics).len(), 2);
+        assert_eq!(
+            super::test_inline_body_proof_walks(),
+            1,
+            "the proven reference set should be reused for the second call site"
+        );
+    }
+
+    #[test]
     fn h2443_uses_the_compiler_scoped_name_for_windows() {
         let provider = PROVIDER
             .replace("uses InlineHelper;", "uses Windows;")
@@ -1092,6 +1376,43 @@ mod tests {
     }
 
     #[test]
+    fn generic_overload_selection_does_not_report_for_a_non_generic_inline_overload() {
+        let provider = concat!(
+            "unit InlineProvider;\n",
+            "interface\n",
+            "function Pick<T>(Value: T): Integer; overload; inline;\n",
+            "function Pick(Value: Integer): Integer; overload; inline;\n",
+            "implementation\n",
+            "uses InlineHelper;\n",
+            "function Pick<T>(Value: T): Integer;\n",
+            "begin Result := 0; end;\n",
+            "function Pick(Value: Integer): Integer;\n",
+            "begin Result := HelperValue; end;\n",
+            "end.\n",
+        );
+        let caller = concat!(
+            "unit InlineCaller;\n",
+            "interface\nimplementation\nuses InlineProvider;\n",
+            "procedure P;\nvar I: Integer;\n",
+            "begin I := Pick<Integer>(1); end;\n",
+            "end.\n",
+        );
+        let diagnostics = indexed_diagnostics(
+            &[
+                ("InlineHelper", HELPER),
+                ("InlineProvider", provider),
+                ("InlineCaller", caller),
+            ],
+            "InlineCaller",
+        );
+
+        assert!(
+            h2443(&diagnostics).is_empty(),
+            "an explicit generic call must not select the same-named non-generic inline routine"
+        );
+    }
+
+    #[test]
     fn unknown_conditional_in_inline_body_does_not_produce_h2443() {
         let provider = PROVIDER.replace(
             "begin Result := HelperValue; end;",
@@ -1133,5 +1454,26 @@ mod tests {
         );
 
         assert!(h2443(&diagnostics).is_empty());
+    }
+
+    #[test]
+    fn inline_body_with_nested_asm_fails_closed() {
+        let provider = PROVIDER.replace(
+            "begin Result := HelperValue; end;",
+            "begin asm HelperValue end; Result := 1; end;",
+        );
+        let diagnostics = indexed_diagnostics(
+            &[
+                ("InlineHelper", HELPER),
+                ("InlineProvider", &provider),
+                ("InlineCaller", CALLER),
+            ],
+            "InlineCaller",
+        );
+
+        assert!(
+            h2443(&diagnostics).is_empty(),
+            "an asm subtree may contain identifiers that are not Pascal references"
+        );
     }
 }

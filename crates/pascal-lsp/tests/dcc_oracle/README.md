@@ -68,13 +68,17 @@ with that entry removed using the same conservative edit policy as the quick
 fix. It compares the sorted multiset of `<file> <code> <message>` diagnostics,
 ignoring shifted line numbers, and writes one result per unit to
 `unused_unit_check.<version>.txt`: `<UnitName> identical` or
-`<UnitName> differs: <first difference>`. Do not hand-edit these files. The
-oracle harness requires a result for every configured unit and compiler,
-rejects any lint4d finding when removal changes compiler output, and requires
-an unused-unit finding for identical output unless recall is waived with a
-reason. An `expect_silent_reason` inline table names units that must remain
-silent despite identical compiler output, such as units with initialization
-side effects; these still require `recall = false` and a case-level `reason`.
+`<UnitName> differs: <first difference>`. It also persists the edited compiler
+output as `unused_unit_check.<version>.<UnitName>.dcc`, in the same normalized
+format as `expected*.dcc`, with a header naming the removed unit. Do not
+hand-edit these files. The oracle harness compares each persisted edited output
+to `expected*.dcc` and requires the `identical`/`differs` result to agree with
+that comparison; it also rejects any lint4d finding when removal changes
+compiler output, and requires an unused-unit finding for identical output
+unless recall is waived with a reason. An `expect_silent_reason` inline table
+names units that must remain silent despite identical compiler output, such as
+units with initialization side effects; these still require `recall = false`
+and a case-level `reason`.
 
 Usage output from dcc32 21.0, 24.0, and 37.0 (run with no arguments) reports
 `-W[+|-|^][warn_id]`; all three versions accept `-W-<ID>`, `-W+<ID>`, and

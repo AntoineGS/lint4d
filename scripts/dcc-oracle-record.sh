@@ -213,12 +213,33 @@ validate_dcc_output() {
   fi
 }
 
-normalize_dcc_messages() {
-  local raw=$1
-  local messages
-  messages=$(grep -E '^[^ ].*\([0-9]+\) (Error|Warning|Hint): [EWH][0-9]{4} ' <<<"$raw" || true)
+write_normalized_dcc_record() {
+  local destination=$1 raw=$2 unit=$3 removed_unit=${4:-}
+  local version header
+  version=$(grep -m1 '^Embarcadero Delphi' <<<"$raw")
+  {
+    printf '# %s\n' "$version"
+    header="# dcc32 -B -H+ -W+ -Q -U<$lib_header>"
+    for flag in "${project_switch_flags[@]}"; do header+=" $flag"; done
+    if [[ $use_unit_scopes == true ]]; then
+      header+=" -NSSystem"
+      for scope in "${unit_scopes[@]}"; do header+=" -NS$scope"; done
+    fi
+    printf '%s %s\n' "$header" "$unit"
+    if [[ -n $removed_unit ]]; then
+      printf '# unused-unit check: removed %s\n' "$removed_unit"
+    fi
+    grep -E '^[^ ].*\([0-9]+\) (Error|Warning|Hint): [EWH][0-9]{4} ' <<<"$raw" \
+      | grep -v ' H2675 ' \
+      | sed -E 's/^(.*[\\/])?([^\\/(]+)\(([0-9]+)\) (Error|Warning|Hint): /\2(\3) /' || true
+  } > "$destination"
+}
+
+normalize_dcc_record() {
+  local path=$1 messages
+  messages=$(grep -E '^[^ ].*\([0-9]+\) [EWH][0-9]{4} ' "$path" || true)
   [[ -n $messages ]] || return 0
-  sed -E 's/^(.*[\\/])?([^\\/(]+)\([0-9]+\) (Error|Warning|Hint): /\2 /' <<<"$messages"
+  sed -E 's/^(.+)\([0-9]+\) /\1 /' <<<"$messages" | LC_ALL=C sort
 }
 
 first_message_difference() {
@@ -232,15 +253,14 @@ first_message_difference() {
 }
 
 record_unused_unit_checks() {
-  local name=$1 dir=$2 unit=$3 original_raw=$4 record tmp tmp_base check_unit
-  local record_tmp
+  local name=$1 dir=$2 unit=$3 expected_output=$4 record tmp tmp_base check_unit
+  local record_tmp edited_output edited_record
   ((${#unused_units[@]})) || return 0
   record="$dir/unused_unit_check.$compiler.txt"
   tmp_base="${TMPDIR:-/tmp/opencode}"
   mkdir -p "$tmp_base"
   tmp=$(mktemp -d "$tmp_base/dcc-oracle-unused.XXXXXX")
-  mkdir -p "$tmp/original" "$tmp/edited"
-  normalize_dcc_messages "$original_raw" | LC_ALL=C sort > "$tmp/original.txt"
+  normalize_dcc_record "$expected_output" > "$tmp/original.txt"
   record_tmp="$tmp/record.txt"
   : > "$record_tmp"
   for check_unit in "${unused_units[@]}"; do
@@ -276,7 +296,10 @@ record_unused_unit_checks() {
       rm -rf "$tmp"
       return 1
     fi
-    normalize_dcc_messages "$edited_raw" | LC_ALL=C sort > "$tmp/edited.txt"
+    edited_output="$tmp/edited-output.dcc"
+    edited_record="$dir/unused_unit_check.$compiler.$check_unit.dcc"
+    write_normalized_dcc_record "$edited_output" "$edited_raw" "$unit" "$check_unit"
+    normalize_dcc_record "$edited_output" > "$tmp/edited.txt"
     if cmp -s "$tmp/original.txt" "$tmp/edited.txt"; then
       printf '%s identical\n' "$check_unit" >> "$record_tmp"
     else
@@ -284,6 +307,7 @@ record_unused_unit_checks() {
       difference=$(first_message_difference "$tmp/original.txt" "$tmp/edited.txt")
       printf '%s differs: %s\n' "$check_unit" "$difference" >> "$record_tmp"
     fi
+    mv "$edited_output" "$edited_record"
   done
   mv "$record_tmp" "$record"
   rm -rf "$tmp"
@@ -349,20 +373,7 @@ for name in "${cases[@]}"; do
     status=1
     continue
   fi
-  version=$(grep -m1 '^Embarcadero Delphi' <<<"$raw")
-  {
-    echo "# $version"
-    header="# dcc32 -B -H+ -W+ -Q -U<$lib_header>"
-    for flag in "${project_switch_flags[@]}"; do header+=" $flag"; done
-    if [[ $use_unit_scopes == true ]]; then
-      header+=" -NSSystem"
-      for scope in "${unit_scopes[@]}"; do header+=" -NS$scope"; done
-    fi
-    echo "$header $unit"
-    grep -E '^[^ ].*\([0-9]+\) (Error|Warning|Hint): [EWH][0-9]{4} ' <<<"$raw" \
-      | grep -v ' H2675 ' \
-      | sed -E 's/^(.*[\\/])?([^\\/(]+)\(([0-9]+)\) (Error|Warning|Hint): /\2(\3) /' || true
-  } > "$output"
+  write_normalized_dcc_record "$output" "$raw" "$unit"
   if ((${#dproj_files[@]} == 1)); then
     {
       for flag in "${project_switch_flags[@]}"; do
@@ -371,6 +382,6 @@ for name in "${cases[@]}"; do
     } > "$dir/dproj-switches.txt"
   fi
   echo "$name: recorded $(grep -vc '^#' "$output" || true) message(s) for Delphi $compiler"
-  if ! record_unused_unit_checks "$name" "$dir" "$unit" "$raw"; then status=1; fi
+  if ! record_unused_unit_checks "$name" "$dir" "$unit" "$output"; then status=1; fi
 done
 exit "$status"

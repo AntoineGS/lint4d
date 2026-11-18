@@ -1848,32 +1848,39 @@ fn expected_file_names_follow_the_compiler() {
     );
 }
 
+fn normalized_dcc_messages(text: &str) -> Vec<(String, String, String)> {
+    let mut messages = text
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let (location, rest) = line.split_once(") ").expect("File(line) prefix");
+            let (file, line_no) = location.split_once('(').expect("File(line)");
+            line_no.parse::<usize>().expect("line number");
+            let (code, message) = rest.split_once(' ').expect("code and message");
+            (file.to_owned(), code.to_owned(), message.to_owned())
+        })
+        .collect::<Vec<_>>();
+    messages.sort();
+    messages
+}
+
 #[test]
 fn unused_unit_recorder_results_cover_every_configured_unit_and_compiler() {
-    let cases = [
-        "unused_unit_truly_unused",
-        "unused_unit_used_by_type",
-        "unused_unit_used_only_by_helper",
-        "unused_unit_initialization",
-        "unused_unit_transitive_initialization",
-        "h2443_caller_uses_needed_unit",
-        "unused_unit_form_dfm_class",
-        "w1004_library_unit",
-        "w1005_conditional_header",
-        "w1005_implementation_uses",
-        "w1005_namespaced_unit",
-        "w1005_platform_unit",
-        "w1006_deprecated_unit",
-        "w1007_experimental_unit",
-    ];
+    let mut dirs = std::fs::read_dir(cases_root())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    dirs.sort();
+    let mut checked_cases = 0;
 
-    for name in cases {
-        let dir = cases_root().join(name);
+    for dir in dirs {
         let case = load_case(&dir);
-        assert!(
-            !case.unused_unit_check.is_empty(),
-            "{name}: empty unused_unit_check"
-        );
+        if case.unused_unit_check.is_empty() {
+            continue;
+        }
+        checked_cases += 1;
+        let name = &case.name;
 
         for version in &case.compilers {
             let path = dir.join(format!("unused_unit_check.{version}.txt"));
@@ -1896,8 +1903,59 @@ fn unused_unit_recorder_results_cover_every_configured_unit_and_compiler() {
                     "{name} under {version}: malformed or out-of-order record {line:?}"
                 );
             }
+
+            let expected_path = expected_path(&dir, version);
+            let expected = std::fs::read_to_string(&expected_path)
+                .unwrap_or_else(|error| panic!("{name}: {}: {error}", expected_path.display()));
+            for check in parse_unused_unit_check(&case, version) {
+                let edited_path =
+                    dir.join(format!("unused_unit_check.{version}.{}.dcc", check.unit));
+                let edited = std::fs::read_to_string(&edited_path).unwrap_or_else(|error| {
+                    panic!(
+                        "{name} under {version}: missing edited DCC output {}: {error}",
+                        edited_path.display()
+                    )
+                });
+                let removed_header = format!("# unused-unit check: removed {}", check.unit);
+                let expected_headers = expected
+                    .lines()
+                    .filter(|line| line.starts_with('#'))
+                    .collect::<Vec<_>>();
+                let edited_headers = edited
+                    .lines()
+                    .filter(|line| line.starts_with('#'))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    expected_headers.len(),
+                    2,
+                    "{} under {version}: malformed expected DCC headers",
+                    expected_path.display()
+                );
+                assert_eq!(
+                    edited_headers,
+                    [
+                        expected_headers[0],
+                        expected_headers[1],
+                        removed_header.as_str()
+                    ],
+                    "{} under {version}: {} headers differ from expected DCC output or omit the removed unit",
+                    name,
+                    edited_path.display()
+                );
+                let identical =
+                    normalized_dcc_messages(&expected) == normalized_dcc_messages(&edited);
+                assert_eq!(
+                    matches!(check.outcome, UnusedUnitOutcome::Identical),
+                    identical,
+                    "{} under {version}: {} verdict disagrees with {}",
+                    name,
+                    path.display(),
+                    edited_path.display()
+                );
+            }
         }
     }
+    assert!(checked_cases > 0, "no unused-unit DCC oracle cases");
 }
 
 #[test]

@@ -93,6 +93,7 @@ impl NavigationIndex {
         else {
             return Ok(Vec::new());
         };
+        let document_has_indexing = document_has_indexing_expression(document, cancel, budget)?;
         let mut used_units = BTreeSet::new();
         for identifier in identifiers {
             check_navigation_cancel(cancel)?;
@@ -222,6 +223,7 @@ impl NavigationIndex {
                 || used_units.contains(&unit_name)
                 || import_is_project_path(uri, document, import)
                 || import_is_duplicated(document, &unit_name)
+                || import_is_in_conditional_uses_clause(document, import.span, cancel, budget)?
             {
                 continue;
             }
@@ -233,6 +235,19 @@ impl NavigationIndex {
             let Some(provider) = self.documents.get(&provider_uri) else {
                 continue;
             };
+            let hazards = match budget_result(
+                unit_lookup_hazards(provider, cancel, budget),
+                budget,
+                cancel,
+            )? {
+                Some(hazards) => hazards,
+                None => continue,
+            };
+            if hazards.operator_or_helper
+                || (document_has_indexing && hazards.default_indexed_property)
+            {
+                continue;
+            }
             if inline_dependencies.contains(&provider_uri) {
                 continue;
             }
@@ -374,6 +389,156 @@ impl NavigationIndex {
         budget.require_bytes(uri.as_str().len(), cancel)?;
         Ok(self.documents.contains_key(&uri).then_some(uri))
     }
+}
+
+#[derive(Debug, Default)]
+struct UnitLookupHazards {
+    operator_or_helper: bool,
+    default_indexed_property: bool,
+}
+
+fn unit_lookup_hazards(
+    document: &Document,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<UnitLookupHazards, String> {
+    let mut hazards = UnitLookupHazards::default();
+    let mut pending = vec![document.tree.root_node()];
+    budget.require_owned_bytes(std::mem::size_of::<Node<'_>>(), cancel)?;
+    while let Some(node) = pending.pop() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        match node.kind() {
+            "declHelper" => hazards.operator_or_helper = true,
+            "declProc"
+                if has_direct_child(node, "kClass") && has_direct_child(node, "kOperator") =>
+            {
+                hazards.operator_or_helper = true;
+            }
+            "declProp"
+                if has_direct_child(node, "declPropArgs")
+                    && has_direct_child_with_child(node, "procAttribute", "kDefault") =>
+            {
+                hazards.default_indexed_property = true;
+            }
+            _ => {}
+        }
+        if hazards.operator_or_helper && hazards.default_indexed_property {
+            break;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            budget.require_owned_bytes(std::mem::size_of::<Node<'_>>(), cancel)?;
+            pending.push(child);
+        }
+    }
+    Ok(hazards)
+}
+
+fn has_direct_child(node: Node<'_>, kind: &str) -> bool {
+    (0..node.child_count())
+        .filter_map(|index| node.child(index))
+        .any(|child| child.kind() == kind)
+}
+
+fn has_direct_child_with_child(node: Node<'_>, parent_kind: &str, child_kind: &str) -> bool {
+    (0..node.child_count())
+        .filter_map(|index| node.child(index))
+        .filter(|child| child.kind() == parent_kind)
+        .any(|parent| has_direct_child(parent, child_kind))
+}
+
+fn document_has_indexing_expression(
+    document: &Document,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    let mut pending = vec![document.tree.root_node()];
+    budget.require_owned_bytes(std::mem::size_of::<Node<'_>>(), cancel)?;
+    while let Some(node) = pending.pop() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if node.kind() == "exprSubscript" {
+            return Ok(true);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            budget.require_owned_bytes(std::mem::size_of::<Node<'_>>(), cancel)?;
+            pending.push(child);
+        }
+    }
+    Ok(false)
+}
+
+fn import_is_in_conditional_uses_clause(
+    document: &Document,
+    import_span: SourceSpan,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    let root = document.tree.root_node();
+    let Some(mut module_name) =
+        root.named_descendant_for_byte_range(import_span.start, import_span.end)
+    else {
+        return Ok(true);
+    };
+    loop {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if module_name.kind() == "moduleName"
+            && module_name.start_byte() == import_span.start
+            && module_name.end_byte() == import_span.end
+        {
+            break;
+        }
+        if module_name.start_byte() > import_span.start || import_span.end > module_name.end_byte()
+        {
+            return Ok(true);
+        }
+        let Some(parent) = module_name.parent() else {
+            return Ok(true);
+        };
+        module_name = parent;
+    }
+    let mut parent = module_name.parent();
+    let clause = loop {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        let Some(current) = parent else {
+            return Ok(true);
+        };
+        parent = current.parent();
+        if current.kind() == "declUses" {
+            break current;
+        }
+    };
+
+    for directive in &document.conditionals.directives {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if directive.start < clause.end_byte() && clause.start_byte() < directive.end {
+            return Ok(true);
+        }
+    }
+
+    let mut conditional_depth = 0usize;
+    for directive in &document.conditionals.directives {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if directive.start >= import_span.start {
+            break;
+        }
+        match directive.kind {
+            DirectiveKind::ConditionalStart => {
+                conditional_depth = conditional_depth.saturating_add(1);
+            }
+            DirectiveKind::ConditionalEnd => {
+                conditional_depth = conditional_depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+    Ok(conditional_depth > 0)
 }
 
 fn is_generic_constraint_identifier(
@@ -780,6 +945,342 @@ mod tests {
                 "side-effect source: {source}"
             );
         }
+    }
+
+    #[test]
+    fn class_operator_declarations_in_direct_or_nested_types_block_unused_hints() {
+        let cases = [
+            (
+                "implicit",
+                "unit U; interface type TNumber = record class operator Implicit(Value: Integer): TNumber; end; implementation end.",
+            ),
+            (
+                "explicit",
+                "unit U; interface type TNumber = record class operator Explicit(Value: Integer): TNumber; end; implementation end.",
+            ),
+            (
+                "add",
+                "unit U; interface type TNumber = record class operator Add(Left, Right: TNumber): TNumber; end; implementation end.",
+            ),
+            (
+                "equal",
+                "unit U; interface type TNumber = record class operator Equal(Left, Right: TNumber): Boolean; end; implementation end.",
+            ),
+            (
+                "nested",
+                "unit U; interface type TOuter = class type TNested = record class operator Implicit(Value: Integer): TNested; end; end; implementation end.",
+            ),
+        ];
+
+        for (case, unit_source) in cases {
+            let (index, uri) = index_with_sources(
+                &[
+                    ("U", unit_source),
+                    ("V", "unit V; interface implementation end."),
+                ],
+                "D",
+                "unit D; interface uses U, V; implementation end.",
+            );
+            let diagnostics = unused_diagnostics(&index, &uri, None);
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.message != "Unit 'U' is not used"),
+                "{case} operator should make U ineligible: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn implicit_conversion_into_an_imported_overload_keeps_operator_unit_used() {
+        let (index, uri) = index_with_sources(
+            &[
+                (
+                    "U",
+                    "unit U; interface type TNumber = record class operator Implicit(Value: Integer): TNumber; end; implementation end.",
+                ),
+                (
+                    "V",
+                    "unit V; interface uses U; function Consume(Value: TNumber): Integer; implementation function Consume(Value: TNumber): Integer; begin Result := Value; end; end.",
+                ),
+            ],
+            "D",
+            "unit D; interface uses U, V; implementation procedure Work; begin Consume(1); end; end.",
+        );
+
+        let diagnostics = unused_diagnostics(&index, &uri, None);
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.message != "Unit 'U' is not used"),
+            "implicit conversions participate in the imported overload: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn record_and_class_helpers_block_unused_unit_hints() {
+        for (kind, unit_source) in [
+            (
+                "record helper",
+                "unit U; interface type TIntHelper = record helper for Integer function Twice: Integer; end; implementation end.",
+            ),
+            (
+                "class helper",
+                "unit U; interface type TObjectHelper = class helper for TObject procedure Touch; end; implementation end.",
+            ),
+        ] {
+            let (index, uri) = index_with_sources(
+                &[
+                    ("U", unit_source),
+                    ("V", "unit V; interface implementation end."),
+                ],
+                "D",
+                "unit D; interface uses U, V; implementation end.",
+            );
+            let diagnostics = unused_diagnostics(&index, &uri, None);
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.message != "Unit 'U' is not used"),
+                "{kind} changes member lookup and must make U ineligible: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn indexing_with_a_default_array_property_keeps_its_declaring_unit() {
+        let (index, uri) = index_with_sources(
+            &[
+                (
+                    "U",
+                    "unit U; interface type TIndexed = class function GetItem(Index: Integer): Integer; property Items[Index: Integer]: Integer read GetItem; default; end; implementation function TIndexed.GetItem(Index: Integer): Integer; begin Result := Index; end; end.",
+                ),
+                (
+                    "V",
+                    "unit V; interface uses U; type TChild = class(TIndexed) end; implementation end.",
+                ),
+            ],
+            "D",
+            "unit D; interface uses U, V; implementation procedure Work; var Item: TChild; Value: Integer; begin Value := Item[0]; end; end.",
+        );
+
+        let diagnostics = unused_diagnostics(&index, &uri, None);
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.message != "Unit 'U' is not used"),
+            "indexing can invoke U's default property without naming it: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn conditional_uses_clauses_withhold_unused_unit_hints() {
+        let cases = [
+            (
+                "conditional entry",
+                "unit D; interface {$DEFINE FEATURE} uses {$IFDEF FEATURE} U, {$ENDIF} V; implementation end.",
+            ),
+            (
+                "unconditional entry beside conditional entry",
+                "unit D; interface {$DEFINE FEATURE} uses U, {$IFDEF FEATURE} V {$ENDIF}; implementation end.",
+            ),
+            (
+                "whole uses clause inside known conditional region",
+                "unit D; interface {$DEFINE FEATURE} {$IFDEF FEATURE} uses U; {$ENDIF} implementation end.",
+            ),
+        ];
+
+        for (case, consumer) in cases {
+            let (index, uri) = index_with_sources(
+                &[
+                    ("U", "unit U; interface implementation end."),
+                    ("V", "unit V; interface implementation end."),
+                ],
+                "D",
+                consumer,
+            );
+            let document = index.documents.get(&uri).expect("consumer document");
+            assert!(
+                document.parser_recovery_spans.is_empty(),
+                "{case} fixture recovered: {:?}",
+                document.parser_recovery_spans
+            );
+            let diagnostics = unused_diagnostics(&index, &uri, None);
+            assert!(
+                diagnostics.is_empty(),
+                "{case} must withhold findings for directive-bearing uses: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn overload_candidate_from_an_unselected_import_keeps_its_unit_used() {
+        let (index, uri) = index_with_sources(
+            &[
+                (
+                    "U",
+                    "unit U; interface function Choose(Value: Integer): Integer; overload; implementation function Choose(Value: Integer): Integer; begin Result := Value; end; end.",
+                ),
+                (
+                    "V",
+                    "unit V; interface function Choose(Value: string): Integer; overload; implementation function Choose(Value: string): Integer; begin Result := Length(Value); end; end.",
+                ),
+                ("W", "unit W; interface implementation end."),
+            ],
+            "D",
+            "unit D; interface uses U, V, W; implementation procedure Work; var Value: Integer; begin Value := Choose('selected from V'); end; end.",
+        );
+
+        let diagnostics = unused_diagnostics(&index, &uri, None);
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["Unit 'W' is not used"],
+            "U remains in the overload candidate set although V's overload is selected"
+        );
+    }
+
+    #[test]
+    fn published_property_and_field_types_keep_their_units_used() {
+        let (index, uri) = index_with_sources(
+            &[
+                (
+                    "U",
+                    "unit U; interface type TExternal = class end; implementation end.",
+                ),
+                ("V", "unit V; interface implementation end."),
+            ],
+            "D",
+            "unit D; interface uses U, V; type TLocal = class published FExternal: U.TExternal; property External: U.TExternal read FExternal; end; implementation end.",
+        );
+
+        let diagnostics = unused_diagnostics(&index, &uri, None);
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["Unit 'V' is not used"],
+            "published fields and property signatures expose U's type"
+        );
+    }
+
+    #[test]
+    fn interface_type_used_only_as_supports_guid_keeps_its_unit_used() {
+        let (index, uri) = index_with_sources(
+            &[
+                (
+                    "U",
+                    "unit U; interface type IFoo = interface ['{00000000-0000-0000-0000-000000000001}'] end; implementation end.",
+                ),
+                ("V", "unit V; interface implementation end."),
+                (
+                    "SysUtils",
+                    "unit SysUtils; interface function Supports(Instance: IInterface; IID: TGUID): Boolean; implementation function Supports(Instance: IInterface; IID: TGUID): Boolean; begin Result := False; end; end.",
+                ),
+            ],
+            "D",
+            "unit D; interface uses U, V, SysUtils; implementation procedure Work(Value: IInterface); begin if Supports(Value, IFoo) then Value := Value; end; end.",
+        );
+
+        let diagnostics = unused_diagnostics(&index, &uri, None);
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["Unit 'V' is not used"],
+            "the Supports IID argument binds the imported interface type"
+        );
+    }
+
+    #[test]
+    fn guid_constant_used_only_as_supports_argument_keeps_its_unit_used() {
+        let (index, uri) = index_with_sources(
+            &[
+                (
+                    "U",
+                    "unit U; interface const IID_IFoo: TGUID = '{00000000-0000-0000-0000-000000000001}'; implementation end.",
+                ),
+                ("V", "unit V; interface implementation end."),
+                (
+                    "SysUtils",
+                    "unit SysUtils; interface function Supports(Instance: IInterface; IID: TGUID): Boolean; implementation function Supports(Instance: IInterface; IID: TGUID): Boolean; begin Result := False; end; end.",
+                ),
+            ],
+            "D",
+            "unit D; interface uses U, V, SysUtils; implementation procedure Work(Value: IInterface); begin if Supports(Value, IID_IFoo) then Value := Value; end; end.",
+        );
+
+        let diagnostics = unused_diagnostics(&index, &uri, None);
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["Unit 'V' is not used"],
+            "the Supports GUID argument binds the imported constant"
+        );
+    }
+
+    #[test]
+    fn known_active_conditional_code_usage_keeps_its_unit_used() {
+        let (index, uri) = index_with_sources(
+            &[
+                (
+                    "U",
+                    "unit U; interface function Needed: Integer; implementation function Needed: Integer; begin Result := 1; end; end.",
+                ),
+                ("V", "unit V; interface implementation end."),
+            ],
+            "D",
+            "unit D; interface uses U, V; implementation procedure Work; var Value: Integer; begin {$DEFINE FEATURE} {$IFDEF FEATURE} Value := Needed; {$ENDIF} end; end.",
+        );
+
+        let diagnostics = unused_diagnostics(&index, &uri, None);
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["Unit 'V' is not used"],
+            "a closed, known-active branch contributes its binding"
+        );
+    }
+
+    #[test]
+    fn inactive_conditional_code_usage_does_not_keep_its_unit_used() {
+        let (index, uri) = index_with_sources(
+            &[
+                (
+                    "U",
+                    "unit U; interface function Needed: Integer; implementation function Needed: Integer; begin Result := 1; end; end.",
+                ),
+                ("V", "unit V; interface implementation end."),
+            ],
+            "D",
+            "unit D; interface uses U, V; implementation procedure Work; var Value: Integer; begin {$UNDEF NEVER_DEFINED} {$IFDEF NEVER_DEFINED} Value := Needed; {$ENDIF} end; end.",
+        );
+
+        let diagnostics = unused_diagnostics(&index, &uri, None);
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["Unit 'U' is not used", "Unit 'V' is not used"],
+            "inactive branch identifiers do not count as unit use"
+        );
     }
 
     #[test]

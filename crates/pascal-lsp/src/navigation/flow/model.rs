@@ -607,6 +607,18 @@ fn build_routine_flow<'a>(
         cancel,
         budget,
     )?;
+    if local_type_references_have_shadowing_uncertainty(
+        index,
+        uri,
+        document,
+        &all_nodes,
+        local_symbol_indices,
+        routine_symbol_index,
+        cancel,
+        budget,
+    )? {
+        note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
+    }
     if routine_scope.is_none() {
         note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
     }
@@ -704,6 +716,14 @@ fn build_routine_flow<'a>(
             continue;
         }
         if is_control_transfer_identifier(identifier, &document.source) {
+            let key = canonical_name(&node_text(identifier, &document.source));
+            if flow_special_name_affects_analysis(&key)
+                && call_target_has_shadowing_uncertainty(
+                    index, uri, document, identifier, cancel, budget,
+                )?
+            {
+                note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
+            }
             if let (Some(result), Some(exit_call)) = (
                 result_local,
                 exit_call_with_argument(identifier, &document.source),
@@ -864,31 +884,33 @@ fn build_routine_flow<'a>(
                 state.inaccessible_candidate,
             )
         };
-        let external_candidate_uncertain = if !is_local_occurrence && !candidates.is_empty() {
-            if super::super::overload::candidate_target_count_after_overload_grouping(
+        let external_target_affects_flow = !is_local_occurrence
+            && !is_right_hand_member(identifier)
+            && !is_call_entity(identifier)
+            && external_identifier_affects_local_flow(
+                identifier,
+                &local_names,
+                &document.source,
+                cancel,
+                budget,
+            )?;
+        let external_candidate_uncertain = if external_target_affects_flow && !candidates.is_empty()
+        {
+            external_candidate_set_has_shadowing_uncertainty(
                 index,
+                uri,
+                document,
+                offset,
+                &key,
                 &candidates,
                 cancel,
                 budget,
-            )? != 1
-            {
-                true
-            } else if is_right_hand_member(identifier) {
-                false
-            } else {
-                index.flow_candidate_has_shadowing_uncertainty(
-                    uri,
-                    document,
-                    offset,
-                    &key,
-                    &candidates[0],
-                    cancel,
-                    budget,
-                )?
-            }
+            )?
         } else {
             false
         };
+        let external_ambiguous_candidate_uncertain =
+            external_target_affects_flow && ambiguous && !candidates.is_empty();
         let local_resolution_uncertain = candidates.len() != 1
             || receiver_uncertain
             || member_lookup_incomplete
@@ -904,7 +926,8 @@ fn build_routine_flow<'a>(
                 || receiver_uncertain
                 || member_lookup_incomplete
                 || inaccessible
-                || ambiguous
+                || (ambiguous
+                    && (candidates.is_empty() || external_ambiguous_candidate_uncertain))
                 || external_candidate_uncertain);
         if is_local_occurrence && local_resolution_uncertain
             || !is_local_occurrence && external_resolution_uncertain
@@ -1027,6 +1050,209 @@ fn build_routine_flow<'a>(
         excluded,
         node,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn local_type_references_have_shadowing_uncertainty(
+    index: &NavigationIndex,
+    uri: &Url,
+    document: &Document,
+    routine_nodes: &[Node<'_>],
+    local_symbol_indices: &[usize],
+    routine_symbol_index: Option<usize>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    if document.interface_uses.is_empty()
+        && document.implementation_uses.is_empty()
+        && document.unknown_imports.is_empty()
+    {
+        return Ok(false);
+    }
+    for &symbol_index in local_symbol_indices {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        let Some(symbol) = document.symbols.get(symbol_index) else {
+            continue;
+        };
+        if !matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Parameter) {
+            continue;
+        }
+        if let Some(shape) = symbol.type_shape.as_ref()
+            && type_shape_has_shadowing_uncertainty(
+                index,
+                uri,
+                document,
+                routine_nodes,
+                shape,
+                cancel,
+                budget,
+            )?
+        {
+            return Ok(true);
+        }
+    }
+
+    let Some(routine_symbol) =
+        routine_symbol_index.and_then(|symbol_index| document.symbols.get(symbol_index))
+    else {
+        return Ok(false);
+    };
+    if routine_symbol.routine_kind == RoutineKind::Function {
+        for type_ref in [
+            routine_symbol.implementation_result_type_ref.as_ref(),
+            routine_symbol.result_type_ref.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if type_ref_has_shadowing_uncertainty(
+                index,
+                uri,
+                document,
+                routine_nodes,
+                type_ref,
+                cancel,
+                budget,
+            )? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn type_shape_has_shadowing_uncertainty(
+    index: &NavigationIndex,
+    uri: &Url,
+    document: &Document,
+    routine_nodes: &[Node<'_>],
+    shape: &TypeShape,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    match shape {
+        TypeShape::Named(type_ref) => type_ref_has_shadowing_uncertainty(
+            index,
+            uri,
+            document,
+            routine_nodes,
+            type_ref,
+            cancel,
+            budget,
+        ),
+        TypeShape::Pointer(inner) | TypeShape::Array { element: inner, .. } => {
+            type_shape_has_shadowing_uncertainty(
+                index,
+                uri,
+                document,
+                routine_nodes,
+                inner,
+                cancel,
+                budget,
+            )
+        }
+        TypeShape::Callable | TypeShape::Unknown => Ok(false),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn type_ref_has_shadowing_uncertainty(
+    index: &NavigationIndex,
+    uri: &Url,
+    document: &Document,
+    routine_nodes: &[Node<'_>],
+    type_ref: &TypeRef,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    check_navigation_cancel(cancel)?;
+    budget.require_work(1, cancel)?;
+    let Some(key) = type_ref.path.last() else {
+        return Ok(false);
+    };
+    if let Some(identifier) = routine_nodes.iter().copied().find(|candidate| {
+        candidate.kind() == "identifier"
+            && candidate.start_byte() >= type_ref.span.start
+            && candidate.end_byte() <= type_ref.span.end
+            && canonical_name(&node_text(*candidate, &document.source)) == *key
+    }) {
+        let mut state = ResolutionState::new();
+        let candidates = index.resolve_candidates_at_with_state_and_budget(
+            uri,
+            document,
+            identifier.start_byte(),
+            identifier,
+            &mut state,
+            0,
+            cancel,
+            budget,
+        )?;
+        if !candidates.is_empty()
+            && (state.receiver_resolution_uncertain()
+                || state.member_lookup_incomplete
+                || state.ambiguous
+                || state.inaccessible_candidate
+                || external_candidate_set_has_shadowing_uncertainty(
+                    index,
+                    uri,
+                    document,
+                    identifier.start_byte(),
+                    key,
+                    &candidates,
+                    cancel,
+                    budget,
+                )?)
+        {
+            return Ok(true);
+        }
+    }
+    for argument in &type_ref.args {
+        if type_ref_has_shadowing_uncertainty(
+            index,
+            uri,
+            document,
+            routine_nodes,
+            argument,
+            cancel,
+            budget,
+        )? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn external_candidate_set_has_shadowing_uncertainty(
+    index: &NavigationIndex,
+    uri: &Url,
+    document: &Document,
+    offset: usize,
+    key: &str,
+    candidates: &[Candidate],
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    if candidates.is_empty() {
+        return Ok(false);
+    }
+    if super::super::overload::candidate_target_count_after_overload_grouping(
+        index, candidates, cancel, budget,
+    )? != 1
+    {
+        return Ok(true);
+    }
+    index.flow_candidate_has_shadowing_uncertainty(
+        uri,
+        document,
+        offset,
+        key,
+        &candidates[0],
+        cancel,
+        budget,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1978,11 +2204,29 @@ fn call_argument_accesses(
         if call.kind() != "exprCall" {
             continue;
         }
+        let Some(entity) = call.child_by_field_name("entity") else {
+            continue;
+        };
+        let lookup_identifier = super::super::callable_lookup_identifier(entity);
+        let callee_name = canonical_name(&node_text(entity, &document.source));
+        let unqualified_special_name = flow_special_name_affects_analysis(&callee_name)
+            && super::super::callable_owner_node(entity).is_none();
+        if (unqualified_special_name
+            || call_has_local_root_argument(call, local_names, &document.source, cancel, budget)?)
+            && call_target_has_shadowing_uncertainty(
+                index,
+                uri,
+                document,
+                lookup_identifier,
+                cancel,
+                budget,
+            )?
+        {
+            result.target_uncertain = true;
+        }
         let Some(arguments) = call.child_by_field_name("args") else {
             continue;
         };
-        let entity = call.child_by_field_name("entity");
-        let callee_name = entity.map(|entity| canonical_name(&node_text(entity, &document.source)));
         let mut cursor = arguments.walk();
         let mut argument_index = 0;
         for argument in arguments.named_children(&mut cursor) {
@@ -2031,13 +2275,13 @@ fn call_argument_accesses(
                 super::super::overload::ParameterModeResolution::UncertainTarget
                     | super::super::overload::ParameterModeResolution::Resolved(None)
             );
-            let access = if matches!(callee_name.as_deref(), Some("inc" | "dec"))
+            let access = if matches!(callee_name.as_str(), "inc" | "dec")
                 && mode
                     == super::super::overload::ParameterModeResolution::Intrinsic(Some(
                         ParameterMode::Var,
                     )) {
                 Access::ReadWrite
-            } else if callee_name.as_deref() == Some("addr")
+            } else if callee_name == "addr"
                 && mode == super::super::overload::ParameterModeResolution::Unresolved
             {
                 Access::AddressOf
@@ -2076,6 +2320,52 @@ fn call_argument_accesses(
         }
     }
     Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call_target_has_shadowing_uncertainty(
+    index: &NavigationIndex,
+    uri: &Url,
+    document: &Document,
+    identifier: Node<'_>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    if identifier.kind() != "identifier" {
+        return Ok(false);
+    }
+    let key = canonical_name(&node_text(identifier, &document.source));
+    let mut state = ResolutionState::new();
+    let candidates = index.resolve_candidates_at_with_state_and_budget(
+        uri,
+        document,
+        identifier.start_byte(),
+        identifier,
+        &mut state,
+        0,
+        cancel,
+        budget,
+    )?;
+    if candidates.is_empty() {
+        return Ok(false);
+    }
+    if state.receiver_resolution_uncertain()
+        || state.member_lookup_incomplete
+        || state.ambiguous
+        || state.inaccessible_candidate
+    {
+        return Ok(true);
+    }
+    external_candidate_set_has_shadowing_uncertainty(
+        index,
+        uri,
+        document,
+        identifier.start_byte(),
+        &key,
+        &candidates,
+        cancel,
+        budget,
+    )
 }
 
 fn call_argument_access_for_mode(mode: super::super::overload::ParameterModeResolution) -> Access {
@@ -2144,7 +2434,9 @@ fn call_argument_lvalue_base<'tree>(
             "exprUnary"
                 if expression
                     .child_by_field_name("operator")
-                    .is_some_and(|operator| node_text(operator, source) == "^") =>
+                    .is_some_and(|operator| {
+                        matches!(node_text(operator, source).as_str(), "^" | "@")
+                    }) =>
             {
                 let Some(operand) = expression.child_by_field_name("operand") else {
                     return Ok(None);
@@ -2318,6 +2610,177 @@ fn is_call_entity(identifier: Node<'_>) -> bool {
         current = parent;
     }
     false
+}
+
+fn flow_special_name_affects_analysis(key: &str) -> bool {
+    matches!(
+        key,
+        "exit"
+            | "break"
+            | "continue"
+            | "raise"
+            | "halt"
+            | "abort"
+            | "runerror"
+            | "assert"
+            | "initialize"
+            | "finalize"
+            | "fillchar"
+            | "inc"
+            | "dec"
+            | "addr"
+            | "read"
+            | "readln"
+            | "str"
+            | "val"
+            | "setlength"
+            | "new"
+            | "dispose"
+            | "getmem"
+            | "freemem"
+            | "include"
+            | "exclude"
+            | "low"
+            | "high"
+            | "sizeof"
+            | "default"
+            | "move"
+            | "write"
+            | "writeln"
+            | "freeandnil"
+            | "create"
+            | "free"
+            | "destroy"
+    )
+}
+
+fn node_contains(outer: Node<'_>, inner: Node<'_>) -> bool {
+    outer.start_byte() <= inner.start_byte() && inner.end_byte() <= outer.end_byte()
+}
+
+fn identifier_is_with_target(identifier: Node<'_>) -> bool {
+    let mut current = identifier;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "with"
+            && parent
+                .child_by_field_name("entity")
+                .is_some_and(|entity| node_contains(entity, identifier))
+        {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn identifier_is_member_receiver(identifier: Node<'_>) -> bool {
+    let mut current = identifier;
+    while let Some(parent) = current.parent() {
+        if matches!(parent.kind(), "exprDot" | "genericDot")
+            && parent
+                .child_by_field_name("lhs")
+                .is_some_and(|lhs| node_contains(lhs, identifier))
+        {
+            return true;
+        }
+        if parent.kind() == "exprSubscript"
+            && parent
+                .child_by_field_name("entity")
+                .is_some_and(|entity| node_contains(entity, identifier))
+        {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn call_has_local_root_argument(
+    call: Node<'_>,
+    local_names: &HashSet<String>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    let Some(arguments) = call.child_by_field_name("args") else {
+        return Ok(false);
+    };
+    let mut cursor = arguments.walk();
+    for argument in arguments.named_children(&mut cursor) {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if argument.kind() == "legacyFormat" {
+            continue;
+        }
+        let expression = if argument.kind() == "namedArgument" {
+            argument.child_by_field_name("value").unwrap_or(argument)
+        } else {
+            argument
+        };
+        if call_argument_lvalue_base(expression, source, cancel, budget)?.is_some_and(|root| {
+            root.kind() == "identifier"
+                && local_names.contains(&canonical_name(&node_text(root, source)))
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn external_identifier_affects_local_flow(
+    identifier: Node<'_>,
+    local_names: &HashSet<String>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    let key = canonical_name(&node_text(identifier, source));
+    if flow_special_name_affects_analysis(&key)
+        || identifier_is_with_target(identifier)
+        || identifier_is_member_receiver(identifier)
+    {
+        return Ok(true);
+    }
+
+    let mut current = identifier;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "exprCall"
+            && parent
+                .child_by_field_name("entity")
+                .is_some_and(|entity| node_contains(entity, identifier))
+            && call_has_local_root_argument(parent, local_names, source, cancel, budget)?
+        {
+            return Ok(true);
+        }
+        if parent.kind() == "exprSubscript"
+            && parent
+                .child_by_field_name("entity")
+                .is_some_and(|entity| node_contains(entity, identifier))
+            && call_has_local_root_argument(parent, local_names, source, cancel, budget)?
+        {
+            return Ok(true);
+        }
+        if parent.kind() == "exprBinary"
+            && parent
+                .child_by_field_name("operator")
+                .is_some_and(|operator| {
+                    matches!(
+                        node_text(operator, source).to_ascii_lowercase().as_str(),
+                        "as" | "is"
+                    )
+                })
+            && parent
+                .child_by_field_name("rhs")
+                .is_some_and(|rhs| node_contains(rhs, identifier))
+            && let Some(lhs) = parent.child_by_field_name("lhs")
+            && !local_identifiers_in_expression(lhs, source, local_names, cancel, budget)?
+                .is_empty()
+        {
+            return Ok(true);
+        }
+        current = parent;
+    }
+    Ok(false)
 }
 
 fn is_control_transfer_identifier(identifier: Node<'_>, source: &str) -> bool {

@@ -1,0 +1,4 @@
+unit = "FlowLaterUsesShadowedExternalValue.pas"
+compilers = ["21.0", "24.0", "37.0"]
+unindexed_units = ["Shadow.pas"]
+reason = "Shadow is intentionally left unindexed; Delphi resolves its later function declaration for a plain external read, which must not suppress H2077."

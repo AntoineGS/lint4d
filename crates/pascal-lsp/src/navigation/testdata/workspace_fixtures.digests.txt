@@ -252,6 +252,9 @@ crates/pascal-lsp/tests/dcc_oracle/flow_compiler_surface_member/FlowCompilerSurf
 crates/pascal-lsp/tests/dcc_oracle/flow_exception_handler_variable/FlowExceptionHandlerVariable.pas 0301a86a1a669a96 4
 crates/pascal-lsp/tests/dcc_oracle/flow_incomplete_imports/FlowExternal.pas aca1910eec50f8d3 2
 crates/pascal-lsp/tests/dcc_oracle/flow_incomplete_imports/FlowIncompleteImports.pas 7322588cef6751d3 4
+crates/pascal-lsp/tests/dcc_oracle/flow_later_uses_shadowed_external_value/FlowLaterUsesShadowedExternalValue.pas e3955514f1b28977 3
+crates/pascal-lsp/tests/dcc_oracle/flow_later_uses_shadowed_external_value/Indexed.pas 2d86d2bbab924ebb 2
+crates/pascal-lsp/tests/dcc_oracle/flow_later_uses_shadowed_external_value/Shadow.pas e75e8220160ad1fe 3
 crates/pascal-lsp/tests/dcc_oracle/flow_later_uses_shadowing/FlowLaterUsesShadowing.pas 0ff13b41404ab064 3
 crates/pascal-lsp/tests/dcc_oracle/flow_later_uses_shadowing/Indexed.pas 023fbc5b8223660e 5
 crates/pascal-lsp/tests/dcc_oracle/flow_later_uses_shadowing/Shadow.pas 0cf442d4da7012bb 5

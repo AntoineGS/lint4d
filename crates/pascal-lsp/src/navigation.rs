@@ -8338,14 +8338,14 @@ impl NavigationIndex {
             let Some(provider) = self.documents.get(provider_uri) else {
                 return Ok(true);
             };
+            if provider_uri == &candidate.uri {
+                return Ok(false);
+            }
             if !Self::document_is_complete_for_proof(provider, cancel, budget)?
                 || !provider.opaque_ranges.is_empty()
                 || !provider.unknown_imports.is_empty()
             {
                 return Ok(true);
-            }
-            if provider_uri == &candidate.uri {
-                return Ok(false);
             }
             if !self
                 .exported_references_for_key_with_budget(provider_uri, key, cancel, budget)?

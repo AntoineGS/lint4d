@@ -1456,6 +1456,73 @@ fn flow_diagnostics(source: &str) -> Vec<SemanticDiagnostic> {
     flow_diagnostics_with_version(source, None)
 }
 
+fn flow_diagnostics_with_later_unindexed_shadow(
+    source: &str,
+) -> (Vec<(String, usize, String)>, Option<FlowExclusion>) {
+    let indexed_source = concat!(
+        "unit Indexed;\n",
+        "interface\n",
+        "type TShadowType = class end;\n",
+        "var ExternalValue: Integer; ExternalObject: TShadowType;\n",
+        "procedure Fill(const V: Integer);\n",
+        "procedure Inc(const V: Integer);\n",
+        "function ExternalFunction: Integer;\n",
+        "function Transform(const V: Integer): Integer;\n",
+        "implementation\n",
+        "procedure Fill(const V: Integer); begin end;\n",
+        "procedure Inc(const V: Integer); begin end;\n",
+        "function ExternalFunction: Integer; begin Result := 1; end;\n",
+        "function Transform(const V: Integer): Integer; begin Result := V; end;\n",
+        "end.\n",
+    );
+    let uri = Url::parse("file:///tmp/flow-later-shadow-program.pas").expect("program URI");
+    let indexed_uri = Url::parse("file:///tmp/Indexed.pas").expect("indexed URI");
+    let shadow_uri = Url::parse("file:///tmp/unindexed/Shadow.pas").expect("shadow URI");
+    let version = CompilerVersion::new(37, 0);
+    let platform = TargetPlatform::Win32;
+    let context = ConditionalContext {
+        compiler_version: Some(version),
+        layout: LayoutContext::for_target(Some(version), Some(&platform)),
+        ..ConditionalContext::default()
+    };
+    let cancel = AtomicBool::new(false);
+    let mut index = NavigationIndex::new();
+    index
+        .update_with_context_with_cancel(
+            indexed_uri.clone(),
+            indexed_source.to_owned(),
+            &context,
+            &cancel,
+        )
+        .expect("indexed provider parses");
+    index
+        .update_with_context_with_cancel(uri.clone(), source.to_owned(), &context, &cancel)
+        .expect("program parses");
+    index.bind_imports(
+        &uri,
+        [
+            ("Indexed".to_owned(), indexed_uri),
+            ("Shadow".to_owned(), shadow_uri),
+        ],
+    );
+
+    let report = index
+        .semantic_diagnostic_report_with_cancel(&uri, &cancel)
+        .expect("semantic report");
+    let document = index.documents.get(&uri).expect("program is indexed");
+    let mut budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "flow test");
+    let flow = routine_flows(&index, &uri, document, &cancel, &mut budget)
+        .expect("flow model builds")
+        .into_iter()
+        .find(|flow| flow.name.eq_ignore_ascii_case("demo"))
+        .expect("Demo flow");
+
+    (
+        flow_finding_lines(source, &report.diagnostics),
+        flow.excluded,
+    )
+}
+
 fn flow_diagnostics_with_version(
     source: &str,
     compiler_version: Option<pascal_project::CompilerVersion>,
@@ -1723,7 +1790,7 @@ fn flow_diagnostics_withhold_findings_when_a_later_incomplete_import_can_shadow_
         "procedure Demo;\n",
         "var X: Integer;\n",
         "begin\n",
-        "  Fill(X);\n",
+        "  Fill(Transform(X));\n",
         "  Writeln(X);\n",
         "end;\n",
         "begin Demo; end.\n",
@@ -1732,9 +1799,12 @@ fn flow_diagnostics_withhold_findings_when_a_later_incomplete_import_can_shadow_
         "unit Indexed;\n",
         "interface\n",
         "procedure Fill(const V: Integer);\n",
+        "function Transform(const V: Integer): Integer;\n",
         "implementation\n",
         "procedure Fill(const V: Integer);\n",
         "begin end;\n",
+        "function Transform(const V: Integer): Integer;\n",
+        "begin Result := V; end;\n",
         "end.\n",
     );
     let uri = Url::parse("file:///tmp/flow-shadowed-routine.pas").expect("source URI");
@@ -1790,6 +1860,203 @@ fn flow_diagnostics_withhold_findings_when_a_later_incomplete_import_can_shadow_
         Some(FlowExclusion::UnresolvedIdentity),
         "the routine must remain uncertain when an incomplete higher-precedence import can shadow its callee"
     );
+}
+
+#[test]
+fn flow_diagnostics_keep_h2077_for_a_shadowable_external_plain_read() {
+    let source = concat!(
+        "program FlowShadowedExternalRead;\n",
+        "uses Indexed, Shadow;\n",
+        "procedure Demo;\n",
+        "var WrittenOnly: Integer;\n",
+        "begin\n",
+        "  WrittenOnly := ExternalValue;\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+
+    let (findings, excluded) = flow_diagnostics_with_later_unindexed_shadow(source);
+
+    assert!(
+        findings.iter().any(|(code, _, _)| code == "H2077"),
+        "a plain read of a shadowable external must not hide an independent local flow finding: {findings:?}"
+    );
+    assert_ne!(
+        excluded,
+        Some(FlowExclusion::UnresolvedIdentity),
+        "the external value read is not a target-dependent flow use"
+    );
+}
+
+#[test]
+fn flow_diagnostics_keep_h2077_for_a_shadowable_external_function_value_read() {
+    let source = concat!(
+        "program FlowShadowedExternalFunctionRead;\n",
+        "uses Indexed, Shadow;\n",
+        "procedure Demo;\n",
+        "var WrittenOnly: Integer;\n",
+        "begin\n",
+        "  WrittenOnly := ExternalFunction;\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+
+    let (findings, excluded) = flow_diagnostics_with_later_unindexed_shadow(source);
+
+    assert!(
+        findings.iter().any(|(code, _, _)| code == "H2077"),
+        "a bare external function value read must not hide an independent local flow finding: {findings:?}"
+    );
+    assert_ne!(
+        excluded,
+        Some(FlowExclusion::UnresolvedIdentity),
+        "the external function value has no local-root arguments"
+    );
+}
+
+#[test]
+fn flow_diagnostics_withhold_findings_for_shadowable_calls_with_local_lvalue_roots() {
+    let sources = [
+        concat!(
+            "program FlowShadowedCallArgument;\n",
+            "uses Indexed, Shadow;\n",
+            "procedure Demo;\n",
+            "var X, WrittenOnly: Integer;\n",
+            "begin X := 1; Fill(X); WrittenOnly := 1; end;\n",
+            "begin Demo; end.\n",
+        ),
+        concat!(
+            "program FlowShadowedFieldArgument;\n",
+            "uses Indexed, Shadow;\n",
+            "type TLocalRecord = record Field: Integer; end;\n",
+            "procedure Demo;\n",
+            "var X: TLocalRecord; WrittenOnly: Integer;\n",
+            "begin X.Field := 1; Fill(X.Field); WrittenOnly := 1; end;\n",
+            "begin Demo; end.\n",
+        ),
+        concat!(
+            "program FlowShadowedIndexedArgument;\n",
+            "uses Indexed, Shadow;\n",
+            "type TLocalArray = array[0..1] of Integer;\n",
+            "procedure Demo;\n",
+            "var X: TLocalArray; I, WrittenOnly: Integer;\n",
+            "begin I := 0; X[I] := 1; Fill(X[I]); WrittenOnly := 1; end;\n",
+            "begin Demo; end.\n",
+        ),
+        concat!(
+            "program FlowShadowedAddressArgument;\n",
+            "uses Indexed, Shadow;\n",
+            "procedure Demo;\n",
+            "var X, WrittenOnly: Integer;\n",
+            "begin X := 1; Fill(@X); WrittenOnly := 1; end;\n",
+            "begin Demo; end.\n",
+        ),
+    ];
+
+    for source in sources {
+        let (findings, excluded) = flow_diagnostics_with_later_unindexed_shadow(source);
+        assert!(
+            findings.is_empty(),
+            "a shadowable call with a local-root argument must withhold flow diagnostics: {source}\n{findings:?}"
+        );
+        assert_eq!(
+            excluded,
+            Some(FlowExclusion::UnresolvedIdentity),
+            "the unresolved call target must exclude flow analysis: {source}"
+        );
+    }
+}
+
+#[test]
+fn flow_diagnostics_withhold_findings_for_a_shadowable_flow_special_name() {
+    let source = concat!(
+        "program FlowShadowedSpecialName;\n",
+        "uses Indexed, Shadow;\n",
+        "procedure Demo;\n",
+        "var WrittenOnly: Integer;\n",
+        "begin\n",
+        "  Inc(1);\n",
+        "  WrittenOnly := 1;\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+
+    let (findings, excluded) = flow_diagnostics_with_later_unindexed_shadow(source);
+
+    assert!(
+        findings.is_empty(),
+        "a target-dependent special name must withhold flow diagnostics: {findings:?}"
+    );
+    assert_eq!(excluded, Some(FlowExclusion::UnresolvedIdentity));
+}
+
+#[test]
+fn flow_diagnostics_withhold_findings_for_a_shadowable_local_declaration_type() {
+    let source = concat!(
+        "program FlowShadowedLocalType;\n",
+        "uses Indexed, Shadow;\n",
+        "procedure Demo;\n",
+        "var Typed: TShadowType; WrittenOnly: Integer;\n",
+        "begin\n",
+        "  Typed := Typed;\n",
+        "  WrittenOnly := 1;\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+
+    let (findings, excluded) = flow_diagnostics_with_later_unindexed_shadow(source);
+
+    assert!(
+        findings.is_empty(),
+        "a shadowable local type can change managedness/classification and must withhold flow findings: {findings:?}"
+    );
+    assert_eq!(excluded, Some(FlowExclusion::UnresolvedIdentity));
+}
+
+#[test]
+fn flow_diagnostics_withhold_findings_for_a_shadowable_cast_type_of_a_local() {
+    let source = concat!(
+        "program FlowShadowedCastType;\n",
+        "uses Indexed, Shadow;\n",
+        "type TLocalClass = class end;\n",
+        "procedure Demo;\n",
+        "var LocalObject: TLocalClass; WrittenOnly: Integer;\n",
+        "begin\n",
+        "  WrittenOnly := 1;\n",
+        "  if LocalObject is TShadowType then begin end;\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+
+    let (findings, excluded) = flow_diagnostics_with_later_unindexed_shadow(source);
+
+    assert!(
+        findings.is_empty(),
+        "a shadowable type test on a local operand must withhold flow diagnostics: {findings:?}"
+    );
+    assert_eq!(excluded, Some(FlowExclusion::UnresolvedIdentity));
+}
+
+#[test]
+fn flow_diagnostics_withhold_findings_for_a_shadowable_with_target() {
+    let source = concat!(
+        "program FlowShadowedWithTarget;\n",
+        "uses Indexed, Shadow;\n",
+        "procedure Demo;\n",
+        "var WrittenOnly: Integer;\n",
+        "begin\n",
+        "  with ExternalObject do begin WrittenOnly := 1; end;\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+
+    let (findings, excluded) = flow_diagnostics_with_later_unindexed_shadow(source);
+
+    assert!(
+        findings.is_empty(),
+        "a shadowable with target can change member lookup for locals and must withhold flow diagnostics: {findings:?}"
+    );
+    assert_eq!(excluded, Some(FlowExclusion::UnresolvedIdentity));
 }
 
 #[test]
@@ -1864,6 +2131,61 @@ fn flow_diagnostics_withhold_findings_for_an_ambiguous_external_call_target() {
         demo.excluded,
         Some(FlowExclusion::UnresolvedIdentity),
         "multiple target groups leave the routine uncertain"
+    );
+}
+
+#[test]
+fn flow_diagnostics_keep_h2077_for_an_ambiguous_external_plain_read() {
+    let source = concat!(
+        "program FlowAmbiguousExternalRead;\n",
+        "uses Indexed, Shadow;\n",
+        "procedure Demo;\n",
+        "var WrittenOnly: Integer;\n",
+        "begin WrittenOnly := ExternalValue; end;\n",
+        "begin Demo; end.\n",
+    );
+    let provider = concat!(
+        "unit Indexed;\n",
+        "interface\n",
+        "var ExternalValue: Integer;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let shadow = concat!(
+        "unit Shadow;\n",
+        "interface\n",
+        "var ExternalValue: Integer;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let uri = Url::parse("file:///tmp/flow-ambiguous-external-read.pas").expect("program URI");
+    let indexed_uri = Url::parse("file:///tmp/Indexed.pas").expect("indexed URI");
+    let shadow_uri = Url::parse("file:///tmp/Shadow.pas").expect("shadow URI");
+    let mut index = NavigationIndex::new();
+    index
+        .update(indexed_uri.clone(), provider.to_owned())
+        .expect("indexed provider parses");
+    index
+        .update(shadow_uri.clone(), shadow.to_owned())
+        .expect("shadow provider parses");
+    index
+        .update(uri.clone(), source.to_owned())
+        .expect("program parses");
+    index.bind_imports(
+        &uri,
+        [
+            ("Indexed".to_owned(), indexed_uri),
+            ("Shadow".to_owned(), shadow_uri),
+        ],
+    );
+
+    let report = index
+        .semantic_diagnostic_report_with_cancel(&uri, &AtomicBool::new(false))
+        .expect("semantic report");
+    let findings = flow_finding_lines(source, &report.diagnostics);
+    assert!(
+        findings.iter().any(|(code, _, _)| code == "H2077"),
+        "ambiguous read targets do not affect whether this local write is used: {findings:?}"
     );
 }
 

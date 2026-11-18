@@ -3,7 +3,7 @@ use super::super::warning_switches::WarningSwitches;
 use super::super::{
     AssistanceBudget, Candidate, DccMessage, DccSeverity, Document, NavigationIndex,
     ResolutionState, SemanticDiagnostic, SemanticDiagnosticKind, SourceSpan, SymbolKind,
-    check_navigation_cancel, node_text,
+    canonical_name, check_navigation_cancel, node_text,
 };
 use super::model::{RoutineFlow, VarOccurrence, collect_nodes};
 use super::{Access, LocalKind, VarType};
@@ -1254,6 +1254,18 @@ fn constant_value_with_visited(
                 cancel,
             )?;
             let candidate = candidates[0].clone();
+            let key = canonical_name(&node_text(node, &document.source));
+            if index.flow_candidate_has_shadowing_uncertainty(
+                uri,
+                document,
+                node.start_byte(),
+                &key,
+                &candidate,
+                cancel,
+                budget,
+            )? {
+                return Ok(None);
+            }
             if !visited.insert(candidate.clone()) {
                 return Ok(None);
             }

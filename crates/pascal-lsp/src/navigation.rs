@@ -8273,6 +8273,102 @@ impl NavigationIndex {
         Ok(Vec::new())
     }
 
+    /// Whether a source-backed candidate is unsafe as flow proof because a
+    /// higher-precedence import is incomplete or already exports the name.
+    ///
+    /// Delphi searches the current unit before imports, then implementation
+    /// uses in reverse source order, interface uses in reverse source order,
+    /// and implicit System last. The ordinary navigation candidate collector
+    /// intentionally aggregates imports, so flow must not treat an aggregate
+    /// candidate as proof without checking this lookup order.
+    #[allow(clippy::too_many_arguments)]
+    fn flow_candidate_has_shadowing_uncertainty(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        key: &str,
+        candidate: &Candidate,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        if candidate.uri == *current_uri {
+            return Ok(false);
+        }
+
+        let region = current_document.region_at(offset);
+        let ordered_uses = match region {
+            Region::Interface => current_document
+                .interface_uses
+                .iter()
+                .rev()
+                .collect::<Vec<_>>(),
+            Region::Implementation | Region::Other => current_document
+                .implementation_uses
+                .iter()
+                .rev()
+                .chain(current_document.interface_uses.iter().rev())
+                .collect::<Vec<_>>(),
+        };
+        budget.require_work(ordered_uses.len(), cancel)?;
+        budget.require_bytes(
+            ordered_uses
+                .len()
+                .saturating_mul(std::mem::size_of::<&String>()),
+            cancel,
+        )?;
+
+        for unit in ordered_uses {
+            check_navigation_cancel(cancel)?;
+            let unit_key = canonical_name(unit);
+            if current_document.unknown_imports.contains(&unit_key) {
+                return Ok(true);
+            }
+            let providers = self.unit_urls_for_import_lookup_with_budget(
+                current_document,
+                &unit_key,
+                Some(key),
+                cancel,
+                budget,
+            )?;
+            if providers.len() != 1 {
+                return Ok(true);
+            }
+            let provider_uri = &providers[0];
+            let Some(provider) = self.documents.get(provider_uri) else {
+                return Ok(true);
+            };
+            if !Self::document_is_complete_for_proof(provider, cancel, budget)?
+                || !provider.opaque_ranges.is_empty()
+                || !provider.unknown_imports.is_empty()
+            {
+                return Ok(true);
+            }
+            if provider_uri == &candidate.uri {
+                return Ok(false);
+            }
+            if !self
+                .exported_references_for_key_with_budget(provider_uri, key, cancel, budget)?
+                .is_empty()
+            {
+                return Ok(true);
+            }
+        }
+
+        let Some(provider) = self.documents.get(&candidate.uri) else {
+            return Ok(true);
+        };
+        if !Self::document_is_complete_for_proof(provider, cancel, budget)?
+            || !provider.opaque_ranges.is_empty()
+            || !provider.unknown_imports.is_empty()
+        {
+            return Ok(true);
+        }
+        // The only source-backed candidate after all explicit imports is
+        // Delphi's implicit System unit.
+        Ok(provider.unit_name != "system")
+    }
+
     fn implicit_system_references_with_budget(
         &self,
         document: &Document,

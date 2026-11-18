@@ -1716,6 +1716,158 @@ fn flow_diagnostics_withhold_findings_for_an_unresolved_nonlocal_with_bound_unin
 }
 
 #[test]
+fn flow_diagnostics_withhold_findings_when_a_later_incomplete_import_can_shadow_a_routine() {
+    let source = concat!(
+        "program FlowShadowedRoutine;\n",
+        "uses Indexed, Shadow;\n",
+        "procedure Demo;\n",
+        "var X: Integer;\n",
+        "begin\n",
+        "  Fill(X);\n",
+        "  Writeln(X);\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+    let indexed_source = concat!(
+        "unit Indexed;\n",
+        "interface\n",
+        "procedure Fill(const V: Integer);\n",
+        "implementation\n",
+        "procedure Fill(const V: Integer);\n",
+        "begin end;\n",
+        "end.\n",
+    );
+    let uri = Url::parse("file:///tmp/flow-shadowed-routine.pas").expect("source URI");
+    let indexed_uri = Url::parse("file:///tmp/Indexed.pas").expect("indexed URI");
+    let shadow_uri = Url::parse("file:///tmp/unindexed/Shadow.pas").expect("shadow URI");
+    let version = CompilerVersion::new(37, 0);
+    let platform = TargetPlatform::Win32;
+    let context = ConditionalContext {
+        compiler_version: Some(version),
+        layout: LayoutContext::for_target(Some(version), Some(&platform)),
+        ..ConditionalContext::default()
+    };
+    let cancel = AtomicBool::new(false);
+    let mut index = NavigationIndex::new();
+    index
+        .update_with_context_with_cancel(
+            indexed_uri.clone(),
+            indexed_source.to_owned(),
+            &context,
+            &cancel,
+        )
+        .expect("indexed provider parses");
+    index
+        .update_with_context_with_cancel(uri.clone(), source.to_owned(), &context, &cancel)
+        .expect("fixture parses");
+    index.bind_imports(
+        &uri,
+        [
+            ("Indexed".to_owned(), indexed_uri),
+            ("Shadow".to_owned(), shadow_uri),
+        ],
+    );
+
+    let report = index
+        .semantic_diagnostic_report_with_cancel(&uri, &cancel)
+        .expect("semantic report");
+    let flow_findings = flow_finding_lines(source, &report.diagnostics);
+    assert!(
+        flow_findings.is_empty(),
+        "a later bound-but-unindexed unit may shadow the indexed routine and change X's access mode: {flow_findings:?}"
+    );
+
+    let document = index.documents.get(&uri).expect("indexed program");
+    let mut budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "flow test");
+    let flows =
+        routine_flows(&index, &uri, document, &cancel, &mut budget).expect("flow model builds");
+    let demo = flows
+        .iter()
+        .find(|flow| flow.name.eq_ignore_ascii_case("demo"))
+        .expect("Demo flow");
+    assert_eq!(
+        demo.excluded,
+        Some(FlowExclusion::UnresolvedIdentity),
+        "the routine must remain uncertain when an incomplete higher-precedence import can shadow its callee"
+    );
+}
+
+#[test]
+fn flow_diagnostics_withhold_findings_for_an_ambiguous_external_call_target() {
+    let source = concat!(
+        "program FlowAmbiguousExternalCall;\n",
+        "uses Indexed, Shadow;\n",
+        "procedure Demo;\n",
+        "var X: Integer;\n",
+        "begin\n",
+        "  Fill(X);\n",
+        "  Writeln(X);\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+    let indexed_source = concat!(
+        "unit Indexed;\n",
+        "interface\n",
+        "procedure Fill(const V: Integer);\n",
+        "implementation\n",
+        "procedure Fill(const V: Integer);\n",
+        "begin end;\n",
+        "end.\n",
+    );
+    let shadow_source = concat!(
+        "unit Shadow;\n",
+        "interface\n",
+        "procedure Fill(const V: Integer);\n",
+        "implementation\n",
+        "procedure Fill(const V: Integer);\n",
+        "begin end;\n",
+        "end.\n",
+    );
+    let uri = Url::parse("file:///tmp/flow-ambiguous-external-call.pas").expect("source URI");
+    let indexed_uri = Url::parse("file:///tmp/Indexed.pas").expect("indexed URI");
+    let shadow_uri = Url::parse("file:///tmp/Shadow.pas").expect("shadow URI");
+    let mut index = NavigationIndex::new();
+    index
+        .update(indexed_uri.clone(), indexed_source.to_owned())
+        .expect("indexed provider parses");
+    index
+        .update(shadow_uri.clone(), shadow_source.to_owned())
+        .expect("shadow provider parses");
+    index
+        .update(uri.clone(), source.to_owned())
+        .expect("fixture parses");
+    index.bind_imports(
+        &uri,
+        [
+            ("Indexed".to_owned(), indexed_uri),
+            ("Shadow".to_owned(), shadow_uri),
+        ],
+    );
+
+    let report = index
+        .semantic_diagnostic_report_with_cancel(&uri, &AtomicBool::new(false))
+        .expect("semantic report");
+    assert!(
+        flow_finding_lines(source, &report.diagnostics).is_empty(),
+        "the flow model must not infer access effects from multiple target groups"
+    );
+
+    let document = index.documents.get(&uri).expect("indexed program");
+    let mut budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "flow test");
+    let flows = routine_flows(&index, &uri, document, &AtomicBool::new(false), &mut budget)
+        .expect("flow model builds");
+    let demo = flows
+        .iter()
+        .find(|flow| flow.name.eq_ignore_ascii_case("demo"))
+        .expect("Demo flow");
+    assert_eq!(
+        demo.excluded,
+        Some(FlowExclusion::UnresolvedIdentity),
+        "multiple target groups leave the routine uncertain"
+    );
+}
+
+#[test]
 fn flow_diagnostics_accept_a_compiler_surface_member_with_incomplete_provider_imports() {
     let source = concat!(
         "program FlowSurfaceIncompleteProvider;\n",

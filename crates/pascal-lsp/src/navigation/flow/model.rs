@@ -252,6 +252,12 @@ pub(crate) struct RoutineFlow<'a> {
     pub(crate) node: Node<'a>,
 }
 
+#[derive(Debug, Default)]
+struct CallArgumentAccesses {
+    by_span: HashMap<(usize, usize), Access>,
+    target_uncertain: bool,
+}
+
 struct CollectedRoutineNodes<'a> {
     all_nodes: Vec<Node<'a>>,
     body_nodes: Vec<Node<'a>>,
@@ -660,7 +666,7 @@ fn build_routine_flow<'a>(
         budget,
     )?;
 
-    let call_argument_accesses = call_argument_accesses(
+    let call_effects = call_argument_accesses(
         index,
         uri,
         document,
@@ -669,6 +675,18 @@ fn build_routine_flow<'a>(
         cancel,
         budget,
     )?;
+    if call_effects.target_uncertain {
+        note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
+        return Ok(RoutineFlow {
+            name: cfg.proc_name.clone(),
+            cfg: Some(cfg),
+            locals,
+            occurrences: Vec::new(),
+            excluded,
+            node,
+        });
+    }
+    let call_argument_accesses = call_effects.by_span;
     let mut pending = Vec::new();
     let result_local = locals
         .iter()
@@ -846,14 +864,31 @@ fn build_routine_flow<'a>(
                 state.inaccessible_candidate,
             )
         };
-        let all_candidates_are_routines = !candidates.is_empty()
-            && candidates.iter().all(|candidate| {
-                index
-                    .documents
-                    .get(&candidate.uri)
-                    .and_then(|document| document.symbols.get(candidate.index))
-                    .is_some_and(|symbol| symbol.kind == SymbolKind::Routine)
-            });
+        let external_candidate_uncertain = if !is_local_occurrence && !candidates.is_empty() {
+            if super::super::overload::candidate_target_count_after_overload_grouping(
+                index,
+                &candidates,
+                cancel,
+                budget,
+            )? != 1
+            {
+                true
+            } else if is_right_hand_member(identifier) {
+                false
+            } else {
+                index.flow_candidate_has_shadowing_uncertainty(
+                    uri,
+                    document,
+                    offset,
+                    &key,
+                    &candidates[0],
+                    cancel,
+                    budget,
+                )?
+            }
+        } else {
+            false
+        };
         let local_resolution_uncertain = candidates.len() != 1
             || receiver_uncertain
             || member_lookup_incomplete
@@ -869,7 +904,8 @@ fn build_routine_flow<'a>(
                 || receiver_uncertain
                 || member_lookup_incomplete
                 || inaccessible
-                || ambiguous && !all_candidates_are_routines);
+                || ambiguous
+                || external_candidate_uncertain);
         if is_local_occurrence && local_resolution_uncertain
             || !is_local_occurrence && external_resolution_uncertain
         {
@@ -1934,8 +1970,8 @@ fn call_argument_accesses(
     local_names: &HashSet<String>,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
-) -> Result<HashMap<(usize, usize), Access>, String> {
-    let mut accesses = HashMap::new();
+) -> Result<CallArgumentAccesses, String> {
+    let mut result = CallArgumentAccesses::default();
     for call in body_nodes.iter().copied() {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
@@ -1990,6 +2026,11 @@ fn call_argument_accesses(
                 cancel,
                 budget,
             )?;
+            result.target_uncertain |= matches!(
+                mode,
+                super::super::overload::ParameterModeResolution::UncertainTarget
+                    | super::super::overload::ParameterModeResolution::Resolved(None)
+            );
             let access = if matches!(callee_name.as_deref(), Some("inc" | "dec"))
                 && mode
                     == super::super::overload::ParameterModeResolution::Intrinsic(Some(
@@ -2008,7 +2049,7 @@ fn call_argument_accesses(
                 if target_is_local {
                     let target = lvalue_base.expect("a local call target is an lvalue base");
                     insert_call_argument_access(
-                        &mut accesses,
+                        &mut result.by_span,
                         (target.start_byte(), target.end_byte()),
                         access,
                     );
@@ -2024,7 +2065,7 @@ fn call_argument_accesses(
                             Access::ReadWrite
                         };
                         insert_call_argument_access(
-                            &mut accesses,
+                            &mut result.by_span,
                             (identifier.start_byte(), identifier.end_byte()),
                             fallback_access,
                         );
@@ -2034,7 +2075,7 @@ fn call_argument_accesses(
             argument_index += 1;
         }
     }
-    Ok(accesses)
+    Ok(result)
 }
 
 fn call_argument_access_for_mode(mode: super::super::overload::ParameterModeResolution) -> Access {
@@ -2048,6 +2089,7 @@ fn call_argument_access_for_mode(mode: super::super::overload::ParameterModeReso
             Access::OutArg
         }
         super::super::overload::ParameterModeResolution::Unresolved
+        | super::super::overload::ParameterModeResolution::UncertainTarget
         | super::super::overload::ParameterModeResolution::Resolved(None)
         | super::super::overload::ParameterModeResolution::Intrinsic(None) => {
             Access::UnknownCallEffect

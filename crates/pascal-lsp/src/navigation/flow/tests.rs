@@ -1523,6 +1523,44 @@ fn flow_diagnostics_with_later_unindexed_shadow(
     )
 }
 
+fn flow_diagnostics_with_bound_unindexed_unit(
+    source: &str,
+    unit_name: &str,
+) -> (Vec<(String, usize, String)>, Option<FlowExclusion>) {
+    let uri = Url::parse("file:///tmp/flow-shadowed-control-transfer.pas").expect("program URI");
+    let shadow_uri =
+        Url::parse(&format!("file:///tmp/unindexed/{unit_name}.pas")).expect("shadow URI");
+    let version = CompilerVersion::new(37, 0);
+    let platform = TargetPlatform::Win32;
+    let context = ConditionalContext {
+        compiler_version: Some(version),
+        layout: LayoutContext::for_target(Some(version), Some(&platform)),
+        ..ConditionalContext::default()
+    };
+    let cancel = AtomicBool::new(false);
+    let mut index = NavigationIndex::new();
+    index
+        .update_with_context_with_cancel(uri.clone(), source.to_owned(), &context, &cancel)
+        .expect("program parses");
+    index.bind_imports(&uri, [(unit_name.to_owned(), shadow_uri)]);
+
+    let report = index
+        .semantic_diagnostic_report_with_cancel(&uri, &cancel)
+        .expect("semantic report");
+    let document = index.documents.get(&uri).expect("program is indexed");
+    let mut budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "flow test");
+    let demo = routine_flows(&index, &uri, document, &cancel, &mut budget)
+        .expect("flow model builds")
+        .into_iter()
+        .find(|flow| flow.name.eq_ignore_ascii_case("demo"))
+        .expect("Demo flow");
+
+    (
+        flow_finding_lines(source, &report.diagnostics),
+        demo.excluded,
+    )
+}
+
 fn flow_diagnostics_with_version(
     source: &str,
     compiler_version: Option<pascal_project::CompilerVersion>,
@@ -1911,6 +1949,66 @@ fn flow_diagnostics_withhold_h2077_when_an_incomplete_import_can_shadow_exit() {
         .find(|flow| flow.name.eq_ignore_ascii_case("demo"))
         .expect("Demo flow");
     assert_eq!(demo.excluded, Some(FlowExclusion::UnresolvedIdentity));
+}
+
+#[test]
+fn flow_diagnostics_withhold_h2077_when_an_incomplete_import_can_shadow_break() {
+    let source = concat!(
+        "program FlowShadowedBreak;\n",
+        "uses ShadowBreak;\n",
+        "procedure Demo;\n",
+        "var I, X: Integer;\n",
+        "begin\n",
+        "  for I := 1 to 2 do begin\n",
+        "    X := 1;\n",
+        "    Break;\n",
+        "    Writeln(X);\n",
+        "  end;\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+
+    let (findings, excluded) = flow_diagnostics_with_bound_unindexed_unit(source, "ShadowBreak");
+
+    assert!(
+        findings.is_empty(),
+        "an incomplete import may provide an ordinary Break routine, so no flow finding is safe: {findings:?}"
+    );
+    assert_eq!(
+        excluded,
+        Some(FlowExclusion::UnresolvedIdentity),
+        "the unresolved Break target must exclude flow analysis"
+    );
+}
+
+#[test]
+fn flow_diagnostics_withhold_h2077_when_an_incomplete_import_can_shadow_continue() {
+    let source = concat!(
+        "program FlowShadowedContinue;\n",
+        "uses ShadowContinue;\n",
+        "procedure Demo;\n",
+        "var I, X: Integer;\n",
+        "begin\n",
+        "  for I := 1 to 2 do begin\n",
+        "    X := 1;\n",
+        "    Continue;\n",
+        "    Writeln(X);\n",
+        "  end;\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+
+    let (findings, excluded) = flow_diagnostics_with_bound_unindexed_unit(source, "ShadowContinue");
+
+    assert!(
+        findings.is_empty(),
+        "an incomplete import may provide an ordinary Continue routine, so no flow finding is safe: {findings:?}"
+    );
+    assert_eq!(
+        excluded,
+        Some(FlowExclusion::UnresolvedIdentity),
+        "the unresolved Continue target must exclude flow analysis"
+    );
 }
 
 #[test]

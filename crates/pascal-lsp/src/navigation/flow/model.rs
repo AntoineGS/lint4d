@@ -2348,10 +2348,9 @@ fn call_target_has_shadowing_uncertainty(
         budget,
     )?;
     if candidates.is_empty() {
-        // Exit is an identifier that Delphi allows a uses-clause routine to
-        // shadow. Break, Continue, and Raise are reserved statement forms and
-        // cannot be shadowed by an imported declaration.
-        if key != "exit" {
+        // Among the flow-control names, Delphi reserves Raise but not Exit,
+        // Break, or Continue; each of those may resolve to an imported routine.
+        if !matches!(key.as_str(), "exit" | "break" | "continue") {
             return Ok(false);
         }
         if state.receiver_resolution_uncertain()

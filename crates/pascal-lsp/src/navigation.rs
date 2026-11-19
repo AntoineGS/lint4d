@@ -8292,7 +8292,49 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<bool, String> {
-        if candidate.uri == *current_uri {
+        self.flow_target_has_shadowing_uncertainty(
+            current_uri,
+            current_document,
+            offset,
+            key,
+            Some(candidate),
+            cancel,
+            budget,
+        )
+    }
+
+    fn flow_intrinsic_has_shadowing_uncertainty(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        key: &str,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        self.flow_target_has_shadowing_uncertainty(
+            current_uri,
+            current_document,
+            offset,
+            key,
+            None,
+            cancel,
+            budget,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn flow_target_has_shadowing_uncertainty(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        key: &str,
+        candidate: Option<&Candidate>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        if candidate.is_some_and(|candidate| candidate.uri == *current_uri) {
             return Ok(false);
         }
 
@@ -8338,7 +8380,20 @@ impl NavigationIndex {
             let Some(provider) = self.documents.get(provider_uri) else {
                 return Ok(true);
             };
-            if provider_uri == &candidate.uri {
+            if candidate.is_some_and(|candidate| provider_uri == &candidate.uri) {
+                let candidate_is_routine = candidate.is_some_and(|candidate| {
+                    provider
+                        .symbols
+                        .get(candidate.index)
+                        .is_some_and(|symbol| symbol.kind == SymbolKind::Routine)
+                });
+                if candidate_is_routine
+                    && (!Self::document_is_complete_for_proof(provider, cancel, budget)?
+                        || !provider.opaque_ranges.is_empty()
+                        || !provider.unknown_imports.is_empty())
+                {
+                    return Ok(true);
+                }
                 return Ok(false);
             }
             if !Self::document_is_complete_for_proof(provider, cancel, budget)?
@@ -8355,6 +8410,9 @@ impl NavigationIndex {
             }
         }
 
+        let Some(candidate) = candidate else {
+            return Ok(false);
+        };
         let Some(provider) = self.documents.get(&candidate.uri) else {
             return Ok(true);
         };
@@ -31975,6 +32033,7 @@ mod tests {
 mod insert_parsed_tests {
     use super::*;
     use pascal_core::conditional::Truth;
+    use pascal_project::{LayoutContext, TargetPlatform};
 
     fn parsed(uri: &Url, context: &ConditionalContext) -> Arc<ParsedDocument> {
         let mut index = NavigationIndex::new();
@@ -32079,5 +32138,109 @@ mod insert_parsed_tests {
                 "a hash match is not proof that this cached parse used the verified context"
             );
         });
+    }
+
+    #[test]
+    fn flow_shadow_check_rejects_an_incomplete_selected_provider() {
+        let consumer_source = concat!(
+            "program FlowIncompleteOverloadProvider;\n",
+            "uses FlowOverloadProvider;\n",
+            "procedure Demo;\n",
+            "var X: Integer;\n",
+            "begin\n",
+            "  X := 1;\n",
+            "  Touch(X);\n",
+            "end;\n",
+            "begin Demo; end.\n",
+        );
+        let provider_source = concat!(
+            "unit FlowOverloadProvider;\n",
+            "interface\n",
+            "procedure Touch(out Value: Integer); overload;\n",
+            "{$IFDEF UNKNOWN_PROVIDER_DEFINE}\n",
+            "procedure Touch(const Value: Integer); overload;\n",
+            "{$ENDIF}\n",
+            "implementation\n",
+            "procedure Touch(out Value: Integer);\n",
+            "begin Value := 0; end;\n",
+            "{$IFDEF UNKNOWN_PROVIDER_DEFINE}\n",
+            "procedure Touch(const Value: Integer);\n",
+            "begin end;\n",
+            "{$ENDIF}\n",
+            "end.\n",
+        );
+        let consumer_uri = Url::parse("file:///tmp/flow-incomplete-provider.pas").unwrap();
+        let provider_uri = Url::parse("file:///tmp/FlowOverloadProvider.pas").unwrap();
+        let version = CompilerVersion::new(37, 0);
+        let platform = TargetPlatform::Win32;
+        let context = ConditionalContext {
+            compiler_version: Some(version),
+            layout: LayoutContext::for_target(Some(version), Some(&platform)),
+            ..ConditionalContext::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let mut index = NavigationIndex::new();
+        index
+            .update_with_context_with_cancel(
+                provider_uri.clone(),
+                provider_source.to_owned(),
+                &context,
+                &cancel,
+            )
+            .expect("provider parses");
+        index
+            .update_with_context_with_cancel(
+                consumer_uri.clone(),
+                consumer_source.to_owned(),
+                &context,
+                &cancel,
+            )
+            .expect("consumer parses");
+        index.bind_imports(
+            &consumer_uri,
+            [("FlowOverloadProvider".to_owned(), provider_uri.clone())],
+        );
+
+        let provider = index
+            .documents
+            .get(&provider_uri)
+            .expect("provider indexed");
+        assert!(
+            !provider.conditionals.unknown_spans.is_empty(),
+            "the potentially present const overload keeps the provider incomplete"
+        );
+
+        let document = index
+            .documents
+            .get(&consumer_uri)
+            .expect("consumer indexed");
+        let offset = consumer_source.find("Touch(X)").expect("Touch call");
+        let identifier =
+            identifier_at(document.tree.root_node(), offset).expect("Touch identifier");
+        let candidates = index.resolve_candidates_at(&consumer_uri, document, offset, identifier);
+        let matching = candidates
+            .iter()
+            .filter(|candidate| candidate.uri == provider_uri)
+            .collect::<Vec<_>>();
+        assert!(
+            !matching.is_empty(),
+            "Touch resolves to the indexed provider"
+        );
+
+        let mut budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "flow test");
+        assert!(
+            index
+                .flow_candidate_has_shadowing_uncertainty(
+                    &consumer_uri,
+                    document,
+                    offset,
+                    "touch",
+                    matching[0],
+                    &cancel,
+                    &mut budget,
+                )
+                .expect("shadow check"),
+            "an incomplete provider may have a competing overload with different argument effects"
+        );
     }
 }

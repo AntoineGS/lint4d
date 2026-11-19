@@ -1863,6 +1863,57 @@ fn flow_diagnostics_withhold_findings_when_a_later_incomplete_import_can_shadow_
 }
 
 #[test]
+fn flow_diagnostics_withhold_h2077_when_an_incomplete_import_can_shadow_exit() {
+    let source = concat!(
+        "program FlowShadowedExit;\n",
+        "uses ShadowExit;\n",
+        "procedure Demo;\n",
+        "var X: Integer;\n",
+        "begin\n",
+        "  X := 1;\n",
+        "  Exit;\n",
+        "  Writeln(X);\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+    let uri = Url::parse("file:///tmp/flow-shadowed-exit.pas").expect("source URI");
+    let shadow_uri = Url::parse("file:///tmp/unindexed/ShadowExit.pas").expect("shadow URI");
+    let version = CompilerVersion::new(37, 0);
+    let platform = TargetPlatform::Win32;
+    let context = ConditionalContext {
+        compiler_version: Some(version),
+        layout: LayoutContext::for_target(Some(version), Some(&platform)),
+        ..ConditionalContext::default()
+    };
+    let cancel = AtomicBool::new(false);
+    let mut index = NavigationIndex::new();
+    index
+        .update_with_context_with_cancel(uri.clone(), source.to_owned(), &context, &cancel)
+        .expect("fixture parses");
+    index.bind_imports(&uri, [("ShadowExit".to_owned(), shadow_uri)]);
+
+    let report = index
+        .semantic_diagnostic_report_with_cancel(&uri, &cancel)
+        .expect("semantic report");
+    assert!(
+        flow_finding_lines(source, &report.diagnostics)
+            .iter()
+            .all(|(code, _, _)| code != "H2077"),
+        "an incomplete import may provide an ordinary Exit routine, so the CFG's intrinsic-exit assumption is unsafe: {:?}",
+        flow_finding_lines(source, &report.diagnostics)
+    );
+
+    let document = index.documents.get(&uri).expect("program is indexed");
+    let mut budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "flow test");
+    let demo = routine_flows(&index, &uri, document, &cancel, &mut budget)
+        .expect("flow model builds")
+        .into_iter()
+        .find(|flow| flow.name.eq_ignore_ascii_case("demo"))
+        .expect("Demo flow");
+    assert_eq!(demo.excluded, Some(FlowExclusion::UnresolvedIdentity));
+}
+
+#[test]
 fn flow_diagnostics_keep_h2077_for_a_shadowable_external_plain_read() {
     let source = concat!(
         "program FlowShadowedExternalRead;\n",

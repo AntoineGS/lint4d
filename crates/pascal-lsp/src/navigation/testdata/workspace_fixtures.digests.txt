@@ -261,6 +261,8 @@ crates/pascal-lsp/tests/dcc_oracle/flow_later_uses_shadowed_external_value/Shado
 crates/pascal-lsp/tests/dcc_oracle/flow_later_uses_shadowing/FlowLaterUsesShadowing.pas 0ff13b41404ab064 3
 crates/pascal-lsp/tests/dcc_oracle/flow_later_uses_shadowing/Indexed.pas 023fbc5b8223660e 5
 crates/pascal-lsp/tests/dcc_oracle/flow_later_uses_shadowing/Shadow.pas 0cf442d4da7012bb 5
+crates/pascal-lsp/tests/dcc_oracle/flow_local_break/FlowLocalBreak.pas 1e00c0db401c47da 5
+crates/pascal-lsp/tests/dcc_oracle/flow_nested_exit/FlowNestedExit.pas 5552855896e975a4 6
 crates/pascal-lsp/tests/dcc_oracle/flow_self_receiver/FlowSelfReceiver.pas 026813df97cc7cf0 5
 crates/pascal-lsp/tests/dcc_oracle/flow_shadow_break/FlowShadowBreak.pas 330212f7ae37e3b7 4
 crates/pascal-lsp/tests/dcc_oracle/flow_shadow_break/ShadowBreak.pas 55f040a6c25c1790 3

@@ -259,10 +259,23 @@ struct CallArgumentAccesses {
     target_uncertain: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlTransferResolution {
+    Intrinsic,
+    UserBinding,
+    Uncertain,
+}
+
 struct CollectedRoutineNodes<'a> {
     all_nodes: Vec<Node<'a>>,
     body_nodes: Vec<Node<'a>>,
     nested_ranges: Vec<Range<usize>>,
+}
+
+struct CollectedDocumentRoutines<'a> {
+    node_count: usize,
+    routines: Vec<(Node<'a>, String)>,
+    control_transfer_identifiers: Vec<Node<'a>>,
 }
 
 pub(crate) fn routine_flows<'a>(
@@ -276,8 +289,12 @@ pub(crate) fn routine_flows<'a>(
     let root = document.tree.root_node();
     budget.require_owned_bytes(document.source.len(), cancel)?;
 
-    let (document_node_count, routines) =
-        collect_document_routines(root, &document.source, cancel, budget)?;
+    let collected = collect_document_routines(root, &document.source, cancel, budget)?;
+    let CollectedDocumentRoutines {
+        node_count: document_node_count,
+        routines,
+        control_transfer_identifiers,
+    } = collected;
     let flow_symbols = FlowSymbolIndex::new(document, &routines, cancel, budget)?;
     let flow_bytes = routines
         .len()
@@ -297,45 +314,65 @@ pub(crate) fn routine_flows<'a>(
             .collect());
     }
 
+    let control_transfer_resolutions = collect_control_transfer_resolutions(
+        index,
+        uri,
+        document,
+        &control_transfer_identifiers,
+        cancel,
+        budget,
+    )?;
+    let mut ordinary_control_transfer_identifiers = HashSet::new();
+    for (&offset, resolution) in &control_transfer_resolutions {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if *resolution != ControlTransferResolution::Intrinsic {
+            budget.require_owned_bytes(std::mem::size_of::<usize>(), cancel)?;
+            ordinary_control_transfer_identifiers.insert(offset);
+        }
+    }
+
     let mut budget_excluded = HashMap::new();
     let mut build_error = None;
     #[cfg(test)]
     TEST_CFG_BUILDER_CALL_COUNT.with(|count| count.set(count.get() + 1));
-    let mut cfgs = cfg_pascal::build_routine_cfgs_with_filter_and_cancel(
-        &document.tree,
-        document.source.as_bytes(),
-        || cancel.load(Ordering::Relaxed),
-        |proc_name, node| {
-            if let Err(error) = check_navigation_cancel(cancel) {
-                build_error = Some(error);
-                return false;
-            }
-            let node_count = node.descendant_count().saturating_add(1);
-            match budget.take_work(node_count, cancel) {
-                Ok(true) => {
-                    if let Err(error) = check_navigation_cancel(cancel) {
+    let mut cfgs =
+        cfg_pascal::build_routine_cfgs_with_filter_and_cancel_and_control_transfer_overrides(
+            &document.tree,
+            document.source.as_bytes(),
+            || cancel.load(Ordering::Relaxed),
+            |proc_name, node| {
+                if let Err(error) = check_navigation_cancel(cancel) {
+                    build_error = Some(error);
+                    return false;
+                }
+                let node_count = node.descendant_count().saturating_add(1);
+                match budget.take_work(node_count, cancel) {
+                    Ok(true) => {
+                        if let Err(error) = check_navigation_cancel(cancel) {
+                            build_error = Some(error);
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    Ok(false) => {
+                        if let Err(error) = budget.require_owned_bytes(proc_name.len(), cancel) {
+                            build_error = Some(error);
+                            return false;
+                        }
+                        budget_excluded
+                            .insert((node.start_byte(), node.end_byte()), proc_name.to_owned());
+                        false
+                    }
+                    Err(error) => {
                         build_error = Some(error);
                         false
-                    } else {
-                        true
                     }
                 }
-                Ok(false) => {
-                    if let Err(error) = budget.require_owned_bytes(proc_name.len(), cancel) {
-                        build_error = Some(error);
-                        return false;
-                    }
-                    budget_excluded
-                        .insert((node.start_byte(), node.end_byte()), proc_name.to_owned());
-                    false
-                }
-                Err(error) => {
-                    build_error = Some(error);
-                    false
-                }
-            }
-        },
-    )?;
+            },
+            &ordinary_control_transfer_identifiers,
+        )?;
     if let Some(error) = build_error {
         return Err(error);
     }
@@ -387,6 +424,7 @@ pub(crate) fn routine_flows<'a>(
             node,
             cfg,
             &flow_symbols,
+            &control_transfer_resolutions,
             cancel,
             budget,
         )?);
@@ -399,9 +437,10 @@ fn collect_document_routines<'a>(
     source: &str,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
-) -> Result<(usize, Vec<(Node<'a>, String)>), String> {
+) -> Result<CollectedDocumentRoutines<'a>, String> {
     let mut node_count = 0usize;
     let mut routines = Vec::new();
+    let mut control_transfer_identifiers = Vec::new();
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
         check_navigation_cancel(cancel)?;
@@ -418,6 +457,10 @@ fn collect_document_routines<'a>(
             budget.require_owned_bytes(name.len(), cancel)?;
             routines.push((node, name));
         }
+        if node.kind() == "identifier" && is_control_transfer_identifier(node, source) {
+            budget.require_owned_bytes(std::mem::size_of::<Node<'a>>(), cancel)?;
+            control_transfer_identifiers.push(node);
+        }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             check_navigation_cancel(cancel)?;
@@ -425,7 +468,106 @@ fn collect_document_routines<'a>(
             pending.push(child);
         }
     }
-    Ok((node_count, routines))
+    Ok(CollectedDocumentRoutines {
+        node_count,
+        routines,
+        control_transfer_identifiers,
+    })
+}
+
+fn collect_control_transfer_resolutions<'a>(
+    index: &NavigationIndex,
+    uri: &Url,
+    document: &Document,
+    identifiers: &[Node<'a>],
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<HashMap<usize, ControlTransferResolution>, String> {
+    let mut resolutions = HashMap::new();
+    for &identifier in identifiers {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        let resolution =
+            resolve_control_transfer_identifier(index, uri, document, identifier, cancel, budget)?;
+        budget.require_owned_bytes(
+            std::mem::size_of::<(usize, ControlTransferResolution)>(),
+            cancel,
+        )?;
+        resolutions.insert(identifier.start_byte(), resolution);
+    }
+    Ok(resolutions)
+}
+
+fn resolve_control_transfer_identifier(
+    index: &NavigationIndex,
+    uri: &Url,
+    document: &Document,
+    identifier: Node<'_>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ControlTransferResolution, String> {
+    let key = canonical_name(&node_text(identifier, &document.source));
+    let mut state = ResolutionState::new();
+    let candidates = index.resolve_candidates_at_with_state_and_budget(
+        uri,
+        document,
+        identifier.start_byte(),
+        identifier,
+        &mut state,
+        0,
+        cancel,
+        budget,
+    )?;
+    if state.receiver_resolution_uncertain()
+        || state.member_lookup_incomplete
+        || state.ambiguous
+        || state.inaccessible_candidate
+        || candidates.len() > 1
+    {
+        return Ok(ControlTransferResolution::Uncertain);
+    }
+    if let Some(candidate) = candidates.first() {
+        if external_candidate_set_has_shadowing_uncertainty(
+            index,
+            uri,
+            document,
+            identifier.start_byte(),
+            &key,
+            &candidates,
+            cancel,
+            budget,
+        )? {
+            return Ok(ControlTransferResolution::Uncertain);
+        }
+        if candidate.uri == *uri {
+            return Ok(ControlTransferResolution::UserBinding);
+        }
+        let is_system_intrinsic = index
+            .documents
+            .get(&candidate.uri)
+            .and_then(|provider| {
+                provider
+                    .symbols
+                    .get(candidate.index)
+                    .map(|symbol| (provider, symbol))
+            })
+            .is_some_and(|(provider, symbol)| {
+                provider.unit_name == "system"
+                    && symbol.kind == SymbolKind::Routine
+                    && symbol.owner_type.is_none()
+            });
+        return Ok(if is_system_intrinsic {
+            ControlTransferResolution::Intrinsic
+        } else {
+            ControlTransferResolution::UserBinding
+        });
+    }
+
+    if call_target_has_shadowing_uncertainty(index, uri, document, identifier, cancel, budget)? {
+        Ok(ControlTransferResolution::Uncertain)
+    } else {
+        Ok(ControlTransferResolution::Intrinsic)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -563,6 +705,7 @@ fn build_routine_flow<'a>(
     node: Node<'a>,
     cfg: Cfg,
     flow_symbols: &FlowSymbolIndex,
+    control_transfer_resolutions: &HashMap<usize, ControlTransferResolution>,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<RoutineFlow<'a>, String> {
@@ -716,46 +859,44 @@ fn build_routine_flow<'a>(
         if identifier.kind() != "identifier" {
             continue;
         }
-        if is_control_transfer_identifier(identifier, &document.source) {
-            let key = canonical_name(&node_text(identifier, &document.source));
-            if flow_special_name_affects_analysis(&key)
-                && call_target_has_shadowing_uncertainty(
-                    index, uri, document, identifier, cancel, budget,
-                )?
-            {
+        if let Some(resolution) = control_transfer_resolutions.get(&identifier.start_byte()) {
+            if *resolution == ControlTransferResolution::Uncertain {
                 note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
+                continue;
             }
-            if let (Some(result), Some(exit_call)) = (
-                result_local,
-                exit_call_with_argument(identifier, &document.source),
-            ) {
-                let span = SourceSpan {
-                    start: exit_call.start_byte(),
-                    end: exit_call.end_byte(),
-                };
-                let Some(locations) = statement_locations_for_node(
-                    &cfg,
-                    statement_index.as_ref(),
-                    exit_call,
-                    cancel,
-                    budget,
-                )?
-                else {
-                    note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
-                    continue;
-                };
-                for (block, statement) in locations {
-                    pending.push(PendingOccurrence {
-                        var: result,
-                        span,
-                        access: Access::Write,
-                        block,
-                        statement_start: statement.start,
-                        semantic_order: 2,
-                    });
+            if *resolution == ControlTransferResolution::Intrinsic {
+                if let (Some(result), Some(exit_call)) = (
+                    result_local,
+                    exit_call_with_argument(identifier, &document.source),
+                ) {
+                    let span = SourceSpan {
+                        start: exit_call.start_byte(),
+                        end: exit_call.end_byte(),
+                    };
+                    let Some(locations) = statement_locations_for_node(
+                        &cfg,
+                        statement_index.as_ref(),
+                        exit_call,
+                        cancel,
+                        budget,
+                    )?
+                    else {
+                        note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
+                        continue;
+                    };
+                    for (block, statement) in locations {
+                        pending.push(PendingOccurrence {
+                            var: result,
+                            span,
+                            access: Access::Write,
+                            block,
+                            statement_start: statement.start,
+                            semantic_order: 2,
+                        });
+                    }
                 }
+                continue;
             }
-            continue;
         }
         let name = node_text(identifier, &document.source);
         let key = canonical_name(&name);

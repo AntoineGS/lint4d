@@ -1402,6 +1402,66 @@ fn flow_diagnostics_report_a_written_only_local_as_h2077() {
 }
 
 #[test]
+fn flow_diagnostics_treat_a_local_break_variable_as_an_ordinary_identifier() {
+    let source = concat!(
+        "program FlowLocalBreakVariable;\n",
+        "procedure Consume(Value: Integer);\n",
+        "begin end;\n",
+        "procedure Demo;\n",
+        "var Break: Integer;\n",
+        "begin\n",
+        "  Break := 1;\n",
+        "  Consume(Break);\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+
+    let flow = routine(source, "Demo");
+    assert_eq!(flow.excluded, None);
+    assert_eq!(
+        occurrences(&flow, "Break")
+            .map(|occurrence| occurrence.access)
+            .collect::<Vec<_>>(),
+        vec![Access::Write, Access::Read],
+        "both the assignment and the read must bind to the local Break variable"
+    );
+    assert!(
+        flow_finding_lines(source, &flow_diagnostics(source))
+            .iter()
+            .all(|(code, _, _)| !matches!(code.as_str(), "H2077" | "H2164")),
+        "the local Break variable is read by Consume and must not be classified as control flow"
+    );
+}
+
+#[test]
+fn flow_diagnostics_treat_a_nested_exit_routine_as_an_ordinary_call() {
+    let source = concat!(
+        "program FlowNestedExitRoutine;\n",
+        "procedure Consume(Value: Integer);\n",
+        "begin end;\n",
+        "procedure Demo;\n",
+        "var Value: Integer;\n",
+        "  procedure Exit;\n",
+        "  begin end;\n",
+        "begin\n",
+        "  Value := 1;\n",
+        "  Exit;\n",
+        "  Consume(Value);\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+
+    let flow = routine(source, "Demo");
+    assert_eq!(flow.excluded, None);
+    assert!(
+        flow_finding_lines(source, &flow_diagnostics(source))
+            .iter()
+            .all(|(code, _, _)| code != "H2077"),
+        "Value is read after the nested Exit call, so the call must not cut off normal flow"
+    );
+}
+
+#[test]
 fn flow_diagnostics_do_not_report_exception_handler_variables_as_unused() {
     let source = concat!(
         "program FlowExceptionHandlerVariable;\n",

@@ -13,6 +13,7 @@ pub mod source_map;
 pub use pascal_builder::{
     build_file_cfgs, build_file_cfgs_in_project, build_routine_cfgs_with_filter,
     build_routine_cfgs_with_filter_and_cancel,
+    build_routine_cfgs_with_filter_and_cancel_and_control_transfer_overrides,
 };
 pub use prepared::{
     EnvironmentCompleteness, IncludeBinding, PreparationBudget, PreparationEnvironment,

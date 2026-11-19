@@ -50,8 +50,16 @@ use crate::project::{ProjectBuildError, ProjectSnapshot, ProjectUnitId};
 /// disable resolution.
 ///
 pub fn build_file_cfgs(tree: &tree_sitter::Tree, source: &[u8]) -> Vec<Cfg> {
-    build_cfgs_with_routine_filter(tree, source, true, || false, |_: &str, _: Node<'_>| true)
-        .expect("the default cancellation probe never cancels")
+    let ordinary_control_transfer_identifiers = HashSet::new();
+    build_cfgs_with_routine_filter(
+        tree,
+        source,
+        true,
+        || false,
+        |_: &str, _: Node<'_>| true,
+        &ordinary_control_transfer_identifiers,
+    )
+    .expect("the default cancellation probe never cancels")
 }
 
 /// Build routine CFGs while allowing callers to skip selected executable routines.
@@ -81,7 +89,38 @@ pub fn build_routine_cfgs_with_filter_and_cancel(
     is_cancelled: impl FnMut() -> bool,
     include_routine: impl FnMut(&str, Node<'_>) -> bool,
 ) -> Result<Vec<Cfg>, String> {
-    build_cfgs_with_routine_filter(tree, source, false, is_cancelled, include_routine)
+    let ordinary_control_transfer_identifiers = HashSet::new();
+    build_cfgs_with_routine_filter(
+        tree,
+        source,
+        false,
+        is_cancelled,
+        include_routine,
+        &ordinary_control_transfer_identifiers,
+    )
+}
+
+/// Build routine CFGs while treating selected control-transfer identifiers as
+/// ordinary statements.
+///
+/// The identifiers are keyed by their start byte in `source`. This lets a
+/// caller with name-resolution context distinguish a user declaration such as
+/// a local `Exit` procedure from the intrinsic control transfer.
+pub fn build_routine_cfgs_with_filter_and_cancel_and_control_transfer_overrides(
+    tree: &tree_sitter::Tree,
+    source: &[u8],
+    is_cancelled: impl FnMut() -> bool,
+    include_routine: impl FnMut(&str, Node<'_>) -> bool,
+    ordinary_control_transfer_identifiers: &HashSet<usize>,
+) -> Result<Vec<Cfg>, String> {
+    build_cfgs_with_routine_filter(
+        tree,
+        source,
+        false,
+        is_cancelled,
+        include_routine,
+        ordinary_control_transfer_identifiers,
+    )
 }
 
 fn build_cfgs_with_routine_filter(
@@ -90,6 +129,7 @@ fn build_cfgs_with_routine_filter(
     include_module_cfgs: bool,
     mut is_cancelled: impl FnMut() -> bool,
     mut include_routine: impl FnMut(&str, Node<'_>) -> bool,
+    ordinary_control_transfer_identifiers: &HashSet<usize>,
 ) -> Result<Vec<Cfg>, String> {
     let root = tree.root_node();
     check_builder_cancel(&mut is_cancelled)?;
@@ -105,11 +145,19 @@ fn build_cfgs_with_routine_filter(
         &exception_types,
         &mut is_cancelled,
         &mut include_routine,
+        ordinary_control_transfer_identifiers,
         &mut cfgs,
     )?;
     check_builder_cancel(&mut is_cancelled)?;
     if include_module_cfgs {
-        collect_module_cfgs(root, source, &unit_key, &exception_types, &mut cfgs);
+        collect_module_cfgs(
+            root,
+            source,
+            &unit_key,
+            &exception_types,
+            ordinary_control_transfer_identifiers,
+            &mut cfgs,
+        );
     }
     cfgs.sort_by_key(|cfg| cfg.byte_range.start);
     Ok(cfgs)
@@ -165,10 +213,18 @@ pub fn build_file_cfgs_in_project(
         &exception_types,
         &mut is_cancelled,
         &mut include_routine,
+        &HashSet::new(),
         &mut cfgs,
     )
     .expect("the default cancellation probe never cancels");
-    collect_module_cfgs(root, unit.source(), &unit_key, &exception_types, &mut cfgs);
+    collect_module_cfgs(
+        root,
+        unit.source(),
+        &unit_key,
+        &exception_types,
+        &HashSet::new(),
+        &mut cfgs,
+    );
     cfgs.sort_by_key(|cfg| cfg.byte_range.start);
     Ok(cfgs)
 }
@@ -182,6 +238,7 @@ fn collect_def_proc_cfgs<'tree, C, F>(
     exception_types: &ExceptionTypeIndex,
     is_cancelled: &mut C,
     include_routine: &mut F,
+    ordinary_control_transfer_identifiers: &HashSet<usize>,
     out: &mut Vec<Cfg>,
 ) -> Result<(), String>
 where
@@ -204,7 +261,14 @@ where
 
         if node.child_by_field_name("body").is_some()
             && include_routine(&proc_name, node)
-            && let Some(cfg) = build_proc_cfg(node, source, proc_name, unit_key, exception_types)
+            && let Some(cfg) = build_proc_cfg(
+                node,
+                source,
+                proc_name,
+                unit_key,
+                exception_types,
+                ordinary_control_transfer_identifiers,
+            )
         {
             out.push(cfg);
         }
@@ -224,6 +288,7 @@ where
                 exception_types,
                 is_cancelled,
                 include_routine,
+                ordinary_control_transfer_identifiers,
                 out,
             )?;
         }
@@ -241,6 +306,7 @@ where
             exception_types,
             is_cancelled,
             include_routine,
+            ordinary_control_transfer_identifiers,
             out,
         )?;
     }
@@ -262,6 +328,7 @@ fn build_proc_cfg(
     proc_name: String,
     unit_key: &UnitKey,
     exception_types: &ExceptionTypeIndex,
+    ordinary_control_transfer_identifiers: &HashSet<usize>,
 ) -> Option<Cfg> {
     let block = def_proc.child_by_field_name("body")?;
 
@@ -274,6 +341,7 @@ fn build_proc_cfg(
         source,
         unit_key,
         exception_types,
+        ordinary_control_transfer_identifiers,
     ))
 }
 
@@ -282,6 +350,7 @@ fn collect_module_cfgs(
     source: &[u8],
     unit_key: &UnitKey,
     exception_types: &ExceptionTypeIndex,
+    ordinary_control_transfer_identifiers: &HashSet<usize>,
     out: &mut Vec<Cfg>,
 ) {
     let Some(module) = direct_named_child(node, ["program", "library", "unit"]) else {
@@ -302,6 +371,7 @@ fn collect_module_cfgs(
                     source,
                     unit_key,
                     exception_types,
+                    ordinary_control_transfer_identifiers,
                 ));
             }
         }
@@ -318,6 +388,7 @@ fn collect_module_cfgs(
                             source,
                             unit_key,
                             exception_types,
+                            ordinary_control_transfer_identifiers,
                         ));
                     }
                     _ => continue,
@@ -358,6 +429,7 @@ struct PreprocessorBranchInfo {
     index: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_scope_cfg(
     scope_name: String,
     byte_range: Range<usize>,
@@ -366,6 +438,7 @@ fn build_scope_cfg(
     source: &[u8],
     unit_key: &UnitKey,
     exception_types: &ExceptionTypeIndex,
+    ordinary_control_transfer_identifiers: &HashSet<usize>,
 ) -> Cfg {
     let mut builder = DefaultCfgBuilder::new(scope_name, byte_range);
 
@@ -408,6 +481,7 @@ fn build_scope_cfg(
         source,
         unit_key,
         exception_types,
+        ordinary_control_transfer_identifiers,
         loop_stack: Vec::new(),
         cleanup_scopes: Vec::new(),
         scope_ids,
@@ -643,6 +717,7 @@ struct BuildContext<'a> {
     source: &'a [u8],
     unit_key: &'a UnitKey,
     exception_types: &'a ExceptionTypeIndex,
+    ordinary_control_transfer_identifiers: &'a HashSet<usize>,
     loop_stack: Vec<LoopFrame>,
     cleanup_scopes: Vec<ScopeId>,
     /// Stable IDs for syntactic try/finally scopes, shared by all runtime
@@ -1565,7 +1640,10 @@ fn process_single_stmt(ctx: &mut BuildContext<'_>, child: Node, current: BlockId
                 transfers,
             }
         }
-        "statement" if is_exit_call(child, ctx.source) => {
+        "statement"
+            if !is_ordinary_control_transfer_override(ctx, child)
+                && is_exit_call(child, ctx.source) =>
+        {
             let statement_block = prepare_statement_block(ctx, current);
             add_stmt_ref(ctx, statement_block, child);
             let mut transfers = vec![PendingTransfer::exit(statement_block)];
@@ -1577,7 +1655,10 @@ fn process_single_stmt(ctx: &mut BuildContext<'_>, child: Node, current: BlockId
                 transfers,
             }
         }
-        "statement" if is_break_call(child, ctx.source) => {
+        "statement"
+            if !is_ordinary_control_transfer_override(ctx, child)
+                && is_break_call(child, ctx.source) =>
+        {
             let statement_block = prepare_statement_block(ctx, current);
             add_stmt_ref(ctx, statement_block, child);
             let transfer = if let Some(frame) = ctx.loop_stack.last() {
@@ -1592,7 +1673,10 @@ fn process_single_stmt(ctx: &mut BuildContext<'_>, child: Node, current: BlockId
             };
             Flow::transfer(transfer)
         }
-        "statement" if is_continue_call(child, ctx.source) => {
+        "statement"
+            if !is_ordinary_control_transfer_override(ctx, child)
+                && is_continue_call(child, ctx.source) =>
+        {
             let statement_block = prepare_statement_block(ctx, current);
             add_stmt_ref(ctx, statement_block, child);
             let transfer = if let Some(frame) = ctx.loop_stack.last() {
@@ -1647,6 +1731,34 @@ fn process_single_stmt(ctx: &mut BuildContext<'_>, child: Node, current: BlockId
                 transfers: implicit_exception_transfers(statement_block),
             }
         }
+    }
+}
+
+fn is_ordinary_control_transfer_override(ctx: &BuildContext<'_>, statement: Node<'_>) -> bool {
+    control_transfer_identifier(statement, ctx.source).is_some_and(|identifier| {
+        ctx.ordinary_control_transfer_identifiers
+            .contains(&identifier.start_byte())
+    })
+}
+
+fn control_transfer_identifier<'tree>(node: Node<'tree>, source: &[u8]) -> Option<Node<'tree>> {
+    match node.kind() {
+        "statement" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find_map(|child| control_transfer_identifier(child, source))
+        }
+        "identifier" => ["exit", "break", "continue"]
+            .iter()
+            .any(|name| node_text(node, source).eq_ignore_ascii_case(name))
+            .then_some(node),
+        "exprCall" => node.child_by_field_name("entity").filter(|entity| {
+            entity.kind() == "identifier"
+                && ["exit", "break", "continue"]
+                    .iter()
+                    .any(|name| node_text(*entity, source).eq_ignore_ascii_case(name))
+        }),
+        _ => None,
     }
 }
 

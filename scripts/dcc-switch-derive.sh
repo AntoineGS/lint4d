@@ -132,11 +132,17 @@ mapfile -t candidate_ids < "$candidate_file"
 candidate_ids_all=("${candidate_ids[@]}")
 candidate_ids=()
 
-codes=(H2219 H2443 W1000 W1001 W1002 W1003 W1004 W1005 W1006 W1007 W1009 W1010)
+codes=(H2077 H2135 H2164 H2219 H2443 W1000 W1001 W1002 W1003 W1004 W1005 W1006 W1007 W1009 W1010 W1035 W1036 W1037)
 source_root="$root/crates/pascal-lsp/tests/dcc_oracle"
 [[ -f "$source_root/w1009_property/W1009Property.pas" ]] || fail "W1009 trigger fixture is missing"
 [[ -f "$source_root/w1010_hides_virtual/W1010HidesVirtual.pas" ]] || fail "W1010 trigger fixture is missing"
 [[ -f "$source_root/h2219_unused_field/UnusedField.pas" ]] || fail "H2219 trigger fixture is missing"
+[[ -f "$source_root/h2164_unused_local/UnusedLocal.pas" ]] || fail "H2164 trigger fixture is missing"
+[[ -f "$source_root/h2077_overwritten/Overwritten.pas" ]] || fail "H2077 trigger fixture is missing"
+[[ -f "$source_root/h2135_for_constant_empty/ForConstantEmpty.pas" ]] || fail "H2135 trigger fixture is missing"
+[[ -f "$source_root/w1035_no_result/NoResult.pas" ]] || fail "W1035 trigger fixture is missing"
+[[ -f "$source_root/w1036_scalar_read_before_write/ScalarReadBeforeWrite.pas" ]] || fail "W1036 trigger fixture is missing"
+[[ -f "$source_root/w1037_read_after_loop/ReadAfterLoop.pas" ]] || fail "W1037 trigger fixture is missing"
 [[ -f "$source_root/h2443_impl_uses_unit/InlUse.pas" ]] || fail "H2443 trigger fixture is missing"
 
 compiler_output=''
@@ -296,6 +302,18 @@ write_single_unit_trigger() {
       source_file="$source_root/h2219_unused_field/UnusedField.pas"
       source_name='UnusedField.pas'
       ;;
+    H2164)
+      source_file="$source_root/h2164_unused_local/UnusedLocal.pas"
+      source_name='UnusedLocal.pas'
+      ;;
+    H2077)
+      source_file="$source_root/h2077_overwritten/Overwritten.pas"
+      source_name='Overwritten.pas'
+      ;;
+    H2135)
+      source_file="$source_root/h2135_for_constant_empty/ForConstantEmpty.pas"
+      source_name='ForConstantEmpty.pas'
+      ;;
     H2443)
       source_file="$source_root/h2443_impl_uses_unit/InlUse.pas"
       source_name='InlUse.pas'
@@ -311,6 +329,18 @@ write_single_unit_trigger() {
     W1010)
       source_file="$source_root/w1010_hides_virtual/W1010HidesVirtual.pas"
       source_name='W1010HidesVirtual.pas'
+      ;;
+    W1035)
+      source_file="$source_root/w1035_no_result/NoResult.pas"
+      source_name='NoResult.pas'
+      ;;
+    W1036)
+      source_file="$source_root/w1036_scalar_read_before_write/ScalarReadBeforeWrite.pas"
+      source_name='ScalarReadBeforeWrite.pas'
+      ;;
+    W1037)
+      source_file="$source_root/w1037_read_after_loop/ReadAfterLoop.pas"
+      source_name='ReadAfterLoop.pas'
       ;;
     *)
       fail "no single-unit trigger for $code"
@@ -334,7 +364,7 @@ write_trigger() {
     W1000|W1001|W1002|W1003|W1004|W1005|W1006|W1007)
       write_program_trigger "$code" "$directives"
       ;;
-    H2219|H2443|W1009|W1010)
+    H2077|H2135|H2164|H2219|H2443|W1009|W1010|W1035|W1036|W1037)
       write_single_unit_trigger "$code" "$directives"
       ;;
     *)

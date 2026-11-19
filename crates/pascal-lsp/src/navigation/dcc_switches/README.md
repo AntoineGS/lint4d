@@ -27,8 +27,9 @@ For each code, the script compiles its trigger without warning directives to
 record the default, then uses `{$WARNINGS ON}` / `{$HINTS ON}` followed by each
 global OFF directive to identify the governing global. Triggers cover
 deprecated, library, platform, and experimental symbols and units, the tier-0
-W1009/W1010 fixtures, the unused-private-field H2219 fixture, and the
-inline-use H2443 fixture.
+W1009/W1010 fixtures, the flow H2077/H2135/H2164 and W1035/W1036/W1037
+fixtures, the unused-private-field H2219 fixture, and the inline-use H2443
+fixture.
 
 Specific-ID candidates come from uppercase attributes on the `DCC` task in
 `bin/CodeGear.Delphi.Targets` and uppercase strings in the compiler binaries.

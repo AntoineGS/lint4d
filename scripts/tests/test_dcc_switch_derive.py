@@ -12,6 +12,35 @@ DERIVE_SCRIPT = ROOT / "scripts" / "dcc-switch-derive.sh"
 
 
 class DeriveScriptTests(unittest.TestCase):
+    def test_flow_codes_use_their_oracle_fixtures_as_probe_triggers(self):
+        script = DERIVE_SCRIPT.read_text()
+        single_unit_triggers = script.split("write_single_unit_trigger() {", 1)[1].split(
+            "\ntrigger_source=''", 1
+        )[0]
+        fixtures = {
+            "H2164": ("h2164_unused_local", "UnusedLocal.pas"),
+            "H2077": ("h2077_overwritten", "Overwritten.pas"),
+            "H2135": ("h2135_for_constant_empty", "ForConstantEmpty.pas"),
+            "W1035": ("w1035_no_result", "NoResult.pas"),
+            "W1036": ("w1036_scalar_read_before_write", "ScalarReadBeforeWrite.pas"),
+            "W1037": ("w1037_read_after_loop", "ReadAfterLoop.pas"),
+        }
+
+        for code, (case, source) in fixtures.items():
+            with self.subTest(code=code):
+                fixture = (
+                    ROOT
+                    / "crates"
+                    / "pascal-lsp"
+                    / "tests"
+                    / "dcc_oracle"
+                    / case
+                    / source
+                )
+                self.assertIn(f"{code})", single_unit_triggers)
+                self.assertIn(f"{case}/{source}", single_unit_triggers)
+                self.assertTrue(fixture.is_file())
+
     def test_property_mapping_accepts_whitespace_around_equals(self):
         script = DERIVE_SCRIPT.read_text()
         grep_pattern = re.search(

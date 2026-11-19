@@ -1,0 +1,4 @@
+unit = "FlowShadowContinue.pas"
+compilers = ["21.0", "24.0", "37.0"]
+unindexed_units = ["ShadowContinue.pas"]
+reason = "ShadowContinue is intentionally unindexed by lint4d; Delphi resolves the imported routine named Continue."

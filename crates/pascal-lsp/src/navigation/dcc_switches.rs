@@ -247,8 +247,8 @@ impl SwitchTable {
 }
 
 const SUPPORTED_CODES: &[&str] = &[
-    "H2219", "H2443", "W1000", "W1001", "W1002", "W1003", "W1004", "W1005", "W1006", "W1007",
-    "W1009", "W1010",
+    "H2077", "H2135", "H2164", "H2219", "H2443", "W1000", "W1001", "W1002", "W1003", "W1004",
+    "W1005", "W1006", "W1007", "W1009", "W1010", "W1035", "W1036", "W1037",
 ];
 
 fn known_code(code: &str) -> Option<&'static str> {
@@ -470,8 +470,8 @@ DCC_Warnings Warnings\n";
                 .unwrap_or_else(|| panic!("{major}.{minor} switch table"));
 
             for code in [
-                "H2219", "W1000", "W1001", "W1002", "W1003", "W1004", "W1005", "W1006", "W1007",
-                "W1009", "W1010",
+                "H2077", "H2135", "H2164", "H2219", "W1000", "W1001", "W1002", "W1003", "W1004",
+                "W1005", "W1006", "W1007", "W1009", "W1010", "W1035", "W1036", "W1037",
             ] {
                 assert!(
                     table.code(code).is_some(),
@@ -483,6 +483,31 @@ DCC_Warnings Warnings\n";
                 Some("SYMBOL_DEPRECATED"),
                 "{major}.{minor}"
             );
+            for (code, global, id, error_capable) in [
+                ("H2077", GlobalSwitch::Hints, None, false),
+                ("H2135", GlobalSwitch::Hints, None, false),
+                ("H2164", GlobalSwitch::Hints, None, false),
+                ("W1035", GlobalSwitch::Warnings, Some("NO_RETVAL"), true),
+                (
+                    "W1036",
+                    GlobalSwitch::Warnings,
+                    Some("USE_BEFORE_DEF"),
+                    true,
+                ),
+                (
+                    "W1037",
+                    GlobalSwitch::Warnings,
+                    Some("FOR_LOOP_VAR_UNDEF"),
+                    true,
+                ),
+            ] {
+                let entry = table
+                    .code(code)
+                    .unwrap_or_else(|| panic!("{major}.{minor} missing {code}"));
+                assert_eq!(entry.global, global, "{major}.{minor} {code}");
+                assert_eq!(entry.id.as_deref(), id, "{major}.{minor} {code}");
+                assert_eq!(entry.error_capable, error_capable, "{major}.{minor} {code}");
+            }
         }
         assert!(switch_table(22, 0).is_none());
     }

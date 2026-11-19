@@ -2234,7 +2234,7 @@ fn inspect_source_membership_impl(
         before_read(source_path);
         let (contents, observation) = match context
             .read_policy
-            .read_payload_with_observation(&source_entry, size)
+            .read_pascal_payload_with_observation(&source_entry, size)
         {
             Ok(payload) => payload,
             Err(error) => {
@@ -2879,6 +2879,49 @@ mod tests {
                 .iter()
                 .any(|observation| observation.path() == target),
             "a source that grew after its reservation must not be accepted as a payload"
+        );
+    }
+
+    #[test]
+    fn ownership_probe_decodes_single_byte_pascal_membership_sources() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().to_path_buf();
+        let main = root.join("Main.pas");
+        fs::write(
+            &main,
+            b"unit Main; interface implementation { Caf\xe9 } end.\n",
+        )
+        .expect("single-byte Pascal source");
+
+        let read_policy = ReadPolicy::new(
+            std::slice::from_ref(&root),
+            &[],
+            &[],
+            &EffectiveOverrides::default(),
+        );
+        let context = ProjectContext {
+            main_source_entry: Some(ProjectPathEntry {
+                path: main.clone(),
+                provenance: ProjectPathProvenance::Configured,
+            }),
+            read_policy,
+            ..ProjectContext::default()
+        };
+        let mut budget = super::OwnershipProbeBudget::default();
+        let inspection =
+            super::inspect_source_membership_with_hook(&context, &mut budget, &mut |_| {});
+
+        assert!(
+            inspection.complete,
+            "valid single-byte source should not make membership incomplete: {:?}",
+            inspection.warnings
+        );
+        assert!(
+            inspection
+                .metadata_observations
+                .iter()
+                .any(|observation| observation.path() == main),
+            "decoded source must retain its original payload observation"
         );
     }
 

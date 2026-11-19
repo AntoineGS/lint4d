@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 24.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem W1005UnitSwitchRegions.pas
+W1005UnitSwitchRegions.pas(9) W1005 Unit 'OnPlatformUnit' is specific to a platform

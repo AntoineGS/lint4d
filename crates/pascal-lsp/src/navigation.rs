@@ -99,6 +99,7 @@ mod system_trust_tests;
 pub(crate) use dcc_message::{DccMessage, DccSeverity};
 mod documentation;
 mod facts;
+mod flow;
 mod folding;
 mod form_file;
 mod hint_directives;
@@ -1011,6 +1012,8 @@ impl SemanticDiagnosticReport {
 const MAX_SEMANTIC_DIAGNOSTIC_NODES: usize = 100_000;
 const MAX_SEMANTIC_DIAGNOSTIC_WORK: usize = 100_000;
 const MAX_SEMANTIC_DIAGNOSTIC_BYTES: usize = 8 * 1024 * 1024;
+const MAX_FLOW_DIAGNOSTIC_WORK: usize = 2_000_000;
+const MAX_FLOW_DIAGNOSTIC_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const MAX_MISSING_UNIT_REQUEST_WORK: usize = 300_000;
 pub(crate) const MAX_MISSING_UNIT_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SEMANTIC_DIAGNOSTICS: usize = 256;
@@ -3096,7 +3099,6 @@ impl NavigationIndex {
                     .rev(),
             );
         }
-
         'analysis: {
             let mut reported_undeclared_names = HashSet::new();
             for &identifier in &identifiers {
@@ -3333,6 +3335,33 @@ impl NavigationIndex {
                 cancel,
                 &mut budget,
             )?;
+        }
+        if report.has_capacity() {
+            let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
+            let mut flow_diagnostic_cap_reached = false;
+            // Keep flow bounded independently: name-proof work above may use
+            // the semantic budget before this more expensive pass runs.
+            let mut flow_budget = AssistanceBudget::new(
+                MAX_FLOW_DIAGNOSTIC_WORK,
+                MAX_FLOW_DIAGNOSTIC_BYTES,
+                "flow diagnostics",
+            );
+            let result = flow::flow_diagnostics_with_budget(
+                self,
+                uri,
+                document,
+                &report.diagnostics,
+                capacity,
+                &mut flow_diagnostic_cap_reached,
+                cancel,
+                &mut flow_budget,
+            );
+            if let Some(flow_diagnostics) = report.checked_candidate(result, &flow_budget)? {
+                report.diagnostics.extend(flow_diagnostics);
+            }
+            if flow_diagnostic_cap_reached {
+                report.note(SemanticCoverageGap::DiagnosticCap);
+            }
         }
         report
             .diagnostics
@@ -8298,6 +8327,160 @@ impl NavigationIndex {
         }
 
         Ok(Vec::new())
+    }
+
+    /// Whether a source-backed candidate is unsafe as flow proof because a
+    /// higher-precedence import is incomplete or already exports the name.
+    ///
+    /// Delphi searches the current unit before imports, then implementation
+    /// uses in reverse source order, interface uses in reverse source order,
+    /// and implicit System last. The ordinary navigation candidate collector
+    /// intentionally aggregates imports, so flow must not treat an aggregate
+    /// candidate as proof without checking this lookup order.
+    #[allow(clippy::too_many_arguments)]
+    fn flow_candidate_has_shadowing_uncertainty(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        key: &str,
+        candidate: &Candidate,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        self.flow_target_has_shadowing_uncertainty(
+            current_uri,
+            current_document,
+            offset,
+            key,
+            Some(candidate),
+            cancel,
+            budget,
+        )
+    }
+
+    fn flow_intrinsic_has_shadowing_uncertainty(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        key: &str,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        self.flow_target_has_shadowing_uncertainty(
+            current_uri,
+            current_document,
+            offset,
+            key,
+            None,
+            cancel,
+            budget,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn flow_target_has_shadowing_uncertainty(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        key: &str,
+        candidate: Option<&Candidate>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        if candidate.is_some_and(|candidate| candidate.uri == *current_uri) {
+            return Ok(false);
+        }
+
+        let region = current_document.region_at(offset);
+        let ordered_uses = match region {
+            Region::Interface => current_document
+                .interface_uses
+                .iter()
+                .rev()
+                .collect::<Vec<_>>(),
+            Region::Implementation | Region::Other => current_document
+                .implementation_uses
+                .iter()
+                .rev()
+                .chain(current_document.interface_uses.iter().rev())
+                .collect::<Vec<_>>(),
+        };
+        budget.require_work(ordered_uses.len(), cancel)?;
+        budget.require_bytes(
+            ordered_uses
+                .len()
+                .saturating_mul(std::mem::size_of::<&String>()),
+            cancel,
+        )?;
+
+        for unit in ordered_uses {
+            check_navigation_cancel(cancel)?;
+            let unit_key = canonical_name(unit);
+            if current_document.unknown_imports.contains(&unit_key) {
+                return Ok(true);
+            }
+            let providers = self.unit_urls_for_import_lookup_with_budget(
+                current_document,
+                &unit_key,
+                Some(key),
+                cancel,
+                budget,
+            )?;
+            if providers.len() != 1 {
+                return Ok(true);
+            }
+            let provider_uri = &providers[0];
+            let Some(provider) = self.documents.get(provider_uri) else {
+                return Ok(true);
+            };
+            if candidate.is_some_and(|candidate| provider_uri == &candidate.uri) {
+                let candidate_is_routine = candidate.is_some_and(|candidate| {
+                    provider
+                        .symbols
+                        .get(candidate.index)
+                        .is_some_and(|symbol| symbol.kind == SymbolKind::Routine)
+                });
+                if candidate_is_routine
+                    && (!Self::document_is_complete_for_proof(provider, cancel, budget)?
+                        || !provider.opaque_ranges.is_empty()
+                        || !provider.unknown_imports.is_empty())
+                {
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
+            if !Self::document_is_complete_for_proof(provider, cancel, budget)?
+                || !provider.opaque_ranges.is_empty()
+                || !provider.unknown_imports.is_empty()
+            {
+                return Ok(true);
+            }
+            if !self
+                .exported_references_for_key_with_budget(provider_uri, key, cancel, budget)?
+                .is_empty()
+            {
+                return Ok(true);
+            }
+        }
+
+        let Some(candidate) = candidate else {
+            return Ok(false);
+        };
+        let Some(provider) = self.documents.get(&candidate.uri) else {
+            return Ok(true);
+        };
+        if !Self::document_is_complete_for_proof(provider, cancel, budget)?
+            || !provider.opaque_ranges.is_empty()
+            || !provider.unknown_imports.is_empty()
+        {
+            return Ok(true);
+        }
+        // The only source-backed candidate after all explicit imports is
+        // Delphi's implicit System unit.
+        Ok(provider.unit_name != "system")
     }
 
     fn implicit_system_references_with_budget(
@@ -28299,6 +28482,36 @@ mod tests {
     }
 
     #[test]
+    fn semantic_diagnostics_report_flow_findings_truncated_by_the_cap() {
+        let uri =
+            Url::parse("file:///tmp/semantic-diagnostics-flow-cap.pas").expect("flow cap URI");
+        let mut source = String::from(
+            "unit SemanticDiagnosticsFlowCap;\ninterface\nimplementation\nprocedure Run;\nvar\n",
+        );
+        for index in 0..=MAX_SEMANTIC_DIAGNOSTICS {
+            writeln!(&mut source, "  Value{index}: Integer;").expect("write local");
+        }
+        source.push_str("begin end;\nend.\n");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source)
+            .expect("flow cap fixture parses");
+
+        let report = index
+            .semantic_diagnostic_report_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("capped flow diagnostics complete");
+
+        assert_eq!(report.diagnostics.len(), MAX_SEMANTIC_DIAGNOSTICS);
+        assert!(
+            report.diagnostics.iter().all(|diagnostic| {
+                diagnostic.kind == SemanticDiagnosticKind::Dcc(DccMessage::H2164)
+            }),
+            "{report:?}"
+        );
+        assert_eq!(report.gaps, vec![SemanticCoverageGap::DiagnosticCap]);
+    }
+
+    #[test]
     fn semantic_diagnostics_keep_a_finding_above_a_syntax_error() {
         let uri =
             Url::parse("file:///tmp/semantic-diagnostics-recovery-below.pas").expect("fixture URI");
@@ -28345,6 +28558,58 @@ mod tests {
             }]
         );
         assert_eq!(report.gaps, vec![SemanticCoverageGap::ParserRecovery]);
+    }
+
+    #[test]
+    fn semantic_diagnostics_withhold_h2077_only_for_a_routine_with_an_error() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-flow-error-scope.pas")
+            .expect("fixture URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsFlowErrorScope;\n",
+            "interface\n",
+            "implementation\n",
+            "procedure Good;\n",
+            "var Value: Integer;\n",
+            "begin\n",
+            "  Value := 1;\n",
+            "end;\n",
+            "procedure Bad;\n",
+            "var Unused: Integer;\n",
+            "  procedure Nested;\n",
+            "  var Number: Integer; Flag: Boolean;\n",
+            "  begin\n",
+            "    Flag := Number;\n",
+            "  end;\n",
+            "begin\n",
+            "  Unused := 2;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| (diagnostic.kind, diagnostic.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    SemanticDiagnosticKind::Dcc(DccMessage::H2077),
+                    "Value assigned to 'Value' never used",
+                ),
+                (
+                    SemanticDiagnosticKind::TypeMismatch,
+                    "type mismatch: cannot assign 'Integer' to 'Boolean'",
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -29792,8 +30057,12 @@ mod tests {
         let visits = test_semantic_generic_symbol_visits();
 
         assert!(
-            diagnostics.is_empty() && visits > 0 && visits <= MAX_SEMANTIC_DIAGNOSTIC_WORK,
-            "upcast parent lookup must consume the shared budget and discard partial results after {visits} provider visits: {diagnostics:?}"
+            diagnostics.len() == 1
+                && diagnostics[0].kind.code() == "H2077"
+                && diagnostics[0].message == "Value assigned to 'B' never used"
+                && visits > 0
+                && visits <= MAX_SEMANTIC_DIAGNOSTIC_WORK,
+            "upcast parent lookup must consume the shared budget and discard partial results after {visits} provider visits, while independent flow diagnostics remain available: {diagnostics:?}"
         );
     }
 
@@ -30456,7 +30725,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_diagnostics_charge_generic_parameter_lookups_to_the_budget() {
+    fn semantic_flow_findings_survive_semantic_budget_exhaustion() {
         // Every reference to the local `Value` runs the generic parameter
         // lookup, which examines the 3,000 routines declaring a `Value`
         // parameter. Nothing else here is expensive: the local resolves in its
@@ -30467,7 +30736,9 @@ mod tests {
         for index in 1..=3_000 {
             writeln!(&mut source, "procedure G{index}<Value>;").expect("write routine");
         }
-        source.push_str("implementation\nprocedure Run;\nvar\n  Value: Integer;\nbegin\n");
+        source.push_str(
+            "implementation\nprocedure Run;\nvar\n  Value: Integer;\n  Unused: Integer;\nbegin\n",
+        );
         for _ in 0..40 {
             source.push_str("  Value := Value;\n");
         }
@@ -30480,6 +30751,12 @@ mod tests {
             .expect("bounded semantic diagnostics complete");
 
         assert_eq!(report.gaps, vec![SemanticCoverageGap::Budget], "{report:?}");
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind.code() == "H2164" && diagnostic.message.contains("'Unused'")
+            }),
+            "flow analysis should use its separate budget after semantic name lookup exhausts its budget: {report:?}"
+        );
     }
 
     #[test]
@@ -31820,6 +32097,7 @@ mod tests {
 mod insert_parsed_tests {
     use super::*;
     use pascal_core::conditional::Truth;
+    use pascal_project::{LayoutContext, TargetPlatform};
 
     fn parsed(uri: &Url, context: &ConditionalContext) -> Arc<ParsedDocument> {
         let mut index = NavigationIndex::new();
@@ -31924,5 +32202,109 @@ mod insert_parsed_tests {
                 "a hash match is not proof that this cached parse used the verified context"
             );
         });
+    }
+
+    #[test]
+    fn flow_shadow_check_rejects_an_incomplete_selected_provider() {
+        let consumer_source = concat!(
+            "program FlowIncompleteOverloadProvider;\n",
+            "uses FlowOverloadProvider;\n",
+            "procedure Demo;\n",
+            "var X: Integer;\n",
+            "begin\n",
+            "  X := 1;\n",
+            "  Touch(X);\n",
+            "end;\n",
+            "begin Demo; end.\n",
+        );
+        let provider_source = concat!(
+            "unit FlowOverloadProvider;\n",
+            "interface\n",
+            "procedure Touch(out Value: Integer); overload;\n",
+            "{$IFDEF UNKNOWN_PROVIDER_DEFINE}\n",
+            "procedure Touch(const Value: Integer); overload;\n",
+            "{$ENDIF}\n",
+            "implementation\n",
+            "procedure Touch(out Value: Integer);\n",
+            "begin Value := 0; end;\n",
+            "{$IFDEF UNKNOWN_PROVIDER_DEFINE}\n",
+            "procedure Touch(const Value: Integer);\n",
+            "begin end;\n",
+            "{$ENDIF}\n",
+            "end.\n",
+        );
+        let consumer_uri = Url::parse("file:///tmp/flow-incomplete-provider.pas").unwrap();
+        let provider_uri = Url::parse("file:///tmp/FlowOverloadProvider.pas").unwrap();
+        let version = CompilerVersion::new(37, 0);
+        let platform = TargetPlatform::Win32;
+        let context = ConditionalContext {
+            compiler_version: Some(version),
+            layout: LayoutContext::for_target(Some(version), Some(&platform)),
+            ..ConditionalContext::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let mut index = NavigationIndex::new();
+        index
+            .update_with_context_with_cancel(
+                provider_uri.clone(),
+                provider_source.to_owned(),
+                &context,
+                &cancel,
+            )
+            .expect("provider parses");
+        index
+            .update_with_context_with_cancel(
+                consumer_uri.clone(),
+                consumer_source.to_owned(),
+                &context,
+                &cancel,
+            )
+            .expect("consumer parses");
+        index.bind_imports(
+            &consumer_uri,
+            [("FlowOverloadProvider".to_owned(), provider_uri.clone())],
+        );
+
+        let provider = index
+            .documents
+            .get(&provider_uri)
+            .expect("provider indexed");
+        assert!(
+            !provider.conditionals.unknown_spans.is_empty(),
+            "the potentially present const overload keeps the provider incomplete"
+        );
+
+        let document = index
+            .documents
+            .get(&consumer_uri)
+            .expect("consumer indexed");
+        let offset = consumer_source.find("Touch(X)").expect("Touch call");
+        let identifier =
+            identifier_at(document.tree.root_node(), offset).expect("Touch identifier");
+        let candidates = index.resolve_candidates_at(&consumer_uri, document, offset, identifier);
+        let matching = candidates
+            .iter()
+            .filter(|candidate| candidate.uri == provider_uri)
+            .collect::<Vec<_>>();
+        assert!(
+            !matching.is_empty(),
+            "Touch resolves to the indexed provider"
+        );
+
+        let mut budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "flow test");
+        assert!(
+            index
+                .flow_candidate_has_shadowing_uncertainty(
+                    &consumer_uri,
+                    document,
+                    offset,
+                    "touch",
+                    matching[0],
+                    &cancel,
+                    &mut budget,
+                )
+                .expect("shadow check"),
+            "an incomplete provider may have a competing overload with different argument effects"
+        );
     }
 }

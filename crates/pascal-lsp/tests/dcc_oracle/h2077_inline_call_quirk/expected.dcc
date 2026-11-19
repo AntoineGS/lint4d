@@ -1,0 +1,8 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem InlUse.pas
+InlUse.pas(8) H2443 Inline function 'UsesImplUnit' has not been expanded because unit 'InlHelper' is not specified in USES list
+InlUse.pas(10) H2443 Inline function 'UsesIntfUnitType' has not been expanded because unit 'InlHelper' is not specified in USES list
+InlUse.pas(11) H2443 Inline function 'UsesImplUnit' has not been expanded because unit 'InlHelper' is not specified in USES list
+InlUse.pas(10) H2077 Value assigned to 'I' never used
+InlUse.pas(9) H2077 Value assigned to 'I' never used
+InlUse.pas(8) H2077 Value assigned to 'I' never used

@@ -16,6 +16,30 @@ fn parse(source: &[u8]) -> tree_sitter::Tree {
     parser.parse(source, None).expect("parse failed")
 }
 
+#[test]
+fn routine_cfg_discovery_honors_cancellation_probe() {
+    let source =
+        b"program Cancel; procedure First; begin end; procedure Second; begin end; begin end.";
+    let tree = parse(source);
+    let mut probe_calls = 0;
+
+    let result = cfg_pascal::build_routine_cfgs_with_filter_and_cancel(
+        &tree,
+        source,
+        || {
+            probe_calls += 1;
+            probe_calls >= 3
+        },
+        |_, _| true,
+    );
+
+    assert_eq!(
+        result.expect_err("the discovery traversal should observe cancellation"),
+        "request cancelled"
+    );
+    assert!(probe_calls >= 3);
+}
+
 fn find_cfg_by_name<'a>(cfgs: &'a [cfg_core::Cfg], name: &str) -> &'a cfg_core::Cfg {
     cfgs.iter()
         .find(|c| c.proc_name == name)

@@ -1,7 +1,7 @@
 //! dcc-recorded fixtures (`crates/pascal-lsp/tests/dcc_oracle`): for the
 //! codes in `ENABLED_CODES`, the semantic pass must report exactly what dcc
-//! recorded (precision always; recall unless a case needs the RTL and
-//! `PASCAL_RTL_<version>` is unset).
+//! recorded (precision always; recall unless a case or code has a documented
+//! waiver, or a required RTL source is unavailable).
 use super::dcc_surface::{SurfaceKey, SurfacePlatform, table_for, verified_system_context};
 use super::dcc_switches::{SwitchTable, switch_table};
 use super::*;
@@ -20,8 +20,8 @@ const MAX_RTL_IMPORT_CLOSURE_DEPTH: usize = 64;
 const ENABLED_CODES: &[&str] = &[
     "E1000", "E1001", "E1002", "E1003", "E1004", "E1005", "E1006", "E1007", "E1009", "E1010",
     "E2003", "E2004", "E2037", "E2065", "E2137", "E2170", "E2211", "E2252", "E2254", "E2291",
-    "E2301", "H2219", "H2443", "W1000", "W1001", "W1002", "W1003", "W1004", "W1005", "W1006",
-    "W1007", "W1009", "W1010",
+    "E2301", "H2077", "H2135", "H2164", "H2219", "H2443", "W1000", "W1001", "W1002", "W1003",
+    "W1004", "W1005", "W1006", "W1007", "W1009", "W1010", "W1035", "W1036", "W1037",
 ];
 
 #[test]
@@ -105,8 +105,20 @@ struct Case {
     reason: Option<String>,
     recall_exempt: Vec<String>,
     silent_codes: Vec<String>,
+    unindexed_units: Vec<String>,
     unused_unit_check: Vec<String>,
     expect_silent_reason: BTreeMap<String, String>,
+}
+
+impl Case {
+    fn recall_enforced_for(&self, code: &str, rtl_available: bool) -> bool {
+        self.recall
+            && (!self.requires_rtl || rtl_available)
+            && !self
+                .recall_exempt
+                .iter()
+                .any(|exempt| exempt.eq_ignore_ascii_case(code))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -427,7 +439,7 @@ fn load_case_from_toml(name: &str, dir: &Path, toml: &str) -> Case {
     let reason = value("recall_exempt_reason").or_else(|| value("reason"));
     assert!(
         (recall && recall_exempt.is_empty()) || reason.is_some(),
-        "{name}: recall waivers require a reason"
+        "{name}: recall_exempt requires a reason; recall = false also requires a reason"
     );
     let unused_unit_check = value("unused_unit_check")
         .map(|raw| parse_string_array(&raw, name, "unused_unit_check"))
@@ -456,12 +468,16 @@ fn load_case_from_toml(name: &str, dir: &Path, toml: &str) -> Case {
             "{name}: empty silence reason for {unit}"
         );
     }
+
     let compilers = value("compilers")
         .map(|raw| parse_string_array(&raw, name, "compilers"))
         .unwrap_or_else(|| vec!["37.0".to_owned()]);
     assert!(!compilers.is_empty(), "{name}: compilers must not be empty");
     let silent_codes = value("silent")
         .map(|raw| parse_string_array(&raw, name, "silent"))
+        .unwrap_or_default();
+    let unindexed_units = value("unindexed_units")
+        .map(|raw| parse_string_array(&raw, name, "unindexed_units"))
         .unwrap_or_default();
     Case {
         unit: value("unit").unwrap_or_else(|| panic!("{name}: case.toml has no unit")),
@@ -473,6 +489,7 @@ fn load_case_from_toml(name: &str, dir: &Path, toml: &str) -> Case {
         reason,
         recall_exempt,
         silent_codes,
+        unindexed_units,
         unused_unit_check,
         expect_silent_reason,
         name: name.to_owned(),
@@ -834,6 +851,12 @@ fn actual_findings(case: &Case, version: &str) -> Vec<Finding> {
         .collect::<Vec<_>>();
     entries.sort();
     for path in entries {
+        if case.unindexed_units.iter().any(|unit| {
+            path.file_name()
+                .is_some_and(|file_name| file_name.eq_ignore_ascii_case(unit))
+        }) {
+            continue;
+        }
         let source = std::fs::read_to_string(&path).unwrap();
         let uri = Url::from_file_path(&path).unwrap();
         let warning_properties = project
@@ -1247,6 +1270,7 @@ fn silent_case_codes_override_matching_dcc_and_linter_findings() {
         reason: None,
         recall_exempt: Vec::new(),
         silent_codes: vec!["E2065".to_owned()],
+        unindexed_units: Vec::new(),
         unused_unit_check: Vec::new(),
         expect_silent_reason: BTreeMap::new(),
     };
@@ -1631,6 +1655,7 @@ fn dproj_oracle_context_uses_selected_warning_properties_and_oracle_defines() {
         reason: None,
         recall_exempt: Vec::new(),
         silent_codes: Vec::new(),
+        unindexed_units: Vec::new(),
         unused_unit_check: Vec::new(),
         expect_silent_reason: BTreeMap::new(),
     };
@@ -1721,6 +1746,7 @@ fn dproj_oracle_cases_require_explicit_config_and_platform() {
             reason: None,
             recall_exempt: Vec::new(),
             silent_codes: Vec::new(),
+            unindexed_units: Vec::new(),
             unused_unit_check: Vec::new(),
             expect_silent_reason: BTreeMap::new(),
         };
@@ -1812,6 +1838,16 @@ fn case_compilers_parse_multiple_versions() {
 
     assert_eq!(case.compilers, ["21.0", "24.0"]);
     assert_eq!(case.recall_exempt, ["H2443"]);
+}
+
+#[test]
+#[should_panic(expected = "recall_exempt requires a reason")]
+fn case_recall_exempt_requires_a_reason() {
+    let _ = load_case_from_toml(
+        "synthetic",
+        Path::new("synthetic"),
+        "unit = \"Synthetic.pas\"\nrecall_exempt = [\"W1000\"]\n",
+    );
 }
 
 #[test]
@@ -2076,10 +2112,13 @@ fn dcc_oracle_cases_match_recorded_dcc_output() {
             let actual_all = actual_findings(&case, version);
             failures.extend(unused_unit_parity_failures(&case, version, &actual_all));
             let actual = actual_all.into_iter().filter(enabled).collect::<Vec<_>>();
-            let recall_enforced =
-                case.recall && (!case.requires_rtl || rtl_root(version).is_some());
+            let rtl_available = rtl_root(version).is_some();
             for code in ENABLED_CODES {
-                let recall_exempt = case.recall_exempt.iter().any(|exempt| exempt == code);
+                let recall_exempt = case
+                    .recall_exempt
+                    .iter()
+                    .any(|exempt| exempt.eq_ignore_ascii_case(code));
+                let recall_enforced = case.recall_enforced_for(code, rtl_available);
                 let case_summary = summarize_code(
                     code,
                     &expected,
@@ -2088,6 +2127,20 @@ fn dcc_oracle_cases_match_recorded_dcc_output() {
                     &case.silent_codes,
                     recall_exempt,
                 );
+                if case.name == "w1000_type_in_var_decl" {
+                    match *code {
+                        "W1000" => assert_eq!(
+                            case_summary.waived + case_summary.matched,
+                            case_summary.expected,
+                            "only unmatched W1000 findings are waived in its duplicate-reporting case"
+                        ),
+                        "W1036" => assert_eq!(
+                            case_summary.waived, 0,
+                            "the W1000 duplicate waiver must not waive W1036 recall"
+                        ),
+                        _ => {}
+                    }
+                }
                 let summary = summaries
                     .get_mut(*code)
                     .expect("summary initialized for every enabled code");
@@ -2114,10 +2167,14 @@ fn dcc_oracle_cases_match_recorded_dcc_output() {
                     case.name
                 ));
             }
-            if recall_enforced && !missed.is_empty() {
+            let missed_with_recall_enforced = missed
+                .into_iter()
+                .filter(|finding| case.recall_enforced_for(&finding.code, rtl_available))
+                .collect::<Vec<_>>();
+            if !missed_with_recall_enforced.is_empty() {
                 failures.push(format!(
-                    "{} under {version}: dcc reported, we missed: {missed:?}",
-                    case.name
+                    "{} under {version}: dcc reported, we missed: {missed_with_recall_enforced:?}",
+                    case.name,
                 ));
             }
         }
@@ -2129,4 +2186,37 @@ fn dcc_oracle_cases_match_recorded_dcc_output() {
         eprintln!("{}", format_summary(code, summary));
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn every_enabled_warning_and_hint_has_a_row_in_each_switch_table() {
+    for (major, minor) in [(21, 0), (24, 0), (37, 0)] {
+        let table = switch_table(major, minor)
+            .unwrap_or_else(|| panic!("missing {major}.{minor} switch table"));
+        for code in ENABLED_CODES
+            .iter()
+            .copied()
+            .filter(|code| matches!(code.as_bytes().first(), Some(b'W' | b'H')))
+        {
+            assert!(
+                table.code(code).is_some(),
+                "{major}.{minor} switch table is missing enabled code {code}"
+            );
+        }
+    }
+}
+
+#[test]
+fn promoted_warning_suppresses_flow_hints_in_the_erroneous_routine() {
+    let case = load_case(&cases_root().join("w1000_error_promotion"));
+    let actual = actual_findings(&case, "37.0");
+
+    assert!(
+        actual.iter().any(|finding| finding.code == "E1000"),
+        "the promoted warning remains an error: {actual:?}"
+    );
+    assert!(
+        actual.iter().all(|finding| finding.code != "H2077"),
+        "dcc withholds flow hints from the routine containing a promoted warning: {actual:?}"
+    );
 }

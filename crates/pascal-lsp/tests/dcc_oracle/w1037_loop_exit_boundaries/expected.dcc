@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem LoopExitBoundaries.pas
+LoopExitBoundaries.pas(9) W1037 FOR-Loop variable 'I' may be undefined after loop
+LoopExitBoundaries.pas(18) W1037 FOR-Loop variable 'I' may be undefined after loop

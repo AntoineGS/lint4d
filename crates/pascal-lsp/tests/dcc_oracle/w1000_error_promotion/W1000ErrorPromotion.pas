@@ -28,6 +28,7 @@ end;
 procedure UseHints;
 var
   Value: Integer;
+  Unused: Integer;
 begin
   DeprecatedRoutine;
   Value := DeprecatedLibraryVariable;

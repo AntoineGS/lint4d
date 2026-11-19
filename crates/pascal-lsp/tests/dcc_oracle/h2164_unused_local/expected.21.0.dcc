@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 21.0
+# dcc32 -B -H+ -W+ -Q -U<lib> UnusedLocal.pas
+UnusedLocal.pas(5) H2164 Variable 'NeverUsed' is declared but never used in 'Unused'

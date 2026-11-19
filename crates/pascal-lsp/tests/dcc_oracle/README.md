@@ -13,6 +13,9 @@ needs Delphi's RTL, and `reason = "..."` to explain that dependency. Cases may
 set `recall = false` with a `reason` when lint4d must conservatively stay silent
 because the semantic model cannot prove a recorded dcc finding; this skips only
 the "dcc reported, lint4d missed" comparison, while precision remains enforced.
+A case may instead set `recall_exempt = ["W1000"]` with a `reason` to waive
+recall for only the listed codes; all other enabled codes in that case still
+have recall enforced. `recall = false` remains a case-wide recall waiver.
 A case may set `silent = ["E2065"]` to list codes lint4d must not report for
 that case, even when dcc recorded the same code. Silent findings are removed
 from dcc's expected side, but lint4d's actual findings are still checked, so any
@@ -20,6 +23,10 @@ such output fails precision. Use this only when an incomplete or unknown
 semantic model makes even a matching dcc diagnostic unsafe. The recording has
 `#` header lines followed by normalized messages in the form
 `<File>.pas(<line>) <code> <message>`.
+
+A case may set `unindexed_units = ["Provider.pas"]` to keep a sibling Pascal
+source available to the dcc recorder while deliberately omitting it from the
+navigation index. This models an import whose provider is not indexed.
 
 A case may contain one sibling `.dproj`. Optional `config = "Debug"` and
 `platform = "Win32"` entries in `case.toml` select its build configuration and
@@ -99,8 +106,12 @@ property and `DCC_Hints=false`.
 The paired H2219 case settles its governing position: dcc uses the hint state
 at the end of the unit, so turning hints off before `end.` suppresses H2219
 even when the private field precedes the directive. The dcc recording confirms
-that a switch inside an expanded include affects following declarations. The
-unexpanded-include case
+that a switch inside an expanded include affects following declarations.
+The W1002 symbol-switch case records the switch at each symbol use, and the W1005
+unit-switch case records the switch at each `uses` entry. Delphi accepts warning
+directives between entries in a `uses` clause, so the OFF/ON pair suppresses the
+first unit warning and retains the second.
+The unexpanded-include case
 records dcc's W1009 but sets `recall = false`: the navigation-only oracle
 cannot see the include's switch, so lint4d must stay silent after that include
 while precision remains enforced. Likewise, a switch in an unknown conditional
@@ -129,7 +140,8 @@ The unit test in `src/navigation/dcc_oracle_tests.rs` compares only codes in
 For enabled codes, precision is always enforced: every lint4d finding must be
 present in the selected compiler's recording, and silent codes must have no
 lint4d findings. Recall is also enforced unless `requires_rtl = true` and that
-compiler's RTL variable is unset, or `recall = false` is set with a reason.
+compiler's RTL variable is unset, `recall = false` is set with a reason, or the
+code appears in `recall_exempt` with a reason.
 The test prints one line per enabled code with its total recorded `expected`,
 exact `matched`, `invented`, enforced `missed`, and recall `waived` counts.
 `waived` counts recorded findings whose recall was not enforced; it can overlap

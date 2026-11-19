@@ -781,7 +781,8 @@ impl NavigationIndex {
             )? {
                 super::overload::ParameterModeResolution::Resolved(mode)
                 | super::overload::ParameterModeResolution::Intrinsic(mode) => mode,
-                super::overload::ParameterModeResolution::Unresolved => {
+                super::overload::ParameterModeResolution::Unresolved
+                | super::overload::ParameterModeResolution::UncertainTarget => {
                     let cache_key = unresolved_call_target_cache_key_with_budget(
                         current_uri,
                         document,

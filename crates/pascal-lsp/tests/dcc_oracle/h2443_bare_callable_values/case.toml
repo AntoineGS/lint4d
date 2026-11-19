@@ -1,2 +1,4 @@
 unit = "CallableValues.pas"
 compilers = ["21.0", "24.0", "37.0"]
+recall_exempt = ["H2077"]
+recall_exempt_reason = "The flow pass conservatively withholds H2077 when callable values refer to an inline routine whose implementation depends on another unit; H2443 and H2077 precision remain checked."

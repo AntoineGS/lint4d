@@ -1,0 +1,2 @@
+unit = "AnonymousResultCapture.pas"
+compilers = ["37.0"]

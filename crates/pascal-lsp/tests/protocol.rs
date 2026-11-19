@@ -5835,7 +5835,10 @@ fn pull_document_diagnostics_returns_owned_related_include_reports() {
             .any(|diagnostic| diagnostic["message"] == "Undeclared identifier: 'Missing'")
     );
 
-    let fixed_include = include_source.replace("Missing", "Value");
+    let fixed_include = include_source.replace(
+        "  Box.Missing := 1;\n",
+        "  Box := TBox.Create;\n  Box.Value := 1;\n",
+    );
     write_file(&include, &fixed_include);
     let changed_id = RequestId::from("pull-document-diagnostic-related-cleared".to_string());
     server.send_request(

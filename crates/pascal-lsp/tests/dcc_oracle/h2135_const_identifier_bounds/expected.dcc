@@ -1,0 +1,6 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem ConstIdentifierBounds.pas
+ConstIdentifierBounds.pas(13) H2135 FOR or WHILE loop executes zero times - deleted
+ConstIdentifierBounds.pas(15) H2135 FOR or WHILE loop executes zero times - deleted
+ConstIdentifierBounds.pas(17) H2135 FOR or WHILE loop executes zero times - deleted
+ConstIdentifierBounds.pas(11) H2164 Variable 'I' is declared but never used in 'Demo'

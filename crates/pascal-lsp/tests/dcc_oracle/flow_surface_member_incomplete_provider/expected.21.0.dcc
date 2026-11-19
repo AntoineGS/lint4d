@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 21.0
+# dcc32 -B -H+ -W+ -Q -U<lib> FlowSurfaceIncompleteProvider.pas
+FlowSurfaceIncompleteProvider.pas(10) H2077 Value assigned to 'Dead' never used
+FlowSurfaceIncompleteProvider.pas(11) W1036 Variable 'Instance' might not have been initialized

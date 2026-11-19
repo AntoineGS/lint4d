@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 21.0
+# dcc32 -B -H+ -W+ -Q -U<lib> MethodLocal.pas
+MethodLocal.pas(14) H2164 Variable 'NeverUsed' is declared but never used in 'TFoo.Bar'

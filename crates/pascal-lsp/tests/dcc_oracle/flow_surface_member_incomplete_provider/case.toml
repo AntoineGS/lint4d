@@ -1,0 +1,4 @@
+unit = "FlowSurfaceIncompleteProvider.pas"
+compilers = ["21.0", "24.0", "37.0"]
+recall_exempt = ["W1036"]
+reason = "The incomplete provider context prevents proving Instance's class-reference type for W1036; H2077 recall remains enforced."

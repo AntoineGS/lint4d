@@ -1,0 +1,5 @@
+unit = "FlowLaterUsesShadowing.pas"
+compilers = ["21.0", "24.0", "37.0"]
+silent = ["H2077", "H2164", "W1036"]
+unindexed_units = ["Shadow.pas"]
+reason = "Shadow is intentionally left unindexed in lint4d; Delphi still resolves the later uses unit, so flow hints must be withheld."

@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem HelperConsumer.pas
+# unused-unit check: removed HelperUnit
+HelperConsumer.pas(11) E2003 Undeclared identifier: 'Touch'

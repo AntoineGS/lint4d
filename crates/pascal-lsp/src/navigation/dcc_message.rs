@@ -16,6 +16,7 @@ pub(crate) enum DccMessage {
     H2077,
     H2135,
     H2164,
+    H2443,
     H2219,
     W1000,
     W1001,
@@ -57,6 +58,7 @@ impl DccMessage {
             Self::H2077 => "H2077",
             Self::H2135 => "H2135",
             Self::H2164 => "H2164",
+            Self::H2443 => "H2443",
             Self::H2219 => "H2219",
             Self::W1000 => "W1000",
             Self::W1001 => "W1001",
@@ -106,7 +108,9 @@ impl DccMessage {
             | Self::E2254
             | Self::E2291
             | Self::E2301 => DccSeverity::Error,
-            Self::H2077 | Self::H2135 | Self::H2164 | Self::H2219 => DccSeverity::Hint,
+            Self::H2077 | Self::H2135 | Self::H2164 | Self::H2219 | Self::H2443 => {
+                DccSeverity::Hint
+            }
             Self::W1000
             | Self::W1001
             | Self::W1002
@@ -139,6 +143,9 @@ impl DccMessage {
             Self::H2077 => "Value assigned to '%s' never used",
             Self::H2135 => "FOR or WHILE loop executes zero times - deleted",
             Self::H2164 => "Variable '%s' is declared but never used in '%s'",
+            Self::H2443 => {
+                "Inline function '%s' has not been expanded because unit '%s' is not specified in USES list"
+            }
             Self::H2219 => "Private symbol '%s' declared but never used",
             Self::W1000 => "Symbol '%s' is deprecated%s",
             Self::W1001 => "Symbol '%s' is specific to a library",
@@ -190,6 +197,7 @@ mod tests {
         assert_eq!(DccMessage::H2135.severity(), DccSeverity::Hint);
         assert_eq!(DccMessage::H2164.severity(), DccSeverity::Hint);
         assert_eq!(DccMessage::H2219.severity(), DccSeverity::Hint);
+        assert_eq!(DccMessage::H2443.severity(), DccSeverity::Hint);
         assert_eq!(DccMessage::W1010.severity(), DccSeverity::Warning);
         assert_eq!(DccMessage::W1035.severity(), DccSeverity::Warning);
         assert_eq!(DccMessage::W1036.severity(), DccSeverity::Warning);
@@ -312,6 +320,11 @@ mod tests {
             ),
             (DccMessage::W1006, "W1006", "Unit '%s' is deprecated"),
             (DccMessage::W1007, "W1007", "Unit '%s' is experimental"),
+            (
+                DccMessage::H2443,
+                "H2443",
+                "Inline function '%s' has not been expanded because unit '%s' is not specified in USES list",
+            ),
             (
                 DccMessage::W1009,
                 "W1009",

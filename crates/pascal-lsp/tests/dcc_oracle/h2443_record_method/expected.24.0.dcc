@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 24.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem RecordUse.pas
+RecordUse.pas(8) H2443 Inline function 'TInlineRecord.GetValue' has not been expanded because unit 'RecordHelper' is not specified in USES list
+RecordUse.pas(8) H2077 Value assigned to 'I' never used

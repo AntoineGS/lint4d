@@ -1105,7 +1105,7 @@ fn routine_group_key(symbol: &Symbol) -> RoutineGroupKey {
     )
 }
 
-fn include_expansion_complete(document: &Document) -> bool {
+pub(super) fn include_expansion_complete(document: &Document) -> bool {
     let has_active_include = document.conditionals.directives.iter().any(|directive| {
         directive.kind == pascal_core::conditional::DirectiveKind::Include
             && directive.potentially_active()

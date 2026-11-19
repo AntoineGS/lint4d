@@ -1240,8 +1240,11 @@ fn generic_substitution_for_group(
     else {
         return Ok(None);
     };
+    let explicit_arguments = generic_call_arguments(call);
     if symbol.generic_parameters.is_empty() {
-        return Ok(Some((owner_substitution, false)));
+        return Ok(explicit_arguments
+            .is_none()
+            .then_some((owner_substitution, false)));
     }
 
     let mut substitution = owner_substitution;
@@ -1252,7 +1255,7 @@ fn generic_substitution_for_group(
         // argument-based inference.
         substitution.remove(&parameter.name);
     }
-    if let Some(explicit_arguments) = generic_call_arguments(call) {
+    if let Some(explicit_arguments) = explicit_arguments {
         if explicit_arguments.len() != symbol.generic_parameters.len() {
             return Ok(None);
         }
@@ -1512,6 +1515,10 @@ fn has_proven_constructor(
     } else {
         ConstraintOutcome::Unknown
     })
+}
+
+pub(super) fn has_explicit_generic_arguments(call: Node<'_>) -> bool {
+    generic_call_arguments(call).is_some()
 }
 
 fn generic_call_arguments(call: Node<'_>) -> Option<Vec<Node<'_>>> {

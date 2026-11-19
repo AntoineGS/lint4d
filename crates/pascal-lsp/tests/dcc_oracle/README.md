@@ -66,6 +66,27 @@ missing because Wine would otherwise create an empty one. Never hand-edit an
 `expected*.dcc` file: it is the compiler's recording, not a hand-authored
 expectation.
 
+Cases may set `unit_scopes = ["Vcl"]` to add compiler unit scopes alongside
+`System` on 24.0 and 37.0; 21.0 keeps its unscoped VCL unit names.
+
+Unused-unit fixtures set `unused_unit_check = ["UnitName", ...]`. For each
+listed unit, the recorder compiles the original case and a temporary full copy
+with that entry removed using the same conservative edit policy as the quick
+fix. It compares the sorted multiset of `<file> <code> <message>` diagnostics,
+ignoring shifted line numbers, and writes one result per unit to
+`unused_unit_check.<version>.txt`: `<UnitName> identical` or
+`<UnitName> differs: <first difference>`. It also persists the edited compiler
+output as `unused_unit_check.<version>.<UnitName>.dcc`, in the same normalized
+format as `expected*.dcc`, with a header naming the removed unit. Do not
+hand-edit these files. The oracle harness compares each persisted edited output
+to `expected*.dcc` and requires the `identical`/`differs` result to agree with
+that comparison; it also rejects any lint4d finding when removal changes
+compiler output, and requires an unused-unit finding for identical output
+unless recall is waived with a reason. An `expect_silent_reason` inline table
+names units that must remain silent despite identical compiler output, such as
+units with initialization side effects; these still require `recall = false`
+and a case-level `reason`.
+
 Usage output from dcc32 21.0, 24.0, and 37.0 (run with no arguments) reports
 `-W[+|-|^][warn_id]`; all three versions accept `-W-<ID>`, `-W+<ID>`, and
 `-W^<ID>` for a warning property. The same usage output lists `-H` as the hint
@@ -206,6 +227,16 @@ initialization options, or server binary path/mtime:
 ```sh
 scripts/dcc-corpus.sh --compare <manifest-entry>
 ```
+
+For a fresh LSP run, `--verify-unused-units` recompiles each
+`lint4d-unused-unit` finding after removing its `uses` entry from a temporary
+source copy. The edited copy is first on DCC's unit search path, compiler outputs
+stay in temporary directories, and the report compares the original and edited
+diagnostic multisets while ignoring line shifts. Findings are marked `verified`
+when the diagnostics are identical and `false-positive` with the first
+difference otherwise; a false positive makes the command exit nonzero.
+`--verify-unused-units` requires `--lsp <binary>` and can be combined with
+`--compare`.
 
 For one project, add its manifest `name` after the options. Set
 `LINT4D_LSP_TIMEOUT` to adjust the default 600-second index-settle limit. The

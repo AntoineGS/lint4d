@@ -1,0 +1,6 @@
+unit = "MethodUse.pas"
+compilers = ["21.0", "24.0", "37.0"]
+requires_rtl = true
+reason = "The inline method's inherited-member lookup requires the source-backed RTL TObject hierarchy."
+recall_exempt = ["H2077"]
+recall_exempt_reason = "With RTL roots, flow analysis conservatively withholds H2077 at the inline method call while resolving the source-backed TObject hierarchy; H2443 remains recall-checked."

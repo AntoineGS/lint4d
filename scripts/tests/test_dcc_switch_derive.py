@@ -177,6 +177,54 @@ class DeriveScriptTests(unittest.TestCase):
         self.assertEqual(result.stdout, "identifier=-\n")
         self.assertEqual(result.stderr, "")
 
+    def test_h2443_probe_uses_the_recorded_fixture_and_its_provider_units(self):
+        script = DERIVE_SCRIPT.read_text()
+        codes = re.search(r"^codes=\(([^)]*)\)$", script, re.MULTILINE)
+        self.assertIsNotNone(codes)
+        self.assertIn("H2443", codes.group(1).split())
+
+        def function_body(name, following):
+            start = script.index(f"{name}() {{")
+            end = script.index(f"\n{following}", start)
+            return script[start:end]
+
+        single_unit = function_body("write_single_unit_trigger", "trigger_source=")
+        dispatch = function_body("write_trigger", "validate_candidate_ids")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = pathlib.Path(temp_dir)
+            work_dir = temp / "work"
+            work_dir.mkdir()
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    "\n".join(
+                        (
+                            "set -eu",
+                            "fail() { printf 'derive: %s\\n' \"$*\" >&2; exit 2; }",
+                            "source_root=$1",
+                            "work_dir=$2",
+                            single_unit,
+                            dispatch,
+                            "write_trigger H2443 $'{$HINTS OFF}\\n'",
+                        )
+                    ),
+                    "h2443-trigger-test",
+                    str(ROOT / "crates/pascal-lsp/tests/dcc_oracle"),
+                    str(work_dir),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            trigger = (work_dir / "InlUse.pas").read_text()
+            self.assertIn("{$HINTS OFF}\n", trigger)
+            self.assertIn("  I := UsesImplUnit;", trigger)
+            self.assertTrue((work_dir / "InlProv.pas").is_file())
+            self.assertTrue((work_dir / "InlHelper.pas").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

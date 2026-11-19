@@ -91,6 +91,7 @@ mod dcc_oracle_tests;
 mod dcc_surface;
 mod dcc_switches;
 mod declarations;
+mod inline_uses;
 #[cfg(test)]
 mod surface_tests;
 #[cfg(test)]
@@ -100,6 +101,7 @@ mod documentation;
 mod facts;
 mod flow;
 mod folding;
+mod form_file;
 mod hint_directives;
 #[cfg(test)]
 mod index_characterization;
@@ -120,6 +122,9 @@ pub(crate) use symbols::{
     WorkspaceSymbolList, lsp_kind_for_shape, too_many_workspace_symbols, workspace_symbol_cap,
 };
 mod type_hierarchy;
+mod unused_units;
+pub(crate) use unused_units::FormFileRequirement;
+mod unit_facts;
 mod warning_switches;
 #[cfg(test)]
 pub(crate) use assistance::CompletionResolutionSeed;
@@ -862,6 +867,7 @@ pub(crate) enum SemanticProofStatus {
 pub(crate) enum SemanticDiagnosticKind {
     TypeMismatch,
     IncompatibleArgument,
+    UnusedUnit,
     #[allow(dead_code)]
     Dcc(DccMessage),
     PromotedDcc(DccMessage),
@@ -872,6 +878,7 @@ impl SemanticDiagnosticKind {
         match self {
             Self::TypeMismatch => "pascal-type-mismatch",
             Self::IncompatibleArgument => "pascal-incompatible-argument",
+            Self::UnusedUnit => "lint4d-unused-unit",
             Self::Dcc(message) => message.code(),
             Self::PromotedDcc(message) => message
                 .promoted_error_code()
@@ -884,6 +891,7 @@ impl SemanticDiagnosticKind {
             Self::Dcc(message) => message.severity(),
             Self::PromotedDcc(_) => DccSeverity::Error,
             Self::TypeMismatch | Self::IncompatibleArgument => DccSeverity::Error,
+            Self::UnusedUnit => DccSeverity::Hint,
         }
     }
 }
@@ -922,6 +930,7 @@ fn semantic_diagnostic_kind_rank(kind: SemanticDiagnosticKind) -> u8 {
         SemanticDiagnosticKind::Dcc(DccMessage::E2003) => 0,
         SemanticDiagnosticKind::TypeMismatch => 2,
         SemanticDiagnosticKind::IncompatibleArgument => 3,
+        SemanticDiagnosticKind::UnusedUnit => 7,
         SemanticDiagnosticKind::Dcc(_) | SemanticDiagnosticKind::PromotedDcc(_) => 6,
     }
 }
@@ -2961,6 +2970,51 @@ impl NavigationIndex {
             || identifier_at(document.tree.root_node(), offset).is_none())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn append_inline_and_hint_directive_diagnostics_with_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        calls: &[Node<'_>],
+        identifiers: &[Node<'_>],
+        capacity: usize,
+        report: &mut SemanticDiagnosticReport,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<(), String> {
+        let mut inline_uses_cap_reached = false;
+        let result = self.inline_uses_diagnostics_with_budget(
+            uri,
+            document,
+            calls,
+            identifiers,
+            capacity,
+            &mut inline_uses_cap_reached,
+            cancel,
+            budget,
+        );
+        if let Some(inline_uses) = report.checked_candidate(result, budget)? {
+            report.diagnostics.extend(inline_uses);
+            if inline_uses_cap_reached {
+                report.note(SemanticCoverageGap::DiagnosticCap);
+            }
+        }
+        if !report.has_capacity() {
+            return Ok(());
+        }
+
+        let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
+        match self.append_hint_directive_diagnostics_with_budget(
+            uri, document, capacity, report, cancel, budget,
+        ) {
+            Err(error) if error == SEMANTIC_DIAGNOSTICS_LIMIT => {
+                report.note(SemanticCoverageGap::DiagnosticCap);
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
     /// Return only source-semantic diagnostics whose absence was proven by the
     /// bounded navigation model.
     ///
@@ -3047,7 +3101,7 @@ impl NavigationIndex {
         }
         'analysis: {
             let mut reported_undeclared_names = HashSet::new();
-            for identifier in identifiers {
+            for &identifier in &identifiers {
                 if cancel.load(Ordering::Relaxed) {
                     return Err("request cancelled".to_string());
                 }
@@ -3163,7 +3217,7 @@ impl NavigationIndex {
                     message: format!("type mismatch: cannot assign '{actual}' to '{expected}'"),
                 });
             }
-            for call in calls {
+            for &call in &calls {
                 if document.conditionals.is_unknown_at(call.start_byte())
                     || document
                         .opaque_ranges
@@ -3271,19 +3325,16 @@ impl NavigationIndex {
                 break 'analysis;
             }
             let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
-            match self.append_hint_directive_diagnostics_with_budget(
+            self.append_inline_and_hint_directive_diagnostics_with_budget(
                 uri,
                 document,
+                &calls,
+                &identifiers,
                 capacity,
                 &mut report,
                 cancel,
                 &mut budget,
-            ) {
-                Err(error) if error == SEMANTIC_DIAGNOSTICS_LIMIT => {
-                    report.note(SemanticCoverageGap::DiagnosticCap);
-                }
-                result => result?,
-            }
+            )?;
         }
         if report.has_capacity() {
             let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
@@ -8204,6 +8255,7 @@ impl NavigationIndex {
                 identifier,
                 owner_type.as_deref(),
                 &current,
+                state.allow_class_global_fallback,
             ) {
                 state.mark_receiver_uncertain();
                 return Ok(Vec::new());
@@ -8255,9 +8307,13 @@ impl NavigationIndex {
             }
         }
         if !imported.is_empty() {
-            if self
-                .is_unknown_global_fallback_for_owner(document, identifier, owner_type, &imported)
-            {
+            if self.is_unknown_global_fallback_for_owner(
+                document,
+                identifier,
+                owner_type,
+                &imported,
+                state.allow_class_global_fallback,
+            ) {
                 state.mark_receiver_uncertain();
                 return Ok(Vec::new());
             }
@@ -17531,6 +17587,12 @@ struct ResolutionState {
     with_context_resolutions: HashMap<(Url, Span), Option<Vec<WithReceiverSlot>>>,
     with_member_substitutions: HashMap<(Url, usize, Candidate), Vec<GenericSubstitution>>,
     suppress_with_lookup: bool,
+    /// H2443 resolves the identifier after the ordinary member lookup has
+    /// established whether a class member shadows an imported global. The
+    /// diagnostic still rejects an incomplete member lookup via
+    /// `member_lookup_incomplete`; this bypasses only the broader D16
+    /// rename-safety guard for otherwise complete read-only lookups.
+    allow_class_global_fallback: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -17564,6 +17626,7 @@ impl ResolutionState {
             with_context_resolutions: HashMap::new(),
             with_member_substitutions: HashMap::new(),
             suppress_with_lookup: false,
+            allow_class_global_fallback: false,
         }
     }
 
@@ -24234,9 +24297,10 @@ pub(super) fn is_non_value_identifier_with_budget_and_declaration(
     budget: &mut AssistanceBudget,
     declaration: bool,
 ) -> Result<bool, String> {
-    let name = canonical_name(node_text_with_budget(identifier, source, cancel, budget)?);
+    let raw_name = node_text_with_budget(identifier, source, cancel, budget)?;
+    let name = canonical_name(raw_name);
     if declaration
-        || is_implicit_or_intrinsic_name(&name)
+        || (!raw_name.starts_with('&') && is_implicit_or_intrinsic_name(&name))
         || is_type_valued_intrinsic_argument_with_budget(identifier, source, cancel, budget)?
     {
         return Ok(true);

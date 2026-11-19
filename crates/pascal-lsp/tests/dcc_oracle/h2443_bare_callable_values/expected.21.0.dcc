@@ -1,0 +1,6 @@
+# Embarcadero Delphi for Win32 compiler version 21.0
+# dcc32 -B -H+ -W+ -Q -U<lib> CallableValues.pas
+CallableValues.pas(19) H2443 Inline function 'InlineFn' has not been expanded because unit 'InlineHelper' is not specified in USES list
+CallableValues.pas(19) H2077 Value assigned to 'X' never used
+CallableValues.pas(18) H2077 Value assigned to 'F' never used
+CallableValues.pas(17) H2077 Value assigned to 'F' never used

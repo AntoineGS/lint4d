@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 21.0
+# dcc32 -B -H+ -W+ -Q -U<lib> TypeConsumer.pas
+# unused-unit check: removed TypeProvider
+TypeConsumer.pas(6) E2003 Undeclared identifier: 'TThing'

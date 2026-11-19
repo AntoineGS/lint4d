@@ -1,0 +1,6 @@
+unit = "InitConsumer.pas"
+compilers = ["21.0", "24.0", "37.0"]
+unused_unit_check = ["InitUnit"]
+recall = false
+reason = "side effect: initialization"
+expect_silent_reason = { "InitUnit" = "side effect: initialization" }

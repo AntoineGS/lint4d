@@ -1,0 +1,3 @@
+unit = "FlowH2135ErrorInRoutine.pas"
+compilers = ["21.0", "24.0", "37.0"]
+reason = "Check whether an undeclared identifier suppresses the independent H2135 constant-loop hint in the same routine."

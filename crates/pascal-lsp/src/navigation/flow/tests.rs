@@ -2010,7 +2010,35 @@ fn flow_diagnostics_withhold_findings_for_a_shadowable_local_declaration_type() 
         findings.is_empty(),
         "a shadowable local type can change managedness/classification and must withhold flow findings: {findings:?}"
     );
-    assert_eq!(excluded, Some(FlowExclusion::UnresolvedIdentity));
+    assert_eq!(excluded, Some(FlowExclusion::TypeReferenceShadowing));
+}
+
+#[test]
+fn flow_diagnostics_keep_h2164_when_only_a_local_type_reference_is_shadowable() {
+    let source = concat!(
+        "program FlowShadowedLocalTypeUnused;\n",
+        "uses Indexed, Shadow;\n",
+        "procedure Demo;\n",
+        "var Typed: TShadowType; WrittenOnly, Unused: Integer;\n",
+        "begin\n",
+        "  Typed := Typed;\n",
+        "  WrittenOnly := 1;\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+
+    let (findings, excluded) = flow_diagnostics_with_later_unindexed_shadow(source);
+
+    assert_eq!(
+        findings,
+        vec![(
+            "H2164".to_owned(),
+            4,
+            "Variable 'Unused' is declared but never used in 'Demo'".to_owned(),
+        )],
+        "type identity uncertainty does not affect whether a local is referenced",
+    );
+    assert_eq!(excluded, Some(FlowExclusion::TypeReferenceShadowing));
 }
 
 #[test]

@@ -32,6 +32,18 @@ pub(super) fn test_flow_trace(
         }
         reasons
     };
+    let h2164_routine_reasons = || {
+        let mut reasons = Vec::new();
+        if let Some(exclusion) = flow.excluded
+            && exclusion != super::FlowExclusion::TypeReferenceShadowing
+        {
+            reasons.push(format!("routine_excluded:{exclusion:?}"));
+        }
+        if flow.cfg.is_none() {
+            reasons.push("missing_cfg".to_string());
+        }
+        reasons
+    };
     let mut variables = serde_json::Map::new();
     for (var, local) in flow.locals.iter().enumerate() {
         let has_occurrence = active_occurrences
@@ -43,7 +55,7 @@ pub(super) fn test_flow_trace(
         let has_out_or_var_arg = active_occurrences.iter().any(|occurrence| {
             occurrence.var == var && matches!(occurrence.access, Access::OutArg | Access::VarArg)
         });
-        let mut h2164_reasons = routine_reasons();
+        let mut h2164_reasons = h2164_routine_reasons();
         if !matches!(local.kind, LocalKind::Local | LocalKind::LoopVar) {
             h2164_reasons.push("kind_not_local_or_loop_variable".to_string());
         }
@@ -187,7 +199,12 @@ pub(super) fn flow_diagnostics(
     for flow in flows {
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
-        if flow.excluded.is_some() || flow.cfg.is_none() {
+        let type_reference_shadowing_only =
+            flow.excluded == Some(super::FlowExclusion::TypeReferenceShadowing);
+        let unresolved_identity = flow.excluded == Some(super::FlowExclusion::UnresolvedIdentity);
+        if (flow.excluded.is_some() && !type_reference_shadowing_only && !unresolved_identity)
+            || flow.cfg.is_none()
+        {
             #[cfg(feature = "test-support")]
             eprintln!(
                 "LINT4D_FLOW_TRACE {}",
@@ -214,6 +231,14 @@ pub(super) fn flow_diagnostics(
             )
         );
         let locals = &flow.locals;
+        let has_error = routine_has_error(
+            flow,
+            document,
+            prior_diagnostics,
+            &warning_switches,
+            cancel,
+            budget,
+        )?;
 
         for (local_index, local) in locals.iter().enumerate() {
             check_navigation_cancel(cancel)?;
@@ -229,7 +254,10 @@ pub(super) fn flow_diagnostics(
             let has_occurrence = active_occurrences
                 .iter()
                 .any(|occurrence| occurrence.var == local_index);
-            if !has_occurrence {
+            if !has_occurrence
+                && !has_error
+                && (flow.excluded.is_none() || type_reference_shadowing_only)
+            {
                 if diagnostics.len() >= capacity {
                     *diagnostic_cap_reached = true;
                     return Ok(diagnostics);
@@ -243,14 +271,24 @@ pub(super) fn flow_diagnostics(
             }
         }
 
-        if routine_has_error(
-            flow,
-            document,
-            prior_diagnostics,
-            &warning_switches,
-            cancel,
-            budget,
-        )? {
+        if type_reference_shadowing_only {
+            continue;
+        }
+        if unresolved_identity || has_error {
+            if !has_error || h2135_survives_routine_errors(document) {
+                append_h2135_diagnostics(
+                    document,
+                    &loop_facts,
+                    &mut diagnostics,
+                    capacity,
+                    diagnostic_cap_reached,
+                    cancel,
+                    budget,
+                )?;
+                if *diagnostic_cap_reached {
+                    return Ok(diagnostics);
+                }
+            }
             continue;
         }
 
@@ -273,7 +311,19 @@ pub(super) fn flow_diagnostics(
             }
         }
 
-        append_loop_diagnostics(
+        append_h2135_diagnostics(
+            document,
+            &loop_facts,
+            &mut diagnostics,
+            capacity,
+            diagnostic_cap_reached,
+            cancel,
+            budget,
+        )?;
+        if *diagnostic_cap_reached {
+            return Ok(diagnostics);
+        }
+        append_w1037_diagnostics(
             index,
             uri,
             document,
@@ -962,14 +1012,9 @@ fn occurrence_in_deleted_loop(occurrence: &VarOccurrence, facts: &[LoopFact<'_>]
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn append_loop_diagnostics(
-    index: &NavigationIndex,
-    uri: &Url,
+fn append_h2135_diagnostics(
     document: &Document,
-    flow: &RoutineFlow<'_>,
     facts: &[LoopFact<'_>],
-    occurrences: &[&VarOccurrence],
     diagnostics: &mut Vec<SemanticDiagnostic>,
     capacity: usize,
     diagnostic_cap_reached: &mut bool,
@@ -995,7 +1040,23 @@ fn append_loop_diagnostics(
             message: DccMessage::H2135.format(&[]),
         });
     }
+    Ok(())
+}
 
+#[allow(clippy::too_many_arguments)]
+fn append_w1037_diagnostics(
+    index: &NavigationIndex,
+    uri: &Url,
+    document: &Document,
+    flow: &RoutineFlow<'_>,
+    facts: &[LoopFact<'_>],
+    occurrences: &[&VarOccurrence],
+    diagnostics: &mut Vec<SemanticDiagnostic>,
+    capacity: usize,
+    diagnostic_cap_reached: &mut bool,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<(), String> {
     let compiler_version = document.conditional_context.compiler_version;
     let mut reported = HashSet::new();
     for &fact in facts {
@@ -1077,6 +1138,16 @@ fn h2135_span(document: &Document, fact: LoopFact<'_>) -> Option<SourceSpan> {
         _ => return None,
     };
     Some(SourceSpan { start, end: start })
+}
+
+fn h2135_survives_routine_errors(document: &Document) -> bool {
+    matches!(
+        document
+            .conditional_context
+            .compiler_version
+            .map(|version| (version.major, version.minor)),
+        Some((21, 0) | (24, 0))
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

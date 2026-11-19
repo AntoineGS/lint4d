@@ -213,6 +213,7 @@ pub(crate) enum FlowExclusion {
     Asm,
     Goto,
     UnresolvedIdentity,
+    TypeReferenceShadowing,
     Budget,
     InlineVariable,
 }
@@ -617,7 +618,7 @@ fn build_routine_flow<'a>(
         cancel,
         budget,
     )? {
-        note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
+        note_exclusion(&mut excluded, FlowExclusion::TypeReferenceShadowing);
     }
     if routine_scope.is_none() {
         note_exclusion(&mut excluded, FlowExclusion::UnresolvedIdentity);
@@ -1858,7 +1859,7 @@ fn source_span_affects_routine(
 }
 
 fn note_exclusion(excluded: &mut Option<FlowExclusion>, reason: FlowExclusion) {
-    if excluded.is_none() {
+    if excluded.is_none() || *excluded == Some(FlowExclusion::TypeReferenceShadowing) {
         *excluded = Some(reason);
     }
 }

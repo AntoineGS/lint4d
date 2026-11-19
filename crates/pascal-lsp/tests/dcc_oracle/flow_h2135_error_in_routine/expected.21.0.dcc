@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 21.0
+# dcc32 -B -H+ -W+ -Q -U<lib> FlowH2135ErrorInRoutine.pas
+FlowH2135ErrorInRoutine.pas(5) H2135 FOR or WHILE loop executes zero times - deleted
+FlowH2135ErrorInRoutine.pas(6) E2003 Undeclared identifier: 'Missing'

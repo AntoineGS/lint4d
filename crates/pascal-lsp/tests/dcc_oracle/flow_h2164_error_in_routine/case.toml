@@ -1,0 +1,3 @@
+unit = "FlowH2164ErrorInRoutine.pas"
+compilers = ["21.0", "24.0", "37.0"]
+reason = "Establish whether Delphi reports an unused local when another identifier in the same routine is undeclared."

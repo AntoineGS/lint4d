@@ -250,6 +250,9 @@ crates/pascal-lsp/tests/dcc_oracle/e2301_identical_procedure/IdenticalProcedure.
 crates/pascal-lsp/tests/dcc_oracle/e2301_identical_result/IdenticalResult.pas d5a67832a8e3e37d 6
 crates/pascal-lsp/tests/dcc_oracle/flow_compiler_surface_member/FlowCompilerSurfaceMember.pas 544147b5df809066 5
 crates/pascal-lsp/tests/dcc_oracle/flow_exception_handler_variable/FlowExceptionHandlerVariable.pas 0301a86a1a669a96 4
+crates/pascal-lsp/tests/dcc_oracle/flow_h2135_error_in_routine/FlowH2135ErrorInRoutine.pas 68733e6b14763628 2
+crates/pascal-lsp/tests/dcc_oracle/flow_h2164_error_in_call_argument/FlowH2164ErrorInCallArgument.pas 6e7f904908dd23ce 5
+crates/pascal-lsp/tests/dcc_oracle/flow_h2164_error_in_routine/FlowH2164ErrorInRoutine.pas bf606bcb7a392e70 3
 crates/pascal-lsp/tests/dcc_oracle/flow_incomplete_imports/FlowExternal.pas aca1910eec50f8d3 2
 crates/pascal-lsp/tests/dcc_oracle/flow_incomplete_imports/FlowIncompleteImports.pas 7322588cef6751d3 4
 crates/pascal-lsp/tests/dcc_oracle/flow_later_uses_shadowed_external_value/FlowLaterUsesShadowedExternalValue.pas e3955514f1b28977 3
@@ -329,7 +332,7 @@ crates/pascal-lsp/tests/dcc_oracle/switch_warnings_off_region/SwitchWarningsOffR
 crates/pascal-lsp/tests/dcc_oracle/w1000_all_overloads_deprecated/W1000AllOverloadsDeprecated.pas 96ebed3f8685a20c 11
 crates/pascal-lsp/tests/dcc_oracle/w1000_const_and_var/W1000ConstAndVar.pas 56d28898e04b37a9 6
 crates/pascal-lsp/tests/dcc_oracle/w1000_declaration_site_not_reported/W1000DeclarationSiteNotReported.pas 0b76c6dda5c3d134 5
-crates/pascal-lsp/tests/dcc_oracle/w1000_error_promotion/W1000ErrorPromotion.pas 8305a4d2a90e6113 11
+crates/pascal-lsp/tests/dcc_oracle/w1000_error_promotion/W1000ErrorPromotion.pas 3852ce3ddd1009be 12
 crates/pascal-lsp/tests/dcc_oracle/w1000_field_and_property/W1000FieldAndProperty.pas 3c405e4eb9a0276e 11
 crates/pascal-lsp/tests/dcc_oracle/w1000_generic_type/W1000GenericType.pas 87d3e5ff1d5bd12f 4
 crates/pascal-lsp/tests/dcc_oracle/w1000_inside_declaring_unit/W1000InsideDeclaringUnit.pas c1f64acf8eca6aac 5

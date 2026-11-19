@@ -1649,12 +1649,13 @@ fn flow_model_keeps_routines_with_known_control_transfers_analyzable() {
         ),
         concat!(
             "program FlowRaise;\n",
-            "uses SysUtils;\n",
+            "procedure Log(Value: Integer);\n",
+            "begin end;\n",
             "procedure Demo;\n",
             "var I: Integer;\n",
             "begin\n",
-            "  for I := 1 to 3 do begin WriteLn(I); raise Exception.Create('stop'); end;\n",
-            "  WriteLn(I);\n",
+            "  for I := 1 to 3 do begin Log(I); raise; end;\n",
+            "  Log(I);\n",
             "end;\n",
             "begin Demo; end.\n",
         ),
@@ -2008,6 +2009,61 @@ fn flow_diagnostics_withhold_h2077_when_an_incomplete_import_can_shadow_continue
         excluded,
         Some(FlowExclusion::UnresolvedIdentity),
         "the unresolved Continue target must exclude flow analysis"
+    );
+}
+
+#[test]
+fn flow_diagnostics_withhold_findings_for_each_unindexed_flow_special_name() {
+    for name in super::model::FLOW_SPECIAL_NAMES {
+        let source = format!(
+            "program FlowShadowedSpecial;\n\
+             uses ShadowSpecial;\n\
+             procedure Demo;\n\
+             var WrittenOnly: Integer;\n\
+             begin\n\
+               WrittenOnly := 1;\n\
+               &{name}();\n\
+             end;\n\
+             begin Demo; end.\n",
+        );
+        let (findings, excluded) =
+            flow_diagnostics_with_bound_unindexed_unit(&source, "ShadowSpecial");
+
+        assert!(
+            findings.is_empty(),
+            "an incomplete import may provide a routine named {name}; flow findings must be withheld: {findings:?}"
+        );
+        assert_eq!(
+            excluded,
+            Some(FlowExclusion::UnresolvedIdentity),
+            "the unresolved {name} target must exclude flow analysis"
+        );
+    }
+}
+
+#[test]
+fn flow_diagnostics_withhold_w1036_when_an_unindexed_write_can_take_out_argument() {
+    let source = concat!(
+        "program FlowShadowedWriteOut;\n",
+        "uses ShadowWrite;\n",
+        "procedure Demo;\n",
+        "var X: Integer;\n",
+        "begin\n",
+        "  Write(X);\n",
+        "end;\n",
+        "begin Demo; end.\n",
+    );
+
+    let (findings, excluded) = flow_diagnostics_with_bound_unindexed_unit(source, "ShadowWrite");
+
+    assert!(
+        findings.is_empty(),
+        "an unindexed Write(out) may initialize X, so lint4d must not report a flow finding: {findings:?}"
+    );
+    assert_eq!(
+        excluded,
+        Some(FlowExclusion::UnresolvedIdentity),
+        "the unresolved Write target must exclude flow analysis"
     );
 }
 
@@ -2524,9 +2580,7 @@ fn flow_type_uncertainty_is_scoped_to_the_local_and_rules_that_need_its_type() {
         "var ExternalValue: ExternalTypes.TExternal;\n",
         "    NeverRead: Integer;\n",
         "begin\n",
-        "  WriteLn(ExternalValue);\n",
         "  ExternalValue := 1;\n",
-        "  WriteLn(ExternalValue);\n",
         "end;\n",
         "end.\n",
     );

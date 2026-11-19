@@ -3,16 +3,20 @@ program RaiseInLoop;
 uses
   SysUtils;
 
+procedure Log(Value: Integer);
+begin
+end;
+
 procedure Demo;
 var
   I: Integer;
 begin
   for I := 1 to 3 do
   begin
-    WriteLn(I);
+    Log(I);
     raise Exception.Create('stop');
   end;
-  WriteLn(I);
+  Log(I);
 end;
 
 begin

@@ -2348,9 +2348,7 @@ fn call_target_has_shadowing_uncertainty(
         budget,
     )?;
     if candidates.is_empty() {
-        // Among the flow-control names, Delphi reserves Raise but not Exit,
-        // Break, or Continue; each of those may resolve to an imported routine.
-        if !matches!(key.as_str(), "exit" | "break" | "continue") {
+        if !flow_special_name_affects_analysis(&key) {
             return Ok(false);
         }
         if state.receiver_resolution_uncertain()
@@ -2632,46 +2630,47 @@ fn is_call_entity(identifier: Node<'_>) -> bool {
     false
 }
 
+pub(super) const FLOW_SPECIAL_NAMES: &[&str] = &[
+    "exit",
+    "break",
+    "continue",
+    "raise",
+    "halt",
+    "abort",
+    "runerror",
+    "assert",
+    "initialize",
+    "finalize",
+    "fillchar",
+    "inc",
+    "dec",
+    "addr",
+    "read",
+    "readln",
+    "str",
+    "val",
+    "setlength",
+    "new",
+    "dispose",
+    "getmem",
+    "freemem",
+    "include",
+    "exclude",
+    "low",
+    "high",
+    "sizeof",
+    "default",
+    "move",
+    "write",
+    "writeln",
+    "freeandnil",
+    "create",
+    "free",
+    "destroy",
+];
+
 fn flow_special_name_affects_analysis(key: &str) -> bool {
-    matches!(
-        key,
-        "exit"
-            | "break"
-            | "continue"
-            | "raise"
-            | "halt"
-            | "abort"
-            | "runerror"
-            | "assert"
-            | "initialize"
-            | "finalize"
-            | "fillchar"
-            | "inc"
-            | "dec"
-            | "addr"
-            | "read"
-            | "readln"
-            | "str"
-            | "val"
-            | "setlength"
-            | "new"
-            | "dispose"
-            | "getmem"
-            | "freemem"
-            | "include"
-            | "exclude"
-            | "low"
-            | "high"
-            | "sizeof"
-            | "default"
-            | "move"
-            | "write"
-            | "writeln"
-            | "freeandnil"
-            | "create"
-            | "free"
-            | "destroy"
-    )
+    FLOW_SPECIAL_NAMES.contains(&key)
 }
 
 fn node_contains(outer: Node<'_>, inner: Node<'_>) -> bool {

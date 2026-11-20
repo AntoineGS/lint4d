@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 21.0
+# dcc32 -B -H+ -W+ -Q -U<lib> IfOnlyBranch.pas
+IfOnlyBranch.pas(8) W1036 Variable 'Value' might not have been initialized

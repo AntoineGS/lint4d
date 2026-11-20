@@ -32,6 +32,7 @@ pascal-core = { path = "../pascal-core" }
 pascal-project = { path = "../pascal-project" }
 pascal-cache = { path = "../pascal-cache" }
 lint4d = { path = "../lint4d" }
+cfg-pascal = { path = "../cfg-pascal" }
 fmt4d = { path = "../fmt4d" }
 tree-sitter = "0.24"
 lsp-types = "=0.95.1"

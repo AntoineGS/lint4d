@@ -5,7 +5,7 @@ use pascal_core::directive_fragment_rewrite::DirectivePatch;
 use pascal_core::{FileInfo, parser};
 #[cfg(test)]
 use pascal_project::CompilerVersion;
-use pascal_project::ConditionalContext;
+use pascal_project::{ConditionalContext, PropertyValue};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::cell::Cell;
@@ -89,7 +89,9 @@ mod dcc_message;
 #[cfg(test)]
 mod dcc_oracle_tests;
 mod dcc_surface;
+mod dcc_switches;
 mod declarations;
+mod inline_uses;
 #[cfg(test)]
 mod surface_tests;
 #[cfg(test)]
@@ -97,7 +99,10 @@ mod system_trust_tests;
 pub(crate) use dcc_message::{DccMessage, DccSeverity};
 mod documentation;
 mod facts;
+mod flow;
 mod folding;
+mod form_file;
+mod hint_directives;
 #[cfg(test)]
 mod index_characterization;
 mod inlay;
@@ -117,6 +122,10 @@ pub(crate) use symbols::{
     WorkspaceSymbolList, lsp_kind_for_shape, too_many_workspace_symbols, workspace_symbol_cap,
 };
 mod type_hierarchy;
+mod unused_units;
+pub(crate) use unused_units::FormFileRequirement;
+mod unit_facts;
+mod warning_switches;
 #[cfg(test)]
 pub(crate) use assistance::CompletionResolutionSeed;
 pub(crate) use assistance::completion_prefix_at_position;
@@ -858,8 +867,10 @@ pub(crate) enum SemanticProofStatus {
 pub(crate) enum SemanticDiagnosticKind {
     TypeMismatch,
     IncompatibleArgument,
+    UnusedUnit,
     #[allow(dead_code)]
     Dcc(DccMessage),
+    PromotedDcc(DccMessage),
 }
 
 impl SemanticDiagnosticKind {
@@ -867,14 +878,20 @@ impl SemanticDiagnosticKind {
         match self {
             Self::TypeMismatch => "pascal-type-mismatch",
             Self::IncompatibleArgument => "pascal-incompatible-argument",
+            Self::UnusedUnit => "lint4d-unused-unit",
             Self::Dcc(message) => message.code(),
+            Self::PromotedDcc(message) => message
+                .promoted_error_code()
+                .unwrap_or_else(|| message.code()),
         }
     }
 
     pub(crate) fn severity(self) -> DccSeverity {
         match self {
             Self::Dcc(message) => message.severity(),
+            Self::PromotedDcc(_) => DccSeverity::Error,
             Self::TypeMismatch | Self::IncompatibleArgument => DccSeverity::Error,
+            Self::UnusedUnit => DccSeverity::Hint,
         }
     }
 }
@@ -913,7 +930,8 @@ fn semantic_diagnostic_kind_rank(kind: SemanticDiagnosticKind) -> u8 {
         SemanticDiagnosticKind::Dcc(DccMessage::E2003) => 0,
         SemanticDiagnosticKind::TypeMismatch => 2,
         SemanticDiagnosticKind::IncompatibleArgument => 3,
-        SemanticDiagnosticKind::Dcc(_) => 6,
+        SemanticDiagnosticKind::UnusedUnit => 7,
+        SemanticDiagnosticKind::Dcc(_) | SemanticDiagnosticKind::PromotedDcc(_) => 6,
     }
 }
 
@@ -994,6 +1012,8 @@ impl SemanticDiagnosticReport {
 const MAX_SEMANTIC_DIAGNOSTIC_NODES: usize = 100_000;
 const MAX_SEMANTIC_DIAGNOSTIC_WORK: usize = 100_000;
 const MAX_SEMANTIC_DIAGNOSTIC_BYTES: usize = 8 * 1024 * 1024;
+const MAX_FLOW_DIAGNOSTIC_WORK: usize = 2_000_000;
+const MAX_FLOW_DIAGNOSTIC_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const MAX_MISSING_UNIT_REQUEST_WORK: usize = 300_000;
 pub(crate) const MAX_MISSING_UNIT_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SEMANTIC_DIAGNOSTICS: usize = 256;
@@ -1389,9 +1409,10 @@ impl NavigationIndex {
         cached: Option<Arc<ParsedDocument>>,
         cancel: &AtomicBool,
     ) -> Result<(), String> {
-        self.update_with_session(uri, source, context, cached, cancel, None)
+        self.update_with_session(uri, source, context, cached, cancel, None, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn update_with_session(
         &mut self,
         uri: Url,
@@ -1400,6 +1421,7 @@ impl NavigationIndex {
         cached: Option<Arc<ParsedDocument>>,
         cancel: &AtomicBool,
         expansion: Option<&crate::include_expansion::ExpandedSource>,
+        warning_properties: Option<Arc<BTreeMap<String, PropertyValue>>>,
     ) -> Result<(), String> {
         let previous = self
             .documents
@@ -1425,6 +1447,7 @@ impl NavigationIndex {
             previous.or(cached),
             expansion,
             verified_system_key,
+            warning_properties,
         )?;
         if cancel.load(Ordering::Relaxed) {
             return Err("request cancelled".to_string());
@@ -2947,6 +2970,51 @@ impl NavigationIndex {
             || identifier_at(document.tree.root_node(), offset).is_none())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn append_inline_and_hint_directive_diagnostics_with_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        calls: &[Node<'_>],
+        identifiers: &[Node<'_>],
+        capacity: usize,
+        report: &mut SemanticDiagnosticReport,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<(), String> {
+        let mut inline_uses_cap_reached = false;
+        let result = self.inline_uses_diagnostics_with_budget(
+            uri,
+            document,
+            calls,
+            identifiers,
+            capacity,
+            &mut inline_uses_cap_reached,
+            cancel,
+            budget,
+        );
+        if let Some(inline_uses) = report.checked_candidate(result, budget)? {
+            report.diagnostics.extend(inline_uses);
+            if inline_uses_cap_reached {
+                report.note(SemanticCoverageGap::DiagnosticCap);
+            }
+        }
+        if !report.has_capacity() {
+            return Ok(());
+        }
+
+        let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
+        match self.append_hint_directive_diagnostics_with_budget(
+            uri, document, capacity, report, cancel, budget,
+        ) {
+            Err(error) if error == SEMANTIC_DIAGNOSTICS_LIMIT => {
+                report.note(SemanticCoverageGap::DiagnosticCap);
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
     /// Return only source-semantic diagnostics whose absence was proven by the
     /// bounded navigation model.
     ///
@@ -3031,10 +3099,9 @@ impl NavigationIndex {
                     .rev(),
             );
         }
-
         'analysis: {
             let mut reported_undeclared_names = HashSet::new();
-            for identifier in identifiers {
+            for &identifier in &identifiers {
                 if cancel.load(Ordering::Relaxed) {
                     return Err("request cancelled".to_string());
                 }
@@ -3150,7 +3217,7 @@ impl NavigationIndex {
                     message: format!("type mismatch: cannot assign '{actual}' to '{expected}'"),
                 });
             }
-            for call in calls {
+            for &call in &calls {
                 if document.conditionals.is_unknown_at(call.start_byte())
                     || document
                         .opaque_ranges
@@ -3254,10 +3321,52 @@ impl NavigationIndex {
                     report.note(SemanticCoverageGap::DiagnosticCap);
                 }
             }
+            if !report.has_capacity() {
+                break 'analysis;
+            }
+            let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
+            self.append_inline_and_hint_directive_diagnostics_with_budget(
+                uri,
+                document,
+                &calls,
+                &identifiers,
+                capacity,
+                &mut report,
+                cancel,
+                &mut budget,
+            )?;
+        }
+        if report.has_capacity() {
+            let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
+            let mut flow_diagnostic_cap_reached = false;
+            // Keep flow bounded independently: name-proof work above may use
+            // the semantic budget before this more expensive pass runs.
+            let mut flow_budget = AssistanceBudget::new(
+                MAX_FLOW_DIAGNOSTIC_WORK,
+                MAX_FLOW_DIAGNOSTIC_BYTES,
+                "flow diagnostics",
+            );
+            let result = flow::flow_diagnostics_with_budget(
+                self,
+                uri,
+                document,
+                &report.diagnostics,
+                capacity,
+                &mut flow_diagnostic_cap_reached,
+                cancel,
+                &mut flow_budget,
+            );
+            if let Some(flow_diagnostics) = report.checked_candidate(result, &flow_budget)? {
+                report.diagnostics.extend(flow_diagnostics);
+            }
+            if flow_diagnostic_cap_reached {
+                report.note(SemanticCoverageGap::DiagnosticCap);
+            }
         }
         report
             .diagnostics
             .retain(|diagnostic| diagnostic.span.end <= proven_end);
+        warning_switches::filter_report(document, &mut report.diagnostics);
         report.diagnostics.sort_by_key(|diagnostic| {
             (
                 diagnostic.span.start,
@@ -8146,6 +8255,7 @@ impl NavigationIndex {
                 identifier,
                 owner_type.as_deref(),
                 &current,
+                state.allow_class_global_fallback,
             ) {
                 state.mark_receiver_uncertain();
                 return Ok(Vec::new());
@@ -8197,9 +8307,13 @@ impl NavigationIndex {
             }
         }
         if !imported.is_empty() {
-            if self
-                .is_unknown_global_fallback_for_owner(document, identifier, owner_type, &imported)
-            {
+            if self.is_unknown_global_fallback_for_owner(
+                document,
+                identifier,
+                owner_type,
+                &imported,
+                state.allow_class_global_fallback,
+            ) {
                 state.mark_receiver_uncertain();
                 return Ok(Vec::new());
             }
@@ -8213,6 +8327,160 @@ impl NavigationIndex {
         }
 
         Ok(Vec::new())
+    }
+
+    /// Whether a source-backed candidate is unsafe as flow proof because a
+    /// higher-precedence import is incomplete or already exports the name.
+    ///
+    /// Delphi searches the current unit before imports, then implementation
+    /// uses in reverse source order, interface uses in reverse source order,
+    /// and implicit System last. The ordinary navigation candidate collector
+    /// intentionally aggregates imports, so flow must not treat an aggregate
+    /// candidate as proof without checking this lookup order.
+    #[allow(clippy::too_many_arguments)]
+    fn flow_candidate_has_shadowing_uncertainty(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        key: &str,
+        candidate: &Candidate,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        self.flow_target_has_shadowing_uncertainty(
+            current_uri,
+            current_document,
+            offset,
+            key,
+            Some(candidate),
+            cancel,
+            budget,
+        )
+    }
+
+    fn flow_intrinsic_has_shadowing_uncertainty(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        key: &str,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        self.flow_target_has_shadowing_uncertainty(
+            current_uri,
+            current_document,
+            offset,
+            key,
+            None,
+            cancel,
+            budget,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn flow_target_has_shadowing_uncertainty(
+        &self,
+        current_uri: &Url,
+        current_document: &Document,
+        offset: usize,
+        key: &str,
+        candidate: Option<&Candidate>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        if candidate.is_some_and(|candidate| candidate.uri == *current_uri) {
+            return Ok(false);
+        }
+
+        let region = current_document.region_at(offset);
+        let ordered_uses = match region {
+            Region::Interface => current_document
+                .interface_uses
+                .iter()
+                .rev()
+                .collect::<Vec<_>>(),
+            Region::Implementation | Region::Other => current_document
+                .implementation_uses
+                .iter()
+                .rev()
+                .chain(current_document.interface_uses.iter().rev())
+                .collect::<Vec<_>>(),
+        };
+        budget.require_work(ordered_uses.len(), cancel)?;
+        budget.require_bytes(
+            ordered_uses
+                .len()
+                .saturating_mul(std::mem::size_of::<&String>()),
+            cancel,
+        )?;
+
+        for unit in ordered_uses {
+            check_navigation_cancel(cancel)?;
+            let unit_key = canonical_name(unit);
+            if current_document.unknown_imports.contains(&unit_key) {
+                return Ok(true);
+            }
+            let providers = self.unit_urls_for_import_lookup_with_budget(
+                current_document,
+                &unit_key,
+                Some(key),
+                cancel,
+                budget,
+            )?;
+            if providers.len() != 1 {
+                return Ok(true);
+            }
+            let provider_uri = &providers[0];
+            let Some(provider) = self.documents.get(provider_uri) else {
+                return Ok(true);
+            };
+            if candidate.is_some_and(|candidate| provider_uri == &candidate.uri) {
+                let candidate_is_routine = candidate.is_some_and(|candidate| {
+                    provider
+                        .symbols
+                        .get(candidate.index)
+                        .is_some_and(|symbol| symbol.kind == SymbolKind::Routine)
+                });
+                if candidate_is_routine
+                    && (!Self::document_is_complete_for_proof(provider, cancel, budget)?
+                        || !provider.opaque_ranges.is_empty()
+                        || !provider.unknown_imports.is_empty())
+                {
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
+            if !Self::document_is_complete_for_proof(provider, cancel, budget)?
+                || !provider.opaque_ranges.is_empty()
+                || !provider.unknown_imports.is_empty()
+            {
+                return Ok(true);
+            }
+            if !self
+                .exported_references_for_key_with_budget(provider_uri, key, cancel, budget)?
+                .is_empty()
+            {
+                return Ok(true);
+            }
+        }
+
+        let Some(candidate) = candidate else {
+            return Ok(false);
+        };
+        let Some(provider) = self.documents.get(&candidate.uri) else {
+            return Ok(true);
+        };
+        if !Self::document_is_complete_for_proof(provider, cancel, budget)?
+            || !provider.opaque_ranges.is_empty()
+            || !provider.unknown_imports.is_empty()
+        {
+            return Ok(true);
+        }
+        // The only source-backed candidate after all explicit imports is
+        // Delphi's implicit System unit.
+        Ok(provider.unit_name != "system")
     }
 
     fn implicit_system_references_with_budget(
@@ -16396,6 +16664,7 @@ struct Symbol {
     type_kind: TypeKind,
     routine_kind: RoutineKind,
     routine_directives: RoutineDirectives,
+    hint_directives: HintDirectives,
     parameter_mode: Option<ParameterMode>,
     scope: usize,
     owner_type: Option<String>,
@@ -16448,8 +16717,21 @@ struct RoutineDirectives {
     forward: bool,
     external: bool,
     abstract_: bool,
+    inline: bool,
     calling_convention: Option<CallingConvention>,
     calling_convention_unknown: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HintDirectives {
+    /// `None` means no deprecated directive; `Some(None)` is bare deprecated.
+    deprecated: Option<Option<String>>,
+    /// The source spelling of the deprecated message literal, including quotes.
+    deprecated_raw: Option<String>,
+    platform: bool,
+    library: bool,
+    experimental: bool,
+    unknown: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17305,6 +17587,12 @@ struct ResolutionState {
     with_context_resolutions: HashMap<(Url, Span), Option<Vec<WithReceiverSlot>>>,
     with_member_substitutions: HashMap<(Url, usize, Candidate), Vec<GenericSubstitution>>,
     suppress_with_lookup: bool,
+    /// H2443 resolves the identifier after the ordinary member lookup has
+    /// established whether a class member shadows an imported global. The
+    /// diagnostic still rejects an incomplete member lookup via
+    /// `member_lookup_incomplete`; this bypasses only the broader D16
+    /// rename-safety guard for otherwise complete read-only lookups.
+    allow_class_global_fallback: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -17338,6 +17626,7 @@ impl ResolutionState {
             with_context_resolutions: HashMap::new(),
             with_member_substitutions: HashMap::new(),
             suppress_with_lookup: false,
+            allow_class_global_fallback: false,
         }
     }
 
@@ -17410,10 +17699,13 @@ pub(crate) struct ParsedDocument {
     source: Arc<str>,
     parser_source: Arc<[u8]>,
     conditional_context: ConditionalContext,
+    warning_properties: Option<Arc<BTreeMap<String, PropertyValue>>>,
     tree: Tree,
     parser_recovery_spans: Vec<Span>,
     unit_name: String,
     unit_display_name: String,
+    #[allow(dead_code)] // Consumed by the unit-use diagnostics in parity tier 1B.
+    unit_hint_directives: HintDirectives,
     interface_range: Option<Span>,
     implementation_range: Option<Span>,
     uses_clauses: Vec<UsesClauseMetadata>,
@@ -17491,6 +17783,19 @@ impl ParsedDocument {
                 )
             },
         );
+        let warning_property_bytes = self.warning_properties.as_ref().map_or(0, |properties| {
+            properties
+                .iter()
+                .fold(std::mem::size_of_val(properties), |bytes, (name, value)| {
+                    bytes
+                        .saturating_add(name.len())
+                        .saturating_add(std::mem::size_of::<PropertyValue>())
+                        .saturating_add(match value {
+                            PropertyValue::Known(value) => value.len(),
+                            PropertyValue::Unknown => 0,
+                        })
+                })
+        });
         self.source
             .len()
             .saturating_mul(PER_SOURCE_BYTE)
@@ -17502,6 +17807,7 @@ impl ParsedDocument {
             )
             .saturating_add(self.symbols.len().saturating_mul(PER_SYMBOL))
             .saturating_add(binding_keys)
+            .saturating_add(warning_property_bytes)
     }
 
     /// Whether symbol `index` can be an unqualified name: it has no owner
@@ -17904,9 +18210,10 @@ impl Document {
         cancel: &AtomicBool,
         previous: Option<Arc<ParsedDocument>>,
     ) -> Result<Self, String> {
-        Self::parse_with_session(uri, source, context, cancel, previous, None, None)
+        Self::parse_with_session(uri, source, context, cancel, previous, None, None, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn parse_with_session(
         uri: Url,
         source: String,
@@ -17915,10 +18222,12 @@ impl Document {
         previous: Option<Arc<ParsedDocument>>,
         expansion: Option<&crate::include_expansion::ExpandedSource>,
         verified_system_surface: Option<dcc_surface::SurfaceKey>,
+        warning_properties: Option<Arc<BTreeMap<String, PropertyValue>>>,
     ) -> Result<Self, String> {
         if let Some(previous) = previous.as_ref()
             && previous.source.as_ref() == source.as_str()
             && previous.conditional_context == *context
+            && previous.warning_properties.as_deref() == warning_properties.as_deref()
             && expansion
                 .and_then(|e| e.conditionals.as_ref())
                 .is_none_or(|c| *c == previous.conditionals)
@@ -18090,6 +18399,12 @@ impl Document {
             .map(|node| identifier_texts(node, &source).join("."))
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| unit_name.clone());
+        let unit_node = unit_module
+            .and_then(|node| node.tree_parent())
+            .filter(|node| node.kind() == "unit");
+        let unit_hint_directives = unit_node
+            .map(|node| hint_directives(node, &source, &conditionals))
+            .unwrap_or_default();
 
         let interface_range = sections
             .iter()
@@ -18173,6 +18488,7 @@ impl Document {
                 type_kind: TypeKind::Other,
                 routine_kind: RoutineKind::Procedure,
                 routine_directives: RoutineDirectives::default(),
+                hint_directives: unit_hint_directives.clone(),
                 parameter_mode: None,
                 scope: ROOT_SCOPE,
                 owner_type: None,
@@ -18204,7 +18520,14 @@ impl Document {
             });
         }
 
-        collect_symbols(root, &source, &scopes, &scope_by_span, &mut symbols);
+        collect_symbols(
+            root,
+            &source,
+            &scopes,
+            &scope_by_span,
+            &conditionals,
+            &mut symbols,
+        );
         pair_omitted_generic_constraints(&mut symbols);
         pair_abbreviated_definitions(root, &source, &scope_by_span, &mut symbols);
         let documentation = documentation::collect(&source, &symbols, cancel)?;
@@ -18377,10 +18700,12 @@ impl Document {
             source: Arc::from(source),
             parser_source: Arc::from(parser_source.into_boxed_slice()),
             conditional_context: context.clone(),
+            warning_properties,
             tree,
             parser_recovery_spans,
             unit_name,
             unit_display_name,
+            unit_hint_directives,
             interface_range,
             implementation_range,
             uses_clauses,
@@ -19018,18 +19343,35 @@ fn collect_symbols(
     source: &str,
     scopes: &[Scope],
     scope_by_span: &HashMap<Span, usize>,
+    conditionals: &ConditionalAnalysis,
     symbols: &mut Vec<Symbol>,
 ) {
     collect_nodes_with_ancestors(root, &mut |node, ancestors| match node.kind() {
-        "defProc" => add_definition_symbol(node, ancestors, source, scopes, scope_by_span, symbols),
+        "defProc" => add_definition_symbol(
+            node,
+            ancestors,
+            source,
+            scopes,
+            scope_by_span,
+            conditionals,
+            symbols,
+        ),
         "declProc" if !is_definition_header_under(node, ancestors.last().copied()) => {
-            add_routine_symbol(node, ancestors, source, scope_by_span, symbols);
+            add_routine_symbol(
+                node,
+                ancestors,
+                source,
+                scope_by_span,
+                conditionals,
+                symbols,
+            );
         }
         "declType" => add_named_symbol(
             node,
             ancestors,
             source,
             scope_by_span,
+            conditionals,
             symbols,
             SymbolKind::Type,
             None,
@@ -19043,6 +19385,7 @@ fn collect_symbols(
                 ancestors,
                 source,
                 scope_by_span,
+                conditionals,
                 symbols,
                 SymbolKind::Variable,
                 type_name,
@@ -19053,6 +19396,7 @@ fn collect_symbols(
             ancestors,
             source,
             scope_by_span,
+            conditionals,
             symbols,
             SymbolKind::Constant,
             None,
@@ -19066,6 +19410,7 @@ fn collect_symbols(
                 ancestors,
                 source,
                 scope_by_span,
+                conditionals,
                 symbols,
                 SymbolKind::Field,
                 type_name,
@@ -19080,6 +19425,7 @@ fn collect_symbols(
                 ancestors,
                 source,
                 scope_by_span,
+                conditionals,
                 symbols,
                 SymbolKind::Property,
                 type_name,
@@ -19094,6 +19440,7 @@ fn collect_symbols(
                 ancestors,
                 source,
                 scope_by_span,
+                conditionals,
                 symbols,
                 SymbolKind::Parameter,
                 type_name,
@@ -19108,6 +19455,7 @@ fn collect_symbols(
                 ancestors,
                 source,
                 scope_by_span,
+                conditionals,
                 symbols,
                 SymbolKind::Variable,
                 type_name,
@@ -19118,6 +19466,7 @@ fn collect_symbols(
             ancestors,
             source,
             scope_by_span,
+            conditionals,
             symbols,
             SymbolKind::EnumValue,
             None,
@@ -19127,6 +19476,7 @@ fn collect_symbols(
             ancestors,
             source,
             scope_by_span,
+            conditionals,
             symbols,
             SymbolKind::Label,
             None,
@@ -19200,6 +19550,8 @@ fn pair_omitted_generic_constraints(symbols: &mut [Symbol]) {
             symbols[declaration_index].generic_parameters.clone();
         symbols[definition_index].routine_directives =
             symbols[declaration_index].routine_directives;
+        symbols[definition_index].hint_directives =
+            symbols[declaration_index].hint_directives.clone();
         symbols[definition_index].result_type_name =
             symbols[declaration_index].result_type_name.clone();
         symbols[definition_index].result_type_ref =
@@ -19352,6 +19704,8 @@ fn pair_abbreviated_definitions(
         symbols[definition_index].routine_key = Some(routine_key.clone());
         symbols[definition_index].routine_directives =
             symbols[declaration_index].routine_directives;
+        symbols[definition_index].hint_directives =
+            symbols[declaration_index].hint_directives.clone();
         symbols[definition_index].result_type_name =
             symbols[declaration_index].result_type_name.clone();
         symbols[definition_index].result_type_ref =
@@ -19410,6 +19764,8 @@ fn pair_abbreviated_definitions(
             symbols[declaration_index].generic_parameters.clone();
         symbols[definition_index].routine_directives =
             symbols[declaration_index].routine_directives;
+        symbols[definition_index].hint_directives =
+            symbols[declaration_index].hint_directives.clone();
     }
 }
 
@@ -19450,6 +19806,7 @@ fn inject_abbreviated_parameters(
                 type_kind: TypeKind::Other,
                 routine_kind: RoutineKind::Procedure,
                 routine_directives: RoutineDirectives::default(),
+                hint_directives: HintDirectives::default(),
                 parameter_mode: Some(parameter_mode(node)),
                 scope: body_scope,
                 owner_type: None,
@@ -19489,6 +19846,7 @@ fn add_definition_symbol<'a>(
     source: &str,
     scopes: &[Scope],
     scope_by_span: &HashMap<Span, usize>,
+    conditionals: &ConditionalAnalysis,
     symbols: &mut Vec<Symbol>,
 ) {
     let Some(header) = node.child_by_field_name("header") else {
@@ -19531,6 +19889,7 @@ fn add_definition_symbol<'a>(
         type_kind: TypeKind::Other,
         routine_kind: routine_kind(header),
         routine_directives: routine_directives(header),
+        hint_directives: hint_directives(header, source, conditionals),
         parameter_mode: None,
         scope,
         owner_type: owner_type.clone(),
@@ -19577,6 +19936,7 @@ fn add_routine_symbol<'a>(
     ancestors: &[Node<'a>],
     source: &str,
     scope_by_span: &HashMap<Span, usize>,
+    conditionals: &ConditionalAnalysis,
     symbols: &mut Vec<Symbol>,
 ) {
     let Some((name, span, owner_type)) = routine_name_among(node, nearest_first(ancestors), source)
@@ -19610,6 +19970,7 @@ fn add_routine_symbol<'a>(
         type_kind: TypeKind::Other,
         routine_kind: routine_kind(node),
         routine_directives: routine_directives(node),
+        hint_directives: hint_directives(node, source, conditionals),
         parameter_mode: None,
         scope,
         owner_type: owner_type.clone(),
@@ -19669,6 +20030,7 @@ fn push_routine_generic_parameter_symbols(
             type_kind: TypeKind::Other,
             routine_kind: RoutineKind::Procedure,
             routine_directives: RoutineDirectives::default(),
+            hint_directives: HintDirectives::default(),
             parameter_mode: None,
             scope,
             owner_type: None,
@@ -19701,11 +20063,13 @@ fn push_routine_generic_parameter_symbols(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_named_symbol<'a>(
     node: Node<'a>,
     ancestors: &[Node<'a>],
     source: &str,
     scope_by_span: &HashMap<Span, usize>,
+    conditionals: &ConditionalAnalysis,
     symbols: &mut Vec<Symbol>,
     kind: SymbolKind,
     type_name: Option<String>,
@@ -19774,6 +20138,7 @@ fn add_named_symbol<'a>(
             type_kind,
             routine_kind: RoutineKind::Procedure,
             routine_directives: RoutineDirectives::default(),
+            hint_directives: hint_directives(node, source, conditionals),
             parameter_mode: (kind == SymbolKind::Parameter).then(|| parameter_mode(node)),
             scope,
             owner_type: owner_type.clone(),
@@ -19820,6 +20185,7 @@ fn add_named_symbol<'a>(
                 type_kind: TypeKind::Other,
                 routine_kind: RoutineKind::Procedure,
                 routine_directives: RoutineDirectives::default(),
+                hint_directives: HintDirectives::default(),
                 parameter_mode: None,
                 scope,
                 owner_type: declared_type_key.clone(),
@@ -20462,6 +20828,7 @@ fn routine_directives(node: Node<'_>) -> RoutineDirectives {
         "kForward" => directives.forward = true,
         "kExternal" => directives.external = true,
         "kAbstract" => directives.abstract_ = true,
+        "kInline" => directives.inline = true,
         "kCdecl" => directives.calling_convention = Some(CallingConvention::Cdecl),
         "kStdcall" => directives.calling_convention = Some(CallingConvention::Stdcall),
         "kPascal" => directives.calling_convention = Some(CallingConvention::Pascal),
@@ -20473,6 +20840,120 @@ fn routine_directives(node: Node<'_>) -> RoutineDirectives {
         _ => {}
     });
     directives
+}
+
+fn hint_directives(
+    node: Node<'_>,
+    source: &str,
+    conditionals: &ConditionalAnalysis,
+) -> HintDirectives {
+    let mut directives = HintDirectives::default();
+    let mut node_cursor = node.walk();
+    for attribute in node.children_by_field_name("attribute", &mut node_cursor) {
+        let mut attribute_cursor = attribute.walk();
+        let children: Vec<_> = attribute.children(&mut attribute_cursor).collect();
+        for child in &children {
+            let is_hint = match child.kind() {
+                "kDeprecated" => {
+                    let raw = children
+                        .iter()
+                        .find(|sibling| sibling.kind() == "literalString")
+                        .map(|literal| node_text(*literal, source));
+                    directives.deprecated =
+                        Some(raw.as_deref().and_then(decode_pascal_string_literal));
+                    directives.deprecated_raw = raw;
+                    true
+                }
+                "kPlatform" => {
+                    directives.platform = true;
+                    true
+                }
+                "kLibrary" => {
+                    directives.library = true;
+                    true
+                }
+                "kExperimental" => {
+                    directives.experimental = true;
+                    true
+                }
+                _ => false,
+            };
+            if is_hint
+                && conditionals.unknown_spans.iter().any(|unknown| {
+                    unknown.start <= child.start_byte() && child.end_byte() <= unknown.end
+                })
+            {
+                directives.unknown = true;
+            }
+        }
+    }
+    directives
+}
+
+/// Decode the literal-string syntax used by a deprecated directive.
+///
+/// Tree-sitter represents a doubled Pascal quote as adjacent quoted tokens,
+/// e.g. `'it''s'`; the raw source remains separately available for dcc's
+/// message formatting.
+fn decode_pascal_string_literal(raw: &str) -> Option<String> {
+    let mut decoded = String::new();
+    let mut cursor = 0;
+    let bytes = raw.as_bytes();
+    while cursor < bytes.len() {
+        let character = raw[cursor..].chars().next()?;
+        if character.is_whitespace() {
+            cursor += character.len_utf8();
+            continue;
+        }
+        match character {
+            '\'' => {
+                cursor += 1;
+                let content_start = cursor;
+                let closing_quote = raw[cursor..].find('\'')? + cursor;
+                decoded.push_str(&raw[content_start..closing_quote]);
+                cursor = closing_quote + 1;
+                if cursor < bytes.len() && bytes[cursor] == b'\'' {
+                    decoded.push('\'');
+                }
+            }
+            '#' => {
+                cursor += 1;
+                let number_start = cursor;
+                let hexadecimal = bytes.get(cursor) == Some(&b'$');
+                if hexadecimal {
+                    cursor += 1;
+                }
+                while cursor < bytes.len()
+                    && (bytes[cursor] == b'_'
+                        || if hexadecimal {
+                            bytes[cursor].is_ascii_hexdigit()
+                        } else {
+                            bytes[cursor].is_ascii_digit()
+                        })
+                {
+                    cursor += 1;
+                }
+                if cursor == number_start + usize::from(hexadecimal) {
+                    return None;
+                }
+                let digits = raw[number_start + usize::from(hexadecimal)..cursor].replace('_', "");
+                let radix = if hexadecimal { 16 } else { 10 };
+                let value = u32::from_str_radix(&digits, radix).ok()?;
+                decoded.push(char::from_u32(value)?);
+            }
+            '^' => {
+                cursor += 1;
+                let control = raw[cursor..].chars().next()?;
+                if !control.is_ascii() {
+                    return None;
+                }
+                decoded.push(char::from_u32((control as u32) & 0x1f)?);
+                cursor += control.len_utf8();
+            }
+            _ => return None,
+        }
+    }
+    Some(decoded)
 }
 
 fn routine_result_type(node: Node<'_>, source: &str) -> Option<(String, Span)> {
@@ -23816,9 +24297,10 @@ pub(super) fn is_non_value_identifier_with_budget_and_declaration(
     budget: &mut AssistanceBudget,
     declaration: bool,
 ) -> Result<bool, String> {
-    let name = canonical_name(node_text_with_budget(identifier, source, cancel, budget)?);
+    let raw_name = node_text_with_budget(identifier, source, cancel, budget)?;
+    let name = canonical_name(raw_name);
     if declaration
-        || is_implicit_or_intrinsic_name(&name)
+        || (!raw_name.starts_with('&') && is_implicit_or_intrinsic_name(&name))
         || is_type_valued_intrinsic_argument_with_budget(identifier, source, cancel, budget)?
     {
         return Ok(true);
@@ -28000,6 +28482,36 @@ mod tests {
     }
 
     #[test]
+    fn semantic_diagnostics_report_flow_findings_truncated_by_the_cap() {
+        let uri =
+            Url::parse("file:///tmp/semantic-diagnostics-flow-cap.pas").expect("flow cap URI");
+        let mut source = String::from(
+            "unit SemanticDiagnosticsFlowCap;\ninterface\nimplementation\nprocedure Run;\nvar\n",
+        );
+        for index in 0..=MAX_SEMANTIC_DIAGNOSTICS {
+            writeln!(&mut source, "  Value{index}: Integer;").expect("write local");
+        }
+        source.push_str("begin end;\nend.\n");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source)
+            .expect("flow cap fixture parses");
+
+        let report = index
+            .semantic_diagnostic_report_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("capped flow diagnostics complete");
+
+        assert_eq!(report.diagnostics.len(), MAX_SEMANTIC_DIAGNOSTICS);
+        assert!(
+            report.diagnostics.iter().all(|diagnostic| {
+                diagnostic.kind == SemanticDiagnosticKind::Dcc(DccMessage::H2164)
+            }),
+            "{report:?}"
+        );
+        assert_eq!(report.gaps, vec![SemanticCoverageGap::DiagnosticCap]);
+    }
+
+    #[test]
     fn semantic_diagnostics_keep_a_finding_above_a_syntax_error() {
         let uri =
             Url::parse("file:///tmp/semantic-diagnostics-recovery-below.pas").expect("fixture URI");
@@ -28046,6 +28558,58 @@ mod tests {
             }]
         );
         assert_eq!(report.gaps, vec![SemanticCoverageGap::ParserRecovery]);
+    }
+
+    #[test]
+    fn semantic_diagnostics_withhold_h2077_only_for_a_routine_with_an_error() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-flow-error-scope.pas")
+            .expect("fixture URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsFlowErrorScope;\n",
+            "interface\n",
+            "implementation\n",
+            "procedure Good;\n",
+            "var Value: Integer;\n",
+            "begin\n",
+            "  Value := 1;\n",
+            "end;\n",
+            "procedure Bad;\n",
+            "var Unused: Integer;\n",
+            "  procedure Nested;\n",
+            "  var Number: Integer; Flag: Boolean;\n",
+            "  begin\n",
+            "    Flag := Number;\n",
+            "  end;\n",
+            "begin\n",
+            "  Unused := 2;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| (diagnostic.kind, diagnostic.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    SemanticDiagnosticKind::Dcc(DccMessage::H2077),
+                    "Value assigned to 'Value' never used",
+                ),
+                (
+                    SemanticDiagnosticKind::TypeMismatch,
+                    "type mismatch: cannot assign 'Integer' to 'Boolean'",
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -29493,8 +30057,12 @@ mod tests {
         let visits = test_semantic_generic_symbol_visits();
 
         assert!(
-            diagnostics.is_empty() && visits > 0 && visits <= MAX_SEMANTIC_DIAGNOSTIC_WORK,
-            "upcast parent lookup must consume the shared budget and discard partial results after {visits} provider visits: {diagnostics:?}"
+            diagnostics.len() == 1
+                && diagnostics[0].kind.code() == "H2077"
+                && diagnostics[0].message == "Value assigned to 'B' never used"
+                && visits > 0
+                && visits <= MAX_SEMANTIC_DIAGNOSTIC_WORK,
+            "upcast parent lookup must consume the shared budget and discard partial results after {visits} provider visits, while independent flow diagnostics remain available: {diagnostics:?}"
         );
     }
 
@@ -30157,7 +30725,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_diagnostics_charge_generic_parameter_lookups_to_the_budget() {
+    fn semantic_flow_findings_survive_semantic_budget_exhaustion() {
         // Every reference to the local `Value` runs the generic parameter
         // lookup, which examines the 3,000 routines declaring a `Value`
         // parameter. Nothing else here is expensive: the local resolves in its
@@ -30168,7 +30736,9 @@ mod tests {
         for index in 1..=3_000 {
             writeln!(&mut source, "procedure G{index}<Value>;").expect("write routine");
         }
-        source.push_str("implementation\nprocedure Run;\nvar\n  Value: Integer;\nbegin\n");
+        source.push_str(
+            "implementation\nprocedure Run;\nvar\n  Value: Integer;\n  Unused: Integer;\nbegin\n",
+        );
         for _ in 0..40 {
             source.push_str("  Value := Value;\n");
         }
@@ -30181,6 +30751,12 @@ mod tests {
             .expect("bounded semantic diagnostics complete");
 
         assert_eq!(report.gaps, vec![SemanticCoverageGap::Budget], "{report:?}");
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind.code() == "H2164" && diagnostic.message.contains("'Unused'")
+            }),
+            "flow analysis should use its separate budget after semantic name lookup exhausts its budget: {report:?}"
+        );
     }
 
     #[test]
@@ -30593,6 +31169,355 @@ mod tests {
             uri,
             index: visible
         }));
+    }
+
+    #[test]
+    fn hint_directives_are_recorded_on_declarations_and_unit_header() {
+        let source = concat!(
+            "unit HintFacts platform;\n",
+            "interface\n",
+            "type\n",
+            "  TDeprecated = class end deprecated 'it''s';\n",
+            "  TBareDeprecated = class end deprecated;\n",
+            "  TLibrary = Integer library;\n",
+            "  TExperimental = Integer experimental;\n",
+            "  TObj = class\n",
+            "    FDeprecated: Integer; deprecated 'field''s';\n",
+            "    FSuffixDeprecated: Integer deprecated;\n",
+            "    property PExperimental: Integer read FDeprecated; experimental;\n",
+            "    procedure Method; deprecated 'method''s';\n",
+            "  end;\n",
+            "var VPlatform: Integer platform;\n",
+            "var VTypeHint: Integer deprecated;\n",
+            "const CDeprecated = 1 deprecated 'const''s';\n",
+            "procedure Routine; experimental;\n",
+            "implementation\n",
+            "procedure Routine; begin end;\n",
+            "procedure TObj.Method; begin end;\n",
+            "end.\n",
+        );
+        let uri = Url::parse("file:///tmp/hint-facts.pas").expect("fixture URI");
+        let document = Document::parse_with_cancel(
+            uri,
+            source.to_owned(),
+            &ConditionalContext::default(),
+            &AtomicBool::new(false),
+            None,
+        )
+        .expect("hint facts fixture parses");
+
+        fn symbol<'a>(document: &'a ParsedDocument, name: &str) -> &'a Symbol {
+            document
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name.eq_ignore_ascii_case(name))
+                .unwrap_or_else(|| panic!("missing {name} symbol"))
+        }
+        fn expected(
+            deprecated: Option<Option<&str>>,
+            deprecated_raw: Option<&str>,
+            platform: bool,
+            library: bool,
+            experimental: bool,
+            unknown: bool,
+        ) -> HintDirectives {
+            HintDirectives {
+                deprecated: deprecated.map(|message| message.map(str::to_owned)),
+                deprecated_raw: deprecated_raw.map(str::to_owned),
+                platform,
+                library,
+                experimental,
+                unknown,
+            }
+        }
+
+        assert_eq!(
+            &symbol(&document, "TDeprecated").hint_directives,
+            &expected(
+                Some(Some("it's")),
+                Some("'it''s'"),
+                false,
+                false,
+                false,
+                false
+            )
+        );
+        assert_eq!(
+            &symbol(&document, "TBareDeprecated").hint_directives,
+            &expected(Some(None), None, false, false, false, false)
+        );
+        assert_eq!(
+            &symbol(&document, "TLibrary").hint_directives,
+            &expected(None, None, false, true, false, false)
+        );
+        assert_eq!(
+            &symbol(&document, "TExperimental").hint_directives,
+            &expected(None, None, false, false, true, false)
+        );
+        assert_eq!(
+            &symbol(&document, "TObj").hint_directives,
+            &HintDirectives::default(),
+            "a type must not inherit hints from nested members"
+        );
+        assert_eq!(
+            &symbol(&document, "FDeprecated").hint_directives,
+            &expected(
+                Some(Some("field's")),
+                Some("'field''s'"),
+                false,
+                false,
+                false,
+                false
+            )
+        );
+        assert_eq!(
+            &symbol(&document, "FSuffixDeprecated").hint_directives,
+            &expected(Some(None), None, false, false, false, false),
+            "a deprecated suffix on a field is a declaration hint"
+        );
+        assert_eq!(
+            &symbol(&document, "PExperimental").hint_directives,
+            &expected(None, None, false, false, true, false)
+        );
+        assert_eq!(
+            &symbol(&document, "Method").hint_directives,
+            &expected(
+                Some(Some("method's")),
+                Some("'method''s'"),
+                false,
+                false,
+                false,
+                false
+            )
+        );
+        assert_eq!(
+            &symbol(&document, "VPlatform").hint_directives,
+            &expected(None, None, true, false, false, false)
+        );
+        assert_eq!(
+            &symbol(&document, "VTypeHint").hint_directives,
+            &expected(Some(None), None, false, false, false, false),
+            "a deprecated suffix on a variable is a declaration hint"
+        );
+        assert_eq!(
+            &symbol(&document, "CDeprecated").hint_directives,
+            &expected(
+                Some(Some("const's")),
+                Some("'const''s'"),
+                false,
+                false,
+                false,
+                false
+            )
+        );
+        assert_eq!(
+            &symbol(&document, "Routine").hint_directives,
+            &expected(None, None, false, false, true, false)
+        );
+        for name in ["Routine", "Method"] {
+            let definition = document
+                .symbols
+                .iter()
+                .find(|symbol| {
+                    symbol.name.eq_ignore_ascii_case(name) && symbol.origin == Origin::Definition
+                })
+                .unwrap_or_else(|| panic!("missing {name} definition"));
+            assert_eq!(
+                definition.hint_directives,
+                symbol(&document, name).hint_directives,
+                "{name} definition should carry the paired declaration's hints"
+            );
+        }
+        let unit_hints = expected(None, None, true, false, false, false);
+        assert_eq!(document.unit_hint_directives, unit_hints);
+        assert_eq!(symbol(&document, "HintFacts").hint_directives, unit_hints);
+    }
+
+    #[test]
+    fn hint_directive_in_unknown_conditional_is_marked_unknown() {
+        let source = concat!(
+            "unit UnknownHint;\n",
+            "interface\n",
+            "{$IFDEF MAYBE}\n",
+            "const Hidden = 1 deprecated 'conditional';\n",
+            "{$ENDIF}\n",
+            "const Visible = 2 platform;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let uri = Url::parse("file:///tmp/unknown-hint.pas").expect("fixture URI");
+        let document = Document::parse_with_cancel(
+            uri,
+            source.to_owned(),
+            &ConditionalContext::default(),
+            &AtomicBool::new(false),
+            None,
+        )
+        .expect("unknown hint fixture parses");
+
+        let hidden = document
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name.eq_ignore_ascii_case("Hidden"))
+            .expect("hidden declaration");
+        let visible = document
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name.eq_ignore_ascii_case("Visible"))
+            .expect("visible declaration");
+        assert!(hidden.hint_directives.unknown);
+        assert!(!visible.hint_directives.unknown);
+    }
+
+    #[test]
+    fn multi_name_variable_hint_directive_attaches_to_each_name() {
+        let source = concat!(
+            "unit MultiNameHint;\n",
+            "interface\n",
+            "var A, B: Integer platform;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let uri = Url::parse("file:///tmp/multi-name-hint.pas").expect("fixture URI");
+        let document = Document::parse_with_cancel(
+            uri,
+            source.to_owned(),
+            &ConditionalContext::default(),
+            &AtomicBool::new(false),
+            None,
+        )
+        .expect("multi-name hint fixture parses");
+
+        for name in ["A", "B"] {
+            let symbol = document
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name.eq_ignore_ascii_case(name))
+                .unwrap_or_else(|| panic!("missing {name} symbol"));
+            assert!(
+                symbol.hint_directives.platform,
+                "{name} did not receive the shared platform hint"
+            );
+            assert!(!symbol.hint_directives.unknown);
+        }
+    }
+
+    #[test]
+    fn overloads_keep_their_own_hint_directives() {
+        let source = concat!(
+            "unit OverloadHint;\n",
+            "interface\n",
+            "procedure P(I: Integer); overload; deprecated;\n",
+            "procedure P(S: string); overload;\n",
+            "implementation\n",
+            "procedure P(I: Integer); begin end;\n",
+            "procedure P(S: string); begin end;\n",
+            "end.\n",
+        );
+        let uri = Url::parse("file:///tmp/overload-hint.pas").expect("fixture URI");
+        let document = Document::parse_with_cancel(
+            uri,
+            source.to_owned(),
+            &ConditionalContext::default(),
+            &AtomicBool::new(false),
+            None,
+        )
+        .expect("overload hint fixture parses");
+        let mut declarations: Vec<_> = document
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.name.eq_ignore_ascii_case("P") && symbol.origin == Origin::Declaration
+            })
+            .collect();
+        declarations.sort_by_key(|symbol| symbol.span.start);
+
+        assert_eq!(
+            declarations.len(),
+            2,
+            "both overload declarations are indexed"
+        );
+        assert_eq!(declarations[0].hint_directives.deprecated, Some(None));
+        assert!(!declarations[0].hint_directives.platform);
+        assert_eq!(declarations[1].hint_directives, HintDirectives::default());
+    }
+
+    #[test]
+    fn forward_declaration_hint_directive_is_propagated_to_its_definition() {
+        let source = concat!(
+            "unit ForwardHint;\n",
+            "interface\n",
+            "implementation\n",
+            "procedure Forwarded; forward; deprecated;\n",
+            "procedure Forwarded; begin end;\n",
+            "end.\n",
+        );
+        let uri = Url::parse("file:///tmp/forward-hint.pas").expect("fixture URI");
+        let document = Document::parse_with_cancel(
+            uri,
+            source.to_owned(),
+            &ConditionalContext::default(),
+            &AtomicBool::new(false),
+            None,
+        )
+        .expect("forward hint fixture parses");
+        let declaration = document
+            .symbols
+            .iter()
+            .find(|symbol| {
+                symbol.name.eq_ignore_ascii_case("Forwarded")
+                    && symbol.origin == Origin::Declaration
+            })
+            .expect("forward declaration symbol");
+        let definition = document
+            .symbols
+            .iter()
+            .find(|symbol| {
+                symbol.name.eq_ignore_ascii_case("Forwarded") && symbol.origin == Origin::Definition
+            })
+            .expect("forward definition symbol");
+
+        assert_eq!(declaration.hint_directives.deprecated, Some(None));
+        assert_eq!(
+            definition.hint_directives, declaration.hint_directives,
+            "the paired definition carries the forward declaration's hint"
+        );
+    }
+
+    #[test]
+    fn hint_directive_token_alone_in_unknown_conditional_is_unknown() {
+        let source = concat!(
+            "unit ConditionalHintToken;\n",
+            "interface\n",
+            "procedure Q; {$IFDEF UNKNOWN_X} deprecated; {$ENDIF}\n",
+            "procedure Outside; platform;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let uri = Url::parse("file:///tmp/conditional-hint-token.pas").expect("fixture URI");
+        let document = Document::parse_with_cancel(
+            uri,
+            source.to_owned(),
+            &ConditionalContext::default(),
+            &AtomicBool::new(false),
+            None,
+        )
+        .expect("conditional hint token fixture parses");
+        let q = document
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name.eq_ignore_ascii_case("Q"))
+            .expect("Q declaration");
+        let outside = document
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name.eq_ignore_ascii_case("Outside"))
+            .expect("outside declaration");
+
+        assert_eq!(q.hint_directives.deprecated, Some(None));
+        assert!(q.hint_directives.unknown);
+        assert!(outside.hint_directives.platform);
+        assert!(!outside.hint_directives.unknown);
     }
 
     #[test]
@@ -31172,6 +32097,7 @@ mod tests {
 mod insert_parsed_tests {
     use super::*;
     use pascal_core::conditional::Truth;
+    use pascal_project::{LayoutContext, TargetPlatform};
 
     fn parsed(uri: &Url, context: &ConditionalContext) -> Arc<ParsedDocument> {
         let mut index = NavigationIndex::new();
@@ -31276,5 +32202,109 @@ mod insert_parsed_tests {
                 "a hash match is not proof that this cached parse used the verified context"
             );
         });
+    }
+
+    #[test]
+    fn flow_shadow_check_rejects_an_incomplete_selected_provider() {
+        let consumer_source = concat!(
+            "program FlowIncompleteOverloadProvider;\n",
+            "uses FlowOverloadProvider;\n",
+            "procedure Demo;\n",
+            "var X: Integer;\n",
+            "begin\n",
+            "  X := 1;\n",
+            "  Touch(X);\n",
+            "end;\n",
+            "begin Demo; end.\n",
+        );
+        let provider_source = concat!(
+            "unit FlowOverloadProvider;\n",
+            "interface\n",
+            "procedure Touch(out Value: Integer); overload;\n",
+            "{$IFDEF UNKNOWN_PROVIDER_DEFINE}\n",
+            "procedure Touch(const Value: Integer); overload;\n",
+            "{$ENDIF}\n",
+            "implementation\n",
+            "procedure Touch(out Value: Integer);\n",
+            "begin Value := 0; end;\n",
+            "{$IFDEF UNKNOWN_PROVIDER_DEFINE}\n",
+            "procedure Touch(const Value: Integer);\n",
+            "begin end;\n",
+            "{$ENDIF}\n",
+            "end.\n",
+        );
+        let consumer_uri = Url::parse("file:///tmp/flow-incomplete-provider.pas").unwrap();
+        let provider_uri = Url::parse("file:///tmp/FlowOverloadProvider.pas").unwrap();
+        let version = CompilerVersion::new(37, 0);
+        let platform = TargetPlatform::Win32;
+        let context = ConditionalContext {
+            compiler_version: Some(version),
+            layout: LayoutContext::for_target(Some(version), Some(&platform)),
+            ..ConditionalContext::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let mut index = NavigationIndex::new();
+        index
+            .update_with_context_with_cancel(
+                provider_uri.clone(),
+                provider_source.to_owned(),
+                &context,
+                &cancel,
+            )
+            .expect("provider parses");
+        index
+            .update_with_context_with_cancel(
+                consumer_uri.clone(),
+                consumer_source.to_owned(),
+                &context,
+                &cancel,
+            )
+            .expect("consumer parses");
+        index.bind_imports(
+            &consumer_uri,
+            [("FlowOverloadProvider".to_owned(), provider_uri.clone())],
+        );
+
+        let provider = index
+            .documents
+            .get(&provider_uri)
+            .expect("provider indexed");
+        assert!(
+            !provider.conditionals.unknown_spans.is_empty(),
+            "the potentially present const overload keeps the provider incomplete"
+        );
+
+        let document = index
+            .documents
+            .get(&consumer_uri)
+            .expect("consumer indexed");
+        let offset = consumer_source.find("Touch(X)").expect("Touch call");
+        let identifier =
+            identifier_at(document.tree.root_node(), offset).expect("Touch identifier");
+        let candidates = index.resolve_candidates_at(&consumer_uri, document, offset, identifier);
+        let matching = candidates
+            .iter()
+            .filter(|candidate| candidate.uri == provider_uri)
+            .collect::<Vec<_>>();
+        assert!(
+            !matching.is_empty(),
+            "Touch resolves to the indexed provider"
+        );
+
+        let mut budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "flow test");
+        assert!(
+            index
+                .flow_candidate_has_shadowing_uncertainty(
+                    &consumer_uri,
+                    document,
+                    offset,
+                    "touch",
+                    matching[0],
+                    &cancel,
+                    &mut budget,
+                )
+                .expect("shadow check"),
+            "an incomplete provider may have a competing overload with different argument effects"
+        );
     }
 }

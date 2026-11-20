@@ -14,10 +14,10 @@ use super::{
 };
 use crate::configuration::{config_directories, resolve_lint};
 use crate::navigation::{
-    AssistanceBudget, DccMessage, MAX_MISSING_UNIT_REQUEST_BYTES, MAX_MISSING_UNIT_REQUEST_WORK,
-    MissingInterfaceMethodImplementationCandidate, MissingMethodImplementationCandidate,
-    MissingUnitCandidate, MissingUnitUseKind, NavigationTarget, SemanticDiagnosticKind, SourceSpan,
-    UnitOrderSafety,
+    AssistanceBudget, DccMessage, FormFileRequirement, MAX_MISSING_UNIT_REQUEST_BYTES,
+    MAX_MISSING_UNIT_REQUEST_WORK, MissingInterfaceMethodImplementationCandidate,
+    MissingMethodImplementationCandidate, MissingUnitCandidate, MissingUnitUseKind,
+    NavigationTarget, SemanticDiagnosticKind, SourceSpan, UnitOrderSafety,
 };
 use crate::text;
 use lint4d::config::{Config, RuleSeverityOverride};
@@ -698,6 +698,55 @@ pub(crate) fn code_actions_from_input(
         Vec::new()
     };
     let mut supplementary_actions = extraction_actions;
+    let mut unused_unit_records = Vec::new();
+    let current_unused_unit_findings = if requests_quickfix
+        && !rule_is_off(&config, "unused-unit")
+        && input_source_is_writable(&input, &uri)
+        && params
+            .context
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic_code(diagnostic) == Some("lint4d-unused-unit"))
+    {
+        match current_unused_unit_findings_from_input(
+            &input,
+            &uri,
+            &source,
+            &target_record,
+            &configuration_records,
+            cancel,
+        ) {
+            Ok((findings, records)) => {
+                unused_unit_records = records;
+                findings
+            }
+            Err(error) if error == CANCELLATION_MESSAGE => {
+                return failed(source_generation, configuration_generation, error);
+            }
+            Err(_) => HashSet::new(),
+        }
+    } else {
+        HashSet::new()
+    };
+    if requests_quickfix
+        && !rule_is_off(&config, "unused-unit")
+        && input_source_is_writable(&input, &uri)
+    {
+        for action in unused_unit_removal_actions(
+            &uri,
+            &source,
+            &target_record,
+            &params.context,
+            features.document_changes,
+            &current_unused_unit_findings,
+        ) {
+            match push_bounded_code_action(&mut supplementary_actions, action) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => return failed(source_generation, configuration_generation, error),
+            }
+        }
+    }
     if requests_signature && input_source_is_writable(&input, &uri) {
         let signature_edits = match signature::plan(&source, params.range, cancel) {
             Ok(edits) => edits,
@@ -1049,6 +1098,7 @@ pub(crate) fn code_actions_from_input(
                 append_records(&mut records, interface_method_records);
                 append_records(&mut records, organize_imports_records);
                 append_records(&mut records, fix_all_records);
+                append_records(&mut records, unused_unit_records);
                 append_records(&mut records, configuration_records);
                 records
             },
@@ -1310,6 +1360,7 @@ pub(crate) fn code_actions_from_input(
                             value: Ok(actions),
                             records: {
                                 let mut records = organize_imports_records.clone();
+                                append_records(&mut records, unused_unit_records.clone());
                                 append_records(&mut records, configuration_records);
                                 records
                             },
@@ -1356,6 +1407,7 @@ pub(crate) fn code_actions_from_input(
                             value: Ok(actions),
                             records: {
                                 let mut records = fix_all_records.clone();
+                                append_records(&mut records, unused_unit_records.clone());
                                 append_records(&mut records, configuration_records);
                                 records
                             },
@@ -1394,6 +1446,7 @@ pub(crate) fn code_actions_from_input(
     append_records(&mut records, interface_method_records);
     append_records(&mut records, organize_imports_records);
     append_records(&mut records, fix_all_records);
+    append_records(&mut records, unused_unit_records);
     append_records(&mut records, configuration_records);
     Computed {
         source_generation,
@@ -3163,6 +3216,438 @@ fn organize_imports_plan_from_input(
     Ok((Some(plan), snapshot_records(&snapshot)))
 }
 
+type CurrentUnusedUnitFindings = HashSet<(Range, String)>;
+
+fn current_unused_unit_findings_from_input(
+    input: &WorkspaceInput,
+    uri: &Url,
+    source: &str,
+    target_record: &SourceRecord,
+    configuration_records: &[SourceRecord],
+    cancel: &AtomicBool,
+) -> Result<(CurrentUnusedUnitFindings, Vec<SourceRecord>), String> {
+    let snapshot = build_snapshot(
+        input,
+        std::slice::from_ref(uri),
+        &[],
+        SnapshotMode::LocalWithImports,
+        Some(
+            SnapshotSeed::new(target_record.clone())
+                .with_consumed_configuration(configuration_records),
+        ),
+        &[],
+        cancel,
+    )?;
+    if !snapshot.editable.contains(uri)
+        || snapshot
+            .sources
+            .get(uri)
+            .is_none_or(|current| current != source)
+    {
+        return Ok((HashSet::new(), Vec::new()));
+    }
+    let report = snapshot
+        .index
+        .semantic_diagnostic_report_with_cancel(uri, cancel)?;
+    if !report.is_complete() {
+        return Ok((HashSet::new(), Vec::new()));
+    }
+    let form_file_requirement = snapshot.index.form_file_requirement(uri);
+    let form_file_bytes = match form_file_requirement {
+        Some(FormFileRequirement::None) => None,
+        Some(FormFileRequirement::Unknown) | None => return Ok((HashSet::new(), Vec::new())),
+        Some(FormFileRequirement::Read(extension)) => {
+            let Some(cached_document) = input.cached_documents.get(uri) else {
+                return Ok((HashSet::new(), Vec::new()));
+            };
+            match super::read_unused_unit_form_resource(
+                cached_document.context.read_policy(),
+                uri,
+                extension,
+                cancel,
+            ) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+                Err(_) => return Ok((HashSet::new(), Vec::new())),
+            }
+        }
+    };
+    let diagnostics = snapshot.index.unused_unit_diagnostics_with_report(
+        uri,
+        &report,
+        form_file_bytes.as_deref(),
+        cancel,
+    )?;
+    let mut findings = HashSet::new();
+    for diagnostic in diagnostics {
+        let Some(unit_name) = source.get(diagnostic.span.start..diagnostic.span.end) else {
+            continue;
+        };
+        let (Some(start), Some(end)) = (
+            text::offset_to_position(source, diagnostic.span.start),
+            text::offset_to_position(source, diagnostic.span.end),
+        ) else {
+            continue;
+        };
+        findings.insert((Range::new(start, end), unit_name.to_owned()));
+    }
+    Ok((findings, snapshot_records(&snapshot)))
+}
+
+fn unused_unit_removal_actions(
+    uri: &Url,
+    source: &str,
+    target_record: &SourceRecord,
+    context: &CodeActionContext,
+    document_changes: bool,
+    current_findings: &HashSet<(Range, String)>,
+) -> Vec<CodeActionOrCommand> {
+    let mut actions = Vec::new();
+    let mut seen_ranges = HashSet::new();
+    for diagnostic in &context.diagnostics {
+        if diagnostic_code(diagnostic) != Some("lint4d-unused-unit") {
+            continue;
+        }
+        let Some(unit_name) = diagnostic
+            .data
+            .as_ref()
+            .and_then(|data| data.get("unitName"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let unit_name = unit_name.to_owned();
+        if !current_findings.contains(&(diagnostic.range, unit_name.clone()))
+            || !seen_ranges.insert(diagnostic.range)
+        {
+            continue;
+        }
+        let Some(edit) = unused_unit_removal_edit(uri, source, diagnostic.range) else {
+            continue;
+        };
+        let Some(start) = text::position_to_offset(source, diagnostic.range.start) else {
+            continue;
+        };
+        let Some(end) = text::position_to_offset(source, diagnostic.range.end) else {
+            continue;
+        };
+        let Some(current_name) = source.get(start..end) else {
+            continue;
+        };
+        if current_name != unit_name {
+            continue;
+        }
+        let raw_edits = HashMap::from([(uri.clone(), vec![edit])]);
+        let records = HashMap::from([(uri.clone(), target_record.clone())]);
+        let Ok(edit) = workspace_edit(raw_edits, &records, document_changes) else {
+            continue;
+        };
+        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+            title: format!("Remove unused unit '{unit_name}'"),
+            kind: Some(CodeActionKind::QUICKFIX),
+            diagnostics: Some(vec![diagnostic.clone()]),
+            edit: Some(edit),
+            command: None,
+            is_preferred: Some(true),
+            disabled: None,
+            data: None,
+        }));
+    }
+    actions
+}
+
+/// Build one removal edit only for an exact unit-name range inside a parsed
+/// `uses` clause. Comments in the removed text are retained, and the edited
+/// source must still parse before the action is exposed.
+fn unused_unit_removal_edit(uri: &Url, source: &str, anchor: Range) -> Option<TextEdit> {
+    let start = text::position_to_offset(source, anchor.start)?;
+    let end = text::position_to_offset(source, anchor.end)?;
+    if start >= end {
+        return None;
+    }
+    let path = uri.to_file_path().ok().map(absolute_path)?;
+    let (tree, _) = parser::parse_file(&FileInfo::new(path.clone()), source.as_bytes()).ok()?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+
+    let mut clause_span = None;
+    let mut import_spans = Vec::new();
+    walk(root, &mut |node| {
+        if node.kind() != "moduleName" {
+            return;
+        }
+        let mut parent = node.parent();
+        while let Some(ancestor) = parent {
+            if ancestor.kind() == "declUses" {
+                let span = (ancestor.start_byte(), ancestor.end_byte());
+                if span.0 <= start && end <= span.1 {
+                    clause_span = Some(span);
+                    import_spans.push((node.start_byte(), node.end_byte()));
+                }
+                break;
+            }
+            parent = ancestor.parent();
+        }
+    });
+    let (clause_start, clause_end) = clause_span?;
+    let (semicolon, commas) = uses_clause_separators(source, clause_start, clause_end)?;
+    import_spans.sort_unstable();
+    let target_index = import_spans.iter().position(|span| *span == (start, end))?;
+    if commas.len().saturating_add(1) != import_spans.len() {
+        return None;
+    }
+
+    let (edit_start, edit_end, fallback, preserve_separator) = if import_spans.len() == 1 {
+        (clause_start, semicolon + 1, "", false)
+    } else if let Some((next_start, _)) = import_spans.get(target_index + 1).copied() {
+        let start = if target_index == 0 {
+            clause_start.checked_add("uses".len())?
+        } else {
+            *commas.get(target_index - 1)? + 1
+        };
+        let fallback = source.get(start..import_spans[target_index].0)?;
+        (start, next_start, fallback, true)
+    } else {
+        let previous_comma = commas
+            .iter()
+            .copied()
+            .take_while(|comma| *comma < import_spans[target_index].0)
+            .last()?;
+        (previous_comma, semicolon, "", false)
+    };
+    if edit_start >= edit_end
+        || !source.is_char_boundary(edit_start)
+        || !source.is_char_boundary(edit_end)
+    {
+        return None;
+    }
+    let replacement =
+        preserve_comments(source, edit_start, edit_end, fallback, preserve_separator)?;
+    let mut updated_source = source.to_owned();
+    updated_source.replace_range(edit_start..edit_end, &replacement);
+    let (updated_tree, _) =
+        parser::parse_file(&FileInfo::new(path), updated_source.as_bytes()).ok()?;
+    if updated_tree.root_node().has_error() {
+        return None;
+    }
+
+    Some(TextEdit::new(
+        Range::new(
+            text::offset_to_position(source, edit_start)?,
+            text::offset_to_position(source, edit_end)?,
+        ),
+        replacement,
+    ))
+}
+
+fn uses_clause_separators(source: &str, start: usize, end: usize) -> Option<(usize, Vec<usize>)> {
+    if start >= end || end > source.len() || !source_keyword_at(source, start, end, "uses") {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    let mut cursor = start + "uses".len();
+    let mut semicolon = None;
+    let mut commas = Vec::new();
+    while cursor < end {
+        match bytes[cursor] {
+            b'\'' | b'"' => {
+                let quote = bytes[cursor];
+                cursor = quoted_string_end(bytes, cursor, end, quote)?;
+            }
+            b'{' => {
+                let (comment_end, directive) = braced_comment_end(bytes, cursor, end)?;
+                if directive {
+                    return None;
+                }
+                cursor = comment_end;
+            }
+            b'(' if bytes.get(cursor + 1) == Some(&b'*') => {
+                let (comment_end, directive) = paren_comment_end(bytes, cursor, end)?;
+                if directive {
+                    return None;
+                }
+                cursor = comment_end;
+            }
+            b'/' if bytes.get(cursor + 1) == Some(&b'/') => {
+                cursor = line_comment_end(bytes, cursor, end);
+            }
+            b',' => {
+                if semicolon.is_some() {
+                    return None;
+                }
+                commas.push(cursor);
+                cursor += 1;
+            }
+            b';' => {
+                if semicolon.replace(cursor).is_some() {
+                    return None;
+                }
+                cursor += 1;
+            }
+            _ => cursor += 1,
+        }
+    }
+    let semicolon = semicolon?;
+    if commas.iter().any(|comma| *comma >= semicolon) {
+        return None;
+    }
+    Some((semicolon, commas))
+}
+
+fn preserve_comments(
+    source: &str,
+    start: usize,
+    end: usize,
+    fallback: &str,
+    preserve_separator: bool,
+) -> Option<String> {
+    let bytes = source.as_bytes();
+    let mut cursor = start;
+    let mut comments = Vec::new();
+    while cursor < end {
+        let comment = match bytes[cursor] {
+            b'{' => {
+                let (comment_end, directive) = braced_comment_end(bytes, cursor, end)?;
+                if directive {
+                    return None;
+                }
+                Some((comment_end, false))
+            }
+            b'(' if bytes.get(cursor + 1) == Some(&b'*') => {
+                let (comment_end, directive) = paren_comment_end(bytes, cursor, end)?;
+                if directive {
+                    return None;
+                }
+                Some((comment_end, false))
+            }
+            b'/' if bytes.get(cursor + 1) == Some(&b'/') => {
+                Some((line_comment_end(bytes, cursor, end), true))
+            }
+            b'\'' | b'"' => {
+                cursor = quoted_string_end(bytes, cursor, end, bytes[cursor])?;
+                None
+            }
+            _ => None,
+        };
+        if let Some((comment_end, line_comment)) = comment {
+            comments.push((cursor, comment_end, line_comment));
+            cursor = comment_end;
+        } else if cursor < end {
+            cursor += 1;
+        }
+    }
+    if comments.is_empty() {
+        return Some(if preserve_separator {
+            fallback.to_string()
+        } else {
+            String::new()
+        });
+    }
+
+    let (first_start, _, _) = comments[0];
+    let prefix = trailing_whitespace(source.get(start..first_start)?).unwrap_or(fallback);
+    let mut result = prefix.to_string();
+    for (index, (comment_start, comment_end, line_comment)) in comments.iter().copied().enumerate()
+    {
+        if index > 0 && !matches!(result.chars().last(), Some('\n' | '\r' | ' ')) && !line_comment {
+            result.push(' ');
+        }
+        result.push_str(source.get(comment_start..comment_end)?);
+    }
+
+    let (_, last_end, last_is_line) = comments.last().copied()?;
+    let mut suffix = leading_whitespace(source.get(last_end..end)?);
+    if last_is_line && suffix.starts_with("\r\n") {
+        suffix = &suffix[2..];
+    } else if last_is_line && suffix.starts_with(['\n', '\r']) {
+        suffix = &suffix[1..];
+    }
+    result.push_str(suffix);
+    if preserve_separator
+        && !result.is_empty()
+        && !result.chars().last().is_some_and(char::is_whitespace)
+    {
+        result.push(' ');
+    }
+    Some(result)
+}
+
+fn trailing_whitespace(text: &str) -> Option<&str> {
+    let index = text
+        .char_indices()
+        .rev()
+        .find_map(|(index, character)| {
+            (!character.is_whitespace()).then_some(index + character.len_utf8())
+        })
+        .unwrap_or(0);
+    text.get(index..)
+}
+
+fn leading_whitespace(text: &str) -> &str {
+    let end = text
+        .char_indices()
+        .find_map(|(index, character)| (!character.is_whitespace()).then_some(index))
+        .unwrap_or(text.len());
+    &text[..end]
+}
+
+fn braced_comment_end(bytes: &[u8], start: usize, limit: usize) -> Option<(usize, bool)> {
+    let directive = bytes.get(start + 1) == Some(&b'$');
+    let mut depth = 1usize;
+    let mut cursor = start + 1;
+    while cursor < limit {
+        match bytes[cursor] {
+            b'{' => depth = depth.checked_add(1)?,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((cursor + 1, directive));
+                }
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn paren_comment_end(bytes: &[u8], start: usize, limit: usize) -> Option<(usize, bool)> {
+    let directive = bytes.get(start + 2) == Some(&b'$');
+    let mut depth = 1usize;
+    let mut cursor = start + 2;
+    while cursor + 1 < limit {
+        if bytes[cursor] == b'(' && bytes[cursor + 1] == b'*' {
+            depth = depth.checked_add(1)?;
+            cursor += 2;
+        } else if bytes[cursor] == b'*' && bytes[cursor + 1] == b')' {
+            depth -= 1;
+            cursor += 2;
+            if depth == 0 {
+                return Some((cursor, directive));
+            }
+        } else {
+            cursor += 1;
+        }
+    }
+    None
+}
+
+fn line_comment_end(bytes: &[u8], start: usize, limit: usize) -> usize {
+    let mut end = start + 2;
+    while end < limit && !matches!(bytes[end], b'\n' | b'\r') {
+        end += 1;
+    }
+    if bytes.get(end) == Some(&b'\r') && bytes.get(end + 1) == Some(&b'\n') {
+        end + 2
+    } else if end < limit {
+        end + 1
+    } else {
+        end
+    }
+}
+
 fn parse_organize_imports_clause(
     source: &str,
     start: usize,
@@ -4185,15 +4670,12 @@ fn interface_post_edit_proves_obligation(
             && remaining.interface_owner == candidate.interface_owner
             && remaining.interface_method == candidate.interface_method
     });
-    if diagnostics.iter().any(|diagnostic| {
+    Ok(!diagnostics.iter().any(|diagnostic| {
         diagnostic.kind == SemanticDiagnosticKind::Dcc(DccMessage::E2291)
             && diagnostic.span.start == anchor_start
             && diagnostic.message.contains(&candidate.interface_method)
             && !same_named_obligation_remains
-    }) {
-        return Ok(false);
-    }
-    Ok(true)
+    }))
 }
 
 fn has_one_generated_interface_definition(
@@ -7161,10 +7643,11 @@ mod tests {
     use crate::workspace::rename::revalidate_input;
     use lsp_types::Url;
     use lsp_types::{
-        CodeActionContext, CodeActionOrCommand, Diagnostic, DiagnosticSeverity, NumberOrString,
-        Position, Range,
+        CodeActionContext, CodeActionOrCommand, Diagnostic, DiagnosticSeverity, DiagnosticTag,
+        NumberOrString, Position, Range,
     };
     use pascal_project::delphi_overrides::OverrideSession;
+    use pascal_project::{CompilerVersion, ConditionalContext, LayoutContext, TargetPlatform};
     use serde_json::json;
     use std::fs::{self, File, FileTimes};
     #[cfg(unix)]
@@ -7172,8 +7655,256 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
+    fn removed_unused_unit(source: &str, unit_name: &str) -> Option<String> {
+        let temp = tempfile::tempdir().expect("unused-unit workspace");
+        let root = temp.path().to_path_buf();
+        let source_path = root.join("Main.pas");
+        fs::write(&source_path, source).expect("source");
+        for name in ["System", "SysInit"] {
+            fs::write(
+                root.join(format!("{name}.pas")),
+                format!("unit {name}; interface implementation end."),
+            )
+            .expect("compiler unit provider");
+        }
+        let uses_clause = source
+            .split_once("uses")
+            .and_then(|(_, rest)| rest.split_once(';').map(|(uses, _)| uses))
+            .unwrap_or_default();
+        let imports = uses_clause
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<String>();
+        for import in imports.split(',') {
+            let Some(provider_name) = import.split_whitespace().next() else {
+                continue;
+            };
+            if provider_name.eq_ignore_ascii_case("in") {
+                continue;
+            }
+            fs::write(
+                root.join(format!("{provider_name}.pas")),
+                format!("unit {provider_name}; interface implementation end."),
+            )
+            .expect("unused-unit provider");
+        }
+        let uri = Url::from_file_path(&source_path).expect("source URI");
+        let start = source.find(unit_name)?;
+        let end = start.checked_add(unit_name.len())?;
+        let range = Range::new(
+            crate::text::offset_to_position(source, start)?,
+            crate::text::offset_to_position(source, end)?,
+        );
+        let mut diagnostic = Diagnostic::new(
+            range,
+            Some(DiagnosticSeverity::HINT),
+            Some(NumberOrString::String("lint4d-unused-unit".to_string())),
+            Some("pascal-lsp".to_string()),
+            format!("Unit '{unit_name}' is not used"),
+            None,
+            Some(vec![DiagnosticTag::UNNECESSARY]),
+        );
+        diagnostic.data = Some(json!({"unitName": unit_name}));
+        let params: lsp_types::CodeActionParams = serde_json::from_value(json!({
+            "textDocument": {"uri": uri},
+            "range": range,
+            "context": {
+                "diagnostics": [diagnostic],
+                "only": ["quickfix"]
+            }
+        }))
+        .expect("code action parameters");
+        let version = CompilerVersion::new(24, 0);
+        let conditional_context = ConditionalContext {
+            compiler_version: Some(version),
+            ..ConditionalContext::default()
+        }
+        .with_layout(LayoutContext::for_target(
+            Some(version),
+            Some(&TargetPlatform::Win32),
+        ));
+        let options = WorkspaceOptions {
+            conditional_context,
+            ..WorkspaceOptions::default()
+        };
+        let mut workspace = test_workspace(vec![root], options);
+        workspace
+            .context_for_uri(&uri)
+            .expect("code-action project context");
+        let input = workspace.analysis_input();
+        let computed = code_actions_from_input(
+            input,
+            params,
+            ClientActionFeatures {
+                resolve: false,
+                document_changes: false,
+                disabled: false,
+            },
+            &AtomicBool::new(false),
+        );
+        let actions = computed.value.ok()?;
+        let edit = actions.into_iter().find_map(|action| {
+            let CodeActionOrCommand::CodeAction(action) = action else {
+                return None;
+            };
+            (action.title == format!("Remove unused unit '{unit_name}'"))
+                .then_some(action.edit)
+                .flatten()
+        })?;
+        let edits = edit.changes?.get(&uri)?.clone();
+        let mut updated = source.to_owned();
+        let mut offsets = edits
+            .iter()
+            .map(|edit| {
+                Some((
+                    crate::text::position_to_offset(&updated, edit.range.start)?,
+                    crate::text::position_to_offset(&updated, edit.range.end)?,
+                    edit.new_text.as_str(),
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        offsets.sort_by_key(|(start, _, _)| *start);
+        for (start, end, new_text) in offsets.into_iter().rev() {
+            updated.replace_range(start..end, new_text);
+        }
+        Some(updated)
+    }
+
     fn test_workspace(roots: Vec<std::path::PathBuf>, options: WorkspaceOptions) -> Workspace {
         Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
+
+    #[test]
+    fn unused_unit_removal_handles_each_uses_list_position() {
+        let cases = [
+            (
+                "unit Main;\ninterface\nuses UnusedFirst, Keep;\nimplementation\nend.\n",
+                "UnusedFirst",
+                "unit Main;\ninterface\nuses Keep;\nimplementation\nend.\n",
+            ),
+            (
+                "unit Main;\ninterface\nuses KeepA, UnusedMiddle, KeepB;\nimplementation\nend.\n",
+                "UnusedMiddle",
+                "unit Main;\ninterface\nuses KeepA, KeepB;\nimplementation\nend.\n",
+            ),
+            (
+                "unit Main;\ninterface\nuses Keep, UnusedLast;\nimplementation\nend.\n",
+                "UnusedLast",
+                "unit Main;\ninterface\nuses Keep;\nimplementation\nend.\n",
+            ),
+            (
+                "unit Main;\ninterface\nuses UnusedOnly;\nimplementation\nend.\n",
+                "UnusedOnly",
+                "unit Main;\ninterface\n\nimplementation\nend.\n",
+            ),
+        ];
+
+        for (source, unit_name, expected) in cases {
+            assert_eq!(
+                removed_unused_unit(source, unit_name).as_deref(),
+                Some(expected),
+                "unit: {unit_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn unused_unit_removal_preserves_neighbor_comments_and_multiline_layout() {
+        let source = concat!(
+            "unit Main;\n",
+            "interface\n",
+            "uses KeepA,\n",
+            "  // Keep this explanation with the following entry.\n",
+            "  UnusedMiddle,\n",
+            "  KeepB;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let expected = concat!(
+            "unit Main;\n",
+            "interface\n",
+            "uses KeepA,\n",
+            "  // Keep this explanation with the following entry.\n",
+            "  KeepB;\n",
+            "implementation\n",
+            "end.\n",
+        );
+
+        assert_eq!(
+            removed_unused_unit(source, "UnusedMiddle").as_deref(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn unused_unit_removal_covers_explicit_path_qualifiers() {
+        let source = "unit Main;\ninterface\nuses UnusedPath in 'UnusedPath.pas', Keep;\nimplementation\nend.\n";
+        let expected = "unit Main;\ninterface\nuses Keep;\nimplementation\nend.\n";
+
+        assert_eq!(
+            removed_unused_unit(source, "UnusedPath").as_deref(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn dcc_oracle_editor_matches_the_unused_unit_quick_fix() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/dcc-oracle-remove-unit.py");
+        let cases = [
+            (
+                "unit Main;\ninterface\nuses UnusedFirst, Keep;\nimplementation\nend.\n",
+                "UnusedFirst",
+            ),
+            (
+                "unit Main;\ninterface\nuses KeepA,\n  // Keep this explanation with the following entry.\n  UnusedMiddle,\n  KeepB;\nimplementation\nend.\n",
+                "UnusedMiddle",
+            ),
+            (
+                "unit Main;\ninterface\nuses UnusedPath in 'UnusedPath.pas', Keep;\nimplementation\nend.\n",
+                "UnusedPath",
+            ),
+            (
+                "unit Main;\ninterface\nuses UnusedOnly;\nimplementation\nend.\n",
+                "UnusedOnly",
+            ),
+        ];
+
+        for (source, unit_name) in cases {
+            let quick_fix = removed_unused_unit(source, unit_name)
+                .unwrap_or_else(|| panic!("quick fix could not remove {unit_name}"));
+            let mut child = Command::new("python3")
+                .arg(&helper)
+                .arg("--unit")
+                .arg(unit_name)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("start dcc-oracle editor");
+            child
+                .stdin
+                .take()
+                .expect("editor stdin")
+                .write_all(source.as_bytes())
+                .expect("write source to editor");
+            let output = child
+                .wait_with_output()
+                .expect("wait for dcc-oracle editor");
+            assert!(
+                output.status.success(),
+                "editor failed for {unit_name}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8(output.stdout).expect("editor output is UTF-8"),
+                quick_fix,
+                "dcc-oracle edit differs from quick fix for {unit_name}"
+            );
+        }
     }
 
     #[test]

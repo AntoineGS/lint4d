@@ -1,0 +1,4 @@
+unit = "W1000TypeInVarDecl.pas"
+compilers = ["21.0", "24.0", "37.0"]
+recall_exempt = ["W1000"]
+reason = "dcc emits two identical W1000 diagnostics for each single deprecated-type identifier; the semantic pass proves one finding per occurrence and cannot establish the compiler's duplicate multiplicity."

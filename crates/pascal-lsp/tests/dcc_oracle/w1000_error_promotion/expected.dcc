@@ -1,0 +1,6 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -W^SYMBOL_DEPRECATED -W^SYMBOL_EXPERIMENTAL -W^SYMBOL_LIBRARY -W^SYMBOL_PLATFORM -NSSystem W1000ErrorPromotion.pas
+W1000ErrorPromotion.pas(33) E1000 Symbol 'DeprecatedRoutine' is deprecated
+W1000ErrorPromotion.pas(34) E1001 Symbol 'DeprecatedLibraryVariable' is specific to a library
+W1000ErrorPromotion.pas(35) E1002 Symbol 'PlatformRoutine' is specific to a platform
+W1000ErrorPromotion.pas(36) E1003 Symbol 'ExperimentalRoutine' is experimental

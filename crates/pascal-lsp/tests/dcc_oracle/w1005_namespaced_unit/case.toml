@@ -1,0 +1,3 @@
+unit = "NamespacedUse.pas"
+compilers = ["24.0", "37.0"]
+unused_unit_check = ["Vcl.Probe"]

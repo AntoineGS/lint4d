@@ -781,7 +781,8 @@ impl NavigationIndex {
             )? {
                 super::overload::ParameterModeResolution::Resolved(mode)
                 | super::overload::ParameterModeResolution::Intrinsic(mode) => mode,
-                super::overload::ParameterModeResolution::Unresolved => {
+                super::overload::ParameterModeResolution::Unresolved
+                | super::overload::ParameterModeResolution::UncertainTarget => {
                     let cache_key = unresolved_call_target_cache_key_with_budget(
                         current_uri,
                         document,
@@ -1175,6 +1176,7 @@ impl NavigationIndex {
             identifier,
             owner_type.as_deref(),
             candidates,
+            false,
         )
     }
 
@@ -1184,6 +1186,7 @@ impl NavigationIndex {
         identifier: Node<'_>,
         owner_type: Option<&str>,
         candidates: &[Candidate],
+        allow_class_global_fallback: bool,
     ) -> bool {
         let type_reference = has_ancestor_kind(identifier, "typeref");
         let unknown = owner_type
@@ -1210,6 +1213,9 @@ impl NavigationIndex {
             self.relaxed_bindings.record(format!(
                 "Members inherited by {name} are unknown; the result may be shadowed."
             ));
+            return false;
+        }
+        if unknown && allow_class_global_fallback {
             return false;
         }
         unknown

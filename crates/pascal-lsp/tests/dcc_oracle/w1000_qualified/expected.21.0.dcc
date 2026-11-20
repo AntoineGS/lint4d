@@ -1,0 +1,4 @@
+# Embarcadero Delphi for Win32 compiler version 21.0
+# dcc32 -B -H+ -W+ -Q -U<lib> W1000Qualified.pas
+W1000Qualified.pas(13) W1000 Symbol 'DeprecatedRoutine' is deprecated
+W1000Qualified.pas(13) W1000 Symbol 'DeprecatedRoutine' is deprecated

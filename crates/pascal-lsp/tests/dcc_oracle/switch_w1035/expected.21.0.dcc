@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 21.0
+# dcc32 -B -H+ -W+ -Q -U<lib> NoResult.pas
+NoResult.pas(11) W1035 Return value of function 'Visible' might be undefined

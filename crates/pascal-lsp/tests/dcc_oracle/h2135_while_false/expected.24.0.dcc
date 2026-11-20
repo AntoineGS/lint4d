@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 24.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem WhileFalse.pas
+WhileFalse.pas(6) H2135 FOR or WHILE loop executes zero times - deleted

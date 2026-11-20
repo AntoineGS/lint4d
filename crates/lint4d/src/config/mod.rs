@@ -40,6 +40,12 @@ impl FromStr for Config {
         let mut rule_overrides = HashMap::new();
         if let Some(rules) = &raw.rules {
             for (key, value) in &rules.overrides {
+                if key == "unused-unit" && !matches!(value.as_str(), "hint" | "off") {
+                    return Err(format!(
+                        "Invalid value '{}' for rule 'unused-unit' (expected 'hint' or 'off')",
+                        value
+                    ));
+                }
                 let override_val = if value == "off" {
                     RuleSeverityOverride::Off
                 } else {

@@ -1,0 +1,2 @@
+unit = "StringNever.pas"
+compilers = ["21.0", "24.0", "37.0"]

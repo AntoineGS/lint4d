@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem Method.pas
+Method.pas(8) W1035 Return value of function 'TWorker.Value' might be undefined

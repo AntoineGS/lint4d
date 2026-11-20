@@ -1,0 +1,8 @@
+# Embarcadero Delphi for Win32 compiler version 24.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem RepeatedUse.pas
+RepeatedUse.pas(8) H2443 Inline function 'UsesHelper' has not been expanded because unit 'RepeatHelper' is not specified in USES list
+RepeatedUse.pas(9) H2443 Inline function 'UsesHelper' has not been expanded because unit 'RepeatHelper' is not specified in USES list
+RepeatedUse.pas(10) H2443 Inline function 'UsesHelper' has not been expanded because unit 'RepeatHelper' is not specified in USES list
+RepeatedUse.pas(10) H2077 Value assigned to 'I' never used
+RepeatedUse.pas(9) H2077 Value assigned to 'I' never used
+RepeatedUse.pas(8) H2077 Value assigned to 'I' never used

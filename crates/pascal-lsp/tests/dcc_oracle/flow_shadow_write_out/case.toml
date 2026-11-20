@@ -1,0 +1,4 @@
+unit = "FlowShadowWriteOut.pas"
+compilers = ["21.0", "24.0", "37.0"]
+unindexed_units = ["ShadowWrite.pas"]
+reason = "ShadowWrite is intentionally unindexed by lint4d; Delphi resolves Write(X) to its Write(out Value) routine."

@@ -149,3 +149,22 @@ fn config_parses_bds_path() {
     .unwrap();
     assert_eq!(config.bds_path(), Some("C:/Embarcadero/Studio/23.0"));
 }
+
+#[test]
+fn unused_unit_rule_accepts_only_hint_or_off() {
+    for value in ["hint", "off"] {
+        let config = format!("version = 1\n[rules]\nunused-unit = \"{value}\"\n")
+            .parse::<Config>()
+            .unwrap();
+        match (value, config.rule_severity("unused-unit")) {
+            ("hint", Some(RuleSeverityOverride::Severity(Severity::Hint))) => {}
+            ("off", Some(RuleSeverityOverride::Off)) => {}
+            result => panic!("unexpected unused-unit configuration: {result:?}"),
+        }
+    }
+
+    let error = "version = 1\n[rules]\nunused-unit = \"warning\"\n"
+        .parse::<Config>()
+        .expect_err("unused-unit only accepts hint or off");
+    assert!(error.contains("unused-unit"), "{error}");
+}

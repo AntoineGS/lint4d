@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 24.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem TryFinally.pas
+TryFinally.pas(8) H2077 Value assigned to 'Value' never used

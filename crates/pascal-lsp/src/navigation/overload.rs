@@ -200,11 +200,38 @@ pub(super) fn candidate_in_group(
     key_for_candidate(index, candidate).is_some_and(|key| key == *group)
 }
 
+pub(super) fn candidate_target_count_after_overload_grouping(
+    index: &NavigationIndex,
+    candidates: &[Candidate],
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<usize, String> {
+    let mut routine_groups = HashSet::new();
+    let mut other_targets = HashSet::new();
+    for candidate in candidates {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if index
+            .symbol(candidate)
+            .is_some_and(|symbol| symbol.kind == SymbolKind::Routine)
+            && let Some(key) = key_for_candidate(index, candidate)
+        {
+            routine_groups.insert(key);
+        } else {
+            other_targets.insert(candidate.clone());
+        }
+    }
+    Ok(routine_groups.len().saturating_add(other_targets.len()))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ParameterModeResolution {
     /// The callable target itself could not be resolved with sufficient
     /// certainty. This result is safe to cache by callable lookup context.
     Unresolved,
+    /// A source-backed target set exists, but import precedence or overload
+    /// ambiguity prevents proving one target for flow effects.
+    UncertainTarget,
     /// The target was resolved, but overload selection may still be
     /// ambiguous or have no parameter at the requested index.
     Resolved(Option<ParameterMode>),
@@ -354,7 +381,11 @@ pub(super) fn parameter_mode_for_argument(
         .any(|candidate| index.candidate_is_conditionally_unknown(candidate))
         || state_has_uncertainty(&state)
     {
-        return Ok(ParameterModeResolution::Unresolved);
+        return Ok(if candidates.is_empty() {
+            ParameterModeResolution::Unresolved
+        } else {
+            ParameterModeResolution::UncertainTarget
+        });
     }
     if candidates.is_empty() {
         return Ok(intrinsic_parameter_mode_for_entity(
@@ -384,7 +415,11 @@ pub(super) fn parameter_mode_for_argument(
         })
     });
     if candidates.is_empty() {
-        return Ok(ParameterModeResolution::Unresolved);
+        return Ok(ParameterModeResolution::UncertainTarget);
+    }
+    let groups = routine_groups(index, &candidates, cancel, budget)?;
+    if groups.is_empty() {
+        return Ok(ParameterModeResolution::UncertainTarget);
     }
     let owner_receivers = super::callable_owner_node(entity)
         .map(|owner| {
@@ -410,7 +445,7 @@ pub(super) fn parameter_mode_for_argument(
         })
         .collect::<Vec<_>>();
     if state_has_uncertainty(&state) {
-        return Ok(ParameterModeResolution::Unresolved);
+        return Ok(ParameterModeResolution::UncertainTarget);
     }
     let selection = select(
         index,
@@ -425,18 +460,43 @@ pub(super) fn parameter_mode_for_argument(
         cancel,
         budget,
     )?;
-    let Some(group) = selection.selected_group else {
-        return Ok(ParameterModeResolution::Resolved(None));
+    let group = match selection.selected_group {
+        Some(group) => group,
+        None if groups.len() == 1 => groups[0].key.clone(),
+        None => return Ok(ParameterModeResolution::UncertainTarget),
     };
-    let selected = candidates
+    let selected = groups
         .iter()
-        .find(|candidate| candidate_in_group(index, candidate, &group));
-    Ok(ParameterModeResolution::Resolved(
-        selected
-            .and_then(|candidate| index.symbol(candidate))
-            .and_then(|symbol| symbol.routine_parameters.get(argument_index))
-            .map(|parameter| parameter.mode),
-    ))
+        .find(|candidate_group| candidate_group.key == group)
+        .map(|candidate_group| &candidate_group.representative);
+    let Some(selected) = selected else {
+        return Ok(ParameterModeResolution::UncertainTarget);
+    };
+    let Some(symbol) = index.symbol(selected) else {
+        return Ok(ParameterModeResolution::UncertainTarget);
+    };
+    if super::callable_owner_node(entity).is_none()
+        && index.flow_candidate_has_shadowing_uncertainty(
+            current_uri,
+            current_document,
+            lookup_identifier.start_byte(),
+            &canonical_name(&super::node_text(
+                lookup_identifier,
+                &current_document.source,
+            )),
+            selected,
+            cancel,
+            budget,
+        )?
+    {
+        return Ok(ParameterModeResolution::UncertainTarget);
+    }
+    Ok(symbol
+        .routine_parameters
+        .get(argument_index)
+        .map_or(ParameterModeResolution::UncertainTarget, |parameter| {
+            ParameterModeResolution::Resolved(Some(parameter.mode))
+        }))
 }
 
 fn intrinsic_parameter_mode_for_entity(
@@ -1180,8 +1240,11 @@ fn generic_substitution_for_group(
     else {
         return Ok(None);
     };
+    let explicit_arguments = generic_call_arguments(call);
     if symbol.generic_parameters.is_empty() {
-        return Ok(Some((owner_substitution, false)));
+        return Ok(explicit_arguments
+            .is_none()
+            .then_some((owner_substitution, false)));
     }
 
     let mut substitution = owner_substitution;
@@ -1192,7 +1255,7 @@ fn generic_substitution_for_group(
         // argument-based inference.
         substitution.remove(&parameter.name);
     }
-    if let Some(explicit_arguments) = generic_call_arguments(call) {
+    if let Some(explicit_arguments) = explicit_arguments {
         if explicit_arguments.len() != symbol.generic_parameters.len() {
             return Ok(None);
         }
@@ -1452,6 +1515,10 @@ fn has_proven_constructor(
     } else {
         ConstraintOutcome::Unknown
     })
+}
+
+pub(super) fn has_explicit_generic_arguments(call: Node<'_>) -> bool {
+    generic_call_arguments(call).is_some()
 }
 
 fn generic_call_arguments(call: Node<'_>) -> Option<Vec<Node<'_>>> {

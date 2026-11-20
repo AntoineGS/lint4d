@@ -1,0 +1,5 @@
+# Embarcadero Delphi for Win32 compiler version 37.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem OverloadUse.pas
+OverloadUse.pas(8) H2443 Inline function 'InlineValue' has not been expanded because unit 'OverloadHelper' is not specified in USES list
+OverloadUse.pas(9) H2077 Value assigned to 'I' never used
+OverloadUse.pas(8) H2077 Value assigned to 'I' never used

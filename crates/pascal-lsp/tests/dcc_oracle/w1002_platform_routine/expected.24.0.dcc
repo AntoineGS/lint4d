@@ -1,0 +1,3 @@
+# Embarcadero Delphi for Win32 compiler version 24.0
+# dcc32 -B -H+ -W+ -Q -U<lib\win32\release> -NSSystem W1002PlatformRoutine.pas
+W1002PlatformRoutine.pas(16) W1002 Symbol 'PlatformRoutine' is specific to a platform

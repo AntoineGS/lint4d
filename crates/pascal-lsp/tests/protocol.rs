@@ -77,6 +77,387 @@ fn diagnostics_suppress_unqualified_global_absence_without_a_system_catalogue() 
     server.shutdown();
 }
 
+#[test]
+fn unused_unit_hint_is_published_with_its_protocol_metadata() {
+    let root = tempfile::tempdir().expect("workspace");
+    for (name, source) in [
+        ("System", "unit System;\ninterface\nimplementation\nend.\n"),
+        (
+            "SysInit",
+            "unit SysInit;\ninterface\nimplementation\nend.\n",
+        ),
+        ("Unused", "unit Unused;\ninterface\nimplementation\nend.\n"),
+    ] {
+        write_file(&root.path().join(format!("{name}.pas")), source);
+    }
+    let source_path = root.path().join("Main.pas");
+    let source = "unit Main;\ninterface\nuses Unused;\nimplementation\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), dcc_surface_options());
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+
+    let publication = diagnostics_for_uri(&mut server, &uri(&source_path));
+    let diagnostics = publication["diagnostics"]
+        .as_array()
+        .expect("published diagnostics");
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "lint4d-unused-unit")
+        .unwrap_or_else(|| panic!("missing unused-unit hint: {diagnostics:?}"));
+    assert_eq!(diagnostic["source"], "pascal-lsp");
+    assert_eq!(diagnostic["severity"], 4, "unused-unit is a Hint");
+    assert_eq!(diagnostic["tags"], json!([1]), "tag 1 is Unnecessary");
+    assert_eq!(diagnostic["message"], "Unit 'Unused' is not used");
+    assert_eq!(
+        diagnostic["data"]["unitName"], "Unused",
+        "quick fixes bind the diagnostic to its unit name"
+    );
+
+    server.shutdown();
+}
+
+#[test]
+fn unused_unit_diagnostics_read_authorized_sibling_form_resources() {
+    let root = tempfile::tempdir().expect("workspace");
+    for (name, source) in [
+        ("System", "unit System;\ninterface\nimplementation\nend.\n"),
+        (
+            "SysInit",
+            "unit SysInit;\ninterface\nimplementation\nend.\n",
+        ),
+        (
+            "FormTypes",
+            "unit FormTypes;\ninterface\ntype TStreamedForm = class end;\nimplementation\nend.\n",
+        ),
+        ("Unused", "unit Unused;\ninterface\nimplementation\nend.\n"),
+    ] {
+        write_file(&root.path().join(format!("{name}.pas")), source);
+    }
+    let source_path = root.path().join("Main.pas");
+    let source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "uses Unused, FormTypes;\n",
+        "implementation\n",
+        "{$R *.dfm}\n",
+        "end.\n",
+    );
+    write_file(&source_path, source);
+    write_file(
+        &root.path().join("Main.dfm"),
+        "object MainForm: TStreamedForm\nend\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), dcc_surface_options());
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+
+    let publication = diagnostics_for_uri(&mut server, &uri(&source_path));
+    let diagnostics = publication["diagnostics"]
+        .as_array()
+        .expect("published diagnostics");
+    let unused_units = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic["code"] == "lint4d-unused-unit")
+        .map(|diagnostic| diagnostic["message"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        unused_units,
+        ["Unit 'Unused' is not used"],
+        "the unused import should be reported while the DFM-streamed class provider is retained: {publication}"
+    );
+    let unused_diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["message"] == "Unit 'Unused' is not used")
+        .expect("unused-unit diagnostic");
+    let request_id = RequestId::from("form-backed-unused-unit-action".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "range": unused_diagnostic["range"],
+            "context": {
+                "diagnostics": [unused_diagnostic],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "form-backed codeAction failed: {response:?}"
+    );
+    let actions = response.result.expect("form-backed code actions");
+    assert!(
+        actions
+            .as_array()
+            .expect("form-backed actions")
+            .iter()
+            .any(|action| action["title"] == "Remove unused unit 'Unused'"),
+        "the fresh analysis for quick-fix revalidation should use the authorized sibling DFM: {actions}"
+    );
+
+    server.shutdown();
+}
+
+#[test]
+fn unused_unit_quickfix_applies_first_middle_last_and_only_entry_edits() {
+    let root = tempfile::tempdir().expect("workspace");
+    let cases = [
+        (
+            "MainFirst",
+            "UnusedFirst",
+            "unit MainFirst;\ninterface\nuses UnusedFirst, KeepFirst;\nimplementation\nend.\n",
+            "unit MainFirst;\ninterface\nuses KeepFirst;\nimplementation\nend.\n",
+            &["KeepFirst"][..],
+        ),
+        (
+            "MainMiddle",
+            "UnusedMiddle",
+            "unit MainMiddle;\ninterface\nuses KeepA, UnusedMiddle, KeepB;\nimplementation\nend.\n",
+            "unit MainMiddle;\ninterface\nuses KeepA, KeepB;\nimplementation\nend.\n",
+            &["KeepA", "KeepB"][..],
+        ),
+        (
+            "MainLast",
+            "UnusedLast",
+            "unit MainLast;\ninterface\nuses KeepLast, UnusedLast;\nimplementation\nend.\n",
+            "unit MainLast;\ninterface\nuses KeepLast;\nimplementation\nend.\n",
+            &["KeepLast"][..],
+        ),
+        (
+            "MainOnly",
+            "UnusedOnly",
+            "unit MainOnly;\ninterface\nuses UnusedOnly;\nimplementation\nend.\n",
+            "unit MainOnly;\ninterface\n\nimplementation\nend.\n",
+            &[][..],
+        ),
+    ];
+    for name in ["System", "SysInit"] {
+        write_file(
+            &root.path().join(format!("{name}.pas")),
+            &format!("unit {name};\ninterface\nimplementation\nend.\n"),
+        );
+    }
+    for (_, _, _, _, providers) in &cases {
+        for provider in *providers {
+            write_file(
+                &root.path().join(format!("{provider}.pas")),
+                &format!("unit {provider};\ninterface\nimplementation\nend.\n"),
+            );
+        }
+    }
+    for (_, unused, _, _, _) in &cases {
+        write_file(
+            &root.path().join(format!("{unused}.pas")),
+            &format!("unit {unused};\ninterface\nimplementation\nend.\n"),
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), dcc_surface_options());
+    for (main_name, unused, source, expected, _) in cases {
+        let path = root.path().join(format!("{main_name}.pas"));
+        write_file(&path, source);
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(&path),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": source,
+                }
+            }),
+        );
+        let publication = diagnostics_for_uri(&mut server, &uri(&path));
+        let diagnostic = publication["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .find(|diagnostic| {
+                diagnostic["code"] == "lint4d-unused-unit"
+                    && diagnostic["message"] == format!("Unit '{unused}' is not used")
+            })
+            .unwrap_or_else(|| panic!("missing unused-unit diagnostic: {publication}"));
+
+        let request_id = RequestId::from(format!("unused-unit-action-{main_name}"));
+        server.send_request(
+            request_id.clone(),
+            "textDocument/codeAction",
+            json!({
+                "textDocument": {"uri": uri(&path)},
+                "range": diagnostic["range"],
+                "context": {
+                    "diagnostics": [diagnostic],
+                    "only": ["quickfix"]
+                }
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_none(),
+            "codeAction failed for {main_name}: {response:?}"
+        );
+        let actions = response.result.expect("code action result");
+        let action = actions
+            .as_array()
+            .expect("code actions")
+            .iter()
+            .find(|action| action["title"] == format!("Remove unused unit '{unused}'"))
+            .unwrap_or_else(|| panic!("missing removal action for {unused}: {actions}"));
+        assert!(
+            action["edit"].is_object(),
+            "protocol action should include an eager workspace edit: {action}"
+        );
+        assert_eq!(
+            apply_workspace_edit_to_source(source, &action["edit"], &uri(&path)),
+            expected,
+            "protocol edit result for {main_name}"
+        );
+    }
+    server.shutdown();
+}
+
+#[test]
+fn unused_unit_quickfix_rejects_a_stale_diagnostic_range_on_a_used_import() {
+    let root = tempfile::tempdir().expect("workspace");
+    for (name, source) in [
+        ("System", "unit System;\ninterface\nimplementation\nend.\n"),
+        (
+            "SysInit",
+            "unit SysInit;\ninterface\nimplementation\nend.\n",
+        ),
+        ("Unused", "unit Unused;\ninterface\nimplementation\nend.\n"),
+        (
+            "UsedOK",
+            concat!(
+                "unit UsedOK;\n",
+                "interface\n",
+                "function Needed: Integer;\n",
+                "implementation\n",
+                "function Needed: Integer;\nbegin Result := 1; end;\n",
+                "end.\n",
+            ),
+        ),
+    ] {
+        write_file(&root.path().join(format!("{name}.pas")), source);
+    }
+
+    let source_path = root.path().join("Main.pas");
+    let initial_source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "uses Unused;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&source_path, initial_source);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), dcc_surface_options());
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": initial_source,
+            }
+        }),
+    );
+    let initial_publication = diagnostics_for_uri(&mut server, &uri(&source_path));
+    let stale_diagnostic = initial_publication["diagnostics"]
+        .as_array()
+        .expect("initial diagnostics")
+        .iter()
+        .find(|diagnostic| {
+            diagnostic["code"] == "lint4d-unused-unit"
+                && diagnostic["message"] == "Unit 'Unused' is not used"
+        })
+        .cloned()
+        .expect("initial unused-unit diagnostic");
+
+    let current_source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "uses UsedOK;\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "var Value: Integer;\n",
+        "begin Value := Needed; end;\n",
+        "end.\n",
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&source_path), "version": 2},
+            "contentChanges": [{"text": current_source}],
+        }),
+    );
+    let current_publication = diagnostics_for_uri(&mut server, &uri(&source_path));
+    assert!(
+        current_publication["diagnostics"]
+            .as_array()
+            .expect("current diagnostics")
+            .iter()
+            .all(|diagnostic| diagnostic["code"] != "lint4d-unused-unit"),
+        "UsedOK is needed by the current source: {current_publication}"
+    );
+
+    let request_id = RequestId::from("stale-unused-unit-action".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "range": stale_diagnostic["range"],
+            "context": {
+                "diagnostics": [stale_diagnostic],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "codeAction failed: {response:?}");
+    let actions = response.result.expect("code actions");
+    assert!(
+        actions
+            .as_array()
+            .expect("actions array")
+            .iter()
+            .all(|action| !action["title"]
+                .as_str()
+                .is_some_and(|title| title.starts_with("Remove unused unit "))),
+        "a stale range must not remove the current used import: {actions}"
+    );
+
+    server.shutdown();
+}
+
 /// Lint withheld because conditional compilation is unresolved names that
 /// cause; it is not an include failure (sysutils-expansion: Delphi 2010's
 /// SysUtils.pas has no include and reported "include expansion").
@@ -5454,7 +5835,10 @@ fn pull_document_diagnostics_returns_owned_related_include_reports() {
             .any(|diagnostic| diagnostic["message"] == "Undeclared identifier: 'Missing'")
     );
 
-    let fixed_include = include_source.replace("Missing", "Value");
+    let fixed_include = include_source.replace(
+        "  Box.Missing := 1;\n",
+        "  Box := TBox.Create;\n  Box.Value := 1;\n",
+    );
     write_file(&include, &fixed_include);
     let changed_id = RequestId::from("pull-document-diagnostic-related-cleared".to_string());
     server.send_request(

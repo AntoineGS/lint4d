@@ -3280,6 +3280,7 @@ impl NavigationIndex {
             identifier,
             document.owner_type_for_scope(scope).as_deref(),
             &candidates,
+            false,
         ) {
             return Ok(None);
         }
@@ -7318,6 +7319,7 @@ mod tests {
             type_kind: TypeKind::Other,
             routine_kind: RoutineKind::Procedure,
             routine_directives: Default::default(),
+            hint_directives: Default::default(),
             parameter_mode: None,
             scope: 0,
             owner_type: None,

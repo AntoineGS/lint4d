@@ -1,0 +1,4 @@
+unit = "FlowShadowBreak.pas"
+compilers = ["21.0", "24.0", "37.0"]
+unindexed_units = ["ShadowBreak.pas"]
+reason = "ShadowBreak is intentionally unindexed by lint4d; Delphi resolves the imported routine named Break."
